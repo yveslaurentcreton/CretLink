@@ -1,0 +1,41 @@
+# cargo-deny configuration — dependency license, advisory, and source policy.
+# Policy rationale: CONTRIBUTING.md "Dependency and license policy" (REQ-N-016,
+# REQ-N-017, REQ-S-005). Runs in CI (ST-M001-004).
+
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+]
+# MIT-0 (MIT No Attribution) is OSI-approved and strictly more permissive than
+# MIT — it drops even the attribution requirement — so it is compatible with the
+# project's permissive-only intent and MIT distribution. It appears in the
+# dev-only JSON-Schema validator of the ST-M004-005 conformance harness
+# (`fluent-uri` -> `borrow-or-share`) and as one option of `aws-lc-sys`'s
+# `Apache-2.0 OR ISC OR MIT-0` license choice (ADR-0017).
+# MPL-2.0 and anything else needs an explicit maintainer exception here with a
+# comment explaining the review outcome.
+confidence-threshold = 0.9
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,27 @@
+[package]
+name = "cretlink-shared"
+description = "Cross-cutting CretLink utilities: identifiers, time, redaction, and audit primitives"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+# The audit module (ST-M002-007, ADR-0008) reuses the protocol `SessionId`
+# rather than minting a second identifier type, serializes typed records with
+# serde/serde_json, chains lines with the workspace `sha2` (0.10 line, shared
+# with the crypto stack per ST-M002-004), and surfaces write failures as a
+# `thiserror` error the console can act on. No new workspace dependency is
+# introduced: all five are already declared in the root manifest and their
+# licenses are on the deny.toml allow list.
+cretlink-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

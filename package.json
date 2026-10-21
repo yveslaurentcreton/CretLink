@@ -1,0 +1,16 @@
+{
+  "name": "cretlink-release-tooling",
+  "private": true,
+  "description": "Release automation tooling for CretLink (semantic-release; versions come from Conventional Commits, never from this file)",
+  "license": "MIT",
+  "engines": {
+    "node": "^22.14.0 || >=24.10.0"
+  },
+  "devDependencies": {
+    "@semantic-release/commit-analyzer": "13.0.1",
+    "@semantic-release/github": "12.0.9",
+    "@semantic-release/release-notes-generator": "14.1.1",
+    "conventional-changelog-conventionalcommits": "9.3.1",
+    "semantic-release": "25.0.9"
+  }
+}

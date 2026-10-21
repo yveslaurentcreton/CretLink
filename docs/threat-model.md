@@ -1,0 +1,2134 @@
+# CretLink threat model
+
+## Purpose and scope
+
+CretLink lets an MCP-capable AI agent on a technician's own computer operate an
+attended customer Windows computer through a temporary, authenticated,
+encrypted LAN session. Because the product intentionally enables
+administrator-level remote execution, its security must be a product property,
+not an afterthought. This document is the public threat model required by
+REQ-S-021. It covers pairing, LAN attackers, malicious peers, compromised AI
+clients, command execution, file transfer, temporary persistence, relay
+operation, and supply-chain risks.
+
+This is a defensive document for a legitimate attended-support tool. It
+describes abuse cases and attacks so they can be mitigated and detected, not as
+a how-to. It contains no exploit code and no operational attack detail beyond
+what is needed to justify a mitigation.
+
+**Implementation-status honesty.** Milestones M001 (project foundation) and
+M002 (pairing and the secure channel) are Done. Remote execution and files
+(M003) and MCP control (M004) are implemented: the execution core
+(ST-M003-001, ST-M003-002), the file-operation and transfer subsystem
+(ST-M003-004, ST-M003-005), and the MCP bridge session control and file tools
+(ST-M004-001 to ST-M004-004) have automated tests, a simulated-agent
+end-to-end run in CI, and real-elevated-agent runs on maintainer hardware; the
+milestones stay in progress because hardware validation is outstanding,
+including the maintainer-run half ([`manual-tests.md`](manual-tests.md)) of
+the privileged adversarial suite (ST-M003-007), whose automated half is green
+and cited by test name below. Resilience and release hardening (M006) is in
+progress: the reboot-resume ticket, proof and fail-closed checks (ADR-0014),
+the residual-access inventory and `cretlink-support-agent recover`, and
+kill-on-close process-tree containment are implemented; wiring reboot-resume
+into an actual reboot (the auto-start entry and the post-reboot reconnect) is
+not, so hardware scenario MT-8 cannot pass yet. Official releases are
+published with checksums, a dependency inventory, and SBOMs, though not yet
+code-signed. The internet relay
+(M007) is in progress: the opaque relay core, `cretlink-relay-server`, the
+endpoint dialer, and the `wss`/TLS transport exist. Desktop control (M005) and
+the technician terminal (M008) are draft milestones with experimental code
+only. A mitigation described for an unshipped area is therefore a **design
+commitment bound to a requirement**, not a claim about shipped code, unless the
+section says otherwise. Each boundary section below states its own status, and
+this document must be revisited whenever a milestone changes a trust boundary
+(see [Maintaining this document](#maintaining-this-document)).
+
+Requirement identifiers cited throughout refer to the security (REQ-S-###),
+functional (REQ-F-###), and non-functional (REQ-N-###) requirements in the
+project's specification.
+
+## Assets
+
+The things worth attacking, and therefore worth protecting:
+
+- **Administrator authority over the customer computer.** The active,
+  consented session itself — the highest-value asset. Whoever holds it can run
+  arbitrary elevated commands (REQ-F-007).
+- **Customer data.** Files, command output, system metadata, and later
+  screenshots, all of which may flow to the technician computer and onward to
+  the technician's AI service (REQ-S-016).
+- **Session secrets.** Session keys and bearer capabilities (REQ-S-007), the
+  Session Approval Code (SAC, bound to the cryptographic session by
+  REQ-S-006), and the reboot-resume continuity ticket stored across a restart
+  when the customer explicitly arms it (REQ-F-021, ADR-0014).
+- **Technician-side secrets.** AI credentials, provider tokens, and account
+  sessions. These must never reach the customer computer (REQ-S-015,
+  REQ-F-015).
+- **Consent integrity.** The accuracy of what the customer believed they
+  approved (REQ-S-001, REQ-S-003) and the customer's ability to trust that
+  "support has ended" means what it says (REQ-F-019).
+- **Identity attribution.** The binding of every result to the correct target,
+  session, and elevation state (REQ-F-016, REQ-S-011).
+- **The audit trail.** The local append-oriented record of what happened
+  (REQ-S-017).
+- **Release artifacts and provenance.** Official binaries, checksums, the
+  build pipeline, and repository and CI credentials (REQ-S-019, REQ-N-017).
+
+## Threat actors
+
+Actors recur across boundaries; each boundary section names the ones relevant
+to it.
+
+- **Passive LAN observer.** Records discovery and session traffic on a shared
+  or hostile network (shop Wi-Fi, customer premises with unknown devices).
+- **Active LAN attacker.** Injects, modifies, replays, or races traffic; spoofs
+  ARP or mDNS; floods the network; may attempt to interpose during pairing.
+- **Rogue endpoint / malicious peer.** A device speaking the CretLink protocol:
+  a rogue console seeking control of a customer device, a tampered or
+  deliberately dishonest support agent feeding false results to the technician,
+  or a post-disconnect impersonator trying to inherit a session.
+- **Compromised or misbehaving AI client.** An AI model or MCP client on the
+  technician computer emitting harmful, deceptive, or malformed tool calls.
+- **Adversary with content on the customer computer.** Resident malware, a
+  booby-trapped file, or hostile text emitted by a program the AI runs — able
+  to plant instructions in data the session reflects back to the AI (indirect
+  prompt injection), or to attack the session components locally.
+- **Malicious technician.** Someone who obtains genuine consent and abuses the
+  granted authority.
+- **Local opportunist after the session.** A later local user or malware that
+  discovers leftover components or reconnect material.
+- **Malicious relay operator (M007).** Modelled as fully hostile.
+- **Supply-chain attackers.** A compromised dependency maintainer, an attacker
+  with repository or workflow access, an artifact tamperer or impersonator, or
+  a careless insider leaking secrets.
+- **Inattentive humans.** Not malicious, but a customer or technician who
+  confirms codes and consent screens without reading them is the enabling
+  condition for several attacks.
+
+A **fully compromised technician computer** is deliberately outside the
+defended model: it holds the AI credentials, target selection, and audit log,
+and no customer-side control can make it harmless. This is stated as a
+trust-boundary fact throughout, not hidden (see
+[Residual risks and explicit non-goals](#residual-risks-and-explicit-non-goals)).
+
+## Trust-boundary overview
+
+This mirrors the trust boundaries defined in the architecture requirements.
+
+- **Technician boundary.** The technician computer is trusted to hold AI
+  credentials, select the correct target, store the local audit log, and invoke
+  tools. A compromised technician computer is therefore a critical threat that
+  the customer agent cannot neutralise.
+- **Customer boundary.** The customer computer trusts only the active,
+  cryptographically paired session after local UAC elevation and full-control
+  consent. It does not trust LAN discovery messages, an unconfirmed console, or
+  a previous session.
+- **LAN boundary.** The LAN is untrusted for confidentiality and authenticity.
+  Discovery may be unauthenticated, but it cannot grant control. Pairing and
+  all control traffic must tolerate observation, injection, replay, and
+  competing peers.
+- **AI boundary.** AI output is untrusted input to the execution system even
+  after the customer grants full control. Tool arguments must be schema-valid
+  and bound to the selected session. The product provides visibility,
+  cancellation, audit, and honest outcomes; it does not attempt to semantically
+  allowlist every administrator command.
+- **Open-source supply-chain boundary.** Repository source, dependencies, CI,
+  build artifacts, release metadata, and signing identities have different
+  trust levels. Official artifacts must have verifiable provenance independent
+  of the fact that the source is public.
+
+The session state model is
+`Idle → Discovered → Pairing → Code confirmation → Awaiting full-control
+consent → Active → Revoking → Cleaning up → Closed`. Any authentication,
+integrity, incompatible-version, or consent failure moves to a non-active
+failure state, and network reconnection alone can never skip pairing or
+consent.
+
+The sections that follow analyse threats by attack surface across these
+boundaries: pairing and session establishment, the local network, malicious
+peers, the AI client, command execution, file transfer and staging, temporary
+persistence and cleanup, the internet relay, and the supply chain.
+
+### Pairing and session establishment
+
+This surface covers everything between an idle customer device and an active,
+consented session: LAN discovery, the manual-address fallback, authenticated
+key agreement, Session Approval Code comparison, and the transition to
+full-control consent.
+
+**Status.** Implemented (M002, Done). Pairing is a Noise `XX` handshake
+(`Noise_XX_25519_ChaChaPoly_SHA256` via `snow`) with fresh per-session static
+keys, a prologue that commits both peers to the protocol version and capability
+set, and a commit-reveal round inside the encrypted channel that binds the
+handshake hash and two fresh nonces into a six-digit Session Approval Code
+(ADR-0003). LAN discovery uses mDNS/DNS-SD scoped to private interfaces, with a
+manual connection-code fallback (ADR-0007). Negative tests cover a
+machine-in-the-middle producing different codes, capability and version
+downgrade, replayed and tampered ciphertext, and oversized frames
+(`crates/transport/tests/pairing.rs`).
+
+**Entry points.**
+
+- LAN discovery traffic (broadcast or multicast, mechanism to be decided):
+  unauthenticated by design; anyone on the local network can observe, answer,
+  or forge it.
+- Manual address entry (REQ-F-004): a typographic error or a socially supplied
+  wrong address leads to the wrong peer.
+- The pairing and key-agreement exchange itself: the first messages either
+  endpoint accepts from an unauthenticated network peer.
+- Version and capability negotiation: pre-authentication protocol metadata an
+  attacker may try to influence.
+- The human comparison step: two people reading and confirming the SAC on the
+  console and support UI.
+
+**Abuse cases and mitigations.**
+
+*Discovery spoofing and rogue endpoints.* An attacker answers discovery probes
+or advertises a fake endpoint so the technician pairs with an attacker device,
+or the customer device connects to an attacker console. Mitigations: discovery
+conveys zero authority — the customer boundary trusts only the
+cryptographically paired, code-confirmed, consented session, never a discovery
+message or an unconfirmed console (REQ-S-001; architecture LAN boundary);
+pairing authenticates the negotiated endpoints and binds the SAC to the
+cryptographic session (REQ-S-006), so a rogue endpoint cannot survive code
+comparison against the genuine peer; discovery and control traffic are limited
+to the intended local interfaces with no internet-reachable listener by
+default (REQ-S-010); before any tool becomes callable, the console displays the
+target hostname, Windows version, architecture, session identifier, and
+elevation state (REQ-F-016), giving the technician a second chance to notice a
+wrong target; and the manual-address fallback (REQ-F-004) follows the identical
+pairing and SAC path — entering an address never bypasses authentication.
+
+*Machine-in-the-middle during key agreement.* An active attacker relays and
+modifies the key agreement so each genuine endpoint unknowingly establishes
+keys with the attacker. Mitigations: key agreement must use an established,
+audited, authenticated design and maintained cryptographic libraries — CretLink
+must not invent its own scheme (REQ-S-005); the SAC is derived from and bound
+to the full protocol transcript (REQ-S-006; architecture transport
+constraints), so an interposed attacker produces different transcripts on each
+side and the two endpoints display different codes; a mismatched or unconfirmed
+code cannot transition to full control (REQ-F-005), and authentication or
+integrity failure denies control with a visible error rather than degrading
+silently (REQ-S-009).
+
+*Session Approval Code weaknesses.* A human-comparable code is necessarily
+short, so an attacker who can force many pairing attempts could try to get
+lucky. Mitigations: the SAC is bound to the protocol transcript (REQ-S-006)
+and derived from fresh random nonces in a commit-reveal round scoped to exactly
+one session attempt (ADR-0003), so each protocol run gives at most one
+implicit guess; a failed run fails closed and terminates rather than allowing
+retries against the same code (REQ-S-008, REQ-S-009); and because that round
+runs inside the encrypted channel, an observer of the exchange gains no offline
+advantage in predicting or brute-forcing the code. The stronger practical
+attack is not guessing but *blind confirmation* — a customer or technician
+confirming without comparing. Mitigations: both
+endpoints must display the same code before full-control consent is possible
+(REQ-F-005); consent screens must use plain language, accurately describe the
+authority granted, and disclose what data may flow to the technician's AI
+service (REQ-S-003, REQ-S-016, REQ-F-006, REQ-N-013); critical confirmation
+controls should be keyboard accessible and not rely on colour alone
+(REQ-N-014, SHOULD); and code comparison and full-control consent are
+deliberately separate steps in the architecture's session state model, so one
+hasty click cannot cover both.
+
+*Replay of pairing messages.* An attacker records a successful exchange and
+replays it later to resurrect a session, skip pairing on reconnect, or splice
+old messages into a new exchange. Mitigations: the protocol must reject
+replayed authentication messages (REQ-S-008); session keys and bearer
+capabilities are random, short-lived, scoped to one session, and invalidated on
+stop or expiry (REQ-S-007), so replayed material references authority that no
+longer exists; reconnection must not restore full control without a valid
+current session state (REQ-S-009), and the state model forbids re-entering
+`Active` without passing pairing, code confirmation, and consent again, with
+explicit lifecycle states (REQ-N-004).
+
+*Downgrade attacks.* An attacker tampers with version or capability
+negotiation so the endpoints settle on weaker cryptography, an older protocol
+revision, or a mode that skips a required protection. Mitigations: a peer must
+not be able to silently downgrade required security properties (REQ-S-008); the
+negotiation outcome must be covered by the authenticated transcript the SAC
+binds (REQ-S-006); protocol messages carry explicit schemas, bounded inputs,
+and explicit version negotiation (REQ-N-012), and an incompatible or
+manipulated negotiation is a fail-closed, visibly reported error, not a quiet
+fallback (REQ-S-009, REQ-N-015). The initial product supports no legacy
+insecure mode, so there is no weaker configuration to downgrade into.
+
+*Competing simultaneous pairing attempts.* An attacker races a legitimate
+pairing — initiating toward the same support agent or console while the
+genuine attempt is in flight, hoping the humans confirm the wrong session — or
+floods attempts to confuse or exhaust an endpoint. Mitigations: the session
+state model admits one pairing flow at a time per endpoint with explicit,
+predictable states (REQ-N-004), so a competing attempt cannot silently attach
+to an in-progress flow; each attempt has its own transcript-bound SAC
+(REQ-S-006; per-attempt scope per ADR-0003), so if the two humans are looking
+at different sessions
+the codes do not match and full control is unreachable (REQ-F-005); pairing
+requires visible local initiation on the customer device (REQ-S-001) and all
+connection state is shown, never hidden (REQ-S-002), so an unexpected
+concurrent attempt is observable; pairing attempts and failures are recorded in
+the local audit trail with session identity and timestamps (REQ-S-017); and
+bounded inputs and resource limits (REQ-N-012, REQ-N-006) constrain flooding —
+a flood degrades availability, not authentication.
+
+**Residual risks.**
+
+- Humans can mis-compare or blindly confirm. UI design reduces but cannot
+  eliminate a customer approving a code that does not match, especially under
+  social pressure from a caller claiming to be the technician. CretLink cannot
+  verify real-world authorisation; it can only make the grant explicit,
+  visible, and revocable (REQ-S-004, REQ-F-018).
+- A short SAC is a deliberate usability trade-off. The design limits an active
+  attacker to roughly one online guess per visible, failed attempt; it does not
+  make guessing impossible, only unattractive and detectable.
+- Discovery denial of service is accepted. Unauthenticated discovery can be
+  jammed or polluted; the fallback is manual addressing (REQ-F-004).
+  Availability of pairing on a hostile LAN is not guaranteed — only that a
+  hostile LAN cannot obtain control.
+- A compromised endpoint before pairing is out of scope. Malware already
+  running on the customer computer, or a fully compromised technician computer,
+  can subvert its own side of pairing and consent; see the malicious-peer
+  section and the consolidated residual risks.
+- Client-isolated or multi-segment LANs may prevent discovery or direct
+  connection entirely; this is an assumption of the initial product, not a
+  mitigated threat.
+
+### LAN attackers
+
+This surface covers adversaries with a presence on the same local network as an
+active or forming session, but with no software on either endpoint. A LAN
+attacker is assumed able to observe all broadcast traffic, inject arbitrary
+packets, spoof ARP and mDNS, race legitimate peers, and flood the network — but
+*not* to control either endpoint (those cases belong to the malicious-peer and
+technician boundaries).
+
+**Status.** Implemented (M002, Done): mDNS/DNS-SD discovery scoped to private
+interfaces with a manual connection-code fallback (ADR-0007), and the Noise
+`XX` secure channel (ADR-0003) described in the pairing section.
+
+**Entry points.**
+
+- Discovery traffic: broadcast or multicast announcements that let the console
+  and support agent find each other without typing an address (REQ-F-004) — the
+  only surface deliberately reachable by unauthenticated LAN peers.
+- The pairing and control listener that accepts the handshake and, after
+  pairing, carries the encrypted session. The architecture prefers the
+  customer agent to initiate the control channel toward the technician console
+  where practical, so the long-lived listener sits on the technician side.
+- In-flight session traffic: encrypted frames carrying commands, output
+  streams, and file transfers.
+- The network fabric itself: ARP, DHCP, mDNS/DNS, and switching behaviour that
+  a LAN attacker can influence to redirect, observe, or suppress traffic.
+
+**Abuse cases and mitigations.**
+
+*Passive observation.* An attacker records discovery announcements and session
+traffic. If session traffic were plaintext, this would expose commands, output,
+transferred files, and any secrets they contain — administrator-level material
+by design. Mitigation: session confidentiality and integrity use audited,
+maintained cryptographic protocols and libraries; CretLink will not invent an
+algorithm or use unauthenticated encryption (REQ-S-005).
+
+*Active injection and manipulation.* An attacker injects, modifies, reorders,
+or replays frames, attempting to insert commands, corrupt a transfer, alter
+results shown to the technician, or resurrect authority from a recorded
+handshake. Mitigations: authenticated channel integrity (REQ-S-005); rejection
+of replayed authentication messages and prevention of silent downgrade
+(REQ-S-008); ephemeral, session-scoped keys and capabilities (REQ-S-007) so
+recorded traffic has no value for a later session; and reconnection cannot
+restore control without valid session state (REQ-S-009). File transfers
+additionally verify length and a cryptographic digest before being reported
+complete (REQ-N-007), so injected or truncated data is detected rather than
+silently accepted.
+
+*Machine-in-the-middle via ARP or mDNS spoofing.* An attacker poisons ARP or
+answers discovery queries first, placing itself between console and agent
+during pairing. The mitigation chain is the one described in the pairing
+section: endpoint authentication with the SAC bound to the transcript
+(REQ-S-006, REQ-F-005) means an interposed attacker produces mismatched codes,
+so ARP or mDNS spoofing can redirect packets but cannot yield an approved
+session.
+
+*Malicious discovery announcements.* An attacker advertises a fake console to
+the agent, or a fake agent to the console, floods the discovery view with
+plausible-looking entries so the technician selects the wrong target, or
+advertises misleading names. Mitigation: discovery output is an untrusted hint
+used only to propose a pairing attempt. Control requires the full chain —
+visible local initiation and consent on the customer computer (REQ-S-001),
+authenticated pairing bound to a human-compared SAC (REQ-S-006, REQ-F-005), and
+a single clearly worded full-control consent (REQ-F-006). A malicious
+announcement can at worst start a pairing attempt that fails code comparison;
+it cannot mint authority.
+
+*Denial of service.* An attacker suppresses or floods discovery, exhausts the
+listener with connection attempts or oversized messages, or disrupts an active
+session by cutting traffic, forcing resets, or jamming Wi-Fi. Subtler goals are
+making a disconnect look like success, or making repeated failures pressure
+users into unsafe workarounds. Mitigations: blocked discovery falls back to
+manual address entry over direct IP connectivity (REQ-F-004); session lifecycle
+states are explicit and idempotent where practical (REQ-N-004); interruption is
+never reported as success — completed, failed, cancelled, timed-out, and
+unknown outcomes are distinguished (REQ-N-008); resource limits and
+backpressure bound the cost of floods (REQ-N-006); and stop and revocation work
+from either endpoint without the other's cooperation (REQ-S-004, REQ-F-018), so
+an attacker who can disrupt traffic cannot prevent revocation from taking
+effect locally. Denial of service degrades availability, never safety.
+
+*Hostile guest or isolated network conditions.* Client-isolated guest networks
+silently drop peer-to-peer traffic; discovery appears dead or connections
+half-work, which can push users toward disabling protections or trusting
+whatever endpoint does respond. Mitigations: manual addressing serves networks
+where multicast is filtered but unicast works (REQ-F-004); errors identify the
+failed stage and a safe next action (REQ-N-015); and all initial session
+functions work with no internet access on the customer computer (REQ-N-003), so
+an attacker who black-holes internet egress on a guest network gains no
+leverage over the session itself.
+
+*Port scanning of the listener.* A scanner enumerates open ports, fingerprints
+the listener, and probes it with malformed or hostile input, looking for
+pre-authentication parsing flaws, resource exhaustion, or information leakage.
+Mitigations: discovery and control traffic are limited to intended local
+interfaces and no internet-reachable listener exists by default (REQ-S-010);
+the pre-authentication surface is deliberately small — schemas with explicit
+length limits, bounded inputs, and version handling on every network message
+(REQ-N-012), bounded buffers and backpressure (REQ-N-006), and errors that
+identify the failed stage without exposing credentials or cryptographic secrets
+(REQ-N-015). There are no provider or AI secrets on the customer device for a
+scanner to reach (REQ-S-015).
+
+*Detection and evidence.* Explicit target identity on every result (REQ-F-016)
+and the local append-oriented audit trail with session identity, timestamps,
+and outcomes (REQ-S-017) give the technician a way to notice anomalies such as
+repeated pairing failures, unexpected disconnects, or duplicate discovery
+entries.
+
+**Residual risks.**
+
+- Availability on a hostile LAN is not guaranteed. An attacker with LAN access
+  can jam, poison, or flood until no session can form or survive. CretLink
+  commits to failing closed and reporting honestly, not to completing a session
+  under active denial of service.
+- Metadata is observable. Even with an encrypted channel, a passive observer
+  learns that a CretLink session exists, the endpoint addresses, approximate
+  traffic volume, and timing. Traffic-analysis resistance is out of scope.
+- The SAC depends on people actually comparing it (see the pairing section);
+  ADR-0003 fixes it at six digits from a commit-reveal round, and the human
+  step remains a real weakness.
+- Discovery flooding and name spoofing cannot be fully prevented.
+  Unauthenticated discovery means an attacker can always populate the target
+  list with noise or misleading names. The defence is that selection leads only
+  to pairing and code comparison, not to control; the confusion itself is
+  accepted as residual.
+- Pre-authentication parser risk is reduced, not eliminated. Bounded schemas
+  shrink the surface, but any implementation flaw in handshake parsing would be
+  reachable by a LAN scanner. This is mitigated over time by negative and
+  malformed-input tests required for stories touching this boundary, and by the
+  coordinated vulnerability-reporting path (REQ-S-022).
+- Client-isolated networks are an assumed-away condition; on isolated networks
+  the session simply fails. The risk that frustrated users route around
+  isolation insecurely is addressed only by clear, actionable errors
+  (REQ-N-015), not by a technical control.
+- Nothing here defends the endpoints; a LAN attacker who also compromises an
+  endpoint moves into a different boundary where these mitigations do not
+  apply.
+
+### Malicious peers
+
+This surface covers adversaries who participate in, or pretend to participate
+in, the CretLink protocol itself: a rogue console that tries to control a
+support agent without consent, a malicious or modified support agent that lies
+to the console, and impersonation of either endpoint after a disconnect. Unlike
+the LAN attacker, a malicious peer speaks the protocol and may hold one side of
+a session.
+
+**Status.** Implemented. Pairing, the secure channel (M002), the
+remote-execution core, and reconnection handling (M003) are implemented and
+have been run on maintainer hardware; the automated half of the privileged adversarial and negative
+suite (ST-M003-007) that hardens this surface has landed —
+`simultaneous_bilateral_revoke_terminates_both_without_hang`,
+`console_revoke_tears_down_both_fail_closed` (which also proves a closed session
+is not re-joinable), and `agent_revoke_tears_down_both_fail_closed` in
+`crates/session/tests/e2e.rs` — while its maintainer-run hardware half
+([`manual-tests.md`](manual-tests.md)) is still outstanding.
+
+**Entry points.**
+
+- The pairing and discovery surface of the support agent, reachable by any
+  device on the same LAN before a session exists.
+- The authenticated control channel of an active session, from the perspective
+  of the peer at the other end.
+- The reconnection path after a network interruption, when either endpoint may
+  try to resume or re-establish a session.
+- The result path: command output, file contents, digests, and self-reported
+  identity and status returned by the support agent to the console, and from
+  there to the technician's AI client.
+
+**Abuse cases and mitigations.**
+
+*A rogue console attempts to control an agent without consent.* A rogue
+console may answer discovery, initiate pairing repeatedly, race a legitimate
+console, or try to negotiate weaker security properties. Success would mean
+arbitrary administrator-level execution on the customer computer — the
+highest-impact case in this boundary. Mitigations: discovery grants nothing,
+traffic is limited to local interfaces, and no internet-reachable listener
+exists by default (REQ-S-010); control requires a chain a rogue console cannot
+complete remotely — visible local initiation and consent on the customer
+computer (REQ-S-001), visible UAC elevation (REQ-F-002), and a SAC displayed on
+both endpoints and confirmed by the people present (REQ-F-005), bound
+cryptographically to the negotiated session (REQ-S-006) so a raced or relayed
+pairing produces a mismatched code; the protocol uses established, audited
+cryptography (REQ-S-005), authenticates both endpoints (REQ-S-006), rejects
+replays, and prevents silent downgrade (REQ-S-008); any authentication,
+integrity, version-negotiation, or authorisation failure denies control with a
+visible error (REQ-S-009), and malformed or oversized pairing traffic is
+rejected rather than interpreted (REQ-N-012); consent language states the real
+authority being granted (REQ-S-003, REQ-F-006, REQ-N-013), so a rogue console
+cannot rely on the customer believing they approved something harmless; and the
+customer can revoke at any time without the console's cooperation (REQ-S-004,
+REQ-F-018), with the agent hiding nothing about its connection state
+(REQ-S-002), so an unexpected session is visible and stoppable at the machine
+it targets.
+
+*A malicious or modified support agent lies to the console.* A tampered agent
+controls everything it sends: it can claim a false hostname or Windows
+identity, claim an action ran elevated when it did not, fabricate exit codes
+and output, attribute output to the wrong job, report cleanup that never
+happened, present a digest computed over different content than it claims, or
+craft output designed to manipulate the technician's AI client. CretLink's
+requirements on the agent (privilege truthfulness, REQ-S-011; honest unknown
+outcomes, REQ-N-008; process-tree and job-identifier correctness, REQ-S-014)
+constrain the official product, not an attacker's binary. The design therefore
+does not assume agent honesty; it limits what a lying agent can achieve:
+
+- Blast radius is capped by construction: no AI credentials, provider tokens,
+  or technician account secrets ever reach the customer computer (REQ-S-015,
+  REQ-F-015), and the MCP bridge is local to the technician computer
+  (REQ-F-013). A malicious agent gains no credential to steal and no network
+  authority over the technician machine; its weapon is deception, not access.
+- Agent output is untrusted input. The architecture treats all remote command
+  output and file content as untrusted data even inside a consented session.
+  The console and MCP bridge attach session and target identity to every result
+  (REQ-F-016) so the AI and technician can always distinguish the remote host
+  from the local one (REQ-F-011) and cannot silently act on data from an
+  unselected or stale session.
+- Claims are recorded, not believed. The console keeps its own append-oriented
+  audit trail with session identity, timestamps, actions, result status, and
+  digests (REQ-S-017), and shows live activity in near real time (REQ-F-017).
+  An agent can lie, but it must lie consistently, on the record, to an
+  attending technician who can stop the session at once (REQ-F-018).
+- Transfer digests bound what tampering can hide. Length and digest
+  verification (REQ-N-007) guarantee that the console received exactly the
+  bytes the agent sent, defeating in-path modification. They deliberately do
+  not prove the agent is honest about where those bytes came from; that limit
+  is recorded under residual risks.
+- Tampered binaries are detectable before use. Official releases are built by
+  documented automation from tagged commits and ship with SHA-256 checksums
+  (REQ-S-019), so a tampered binary is detectable and a technician can direct
+  the customer to a verifiable artifact. Authenticode signing is implemented
+  but no signing identity is configured, so current releases are unsigned.
+
+*Impersonation of either endpoint after disconnect.* After a Wi-Fi drop or a
+deliberately induced disconnect, an attacker may take over the agent's address
+or discovery name and wait for the console to reconnect, replay captured
+handshake material, or present themselves to the agent as the returning console
+in the hope of inheriting full control without consent. Mitigations:
+reconnection alone restores nothing — reconnecting must not restore full
+control without valid session state (REQ-S-009), and the state model makes
+every failure transition to a non-active state from which pairing and consent
+cannot be skipped (REQ-N-004); session authority is ephemeral — keys and bearer
+capabilities are random, short-lived, session-scoped, and invalidated on stop
+or expiry (REQ-S-007), so a stopped or expired session leaves nothing to
+inherit, and stop is available to both endpoints and fails closed (REQ-S-004,
+REQ-F-018); replayed authentication messages are rejected (REQ-S-008); a fresh
+session started by an impersonator is just a new pairing, producing a new SAC
+that the people at both real endpoints will not have confirmed (REQ-F-005,
+REQ-S-006) and requiring new visible consent on the customer computer
+(REQ-S-001); cleanup removes temporary credentials, services, and access paths
+after normal shutdown (REQ-F-019, REQ-S-012), and errors during resumption name
+the failed stage without leaking secrets (REQ-N-015), so a failed impersonation
+surfaces as a visible pairing failure rather than a silent retry loop.
+Reboot-resume (ADR-0014) is explicitly armed by the customer, single-use,
+expiring, and target-bound (REQ-F-021); proving continuity after a reboot never
+restores control — attended consent runs again on a fresh handshake — so the
+ticket is not a standing reconnection credential an impersonator could exploit
+(verified headlessly; hardware scenario MT-8).
+
+**Residual risks.**
+
+- Cryptography authenticates the channel, not the peer's honesty. The SAC
+  proves both people confirmed the same negotiated session; it cannot make a
+  malicious agent binary tell the truth about its hostname, elevation, results,
+  or cleanup. CretLink does not attempt remote attestation of the peer binary
+  and does not claim to. The defences are attended visibility, provenance
+  checking of the official artifact, and treating all agent output as untrusted
+  claims.
+- A digest verifies transfer, not provenance. A malicious agent can compute a
+  correct digest over dishonest content; REQ-N-007 protects against corruption
+  and in-path tampering only.
+- Poisoned output can still influence the AI. Even with results marked
+  untrusted and identity-stamped, crafted command output may steer an AI
+  client's reasoning. CretLink mitigates with technician visibility,
+  cancellation, and audit (REQ-F-017, REQ-F-018, REQ-S-017) rather than
+  claiming to sanitise arbitrary administrator output; this overlaps with the
+  AI-client boundary.
+- Social engineering of the attending customer. If an attacker persuades the
+  customer to launch an agent, read out or confirm the attacker's SAC, and
+  grant consent, the protocol has worked as designed for the wrong technician.
+  Clear risk language (REQ-N-013, REQ-S-003) reduces but cannot eliminate
+  this.
+- A compromised host defeats its own endpoint. CretLink does not defend
+  against a customer computer whose operating system is already compromised and
+  tampers with the running agent, nor against a fully compromised technician
+  computer, where a rogue console is indistinguishable from the legitimate one
+  because it holds the same trust.
+- Code signing is a SHOULD under REQ-S-019: it is implemented but gated, and
+  no signing identity is configured, so current releases are unsigned. The
+  relay (REQ-F-022, M007) and reboot-resume (REQ-F-021) re-open parts of this
+  boundary; they are analysed in their own sections (REQ-S-021).
+
+### The AI client: compromised AI and prompt injection
+
+CretLink treats the AI as untrusted input to the execution system at all
+times, including after the customer grants full control. Consent authorises the
+*session*, not any particular AI output. The AI client runs only on the
+technician computer, holds no network route or credential to the customer
+device, and can act on the target solely through the local MCP bridge and the
+one explicitly selected, consented session (REQ-F-013, REQ-F-015, REQ-S-015).
+
+**Status.** Implemented. Pairing (M002) and the remote-execution core (M003)
+are implemented and have been run on maintainer hardware. The MCP bridge
+(M004) is implemented: session control (ST-M004-001, ST-M004-002,
+ST-M004-004) and the generic file and transfer tools (ST-M004-003) have
+automated and simulated-agent CI coverage plus a real-elevated-agent
+end-to-end run on maintainer hardware recorded on 2026-08-10.
+
+**Entry points.**
+
+- Tool-call arguments from the MCP client into the bridge: `remote_exec`
+  command lines, stdin data, working directories and the constrained
+  environment-override set (REQ-F-009), file paths and contents, transfer
+  sources and destinations, job identifiers, cancellation and timeout
+  parameters.
+- Reflected content returned to the AI: command stdout and stderr, exit codes,
+  file contents, directory listings, filenames, and system metadata from the
+  customer computer — the channel through which hostile content on the target
+  can reach the AI's context.
+- Desktop observation widens the reflection surface: M005 is a draft; an
+  experimental op-set exists behind `desktop.v1`, and its screenshots expose
+  on-screen text — including web pages, chat windows, and malware UI — to the
+  AI as untrusted input.
+
+**Threat actors.** A misbehaving or compromised AI model or MCP client on the
+technician computer; an adversary with content on the customer computer who
+cannot talk to the AI directly but can plant instructions in the data the
+session reflects back to it (indirect prompt injection); and a remote adversary
+reachable from the customer computer, if that machine has internet access, who
+benefits when an injected or compromised AI is steered into sending data
+outward or fetching hostile payloads.
+
+**Abuse cases.**
+
+- *Prompt-injected instructions reflected into tool calls.* Command output or
+  file contents contain text instructing further commands, weakened defences,
+  persistence, or uploads; the AI incorporates the text into its reasoning and
+  issues matching tool calls. Because the session legitimately holds
+  administrator authority, the injected actions are schema-valid and cannot be
+  distinguished mechanically from intended repair work.
+- *Exfiltration attempts.* The AI is induced (or a compromised client is
+  instructed) to read sensitive customer files and move them off the device —
+  via `remote_download` to the technician side, or via arbitrary commands that
+  transmit data from the customer computer directly.
+- *Credential planting or capture.* Attempts to copy technician AI
+  credentials, tokens, or account state to the target, or to invoke
+  credential-harvesting behaviour on the target.
+- *Hostile or degenerate arguments.* Schema-invalid messages, oversized
+  command lines or file payloads intended to exhaust buffers, ambiguous or
+  forged job identifiers aimed at cancelling or hijacking the wrong job, and
+  attempts to smuggle protocol-level effects through argument fields.
+- *Wrong-target confusion.* The AI treats a remote path, process, or shell as
+  local (or the reverse), acts on a stale or revoked session as if it were
+  live, or is confused into addressing an unselected target.
+- *Outcome masking.* A hostile client reports or assumes success for work that
+  failed, was cancelled, or never reached the target, so the technician's
+  picture of the customer machine diverges from reality.
+
+**Mitigations.**
+
+- *Structural containment.* AI credentials, provider tokens, and account
+  sessions never reach the customer computer (REQ-F-015, REQ-S-015), the MCP
+  transport is local to the technician computer (REQ-F-013), and no
+  internet-reachable listener exists by default (REQ-S-010). A compromised AI
+  client gains no direct route to the target; everything funnels through the
+  bridge, where it can be validated, attributed, audited, and stopped.
+- *Schema validation and bounded inputs.* Every MCP and network message has an
+  explicit schema, version handling, and bounded inputs (REQ-N-012); buffers,
+  logs, and transfers have documented limits and backpressure (REQ-N-006).
+  Schema-invalid or oversized tool calls are rejected, and validation or
+  authorisation failure denies the action rather than degrading it
+  (REQ-S-009).
+- *Session and target binding.* Tool calls are routed only to the explicitly
+  selected, consented session (REQ-F-013); switching targets requires a
+  deliberate console action, and every tool result carries the target
+  hostname, session identifier, and elevation state (REQ-F-016) so the AI,
+  technician, and audit trail agree on which machine acted. Job identifiers
+  are tracked per process tree with confusion prevented, so cancellation hits
+  the intended job (REQ-S-014, REQ-F-008).
+- *Reflected content treated as data.* Remote command output and file contents
+  are transported, displayed, and logged as untrusted data; the bridge and
+  console never interpret them as control messages, and the control plane is
+  kept structurally separate from remote data by the architecture's
+  AI-boundary rule and the explicit message schemas (REQ-N-012). CretLink
+  cannot stop the AI *model* from being persuaded by hostile text, but it
+  ensures such text has no mechanical authority over the session.
+- *Human oversight of an untrusted AI.* The console shows session state,
+  running commands, transfers, and failures in near real time, and each visible
+  action is attributable to a specific MCP tool call (REQ-F-017, ST-M004-006):
+  every routed tool result carries the same console-minted `call_id` the audit
+  record was written under, so the AI transcript maps one-to-one onto the audit
+  trail (result `call_id` ↔ audit `call_id` ↔ job or transfer id). The
+  console distinguishes active AI control from an idle bridge connection through
+  an in-flight count of routed calls, surfaced to the technician CLI; a richer
+  graphical indicator on the same signal is not yet implemented. Every wire
+  request carries an `origin` (`console`, `mcp`, or `terminal`), so the
+  customer-side agent can label AI-driven operations distinctly from
+  technician-driven ones and hides nothing (REQ-S-002).
+  `origin` is **attribution only**: it grants no new authority and changes no
+  routing, consent, or fail-closed behaviour — a forged or defaulted origin
+  cannot widen what a session may do. The append-oriented audit trail records
+  session identity, actor or source, action, arguments, and results
+  (REQ-S-017), so injected or malicious actions are observable during the
+  session and reconstructable afterwards.
+- *Immediate interruption and ephemeral authority.* Customer and technician
+  each hold an always-available stop control; stop rejects new tool calls,
+  terminates or honestly reports running work, and invalidates session secrets
+  (REQ-F-018, REQ-S-004). Session authority is short-lived and scoped to one
+  session (REQ-S-007), reconnection cannot restore control without valid
+  session state (REQ-S-009), and cleanup removes temporary access paths
+  (REQ-F-019, REQ-S-012). A hostile AI cannot convert one session into durable
+  access.
+- *No high-value primitives to inject into.* The tool surface is generic and
+  contains no credential harvesting, password extraction, keylogging, or
+  authentication-bypass functions for an injected instruction to invoke
+  (REQ-S-013). An attack must express itself as ordinary, visible, audited
+  commands.
+- *Honest outcomes.* The execution layer reports its true identity and
+  elevation (REQ-S-011) and distinguishes completed, failed, cancelled,
+  timed-out, and unknown outcomes rather than ever silently reporting success
+  (REQ-N-008), limiting a hostile client's ability to mask failure or
+  fabricate state.
+- *Informed exposure.* Before consent, the customer is told that command
+  output and selected files may be sent to the technician computer and onward
+  to the technician's AI service (REQ-S-016), the consent wording states the
+  real authority granted (REQ-S-003, REQ-F-006), and the console warns that
+  arbitrary administrator commands can reveal sensitive data, with redaction
+  markers and configurable retention planned (REQ-S-018).
+
+**Residual risks.**
+
+- No semantic allowlisting of administrator commands. Within a consented
+  full-control session, CretLink deliberately does not attempt to judge
+  whether each schema-valid command is benign. A prompt-injected or
+  compromised AI can therefore execute harmful commands indistinguishable in
+  form from legitimate repair work. The defence is visibility, attribution,
+  audit, and immediate stop — detection and interruption, not prevention.
+- Prompt-injection resistance of the model is outside CretLink's control.
+  CretLink cannot sanitise the semantic content of remote output before the AI
+  reads it, and it depends on the technician actually watching the activity
+  view. Model-level safeguards and technician vigilance are assumed, not
+  enforced.
+- Exfiltration by command is not blockable. An AI with consented administrator
+  control can move customer data using ordinary commands, including directly
+  off the customer computer when that machine has internet access. CretLink
+  makes such actions visible and audited; it cannot make them impossible
+  without abandoning the general-purpose surface the product exists to
+  provide.
+- Deferred surface: output redaction is a SHOULD (REQ-S-018) and not yet
+  designed in detail. Desktop control adds an on-screen prompt-injection
+  channel analysed in
+  [Desktop observation and control (M005)](#desktop-observation-and-control-m005);
+  M005 is a draft and an experimental op-set exists behind `desktop.v1`, so
+  those mitigations rest on the design and automated tests rather than
+  hardware evidence.
+- Audit is local and technician-held: it evidences what happened to an honest
+  technician and is not tamper-proof against a dishonest one.
+- Bridge-to-console IPC lacks full Windows DACL hardening. The local IPC that
+  carries tool calls from the MCP bridge to the console is same-user by
+  construction — a per-user named pipe with `reject_remote_clients(true)` and
+  `first_pipe_instance(true)` on Windows, a `0600` socket in a `0700` per-user
+  directory on Unix (ADR-0004). An explicit same-user DACL on the pipe and a
+  connect-side verification of the pipe server's owner SID both require raw
+  Win32 calls and therefore `unsafe`, which the workspace denies, so they are
+  not yet applied (see `crates/mcp/src/ipc/transport.rs`). This is an accepted
+  residual risk: it must fail closed if it cannot be applied, and it remains the
+  ADR-0004 threat-model item to close.
+- A fully compromised technician computer defeats this boundary entirely; see
+  the consolidated residual risks.
+
+### The terminal IPC client: a second local consumer of the consented session
+
+The interactive terminal (ST-M003-009) introduces a **second class of local IPC
+client** beside the MCP bridge. A terminal consumer — the console terminal panel
+or the command-line terminal client — connects
+to the same same-user IPC endpoint (ADR-0004) and reaches the same one
+explicitly selected, consented session, but it is a distinct actor with its own
+attribution and its own bounded message set. It is not the AI: terminal activity
+is never counted as AI in-flight control and is attributed separately.
+
+**Status.** The wire and same-user IPC surface are implemented: the terminal
+attach/stream/detach message set, the console terminal registry and
+multi-consumer fan-out, fail-closed routing, and the adversarial suite. M008 is
+a draft milestone, and its front ends are experimental. The standalone
+`cretlink-shell` command-line client (ST-M008-002) is a same-user IPC consumer
+beside the MCP bridge: it holds no session authority and adds no new listener,
+endpoint, protocol variant, or trust anchor (REQ-N-012, REQ-S-023). The console
+GUI's terminal panel (ST-M008-001) attaches to the hosted session in-process
+rather than over IPC, fails closed outside a consented session, and writes the
+untrusted VT stream to an xterm.js terminal. Verified by the console IPC tests
+(`apps/console/tests/terminal_ipc_e2e.rs`), the terminal registry unit tests
+(`apps/console/src/service.rs`), a `cfg(windows)` real-ConPTY-over-IPC
+end-to-end, and the ST-M008-003 adversarial consolidation suite for the operator
+terminal surface (see below).
+
+**Entry points.**
+
+- Terminal messages from a local client into the console over the same-user IPC:
+  `TermOpen` (shell, dimensions, working directory, environment), `TermAttach`,
+  and — once attached, in the bounded duplex stream mode — `TermInput` bytes,
+  `TermResize` dimensions, `TermDetach`, and `TermClose`.
+- Reflected content pushed to attached consumers: the terminal's merged VT
+  output (raw pass-through, ADR-0010), its honest exit, and fail-closed teardown
+  frames — the channel through which hostile on-target terminal output reaches
+  the local consumer, treated as untrusted data exactly like piped output.
+
+**Threat actors.** A misbehaving or compromised local terminal client on the
+technician computer (same-user, so it already shares the technician's authority);
+an adversary with content on the customer computer who plants escape sequences or
+instructions in terminal output; and a slow or wedged consumer whose backpressure
+could otherwise stall the shared stream.
+
+**Abuse cases.**
+
+- *Authority escalation by attaching.* A local client attaches to a terminal
+  hoping the attach itself widens what it may do, or reaches a session it was not
+  granted.
+- *Cross-consumer leakage.* One consumer's raw input is delivered to another
+  consumer, or a consumer observes or influences a session that is not the one
+  consented target.
+- *Stale/forged handles.* Attach or input aimed at an unknown or already-exited
+  terminal, or at a revoked session, hoping for a panic, a hang, or a silent
+  success.
+- *Backpressure denial of service.* A deliberately slow consumer refuses to read
+  its stream, aiming to stall the shared VT stream and starve the other
+  consumers, or to exhaust console memory with unbounded buffering.
+- *Outcome masking on a lost link.* A disconnect or revoke is presented to a
+  consumer as a clean terminal close rather than the honest, non-success outcome.
+
+**Mitigations.**
+
+- *Attach grants no new authority.* Attaching is a purely local registry
+  operation on the already-consented session; it mints no session authority and
+  never reaches the target. Input, resize, and close still route through the same
+  fail-closed session surface as any other action, stamped `origin = terminal`
+  (attribution only, no routing or consent effect).
+- *Distinct attribution.* Terminal actions are audited as `Actor::Terminal`,
+  frozen into the actor vocabulary by ST-M003-006 and kept distinct from the MCP
+  bridge's `Actor::Mcp` (REQ-S-023), so the audit trail separates a technician
+  terminal from AI-driven work. Terminal messages are excluded from the AI
+  in-flight indicator.
+- *Fail-closed routing.* With no consented active session — or after a revoke or
+  stop — `TermOpen`/`TermAttach` fail closed with the explicit no-consented-session
+  error, mirroring the bridge (ST-M004-004, REQ-S-009). A revoke while consumers
+  are attached **actively** tears every attached stream down with an honest
+  `Revoked` frame rather than leaving it to hang; a lost link yields an honest
+  `Unknown` exit, never a fabricated clean close (REQ-N-008).
+- *Multi-consumer without cross-talk.* Input from every consumer is muxed to the
+  single pseudo-console; the shared merged output (including the pty echo) is
+  fanned out to all consumers, but a raw input frame is never delivered to
+  another consumer. There is no wire frame that carries one consumer's input to
+  another.
+- *Bounded everywhere, slow consumer disconnected.* At most `MAX_TERMINALS`
+  concurrent terminals (enforced fail-closed by a reservation before the host
+  round-trip) and `MAX_TERM_CONSUMERS` consumers per terminal. The VT stream is
+  fanned out over **per-consumer bounded channels**, not a shared lossy
+  broadcast: a consumer that overruns its window is disconnected with an honest
+  `Dropped` frame, so it can never corrupt the shared stream by dropping bytes
+  for the others (REQ-N-006). Every frame and input chunk stays within the
+  existing IPC frame and chunk bounds.
+- *Bounded duplex extension, same framing.* After a successful `TermAttach` the
+  connection enters a duplex stream mode — a deliberate, well-scoped extension of
+  ADR-0004's request/response turn-taking — layered on the **same** length-prefix
+  framing. The non-cancel-safe read loop runs alone on the connection's read half
+  so a frame is never torn by cancellation; the writer runs on the write half.
+  The bridge's request/response connections are unaffected: only a `TermAttach`
+  puts a connection into duplex mode.
+
+**Operator-surface validation (ST-M008-003).** The operator terminal surface —
+the standalone `cretlink-shell` client and the console panel, both non-AI
+technician front ends — is exercised by an adversarial consolidation
+suite so its safety properties are pinned, not assumed:
+
+- *Attach and open races.* Concurrent opens each receive a distinct terminal
+  handle (no id collision that could cross-wire two operators), and concurrent
+  attaches to one terminal all register as distinct consumers with none silently
+  lost — every racing consumer still receives the shared stream.
+- *Reattachment prevented after stop/revoke.* A revoke or stop tears the live
+  stream down with an honest `Revoked` frame, and a fresh connection may **not**
+  reattach to the same handle: it fails closed with the explicit
+  no-consented-session error — not a stale-handle leak, not a silent success.
+- *Stale handles refused.* Reattaching to a terminal that was valid but has
+  since exited is refused with an honest `UnknownJob`, never a panic, hang, or
+  fabricated success — even while the session stays consented.
+- *Honest unknown on a lost link.* A link lost mid-terminal ends the consumer's
+  stream with an honest `Unknown` outcome and no exit code, never a fabricated
+  clean close (REQ-N-008).
+- *Owning-session attribution.* Every terminal audit record carries the
+  `Actor::Terminal` actor and the owning session id, so terminal activity is
+  always attributable to the one consented session and never merged with AI/MCP
+  work (REQ-S-017, REQ-F-016).
+
+**Residual risks.**
+
+- The terminal IPC transport shares the bridge's same-user IPC and therefore the
+  same accepted Windows DACL-hardening residual risk (ADR-0004; see the AI-client
+  section above). A same-user local client already shares the technician's
+  authority by construction.
+- Operator-facing rendering of the VT stream relies on the terminal emulator in
+  each front end (xterm.js in the console panel, the host terminal for
+  `cretlink-shell`); the contract passes raw VT bytes through as untrusted data,
+  and escape-sequence handling is only as robust as that emulator.
+
+### Command execution
+
+CretLink's core capability is arbitrary elevated PowerShell and Command Prompt
+execution on the customer computer (REQ-F-007), granted through one attended
+full-control consent (REQ-F-006, REQ-S-001). This is a deliberate design
+choice: the product does not attempt to semantically allowlist administrator
+commands, because no such filter can reliably distinguish a legitimate repair
+action from a harmful one when both use the same operating-system facilities.
+
+The security boundary is therefore **not** "which commands may run". It is:
+
+- **when** commands may run — only inside an active, consented,
+  cryptographically paired session (REQ-S-001, REQ-S-007, REQ-S-009);
+- **as whom** — with truthfully reported Windows identity and elevation
+  (REQ-S-011);
+- **under whose observation** — visible to the customer and technician at all
+  times (REQ-S-002, REQ-F-017);
+- **with what containment** — tracked job identifiers and process trees,
+  bounded output, enforced timeouts, and cancellation (REQ-S-014, REQ-F-008,
+  REQ-N-006);
+- **until when** — revocable by either endpoint at any moment, with session
+  authority invalidated on stop (REQ-S-004, REQ-F-018, REQ-S-007).
+
+**Status.** Implemented (M003). The execution broker, the MCP execution tools,
+and pairing are in place with the negative tests listed under verification
+evidence below (REQ-N-010, REQ-N-011); the maintainer-run hardware scenarios in
+[`manual-tests.md`](manual-tests.md) are partly recorded.
+
+**Entry points.**
+
+- The MCP bridge execution tools on the technician computer: `remote_exec`,
+  `remote_write_stdin`, `remote_cancel`, `remote_list_jobs`.
+- The execution-context arguments carried with each command — the explicit
+  working directory and the constrained set of environment overrides
+  (REQ-F-009) — AI-supplied values that shape where and how a job runs, and
+  untrusted input like every other tool argument.
+- The execution broker on the customer computer, which receives job requests
+  over the authenticated encrypted channel and starts processes with the
+  granted Windows authority.
+- The returning stream of stdout, stderr, exit codes, and job metadata — an
+  entry point in its own right, because remote output flows into the
+  technician's AI context and must be treated as untrusted input.
+- Later, an optional session-scoped SYSTEM helper (separately specified;
+  REQ-S-012) — out of scope for the initial milestone.
+
+**Threat actors.** A manipulated or compromised AI client (see the AI-client
+section); a malicious technician who obtains genuine consent and then abuses
+the granted authority; hostile code on the customer computer — processes
+started by a job, or malware already present — that may try to confuse job
+identifiers, forge or pollute output, or escape the tracked process tree; and a
+network attacker, whose injection or replay of execution messages is mitigated
+at the channel boundary (REQ-S-005, REQ-S-006, REQ-S-008) — the execution layer
+assumes an authenticated channel and rejects anything else (REQ-S-009).
+
+**Abuse cases and mitigations.**
+
+*Execution outside the consent window.* A command runs before full-control
+consent, after stop or revocation, or through a reconnect that silently
+resumes a dead session. Mitigations: no privileged command may run before
+consent (REQ-F-006, REQ-S-001); stop and revocation reject new tool calls and
+invalidate session secrets (REQ-F-018, REQ-S-004, REQ-S-007); reconnection
+cannot restore control without a valid session state, and all authorisation
+failures fail closed with a visible error (REQ-S-009); the session state model
+makes these transitions explicit and idempotent (REQ-N-004).
+
+*Execution-identity lies.* The broker claims a command ran elevated when it
+did not, or results are attributed to the wrong host or session — leading the
+technician or AI to act on false premises, or masking a privilege failure as
+success. Mitigations: the agent must report its effective Windows identity and
+elevation state and must never claim elevation it does not have (REQ-S-011);
+UAC elevation is requested visibly and the UI reflects the true broker state
+(REQ-F-002); every result carries exit code, output, duration, and execution
+identity (REQ-F-007); every tool result identifies the target and session, so
+remote results cannot be mistaken for local ones (REQ-F-016).
+
+*Process-tree escape.* A started command spawns work that detaches from the
+tracked tree — for example by re-parenting or by launching processes through
+operating-system facilities that create them outside the job — so that
+cancellation, session stop, or cleanup misses them. In the worst case this
+becomes unintended persistence beyond the session. Mitigations: the broker
+must track the process tree created for each job and make a best effort to
+terminate the correct tree on cancellation or revocation (REQ-S-014); it must
+report whether a process continues after a client disconnect rather than
+implying it stopped (REQ-F-008); active CretLink-owned processes and jobs are
+identifiable through inspection (REQ-F-011); cleanup removes temporary
+services and auto-start mechanisms, and cleanup failures are shown prominently
+and recorded (REQ-F-019); the agent hides nothing from the customer
+(REQ-S-002). Escapes that survive despite this are a residual risk and must be
+reported as such, never as success (REQ-N-008).
+
+*Job identifier confusion.* A cancel, stdin write, or stream request is
+applied to the wrong job — through a stale, reused, or forged identifier —
+terminating an unrelated process or crossing output between jobs. Mitigations:
+the broker must prevent job identifier confusion (REQ-S-014); all execution
+messages have explicit schemas, bounded inputs, and identifiers with version
+handling (REQ-N-012); tool calls are routed only through the selected,
+consented session (REQ-F-013, REQ-F-016).
+
+*Hostile or ambiguous execution-context arguments.* A manipulated AI supplies
+a misleading working directory or hostile environment overrides so that a
+command acts somewhere, or on something, other than what the humans believe.
+Mitigations: environment overrides are restricted to a constrained set rather
+than arbitrary process-environment control (REQ-F-009); execution-context
+arguments are schema-bounded like every other tool argument (REQ-N-012); and
+each result reports the effective working directory (REQ-F-009 acceptance
+evidence), so ambiguity is visible rather than silent.
+
+*Output flooding.* A command emits unbounded output to exhaust memory or disk
+on either endpoint, push earlier evidence out of the console's view, degrade
+the session, or saturate the AI context with attacker-chosen text.
+Mitigations: command buffers have documented resource limits and backpressure
+behaviour (REQ-N-006); output is streamed incrementally with chunking, flow
+control, and upper bounds rather than accumulated (REQ-F-008, REQ-N-005); the
+audit trail records actions and digests independently of the live view
+(REQ-S-017); the product warns that arbitrary administrator output can reveal
+sensitive data, with redaction and retention controls planned (REQ-S-018,
+SHOULD). Remote output is treated as untrusted input to the AI by
+architectural rule.
+
+*Timeout abuse.* An effectively unlimited timeout keeps a process running past
+anyone's attention; or a process ignores termination at timeout, so "timed
+out" silently means "still running". Mitigations: timeouts are configurable
+and enforced (REQ-F-008); the console distinguishes completed, failed,
+cancelled, timed-out, and unknown outcomes and never reports them as success
+(REQ-N-008); long-running work remains visible in the live activity view
+(REQ-F-017) and stoppable at any time from either endpoint (REQ-F-018,
+REQ-S-004); whether a process survived is reported honestly (REQ-F-008).
+
+*Cancellation failure.* Cancellation or emergency stop appears to succeed
+while the process tree survives — the most dangerous failure mode, because
+both humans believe the work has ended. Mitigations: termination is
+best-effort but reporting is not — cancellation either terminates the intended
+tree or states why it cannot (REQ-S-014, REQ-F-008); stop fails closed at the
+authority level regardless: new tool calls are rejected and session secrets
+are invalidated even when an existing process could not be killed (REQ-F-018,
+REQ-S-007, REQ-S-009); surviving work is surfaced through inspection and
+cleanup reporting (REQ-F-011, REQ-F-019, REQ-N-008).
+
+*Authorised power used abusively.* Arbitrary elevated execution can
+technically be turned toward credential theft, surveillance, or sabotage —
+this is the line between authorised power and abuse. Mitigations: CretLink
+ships no credential harvesting, keylogging, browser-session extraction, or
+OS-authentication bypass features, and will not add them (REQ-S-013); consent
+honestly describes the authority granted — install and remove software, change
+system settings, access files, restart — and never implies read-only access
+(REQ-S-003, REQ-F-006, REQ-N-013); the customer is told before consent that
+commands, output, and files may reach the technician's AI service
+(REQ-S-016); every action is visible to the customer (REQ-S-002), observable
+in near real time by the technician (REQ-F-017), and recorded with session
+identity, actor, arguments, and result in the local audit trail (REQ-S-017);
+and the customer can end the session unilaterally at any moment (REQ-S-004,
+REQ-F-018). The defence against abuse is attendance, visibility, attribution,
+and revocation — not command filtering.
+
+*Prompt injection through remote output.* Text produced on the customer
+computer — file contents, process names, error messages — is crafted to
+instruct the technician's AI to run harmful follow-up commands. The mechanics
+and primary mitigations are covered in the AI-client section; at this boundary
+the human technician remains in the loop with a live view of every action
+(REQ-F-017) and an immediate stop (REQ-F-018), and the audit trail preserves
+what was actually executed (REQ-S-017). CretLink does not claim to filter
+injected instructions semantically; this is a shared residual risk with the
+AI-client boundary.
+
+*Privileged broker outliving the session.* The elevated broker, or a future
+SYSTEM helper, persists past the session and becomes a standing privileged
+service. In M003 there is no separate SYSTEM helper process: the "privileged
+helper" is the **in-process elevated broker of the single-session agent**, so
+its lifetime is the agent process's lifetime. Mitigations: any privileged broker
+is scoped to the current session and removed or disabled during cleanup
+(REQ-S-012); normal shutdown removes temporary credentials, services, and
+auto-start mechanisms, and a post-session check must find no active access path
+(REQ-F-019, REQ-F-001); session authority is ephemeral and invalidated on stop
+or expiry (REQ-S-007). The reuse-after-closure claim decomposes into three
+sub-claims verified concretely: a closed session is **not re-joinable** (the
+fresh-join rejection in `console_revoke_tears_down_both_fail_closed`), a fresh
+session requires **full pairing plus consent** — no resume path, per
+`no_control_before_consent` and `happy_path_same_code_consent_and_heartbeats` —
+and the **agent process ends after its session** (the single-session `run()`
+returns and the broker is dropped — proven automatically by
+`agent_run_loop_ends_after_a_single_session`, which drains the agent handle to
+its close, the exact condition on which the binary `run()` returns and the
+process exits, and confirms the console accepts no second connection; exercised
+on hardware in [`manual-tests.md`](manual-tests.md) MT-3/MT-4). See also the
+temporary-persistence section.
+
+**Verification commitments.** Each milestone that delivers execution
+capability must land with negative authorisation tests, cancellation and
+revocation tests, cleanup tests, and an updated version of this section, as
+required by the security acceptance evidence in the security requirements.
+Routine testing uses a non-privileged simulated agent so containment and
+cancellation logic is exercised without granting administrator control to CI
+(REQ-N-011, REQ-N-010).
+
+**Verification evidence (ST-M003-007).** The automated adversarial suite for
+this boundary is green on every CI platform: revocation races are covered by
+`revoke_mid_job_reports_an_honest_outcome_never_success`,
+`revoke_mid_upload_is_honest_and_sweeps_staging`, and
+`simultaneous_bilateral_revoke_terminates_both_without_hang`
+(`crates/session/tests/e2e.rs`); cancellation reaping the tracked process tree
+with zero survivors is covered by `exec_cancel_terminates_the_job_as_cancelled`
+and the ConPTY containment tests (ST-M003-008); tree containment surviving a
+hard `TerminateProcess` of the agent is covered by
+`windows_hard_kill_reaps_the_whole_tree_via_kill_on_close` (ST-M006-007);
+fail-closed teardown and a
+non-re-joinable closed session by `console_revoke_tears_down_both_fail_closed`
+and `agent_revoke_tears_down_both_fail_closed`; the agent run loop ending after
+its one session (and no second connection accepted) by
+`agent_run_loop_ends_after_a_single_session`; and honest disconnect by
+`disconnect_mid_session_is_honest_never_success`, with its mid-transfer sibling
+`disconnect_mid_upload_is_honest_never_success` proving a severed transport
+mid-upload is `Revoked { Error }` and never a completed transfer. The
+running-job policy on stop
+(revoke → `cancel_all` plus a bounded drain; an unkillable process → `Unknown`;
+both a graceful agent exit and a hard `TerminateProcess` reap the Job Object
+tree — the latter via `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` since ST-M006-007; a
+job never outlives its session) and the maintainer-run hardware scenarios are
+recorded in [`manual-tests.md`](manual-tests.md).
+
+**No credential-capture primitive (REQ-S-013).** The generic tool surface —
+`remote_exec`, `remote_write_stdin`, `remote_cancel`, `remote_list_jobs`, the
+file and transfer tools, and `remote_system_info` — exposes ordinary
+computer-control operations only. It ships no keylogger, no password or
+browser-session extractor, and no OS-authentication-bypass primitive, and none
+will be added (REQ-S-013). Any credential theft an authorised, prompt-injected,
+or malicious operator attempts must therefore express itself as ordinary,
+visible, audited commands, not as a hidden capability of the product. This is a
+statement backed by review of the tool surface, not a runtime test.
+
+**Residual risks.**
+
+- Containment is best-effort. An elevated process has the full power of the
+  operating system and can create work outside any tracked tree. CretLink
+  guarantees honest reporting of escapes and survivors (REQ-S-014, REQ-N-008),
+  not their impossibility.
+- No semantic command filtering. Within an authorised session, harmful
+  commands are technically executable. The defence is attended consent,
+  visibility, audit, and revocation — accepted by design.
+- A malicious technician within a consented session. The customer's
+  protections are attendance, the visible activity indication, and the stop
+  control; CretLink cannot prevent misuse of authority the customer genuinely
+  granted.
+- The audit trail is held by the technician: it supports honest technicians
+  and after-the-fact review, and is not tamper-proof against the person who
+  controls the console (REQ-S-017).
+- Executed effects cannot be revoked. Stop fails closed for future actions but
+  cannot undo system changes already made, and an elevated command can in
+  principle degrade or terminate CretLink itself on the customer computer.
+- Further surfaces: the optional SYSTEM helper is not implemented (REQ-S-012);
+  desktop control is experimental (M005 draft, REQ-F-020); reboot persistence
+  is implemented as the single-use reboot-resume ticket (ADR-0014, REQ-F-021)
+  and analysed under temporary persistence.
+
+### File transfer and staging
+
+File transfer moves bytes between the two computers: uploading
+technician-provided scripts, utilities, installers, and drivers to the
+customer computer; downloading files, logs, and results back to the technician
+computer; and the general remote file operations (stat, directory listing,
+directory create and remove, move, and delete) exposed to the AI. Reading and
+writing file *content* is deliberately not a standalone AI tool: bytes cross
+the boundary only through the bounded upload and download transfer engine,
+never as tool-call payloads.
+
+**Status.** Implemented on `main`. The transfer and file-operation subsystem
+(ST-M003-004, ST-M003-005) and its AI-facing MCP tools (ST-M004-003) have
+landed with automated tests, a simulated-agent end-to-end run in CI (upload,
+execute, download, and cleanup), and a real-elevated-agent-on-hardware
+end-to-end run on maintainer hardware recorded on 2026-08-10, so all three
+stories are Done. The automated half of the privileged adversarial and negative
+suite (ST-M003-007) that hardens this surface with revocation, race, and
+hostile-input tests has landed — see the per-abuse-case evidence below
+(`revoke_mid_upload_is_honest_and_sweeps_staging`,
+`cleanup_failure_is_reported_then_retried_at_next_start`,
+`staging_path_traversal_is_rejected_at_the_mcp_surface`) — while its
+maintainer-run hardware half ([`manual-tests.md`](manual-tests.md)) is still
+outstanding.
+
+**Entry points.**
+
+- The MCP bridge file and transfer tools on the technician computer
+  (`remote_stat`, `remote_list_dir`, `remote_make_dir`, `remote_remove_dir`,
+  `remote_move`, `remote_delete`, `remote_upload`, `remote_download`,
+  `remote_list_staged`, and `remote_cleanup`), driven by an AI client whose
+  output is untrusted input. There is deliberately no file-content read or
+  write tool; content crosses only through `remote_upload` and
+  `remote_download`.
+- The chunked transfer messages carried inside the authenticated encrypted
+  session channel.
+- The file and transfer functions of the elevated execution broker on the
+  customer computer.
+- Technician-side staging sources (local disk, removable media) and the
+  technician-side download destination directory, which receives content
+  originating from the untrusted customer machine.
+
+**Threat actors.** A malicious or manipulated AI client issuing hostile paths,
+oversized requests, or prompt-injection-induced requests; a LAN attacker
+attempting to corrupt, truncate, reorder, or inject transfer chunks or
+substitute a staged tool in transit; a malicious peer (rogue console or rogue
+agent) lying about transfer outcomes, supplying hostile filenames and
+metadata, or streaming unbounded data; a malicious operator of either endpoint
+using the transfer surface to exfiltrate customer files or stage malware; and
+the remote filesystem itself as untrusted input — downloaded content and
+remote-supplied names, paths, and sizes may be crafted to confuse the console,
+the audit log, or the technician.
+
+**Abuse cases and mitigations.**
+
+*FT-1 — Path traversal and path confusion.* Hostile relative paths, `..`
+segments, drive-relative forms, NTFS alternate data streams, or Unicode tricks
+could aim writes or deletes at unintended locations. Two distinct cases
+matter. On the **customer** side, full-control consent deliberately authorises
+access to arbitrary in-scope paths (REQ-F-006, REQ-S-003), so traversal there
+is not a sandbox escape; the risks are ambiguity and misattribution, and where
+a constrained staging area exists, traversal out of it must be rejected. On
+the **technician** side, a remote-supplied filename or path escaping the
+chosen download destination would let untrusted customer-machine content
+overwrite technician files — the more direct traversal target. Mitigations:
+bounded, schema-validated path fields with explicit local/remote semantics
+(REQ-N-012; the architecture requires that transfer functions never pretend
+remote paths are local); canonicalisation and rejection of paths that escape a
+constrained staging or download area, proven end to end over the MCP surface by
+`staging_path_traversal_is_rejected_at_the_mcp_surface`
+(`apps/console/tests/mcp_bridge_e2e.rs`, rejected as `invalid_path`) and backed
+by the protocol-level `validate_staging_name` and the store's own
+`staging_reference_cannot_escape_root` guard (REQ-N-010); every result carries
+session and target identity
+so a path is never applied to the wrong machine (REQ-F-016); malformed or
+ambiguous paths fail closed with an actionable error (REQ-S-009, REQ-N-015);
+destructive operations record the affected remote path in the audit trail
+(REQ-F-010, REQ-S-017).
+
+*FT-2 — Tampered or substituted content and digest mismatches.* An attacker
+who could modify chunks in transit, or a buggy or lying peer, could cause the
+executed artifact to differ from the artifact the technician staged.
+Mitigations: all transfer traffic runs inside the authenticated encrypted
+channel built from established cryptographic protocols and libraries
+(REQ-S-005), with endpoint authentication bound to the SAC (REQ-S-006) and
+replay and downgrade resistance (REQ-S-008); independently of the channel,
+each transfer verifies length and a cryptographic digest before it may be
+reported complete (REQ-N-007), staged artifacts are verified by digest before
+execution (REQ-F-012), and digests are recorded in the audit trail so what ran
+can later be tied to what was staged (REQ-S-017). A digest mismatch is a hard
+failure: the transfer is not reported complete and the error identifies the
+failed stage (REQ-S-009, REQ-N-015).
+
+*FT-3 — Partial or corrupted transfers reported as complete.* A dropped
+connection, cancelled job, revoked session, or crash mid-transfer could leave
+a truncated file that a later step treats as valid — particularly dangerous
+when the file is an installer or driver about to be executed. Mitigations:
+completion is only reported after both length and digest match (REQ-N-007;
+ST-M003-005 acceptance criteria); network interruption or process failure must
+never be reported as success, and outcomes distinguish completed, failed,
+cancelled, timed out, and unknown (REQ-N-008); transfers support chunking,
+progress, and cancellation with documented behaviour for interrupted transfers
+(REQ-F-010, REQ-N-006); revocation and stop fail closed rather than leaving a
+transfer in a claimed-successful state (REQ-S-004, REQ-S-009, REQ-F-018) —
+`revoke_mid_upload_is_honest_and_sweeps_staging`
+(`crates/session/tests/e2e.rs`) drives a revoke into a mid-flight upload and,
+observing the in-process agent's real staging root, asserts that the interrupted
+part is created mid-transfer, that the transfer never reports success and
+publishes no final path, and that after the agent's autonomous session-end sweep
+the orphaned part is gone and no committed final file exists (a commit is the
+only route to a final name, so this is a filesystem-level "no torn file" check);
+its hard-disconnect sibling `disconnect_mid_upload_is_honest_never_success`
+proves the same honest outcome when the transport is *severed* mid-upload rather
+than gracefully revoked — the console surfaces a terminal `Revoked { Error }`,
+the upload never reads complete, and no committed final file is published;
+partial-write atomicity or recovery behaviour is documented per operation
+(ST-M003-004).
+
+*FT-4 — Staging of malicious tools.* The staging capability (REQ-F-012) is
+genuinely dual-use: the same mechanism that delivers a legitimate driver can
+deliver malware. CretLink does not try to classify staged binaries; it makes
+staging attributable, visible, and reversible. Mitigations: staging is only
+possible inside an attended session that the customer visibly initiated and
+consented to, with consent language that explicitly covers installing and
+removing software (REQ-S-001, REQ-S-003, REQ-F-006, REQ-N-013); the agent
+hides nothing about its activity from the customer (REQ-S-002) and transfers
+appear in the live activity view (REQ-F-017); the source, resulting remote
+path, and digest of each staged artifact are audited (REQ-F-012, REQ-S-017);
+staged files are associated with the session and covered by cleanup, with
+cleanup failures reported rather than suppressed (REQ-F-019); CretLink adds no
+hidden persistence and does not bypass or disable endpoint security, so staged
+malware remains subject to the platform's own defences (product non-goals;
+REQ-S-012).
+
+*FT-5 — Exfiltration of sensitive files.* After consent, downloading
+arbitrary readable files is an authorised capability, and downloaded content
+may additionally be forwarded to the technician's AI provider. The threat is
+abuse of that authority — bulk copying of documents, mail stores, or
+credential databases — and the customer's inability to assess each individual
+read. Mitigations: the pre-consent disclosure states that selected files may
+be sent to the technician computer and on to the AI service (REQ-S-016);
+CretLink ships no credential-harvesting, browser-session-extraction, or
+OS-authentication bypass tooling, and ordinary file access remains visible and
+audited rather than covert (REQ-S-013); transfers are shown in near real time
+(REQ-F-017) and recorded with paths, sizes, and digests (REQ-S-017); the
+customer can stop the session at any moment and stop fails closed (REQ-F-018,
+REQ-S-004); session authority is ephemeral, so exfiltration cannot silently
+continue after the session ends (REQ-S-007); the console warns that arbitrary
+administrator access can reveal sensitive data, with redaction markers and
+retention configuration planned for what it logs locally (REQ-S-018, SHOULD).
+
+*FT-6 — Resource exhaustion via huge or unbounded transfers.* A hostile peer,
+a runaway AI loop, or a malformed length field could exhaust memory through
+oversized chunks, fill the disk of either endpoint, or starve the session
+channel so that the stop control becomes sluggish. Mitigations: transfers
+require chunking, flow control, cancellation, and documented upper bounds by
+design (architecture transport constraints; REQ-N-006); all transfer messages
+have explicit schemas with bounded fields and declared lengths, so an
+oversized or inconsistent frame is rejected rather than buffered (REQ-N-012);
+buffers are bounded with backpressure (REQ-N-006); transfers are cancellable
+and the emergency stop remains immediately effective (REQ-F-010, REQ-F-018);
+adversarial oversized-input tests cover this end to end
+(`crates/mcp/tests/bridge_mock.rs`): `oversized_command_is_a_tool_error_not_a_panic`,
+`oversized_stdin_is_rejected_before_decoding`,
+`oversized_upload_source_label_is_rejected`, and
+`oversized_absolute_path_is_rejected`, plus the protocol field-limit suite
+(`crates/protocol/src/tests.rs`) — so an oversized or inconsistent frame is
+rejected rather than buffered (REQ-N-010, ST-M003-007).
+
+**Residual risks.**
+
+- An authorised technician is trusted with file content. Once the customer
+  grants full control, CretLink cannot distinguish a legitimate log download
+  from exfiltration of a personal document. The defence is disclosure,
+  visibility, audit, and revocation — not prevention.
+- Content forwarded to the AI provider leaves both machines. Disclosure
+  (REQ-S-016) informs the customer, but CretLink cannot retract data once a
+  cloud model has received it.
+- No malware scanning of staged artifacts. CretLink verifies integrity (the
+  bytes are the bytes the technician staged), not safety. It relies on the
+  platform's endpoint security, which it deliberately does not bypass.
+- Full-control file access is intentionally broad on the customer side. Path
+  restrictions apply to constrained staging and download areas, not to the
+  consented general file surface; a semantic allowlist of "safe paths" is a
+  non-goal.
+- Resource limits are robustness bounds, not quotas. An authorised session can
+  still legitimately fill a disk with a large installer; limits exist to stop
+  unbounded or accidental exhaustion, not to police approved work.
+- Cleanup can fail. A staged file may survive an unclean shutdown; the
+  commitment is to report residual artifacts prominently (REQ-F-019), not to
+  guarantee their removal. This honesty is verified by
+  `cleanup_failure_is_reported_then_retried_at_next_start`
+  (`crates/exec/src/fs/tests.rs`): a genuine removal failure (a delete-denying
+  open handle on Windows, a directory planted at the artifact path elsewhere) is
+  reported in the cleanup report's failed set with an honest reason and its
+  manifest record kept, and the next startup sweep retries and clears it
+  (REQ-N-008).
+- The transfer subsystem and its AI-facing tools have landed with automated
+  and simulated-agent CI evidence plus a real-elevated-agent-on-hardware
+  end-to-end run recorded on 2026-08-10, closing the M003/M004 file and
+  transfer stories; the automated half of the privileged adversarial and
+  negative suite (ST-M003-007) that adds revocation, race, and hostile-input
+  coverage has landed (named per abuse case above), while its maintainer-run
+  hardware half ([`manual-tests.md`](manual-tests.md)) remains outstanding, so
+  this section must be revisited when that hardware run is recorded (REQ-S-021).
+
+### Desktop observation and control (M005)
+
+**Status scope.** M005 is a draft; an experimental op-set exists behind
+`desktop.v1`, following ADR-0015: a
+same-session Windows capture-and-input backend (DXGI/GDI duplication,
+`SendInput` synthesis, bounded clipboard), an honest cross-platform stub
+elsewhere, capture and input governors that bound rate, memory, and burst, an
+honest `DesktopState` taxonomy (Active, Locked, Switched, Disconnected,
+NoInputDesktop, Secure), and a `DesktopActivity` observe/control signal so the
+customer console can indicate live observation and control. The capability is
+off unless advertised, and where no capture-and-input backend exists every op
+fails closed from the backend rather than fabricating a frame or accepting an
+input. This section records both the **binding design constraints** on the new
+screen-and-input surface (REQ-F-020, REQ-S-021) and the mitigations now
+implemented in the experimental code; it covers screen data, input injection,
+clipboard data, session switching, lock screen, and secure desktop. A graphical
+customer-facing indicator — as opposed to the colour-independent CLI
+Observe/Control text line — is not yet implemented.
+
+**Entry points.**
+
+- Capture requests from the MCP client or console into the bridge: display
+  selection, quality/rate parameters, and the returned frames themselves.
+- Input actions from the MCP client or console into the bridge: pointer
+  coordinates, buttons, key values, scroll deltas, hotkey sequences, and wait
+  actions.
+- Clipboard exchange in either direction, when explicitly enabled.
+- Reflected screen content back to the AI: on-screen text — web pages, chat
+  windows, documents, credential fields, and any malware UI visible on the
+  desktop — becomes AI-readable input, widening the indirect-prompt-injection
+  surface described in the AI-client section from text to pixels.
+
+**Threat actors.** A misbehaving or compromised AI/MCP client on the technician
+computer that drives capture and input; adversary content *on the customer
+screen* that cannot address the AI directly but can plant instructions the AI
+reads out of a screenshot (indirect prompt injection through pixels); a remote
+adversary who benefits if a compromised AI is steered into typing data outward
+or into sensitive fields; and any party hoping desktop control can be turned
+into covert surveillance or credential capture on the target.
+
+**Abuse cases.**
+
+- *Covert or stale capture.* Capture continues after revocation or stop, or a
+  cached/black/last-known frame is presented as if it were the live desktop, so
+  the customer believes observation ended when it did not, or the technician
+  acts on a frame that no longer reflects the screen.
+- *Secure-desktop escape.* Capture or input is aimed at the logon screen, the
+  UAC/credential-provider prompt, or the Secure Attention Sequence in order to
+  read or drive credential entry the attended model keeps outside CretLink.
+- *Input after handoff.* Synthetic input lands after a target switch, session
+  switch, lock, or revocation, or on the wrong desktop, so actions reach a
+  surface no consented endpoint intended.
+- *Keylogging or credential harvesting by primitive.* The desktop tool surface
+  is pushed to expose a keystroke-logging or password-scraping capability rather
+  than only discrete, visible, audited pointer/keyboard actions.
+- *Clipboard exfiltration or secret spill.* The clipboard is used to pull
+  sensitive customer data off the machine, or CretLink is induced to place a
+  session secret onto the remote clipboard.
+- *Screen-content prompt injection.* Text rendered on the desktop instructs the
+  AI to run further commands, weaken defences, or exfiltrate, reaching the AI as
+  trusted-looking content through a screenshot.
+- *Resource exhaustion via capture.* Unbounded frame rate, dimensions, or
+  in-flight frames are used to exhaust memory or bandwidth on either endpoint.
+- *Outcome masking.* A dropped or failed capture or input is reported as
+  success, so the technician's picture of the desktop diverges from reality.
+
+**Mitigations (design commitments for M005; implemented in the experimental
+op-set unless noted).**
+
+- *Capture is same-session and secure-desktop-bounded.* The agent duplicates or
+  blits only the active input desktop of its own interactive session
+  (ADR-0015); the secure desktop, logon screen, and SAS are **not reachable**
+  from the user-mode agent, and locked, switched, disconnected, and
+  no-input-desktop conditions are returned as **explicit metadata states**, not
+  a fabricated frame (REQ-N-008, REQ-S-013). CretLink installs no mirror/kernel
+  driver, hooks no Winlogon, and injects no synthetic SAS to defeat this
+  boundary (REQ-S-002, REQ-S-010).
+- *Every frame is attributed and bounded.* Each frame carries target hostname,
+  `session_id`, session/desktop identity, display, dimensions, DPI, timestamp,
+  and desktop state (REQ-F-016); size, quality, rate, in-flight count, and
+  memory are bounded with backpressure that coalesces or drops rather than
+  buffering without limit (REQ-N-006, REQ-N-005). Stale frames are identifiable
+  by timestamp and state so a changed or dead desktop is never mistaken for a
+  live one.
+- *Input is explicit, bounded, and fail-closed.* Actions name coordinates,
+  button, and key values, are rate-limited, and re-validate session `Active`
+  state and target/desktop match immediately before delivery; a switch,
+  revocation, stop, or mismatch **refuses** the action (REQ-S-004, REQ-S-009,
+  REQ-F-018). Stop and revoke work from either endpoint without the other's
+  cooperation and block further capture and input (REQ-S-004).
+- *No high-value primitive to inject into.* The desktop surface contains no
+  keylogging, credential-scraping, or authentication-bypass function
+  (REQ-S-013); an attack must express itself as ordinary, visible, audited
+  pointer and keyboard actions, each attributable to a specific tool call via
+  the routed `call_id` and `origin` (REQ-F-017, REQ-S-017).
+- *Clipboard is explicit and secret-free.* Clipboard exchange is off by default,
+  bounded in type and size, visible and audited (REQ-S-016 through REQ-S-018),
+  and CretLink never places session secrets or AI/provider credentials on the
+  remote clipboard (REQ-F-015, REQ-S-015).
+- *Visible, accessible indication and informed consent.* The customer always
+  sees when screen observation and when input control are active, distinguished
+  without relying on colour alone (REQ-N-013, REQ-N-014, REQ-F-020), and consent
+  discloses before `Active` that screen contents may be sent to the technician
+  computer and onward to the AI service (REQ-S-016, REQ-S-003).
+- *Screen content is untrusted input.* As with reflected command output, pixels
+  and the text within them carry **no mechanical authority**: CretLink cannot
+  stop an AI *model* persuaded by on-screen text, but the architecture gives
+  such text no routing, consent, or execution power of its own, and the
+  technician's activity view and audit trail keep every resulting action
+  visible and attributable (see the AI-client section).
+- *Honest outcomes.* Capture and input distinguish completed, failed, refused,
+  and unknown results; a dropped frame or undelivered action is never reported
+  as success (REQ-N-008).
+
+**Residual risks.**
+
+- On-screen prompt injection is not preventable, only contained. CretLink cannot
+  sanitise the semantic content of the customer's screen before the AI reads it;
+  defence is the same visibility, attribution, audit, and immediate stop as for
+  reflected command output, plus the technician actually watching. Model-level
+  safeguards and technician vigilance are assumed, not enforced.
+- Screen content is inherently sensitive. A consented desktop-observation
+  session necessarily exposes whatever is on screen, including data the customer
+  did not consciously intend to reveal; CretLink bounds, discloses, and makes
+  visible this exposure but does not redact screen contents semantically.
+- The secure desktop is out of reach *by design*, which is a deliberate
+  limitation, not a defect: flows that require entering credentials at a UAC or
+  logon prompt must be completed by the attending human, and CretLink reports
+  the secure-desktop state rather than driving it.
+- The experimental op-set is covered by automated tests — the capability
+  gate, backend fail-closed behaviour, honest `DesktopState` frames, the
+  malformed/oversized action taxonomy, input pacing, the `DesktopActivity`
+  signal, and fail-closed behaviour across a mid-session network interruption
+  all have workspace tests. The residual risk is now confined to the surfaces
+  that only a real attended Windows desktop can exercise: the *live-capture
+  honesty* on the actual secure desktop, lock screen, session switch, and
+  display/focus changes, and the *graphical* customer-facing observation/control
+  indicator. Those need hardware runs and UI work before M005 can leave draft;
+  until then the corresponding secure-desktop and consent-visibility
+  mitigations rest on the design and the automated state taxonomy rather than
+  on hardware evidence (REQ-S-021).
+- A fully compromised technician computer defeats this boundary entirely; see the
+  consolidated residual risks.
+
+### Temporary persistence and cleanup
+
+CretLink's value proposition depends on the word *temporary*. Everything the
+product places on the customer computer — an elevated execution broker, an
+optional SYSTEM helper, staged files, session keys, and the single-use
+reboot-resume ticket — is authority or material that could
+outlive the attended session if it is not reliably removed. This surface
+covers what can be left behind, who benefits from it, and how CretLink is
+required to remove it or to admit that it could not.
+
+**Status.** Implemented. Session-scoped cleanup of staged files and the
+in-process elevated broker comes from the session lifecycle milestones
+(M002–M003). Reboot-resume is specified in ADR-0014 and implemented on
+Windows: an attended, local arming gesture (ST-M006-001) mints a single-use,
+short-lived, target-bound ticket derived from the armed session's
+transcript-bound handshake hash (`K_rr = HKDF-SHA256(…, h ‖ Na_rr ‖ Nc_rr)`),
+sealed at rest per-user with DPAPI. After a reboot, a challenge-response over a
+fresh handshake proves peer continuity but never restores control — attended
+full-control consent still runs (ST-M006-002). It is the **single reviewed
+exception** to ADR-0003's "no key material persists across sessions", bounded
+to authority-reducing continuity proof only. The owned-resource inventory and
+`cretlink-support-agent recover [--remove]` (ST-M006-003) report and remove
+CretLink residue offline — staged trees and sealed tickets — and assert every
+other ownable kind empty. The agent does not itself register the per-user OS
+auto-start entry or bind redemption into a live post-reboot dial; the
+end-to-end reboot path is hardware scenario MT-8 in
+[`manual-tests.md`](manual-tests.md), not yet recorded. On Windows, every
+job's process tree is held in a kill-on-close Job Object (ST-M006-007), so even
+a hard kill of the agent reaps it.
+
+**Entry points and assets at risk.**
+
+- The elevated execution broker and any optional temporary SYSTEM helper
+  running on the customer computer during a session (REQ-S-012).
+- Auto-start mechanisms — services, scheduled tasks, or equivalent — that
+  would only ever exist to support the explicitly opted-in reboot-resume
+  capability (REQ-F-021), plus any reconnect state stored on the customer disk
+  for it.
+- Session keys and bearer capabilities held in memory or transiently on disk
+  on either endpoint (REQ-S-007).
+- Files staged onto the customer computer during the session: scripts,
+  utilities, installers, and drivers (REQ-F-012).
+- The cleanup process itself, including its result reporting (REQ-F-019) — a
+  cleanup that misreports success is an asset an attacker can hide behind.
+
+**Threat actors.** A local opportunist or malware already present on the
+customer computer that discovers leftover elevated components or reconnect
+material after the session ends; a LAN attacker or malicious peer attempting
+to replay or reuse reboot-resume authority; a malicious or negligent
+technician seeking access that outlives the attended session, or an AI client
+compromised or misled into requesting covert persistence; and non-adversarial
+failure — a crash, power loss, forced reboot, or removal of the portable media
+while cleanup is incomplete.
+
+**Abuse cases.**
+
+- *Leftover elevated helper.* If the execution broker or a temporary SYSTEM
+  helper survives session end, it becomes a local privilege-escalation path:
+  any later local process or user could attempt to drive an already-elevated
+  component that no longer has a consenting session behind it.
+- *Auto-start residue.* A service, scheduled task, or startup entry that
+  persists beyond its purpose is functionally a backdoor, regardless of
+  intent. Even benign residue erodes the customer's ability to trust that
+  "support has ended" means what it says.
+- *Reboot-resume token theft or replay (REQ-F-021).* Reboot-resume
+  necessarily stores some reconnect authority across a restart. If that
+  material could be copied — by co-resident malware, a second local user, or a
+  cloned disk — and later presented, an attacker could attempt to resume a
+  session the customer believed was bound to one approved reboot. Replay after
+  legitimate use, use after expiry, and use against a different target are all
+  variants of the same abuse.
+- *Dishonest cleanup.* A cleanup routine that reports success while residue
+  remains is worse than one that fails loudly: it converts a recoverable
+  operational problem into false assurance for both the customer and the
+  technician's records.
+- *Crash during cleanup.* A crash, power loss, or premature shutdown
+  mid-cleanup leaves the system in a partially cleaned state. If the product
+  cannot resume or at least report that state, residue persists silently.
+- *Lingering session secrets.* Session keys, bearer capabilities, or
+  reconnect material remaining in memory, logs, or temporary files after
+  session close extend the window in which theft is useful, including via
+  crash dumps or swapped memory that CretLink does not fully control.
+
+**Mitigations.**
+
+- *Session-scoped privileged components.* Any administrator or SYSTEM broker
+  must be scoped to the current session and removed or disabled during cleanup
+  (REQ-S-012). The architecture permits a SYSTEM helper only when it is
+  separately specified, visible, session-scoped, and cleaned up.
+- *No auto-start by default.* Normal session shutdown must leave no auto-start
+  entry or long-lived credential on the customer computer (REQ-F-001). Cleanup
+  must remove temporary credentials, temporary services, temporary auto-start
+  mechanisms, and CretLink-owned staged files selected for cleanup
+  (REQ-F-019). Staged artifacts are digest-verified, audited, and removable
+  (REQ-F-012).
+- *Ephemeral session authority.* Session keys and bearer capabilities must be
+  randomly generated, short-lived, scoped to one session, stored only as long
+  as required, and invalidated on stop or expiry (REQ-S-007). Stop from either
+  endpoint invalidates session secrets and rejects new actions (REQ-F-018,
+  REQ-S-004), and cancellation terminates the tracked process trees or reports
+  why it cannot (REQ-S-014). Audit logs must not intentionally store session
+  secrets (REQ-S-017), and AI or provider credentials are never on the
+  customer computer to leak in the first place (REQ-S-015).
+- *Reboot-resume is opt-in, single-use, and expiring.* Reconnection across a
+  reboot may only exist after an explicit, plainly worded local consent that
+  distinguishes reboot persistence from ordinary session control (REQ-F-021,
+  REQ-N-013). The reconnect capability must expire after its approved use or
+  timeout, and the temporary persistence must be removed after reconnection or
+  failure (REQ-F-021). Replayed authentication material must be rejected
+  (REQ-S-008), and reconnection without valid session state must fail closed
+  rather than restore control (REQ-S-009). ADR-0014 additionally scopes the
+  reconnect authority cryptographically to the session and target, and
+  redemption fails closed on expired, replayed, cloned, wrong-target, or
+  interrupted state — proven by the ST-M006-002 fail-closed matrix
+  (`replayed_redemption_is_refused_single_use`,
+  `console_expired_clock_fails_closed`,
+  `wrong_target_fails_closed_with_valid_proof`,
+  `cloned_agent_blob_in_foreign_environment_fails_closed`,
+  `interrupted_before_proof_fails_closed` in
+  `crates/session/src/redeem/tests.rs`), with
+  the reboot itself covered by MT-8.
+- *Honest cleanup outcomes.* Cleanup failures must be shown prominently and
+  recorded locally (REQ-F-019); the product must never silently report success
+  and must distinguish completed, failed, cancelled, timed-out, and unknown
+  outcomes (REQ-N-008). Lifecycle states, including crash recovery and
+  cleanup, must be explicit and idempotent where practical (REQ-N-004), so an
+  interrupted cleanup can be re-run rather than abandoned. The recovery command
+  `cretlink-support-agent recover` (ST-M006-003) inspects and, with
+  `--remove`, removes known CretLink residuals without hiding evidence,
+  reporting anything it keeps with a reason and manual remediation, consistent
+  with the no-stealth rule (REQ-S-002).
+- *Visibility as a mitigation.* Because the agent may not hide its process,
+  windows, or connection state (REQ-S-002), any residue that does survive is
+  at least discoverable by ordinary inspection rather than concealed, and the
+  audit trail (REQ-S-017) records what was created during the session.
+
+**Residual risks.**
+
+- Persistence created through arbitrary commands. CretLink deliberately
+  exposes general elevated command execution (REQ-F-007) and does not
+  semantically allowlist administrator commands. A technician or a compromised
+  AI client could instruct the session to create persistence that CretLink did
+  not itself install and therefore cannot inventory or remove. The audit trail
+  makes this detectable after the fact; it does not prevent it.
+- A compromised customer computer. Malware already resident on the customer
+  computer can read process memory, copy reconnect state within its validity
+  window, or tamper with cleanup. CretLink narrows the useful window of stolen
+  material; it does not defend a machine that is already hostile.
+- Memory remnants outside CretLink's control. Secrets may transiently exist in
+  crash dumps, swap, or hibernation files managed by Windows. Minimising
+  secret lifetime reduces, but cannot eliminate, this exposure.
+- Catastrophic failure during cleanup. If the agent is destroyed mid-cleanup
+  (disk failure, forced power-off, removal of the portable media), residue can
+  remain until the documented manual remediation is followed. The commitment
+  is honest reporting and recoverable tooling, not impossibility of residue.
+- The reboot-resume window is persistence by design. Between the approved
+  reboot and the resumed session, reconnect authority necessarily exists on
+  disk. Scoping, expiry, and single-use consumption bound the risk; they do
+  not make the window zero.
+- Cleanup has fault-injection evidence in automated tests:
+  `cleanup_failure_is_reported_then_retried_at_next_start` (a genuine OS
+  refusal to remove a staged file), the ST-M006-003 inventory tests
+  (`recover_keeps_unremovable_ticket_store_and_names_remediation`,
+  `unreadable_ticket_store_is_surfaced_not_assumed_empty`), and
+  `windows_hard_kill_reaps_the_whole_tree_via_kill_on_close` (ST-M006-007).
+  Cleanup and reboot-resume on real hardware (MT-4, MT-8) are not yet
+  recorded, so that evidence is still pending.
+
+### Internet relay (M007, in progress)
+
+**Status and scope.** M007 is under way. The opaque outbound-rendezvous
+forwarder now ships as a real binary (`cretlink-relay-server`, ST-M007-007), the
+console and support-agent dial it behind the same transport trait as the LAN
+dial (ST-M007-008), and the relay hop is wrapped in `wss` over TLS as the
+shipped default (ST-M007-009) with plain TCP kept as a documented interim. The
+relay terminates only the transport envelope; it never holds the Noise session
+key or decodes a protocol message, so the **binding design constraints** below
+are the rules the shipped code satisfies, not merely a future commitment. The
+end-to-end trust model is unchanged by the relay's presence (REQ-F-022,
+REQ-S-021).
+
+Equally important is what the endpoints expose: neither the console nor the
+support agent opens an internet-reachable listener (REQ-S-010). On the LAN path
+discovery and control traffic are limited to the intended local interfaces,
+and the customer computer may have no internet access at all (REQ-N-003). On
+the relay path both endpoints dial the relay **outbound**. The only
+internet-facing listener is the operator-hosted `cretlink-relay-server`, which
+binds `0.0.0.0:9970` by default by design, because a relay must be reachable
+(see [`relay-server.md`](relay-server.md)); it runs on neither endpoint. Any
+internet-reachable listener on an endpoint is a defect, not a feature.
+
+**Entry points.** The endpoints expose no relay entry point and no
+internet-reachable listener (REQ-S-010). The relay itself exposes a
+rendezvous endpoint that the console and the support agent each reach
+**outbound**, carrying a one-time preamble (an optional admission token and a
+single-use rendezvous ticket) so the relay can match the two ends of a session;
+a forwarding channel that carries opaque, end-to-end encrypted session frames
+between the matched endpoints; and relay-operator surfaces (admission
+authentication, rate limits, concurrency quotas, and metadata-only metrics and
+event logs) for self-hosted deployments.
+
+**Threat actors.** A malicious or compromised relay operator — the defining
+actor for this boundary, modelled as fully hostile: it may observe, store,
+delay, drop, replay, reorder, or modify every frame it forwards, and may
+attempt to act as an endpoint (this includes a hostile self-hosted relay run
+by a third party, since the relay is intended to be self-hostable open
+source); a network attacker between an endpoint and the relay, including the
+relay's hosting provider, with the same capabilities; a relay impersonator who
+convinces endpoints to rendezvous through an attacker-controlled relay;
+abusive third parties who would use a reachable relay as an anonymising
+rendezvous for unauthorised remote access or scanning, independent of any
+legitimate session; and a traffic-analysis observer harvesting session
+metadata rather than content.
+
+**Abuse cases.**
+
+- *Plaintext recovery.* The relay attempts to read commands, command output,
+  transferred files, or screenshots from forwarded traffic, or to downgrade
+  the channel to a relay-readable mode.
+- *Command authority via the relay.* The relay attempts to synthesise or
+  modify tool calls, impersonate an authenticated console or support agent, or
+  replay and reorder recorded frames so that the customer computer executes
+  actions no endpoint requested.
+- *Relay-in-the-middle at pairing.* An attacker-controlled relay inserts
+  itself as each endpoint's "peer" during pairing, hoping the humans confirm a
+  session that actually terminates at the relay.
+- *Consent and revocation interference.* The relay withholds or delays
+  traffic to keep a session apparently alive after a stop, to suppress a
+  revocation, or to encourage skipping the code comparison and consent steps
+  on the internet path.
+- *Metadata harvesting.* The relay records who supported whom, endpoint IP
+  addresses, session timing, frequency, and traffic volumes.
+- *Anonymous abuse service.* A publicly reachable relay is used by parties
+  with no legitimate session as free infrastructure for abuse, creating legal
+  and reputational exposure for operators.
+- *Scope creep in the endpoints.* A convenience feature quietly introduces an
+  internet-reachable listener on an endpoint, or makes the LAN workflow depend
+  on a relay, bypassing the M007 requirements, review, and adversarial
+  testing.
+
+**Mitigations (binding design constraints for M007).**
+
+- *No internet exposure on the endpoints.* Endpoints open no
+  internet-reachable listener (REQ-S-010): the LAN path limits discovery and
+  control to local interfaces, and on the relay path both endpoints dial
+  outbound. The operator-hosted `cretlink-relay-server` binds `0.0.0.0:9970` by
+  default by design and runs on neither endpoint. The LAN-only workflow remains
+  available alongside the relay (M007 exit criteria), and initial session
+  functions work with no customer internet access at all (REQ-N-003).
+- *Relay is a forwarder, never an authority.* A relay may only be added
+  without changing the end-to-end trust model and without exposing remote
+  execution to the relay (REQ-F-022). It forwards opaque end-to-end encrypted
+  traffic and never receives session plaintext, session keys, or
+  remote-execution authority (REQ-S-005, REQ-S-007).
+- *Endpoint authentication excludes the relay.* Pairing authenticates the two
+  endpoints — not the transport between them — using established, audited
+  cryptography, and binds the human-compared SAC to the cryptographic session
+  transcript (REQ-S-005, REQ-S-006, REQ-F-005). A relay-in-the-middle that
+  terminates the cryptography at itself produces mismatched codes and cannot
+  reach full control.
+- *No relay-driven replay or downgrade.* The protocol must reject replayed
+  authentication messages and prevent any peer — including a relay posing as
+  one — from silently downgrading required security properties (REQ-S-008).
+  Messages carry explicit schemas, versions, identifiers, and bounds
+  (REQ-N-012), and flow control and quotas bound relay-driven resource
+  pressure at the endpoints (REQ-N-006).
+- *Fail closed through the relay.* Authentication, integrity, or
+  version-negotiation failures on a relayed path deny control with a visible
+  error, and reconnecting through a relay cannot restore full control without
+  valid session state (REQ-S-009). Session keys are ephemeral, scoped to one
+  session, and invalidated on stop or expiry (REQ-S-007), so a relay that
+  records traffic gains nothing durable.
+- *Revocation does not depend on relay cooperation.* Either endpoint can
+  revoke unilaterally, and stop controls are enforced at the endpoints
+  (REQ-S-004, REQ-F-018). A relay that withholds or delays frames can degrade
+  availability but cannot keep a revoked session authoritative.
+- *Consent, identity, and audit are unchanged by transport.* Attended local
+  initiation, informed full-control consent, explicit target identity on
+  results, and the local audit trail apply identically on a relayed path
+  (REQ-S-001, REQ-F-006, REQ-F-016, REQ-S-017). AI and provider credentials
+  remain on the technician computer and never transit to the relay or the
+  customer device (REQ-S-015).
+- *Abuse controls before operation.* M007 requires relay authentication, rate
+  limits, abuse controls, and operational metrics so a reachable relay is not
+  an anonymous abuse service, plus self-hosting documentation with verifiable
+  release provenance (REQ-S-019; M007 scope covering REQ-S-017 through
+  REQ-S-022).
+- *Adversarial validation gates release.* M007 cannot exit until tests
+  demonstrate that a relay which observes, delays, drops, replays, reorders,
+  or modifies traffic gains neither plaintext nor command authority (M007 exit
+  criteria). The shipped relay-server and endpoint dialer are proven against
+  these on the raw-TCP and `wss` paths by the relay integration suites, which
+  assert byte-identical pairing, consent, attribution, and revocation to a direct
+  LAN session and zero forwarding on a fail-closed transport.
+
+**Residual risks.**
+
+- Metadata exposure is inherent. Any relay necessarily learns endpoint
+  addresses, session existence, timing, duration, and traffic volume, and can
+  attempt traffic analysis on encrypted frames. CretLink commits to measuring
+  and documenting this exposure, not to eliminating it; padding and anonymity
+  networks are not planned.
+- Availability is not defended. A hostile relay can always refuse, delay, or
+  degrade service. The guarantee is fail-closed denial of control, not
+  liveness.
+- Third-party relay deployments. As MIT-licensed software, relay code can be
+  self-hosted by anyone; the project cannot police hostile or negligent
+  deployments beyond making endpoint security independent of relay honesty.
+- Transport TLS crypto provider (accepted). The `wss` transport (ST-M007-009)
+  terminates TLS with `rustls` and its default **`aws-lc-rs`** crypto provider
+  (ADR-0017, ST-M006-009). It replaced the pure-Rust `rustls-rustcrypto`
+  provider, an alpha whose graph carried `rsa` with the unfixed Marvin timing
+  side channel (RUSTSEC-2023-0071) and the unmaintained `paste`. The residual is
+  that the TLS primitives now run in AWS-LC's C and assembly code, outside
+  Rust's memory-safety guarantees, in exchange for a far more widely used and
+  audited, partly formally verified implementation; building the transport
+  needs a C compiler. The provider stays isolated behind the `cretlink-wss`
+  config builders, and the end-to-end Noise session is unaffected by the
+  provider choice (REQ-S-005, REQ-S-021).
+- Scope discipline still applies to what remains. Screenshot/computer-action
+  surfaces and relay abuse-at-scale hardening are not yet exercised on hostile
+  hardware; the residual risk is an internet-facing capability outrunning its
+  malicious-relay testing, mitigated procedurally by the spec-first gate and
+  REQ-S-010 until each remaining part lands its own code and test evidence.
+- Compromised endpoints remain out of scope. End-to-end encryption terminates
+  on the technician and customer computers; a relay design cannot protect a
+  session whose technician computer is already compromised.
+
+### Supply chain and distribution
+
+This surface covers everything between the public CretLink source code and the
+binaries that actually run: third-party dependencies, the build and CI
+pipeline, release artifacts and their distribution, and repository secret
+hygiene. It deserves particular care because the support agent runs elevated
+on other people's computers. A compromised official artifact inherits
+administrator authority on every customer machine it touches, and the customer
+has no practical means of inspecting the binary the technician asks them to
+run. The architecture therefore treats repository source, dependencies, CI,
+build artifacts, release metadata, and signing identities as having different
+trust levels, and requires official artifacts to have verifiable provenance
+independent of the fact that the source is public.
+
+**Status.** Enforced on `main` and in the release workflow. The Cargo
+workspace with its committed lockfile and `deny.toml` (ST-M001-002), the
+continuous-verification pipeline (ST-M001-004), and semantic-release automation
+(ST-M001-005) are configured and verified. Official artifacts — five binaries
+per target, SHA-256 checksums, a dependency inventory, and CycloneDX SBOMs —
+are published by the release workflow (ST-M006-004). Authenticode signing is
+implemented but gated, and no signing identity is configured, so current
+releases are unsigned (ST-M006-005); build provenance attestation is not yet
+implemented. Branch protection is pending the repository becoming public (a
+GitHub free-plan limit on private repositories). Each mitigation below is
+marked with its honest implementation status.
+
+**Entry points.**
+
+- crates.io dependencies resolved by Cargo for the Rust workspace (ADR-0001),
+  including transitive crates, build scripts, and procedural macros that
+  execute code at compile time on maintainer and CI machines.
+- Build tooling: the Rust toolchain and any tools fetched by CI.
+- Repository content and access: source, GitHub Actions workflow definitions,
+  branch-protection configuration, and maintainer accounts.
+- CI jobs: pull-request jobs that execute contributed code, and release jobs
+  that hold publishing credentials.
+- Release artifacts: five binaries (`cretlink-console`, `cretlink-mcp`,
+  `cretlink-shell`, `cretlink-support-agent`, `cretlink-relay-server`) on three
+  targets (Windows x86_64, macOS aarch64, Linux x86_64), per-target checksums,
+  the dependency inventory, SBOMs, and the generated release notes.
+- The distribution path to the customer: download on the technician computer,
+  copy to removable media or a temporary local copy, and visible elevated
+  launch on the customer computer (REQ-F-001, REQ-F-002).
+
+**Threat actors.** A compromised or malicious dependency maintainer
+(crates.io account takeover, a hostile transitive dependency, or a
+typosquatted crate name added by mistake); an attacker with repository or
+workflow access (a compromised maintainer account, or a malicious pull request
+that attempts to alter CI behaviour or reach release credentials); an artifact
+tamperer or impersonator (someone who modifies binaries after build, or
+distributes altered or lookalike "CretLink Support" binaries outside the
+official release channel); and a careless insider (accidental commit of
+tokens, signing material, or test fixtures containing real credentials).
+
+**Abuse cases.**
+
+- *Backdoored dependency.* A malicious crate executes code at build time or
+  ships hostile runtime behaviour inside the support agent. Because the agent
+  runs elevated on customer machines, this is the highest-impact supply-chain
+  case: the backdoor bypasses every runtime consent and visibility control,
+  since those controls are implemented by the very binary that was
+  compromised.
+- *CI or workflow compromise.* A malicious pull request tries to run with
+  release credentials, exfiltrate secrets from CI, or change the pipeline so
+  that published artifacts no longer correspond to the tagged source.
+- *Release-artifact tampering.* Binaries are replaced or modified between
+  build and download, or a third party mirrors modified binaries that
+  technicians mistake for official releases.
+- *Unsigned-binary impersonation.* Until code signing exists, a lookalike
+  binary can imitate the CretLink Support consent screens while omitting the
+  safety properties behind them. Customers cannot cryptographically
+  distinguish it, and repeated Windows SmartScreen warnings on the genuine
+  unsigned artifact risk training users to click through warnings generally.
+- *Update-channel abuse.* If automatic updates are ever added, a hostile
+  update or a silent downgrade to a vulnerable version would convert the
+  update channel into a remote-execution channel.
+- *Repository secret leakage.* A leaked release token or signing key lets an
+  attacker publish artifacts that appear official.
+
+**Mitigations.**
+
+*Dependency compromise.* CI enforces a dependency policy with `cargo-deny`:
+known RustSec advisories, violations of the MIT-compatible licence policy,
+banned or yanked crates, and wildcard or unknown-source dependencies fail the
+build, duplicate crate versions are surfaced as warnings, and dependency
+review plus secret scanning run on every pull request and on the release
+branch (REQ-N-010, REQ-N-016, REQ-N-017; M001 exit criteria, ST-M001-004) —
+*configured and enforced on `main` (ST-M001-004, Done): `ci.yml` runs
+`cargo-deny` licence, advisory, ban, and source checks plus gitleaks secret
+scanning, with all actions SHA-pinned*. The committed Cargo lockfile pins the
+exact dependency graph, so a release builds from reviewed, recorded versions
+rather than whatever resolves on the day — *in place: the Cargo workspace,
+`Cargo.lock`, and `deny.toml` are committed (ST-M001-002, Done)*.
+Security-critical functionality uses established, maintained cryptographic
+libraries rather than novel code (REQ-S-005), which keeps the set of crates
+that must be deeply trusted small and auditable.
+
+*Build and CI compromise.* Privileged tests and release credentials are
+isolated from untrusted pull-request execution: routine CI runs against the
+non-privileged simulated agent, and release secrets and signing keys never
+enter untrusted pull-request jobs (REQ-N-011, REQ-N-017; [release policy](releasing.md))
+— *configured on `main` (ST-M001-004, Done): pull-request jobs carry no write
+tokens, and the release workflow runs only on `main` behind a fork guard*.
+Only protected release automation may publish from the release branch;
+versions, tags, and changelogs come from semantic-release rather than manual
+steps that an attacker could imitate (REQ-N-018, REQ-N-019, ST-M001-005) —
+*configured on `main` (ST-M001-005, Done): `release.yml` runs semantic-release
+with a pinned `.releaserc.json`, `package.json`, and `package-lock.json`; the
+only manual tags are the seed tags `v0.0.0` and `v0.21.1`, and releases are
+computed by semantic-release*.
+
+*Release-artifact tampering and unsigned binaries.* Official releases must be
+produced by documented automation from a tagged commit and ship with
+checksums, so a technician can verify an artifact before copying it to
+removable media, and any observer can check that a binary in circulation
+matches the published release (REQ-S-019) — *in place: the release workflow
+publishes checksums, a dependency inventory, and CycloneDX SBOMs with every
+release (ST-M006-004); build provenance attestation is not yet implemented
+([release policy](releasing.md))*. Code signing is a stated goal (REQ-S-019,
+SHOULD) — *Authenticode signing is implemented and gated on a configured
+signing identity (ST-M006-005); none is configured, so current releases are
+unsigned*. Staged tools and drivers transferred during a
+session are verified by cryptographic digest and recorded in the audit trail,
+which limits silent substitution during the last hop onto the customer machine
+(REQ-F-012, REQ-N-007).
+
+*Update authenticity.* The initial product has no automatic update mechanism.
+If one is introduced, update metadata and artifacts must be authenticated
+before execution and downgrade behaviour must be explicit (REQ-S-020) — *not
+applicable yet; binding on any future update work*.
+
+*Blast-radius limits and disclosure.* No AI credentials, provider tokens, or
+technician account secrets ever reach the customer computer (REQ-S-015,
+REQ-F-015), so even a tampered support agent has nothing of that kind to steal
+from its own host. The repository maintains this public threat model
+(REQ-S-021) and a private coordinated vulnerability-reporting path
+(REQ-S-022), so a discovered supply-chain compromise can be reported and
+handled without forcing public disclosure of exploitable detail —
+*SECURITY.md is published alongside this threat model (ST-M001-006)*.
+
+**Residual risks.**
+
+- Checksums alone do not prove authorship. Checksums published alongside the
+  artifacts defend against corruption and casual tampering, but not against an
+  attacker who controls the release channel itself. Until signing (REQ-S-019
+  SHOULD) and independent provenance attestation exist, artifact authenticity
+  ultimately rests on GitHub account security and branch-protection integrity.
+- Customers cannot verify the binary. With current releases unsigned, the
+  customer's trust in the support agent is trust in the technician who brings
+  it.
+  CretLink cannot prevent someone from distributing a hostile lookalike
+  outside official channels; pairing and the SAC protect genuine endpoints
+  from each other, not the customer from a fake agent they were handed.
+- Advisory-based scanning lags novel attacks. `cargo-deny` catches known
+  vulnerabilities and policy violations, not a well-executed malicious
+  dependency change before public disclosure. Dependency-diff review in a
+  personal open-source project is best-effort, not a guarantee.
+- Bit-for-bit reproducible builds are not promised initially. REQ-S-019
+  requires documented automation and checksums; full reproducibility that
+  would let third parties independently rebuild and compare artifacts is a
+  desirable later hardening, not an M001 deliverable.
+- Current releases are unsigned. The CI, dependency, and release gates above
+  are configured and enforced on `main` (ST-M001-002, ST-M001-004, and
+  ST-M001-005 are Done), and releases ship with checksums, a dependency
+  inventory, and SBOMs, but no signing identity is configured and build
+  provenance attestation is not yet implemented, and branch protection cannot
+  be enabled until the repository is public (a GitHub free-plan limit on
+  private repositories). Until then, checksums verified against the official
+  release page are the practical integrity assurance.
+
+## Residual risks and explicit non-goals
+
+The boundary sections above list their own residual risks. The following
+cross-cutting risks are accepted deliberately and stated here once so nobody
+has to infer them:
+
+- **A fully compromised technician computer is out of scope.** It holds the AI
+  credentials, the console, target selection, and the audit log; no
+  customer-side control can make it harmless. The customer's protections
+  against a hostile technician machine reduce to attendance, the visible
+  session UI, and the stop control (REQ-S-002, REQ-S-004, REQ-F-018). This is
+  a stated trust-boundary fact, not a mitigation gap.
+- **A customer computer that is already compromised is out of scope.** Malware
+  resident before the session can subvert the agent's own side of pairing,
+  consent, cleanup, and reboot-resume material. CretLink narrows windows and
+  keeps everything visible; it does not disinfect or defend a hostile host.
+- **Abuse of genuinely granted authority cannot be prevented, only exposed.**
+  There is no semantic allowlisting of administrator commands, no "safe paths"
+  filter, and no way to distinguish a legitimate log download from
+  exfiltration. The defence throughout is attended consent, visibility,
+  attribution, audit, and immediate revocation (REQ-S-001..004, REQ-F-017,
+  REQ-F-018, REQ-S-017) — detection and interruption, not prevention.
+- **Human factors remain a real weakness.** Blind confirmation of the Session
+  Approval Code, consent under social pressure, and a technician not watching
+  the activity view all reduce the value of the technical controls. UI
+  requirements (REQ-N-013, REQ-N-014, REQ-S-003, REQ-S-016) reduce but cannot
+  eliminate this.
+- **Prompt-injection resistance of the AI model is outside CretLink's
+  control.** CretLink guarantees hostile reflected text has no mechanical
+  authority over the session; it cannot guarantee the model is not persuaded
+  by it.
+- **Availability under attack is not guaranteed.** Denial of service on the
+  LAN, discovery jamming, or a hostile relay can prevent a session from
+  forming or surviving. CretLink commits to failing closed and reporting
+  honestly, never to liveness.
+- **Metadata is observable.** Session existence, endpoint addresses, timing,
+  and traffic volume are visible to network observers and, on the relay path,
+  to the relay. Traffic-analysis resistance is out of scope.
+- **Data sent to an AI provider cannot be retracted.** Disclosure before
+  consent (REQ-S-016) is the control; recall is not possible.
+- **The audit trail is technician-held.** It is append-oriented and supports
+  honest review; it is not tamper-proof against the person who controls the
+  console (REQ-S-017).
+- **Executed effects are irreversible.** Stop fails closed for future actions
+  but cannot undo changes already made, and an elevated command can in
+  principle degrade CretLink itself on the customer computer.
+- **Memory remnants are bounded, not eliminated.** Secrets may transiently
+  exist in crash dumps, swap, or hibernation files managed by Windows.
+- **Provenance is checksum-strength for now.** Current releases are unsigned;
+  code signing (REQ-S-019 SHOULD) awaits a signing identity, provenance
+  attestation and bit-for-bit reproducible builds are not implemented, and
+  artifact authenticity rests meanwhile on release-channel account security.
+- **Per-section status is authoritative.** Each boundary section states what
+  is implemented; mitigations in sections marked as design commitments are
+  enforced by the spec-first gate and traceability, not by shipped code, and
+  are not claims about shipped behaviour.
+
+### What CretLink refuses to contain
+
+Some capabilities are excluded on purpose, permanently, because their presence
+would convert a support tool into an attack tool. These are requirements and
+product non-goals, not implementation gaps, and contributions adding them will
+be rejected:
+
+- **No stealth.** The support agent must never hide its process, window, tray
+  state, connection state, logs, or active-control indication from the
+  customer (REQ-S-002). Covert monitoring and anti-forensics are explicit
+  product non-goals.
+- **No consent bypass.** Full control exists only after visible local
+  initiation, visible UAC elevation, and informed consent on the customer
+  computer (REQ-S-001, REQ-F-002, REQ-F-006). CretLink does not bypass
+  customer consent, UAC, operating-system protections, endpoint security, or
+  organisational policy (product non-goals).
+- **No credential capture.** No credential harvesting, password extraction,
+  browser-session extraction, keylogging, or mechanisms designed to bypass
+  operating-system authentication (REQ-S-013).
+- **No hidden or permanent persistence.** Hidden, unattended, or permanent
+  access by default is a product non-goal; normal shutdown leaves no
+  auto-start entry or long-lived credential (REQ-F-001, REQ-F-019), privileged
+  brokers are session-scoped (REQ-S-012), and the only cross-reboot mechanism,
+  reboot-resume, is explicitly armed by the customer, single-use, and expiring
+  (REQ-F-021, ADR-0014; hardware scenario MT-8).
+- **No AI credentials on the customer computer.** AI authentication and
+  provider communication remain on the technician computer (REQ-S-015,
+  REQ-F-015).
+- **No invented cryptography and no unauthenticated encryption** (REQ-S-005).
+- **No internet-reachable listener on an endpoint by default** (REQ-S-010);
+  the relay remains optional and never an authority (REQ-F-022).
+
+Because CretLink is MIT-licensed, a fork could remove these refusals. The
+project cannot prevent that; it can ensure the official artifacts are
+verifiable (REQ-S-019) so a modified binary is distinguishable from an
+official release, and it will not accept such changes upstream.
+
+## Maintaining this document
+
+REQ-S-021 requires this threat model to cover pairing, LAN attackers,
+malicious peers, compromised AI clients, command execution, file transfer,
+temporary persistence, relay operation, and supply-chain risks — and to be
+kept current. Per the security acceptance evidence in the
+security requirements, **every milestone that changes a trust
+boundary must ship with**: abuse and misuse cases; negative authorisation
+tests; cleanup and revocation tests; dependency and artifact provenance
+checks; an updated threat-model section; and a record of unresolved risks.
+Pull requests that alter a trust boundary must therefore update the relevant
+section here in the same change.
+
+For tabletop review (ST-M001-006), the walkthrough scenarios map onto this
+document's sections as follows:
+
+- hostile LAN → LAN attackers, with the pairing-time cases in Pairing and
+  session establishment;
+- malicious console → Malicious peers (the rogue-console abuse cases);
+- compromised AI client → The AI client: compromised AI and prompt injection;
+- malicious target → Malicious peers (the tampered support agent), the AI
+  client section (reflected content), and Command execution (hostile code on
+  the target);
+- supply chain → Supply chain and distribution.
+
+Known upcoming triggers for revision:
+
+- the maintainer-run hardware half of the privileged adversarial and negative
+  execution suite (ST-M003-007) and the other hardware scenarios in
+  [`manual-tests.md`](manual-tests.md), including the reboot-resume run (MT-8),
+  being recorded;
+- promotion of desktop observation and control (M005) or the technician
+  terminal (M008) out of draft, which must record their actual status and any
+  new residual risk in the
+  [Desktop observation and control (M005)](#desktop-observation-and-control-m005)
+  and terminal sections;
+- introduction of any automatic update mechanism (REQ-S-020).
+
+Suspected vulnerabilities in CretLink should be reported privately as
+described in [`SECURITY.md`](../SECURITY.md) (REQ-S-022), not in public
+issues.

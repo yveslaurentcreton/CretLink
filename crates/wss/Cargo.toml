@@ -1,0 +1,66 @@
+[package]
+name = "cretlink-wss"
+description = "wss-over-TLS transport envelope for the CretLink internet relay: an opaque byte-stream carrier over WebSocket/TLS (M007, ST-M007-009)"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+default = ["system-roots"]
+# Trust the operating system's native root store, for a relay presenting a
+# public-CA certificate rather than a pinned one. Pulls `rustls-native-certs`
+# (triple MIT/Apache-2.0/ISC), which is deny.toml-clean.
+system-roots = ["dep:rustls-native-certs"]
+# Pure-Rust self-signed leaf generation for tests only (x509-cert + p256). Never
+# enabled in a shipped binary; honours REQ-N-017 (no committed key material).
+test-cert = [
+  "dep:x509-cert",
+  "dep:p256",
+  "dep:rand_core",
+  "dep:const-oid",
+  "dep:sha2",
+]
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+futures-util.workspace = true
+# TLS in Rust (`rustls`) with the `aws-lc-rs` crypto provider (ADR-0017).
+# `default-features = false` on rustls/tokio-rustls/tokio-tungstenite keeps
+# ring/openssl out of the build. PEM parsing uses `rustls::pki_types`.
+rustls.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+rustls-native-certs = { workspace = true, optional = true }
+
+# test-cert feature only — pure-Rust cert minting, no committed secrets.
+x509-cert = { workspace = true, optional = true }
+p256 = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+const-oid = { workspace = true, optional = true }
+# The ECDSA-with-SHA-256 signer needs SHA-256's algorithm identifier.
+sha2 = { workspace = true, optional = true, features = ["oid"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+  "rt",
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+] }
+# The crate's own round-trip tests need a certificate; enabling the feature on a
+# self path is the standard Cargo idiom for a test-only feature.
+cretlink-wss = { path = ".", features = ["test-cert"] }
+
+[lints]
+workspace = true
+
+# `sha2` is only enabled for its `oid` feature, which the test-certificate
+# signer needs; it is never named in code.
+[package.metadata.cargo-machete]
+ignored = ["sha2"]

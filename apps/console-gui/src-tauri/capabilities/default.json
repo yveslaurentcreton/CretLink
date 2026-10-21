@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Core capability for the CretLink console main window. The console's own session commands are app-defined and always available; this grants only the core window/event/webview defaults.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

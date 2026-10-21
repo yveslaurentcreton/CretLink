@@ -1,0 +1,147 @@
+[workspace]
+resolver = "3"
+members = [
+  "apps/console",
+  "apps/mcp-bridge",
+  "apps/relay-server",
+  "apps/shell-cli",
+  "apps/support-agent",
+  "crates/discovery",
+  "crates/exec",
+  "crates/mcp",
+  "crates/protocol",
+  "crates/relay",
+  "crates/session",
+  "crates/shared",
+  "crates/simulator",
+  "crates/transport",
+  "crates/wss",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/yveslaurentcreton/CretLink"
+rust-version = "1.95"
+authors = ["Yves-Laurent Creton"]
+
+[workspace.dependencies]
+cretlink-discovery = { path = "crates/discovery", version = "0.0.0" }
+cretlink-exec = { path = "crates/exec", version = "0.0.0" }
+cretlink-mcp = { path = "crates/mcp", version = "0.0.0" }
+cretlink-protocol = { path = "crates/protocol", version = "0.0.0" }
+cretlink-relay = { path = "crates/relay", version = "0.0.0" }
+cretlink-session = { path = "crates/session", version = "0.0.0" }
+cretlink-shared = { path = "crates/shared", version = "0.0.0" }
+cretlink-simulator = { path = "crates/simulator", version = "0.0.0" }
+cretlink-transport = { path = "crates/transport", version = "0.0.0" }
+cretlink-wss = { path = "crates/wss", version = "0.0.0" }
+
+base64 = "0.23"
+# LAN discovery (ADR-0007, ST-M002-003). `mdns-sd` is standard mDNS/DNS-SD on
+# both endpoints (Apache-2.0 OR MIT); the minor is pinned per ADR-0007 (`0.20`
+# resolves >=0.20.0, <0.21.0). `if-addrs` enumerates local interfaces for the
+# REQ-S-010 private-interface scoping (MIT OR BSD-3-Clause). Both license sets
+# are in the deny.toml allow list.
+mdns-sd = "0.20"
+# Kept at 0.15 to match the version mdns-sd pulls in, so the dependency graph
+# carries a single if-addrs (avoids deny.toml multiple-versions).
+if-addrs = "0.15"
+# Secure-channel crypto (ADR-0003, M002 / ST-M002-004). We compose the `snow`
+# Noise implementation with RustCrypto/dalek primitives and invent no
+# cryptography of our own. `snow`'s pure-Rust `default-resolver-crypto` supplies
+# Noise_XX_25519_ChaChaPoly_SHA256; `sha2`/`hkdf` derive the Session Approval
+# Code; `zeroize` erases key material; `subtle` gives the constant-time
+# commitment compare; `rand` provides OS-backed randomness for session nonces.
+# Exact resolved versions are captured in Cargo.lock. Licenses are all in the
+# deny.toml allow set (MIT / Apache-2.0 / BSD-3-Clause family).
+#
+# `default-features = false` is deliberate: `snow`'s default `std` feature
+# lists `ring/std` without the `?` guard, which force-enables the optional
+# `ring` C/asm backend. Selecting only `default-resolver-crypto` keeps the
+# Noise channel's primitives pure-Rust (ADR-0003) and avoids compiling `ring`
+# as a second C/asm backend beside `aws-lc-rs`.
+snow = { version = "0.10", default-features = false, features = [
+  "default-resolver-crypto",
+] }
+# sha2/hkdf are pinned to the RustCrypto `digest` 0.10 line to match the
+# versions `snow`'s default resolver already pulls in, so the whole crypto
+# stack shares one SHA-256 implementation instead of duplicating it. HKDF-SHA256
+# output is identical across these crate versions (the SAC golden vectors pin
+# it), so the choice is transparent to the wire protocol.
+sha2 = "0.10"
+hkdf = "0.12"
+# HMAC-SHA256 for the reboot-resume continuity proof (ADR-0014). Same
+# RustCrypto `digest` 0.10 line as sha2/hkdf, so the crypto stack keeps sharing
+# one SHA-256 implementation. `verify_slice` gives a constant-time tag compare.
+hmac = "0.12"
+rand = "0.9"
+zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2.6"
+# Pinned exactly per ADR-0004; the `macros` feature pulls the matching
+# rmcp-macros. Feature names verified against rmcp 3.1.1 on crates.io.
+rmcp = { version = "=3.1.1", features = [
+  "server",
+  "client",
+  "transport-io",
+  "macros",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = [
+  "rt",
+  "rt-multi-thread",
+  "io-util",
+  "io-std",
+  "time",
+  "sync",
+  "macros",
+  "signal",
+] }
+uuid = { version = "1", features = ["v4", "serde"] }
+# wss-over-TLS relay transport envelope (ADR-0016 §3, ST-M007-009). `rustls`
+# implements TLS in Rust; its crypto provider is `aws-lc-rs` (ADR-0017,
+# ST-M006-009), the widely audited default provider, which compiles AWS-LC's C
+# and assembly sources and so needs a C compiler. `default-features = false`
+# keeps `ring` and `openssl` out of the build. All licenses (ISC / Apache-2.0 /
+# MIT / BSD-3-Clause / MIT-0) are in the deny.toml allow set. The provider stays
+# isolated behind the `cretlink-wss` config builders.
+rustls = { version = "0.23.46", default-features = false, features = [
+  "std",
+  "tls12",
+  "aws_lc_rs",
+] }
+tokio-rustls = { version = "0.26", default-features = false }
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+  "handshake",
+] }
+futures-util = "0.3"
+# Native OS trust store for public-CA relay certificates (MIT/Apache-2.0/ISC).
+# Behind the `system-roots` feature of cretlink-wss.
+rustls-native-certs = "0.8"
+# Pure-Rust self-signed test-certificate generation (RustCrypto), used only
+# under the `test-cert` feature of cretlink-wss — no committed key material
+# (REQ-N-017). It never ships, so it stays independent of the TLS provider.
+x509-cert = { version = "0.2", features = ["builder", "hazmat"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+const-oid = { version = "0.9", features = ["db"] }
+
+[profile.dev]
+# The end-to-end integration suites link hundreds of object files into a single
+# test binary; the default full debug info overflows the MSVC PDB format on
+# Windows (LNK1140: "limit exceeded for program database"). Line tables keep
+# panic/backtrace `file:line` resolution — which the suites rely on for readable
+# failures — while keeping the generated PDB within the linker's limit.
+debug = "line-tables-only"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"

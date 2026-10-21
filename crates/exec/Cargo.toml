@@ -1,0 +1,85 @@
+[package]
+name = "cretlink-exec"
+description = "CretLink execution broker: tracked, streamed, cancellable remote shell jobs with process-tree termination (M003, ADR-0006)"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+# The broker reuses the wire vocabulary (Shell, OutputStream, JobOutcome) and
+# the chunk-size ceiling from the protocol crate so the session layer forwards
+# broker output without lossy conversions.
+cretlink-protocol.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "fs", "sync", "time", "rt", "macros"] }
+# File operations (ADR-0012, ST-M003-004/005). `sha2` verifies commit and
+# resume digests (it invents no cryptography — the same RustCrypto hash the
+# secure channel uses); `serde`/`serde_json` persist the agent-owned staging
+# manifest so cleanup policies survive an agent restart (REQ-F-019).
+sha2.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+# Desktop-frame encoder (ADR-0015, ST-M005-001). Pure-Rust PNG so the capture
+# path needs no C toolchain and the encoder is unit-testable on every platform
+# in the matrix (the Win32 capture that feeds it is `cfg(windows)`-gated). png is
+# MIT OR Apache-2.0; its miniz_oxide/fdeflate deflate deps are MIT/Apache/Zlib,
+# all in the deny.toml allow set.
+png = "0.18"
+
+# tokio `ChildWrapper` surface (`tokio1`) plus the Unix `process-group` wrapper.
+# On every platform the broker holds the child as a `Box<dyn ChildWrapper>` for
+# uniform stdio/`wait`. Off Windows it also wraps the child in a process group so
+# a forking `sh -c` fallback reaps grandchildren on cancel/timeout/revoke/drop
+# (ADR-0006, REQ-S-014/S-009). On Windows the tree is instead contained by the
+# exec `platform` module's own kill-on-close Job Object (ST-M006-007), because
+# process-wrap 9.1.0's `JobObject` wrapper cannot set
+# `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; process-wrap's own job wrapper is
+# therefore unused on Windows. process-wrap is Apache-2.0 OR MIT (deny.toml allow
+# set); its platform wrappers are gated internally, so this stays portable.
+process-wrap = { version = "9.1", features = ["tokio1"] }
+
+# Windows-only bindings, confined to `cfg(windows)` so the workspace test matrix
+# (windows, macos, ubuntu) still builds everywhere. windows-rs is MIT OR
+# Apache-2.0 (deny.toml allow set); pinned to the 0.62 line already in the
+# lockfile (see apps/support-agent). Two localized adapters use them:
+#   - ConPTY interactive execution (ADR-0006 Mode B, ST-M003-008): the
+#     pseudo-console, the Job Object that contains the tree (REQ-S-014), the
+#     anonymous pipes bridged to tokio, and CreateProcessW with the
+#     pseudo-console + job attribute list.
+#   - Piped-mode kill-on-close containment (ST-M006-007): its own Job Object
+#     assigned while the child is suspended, then resumed via the Toolhelp thread
+#     snapshot — so a hard `TerminateProcess` of the agent still reaps the tree.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+  # Interactive-desktop capture and input (ADR-0015, ST-M005-001/002/003).
+  # GDI screen capture, monitor enumeration and DPI, SendInput synthesis,
+  # the clipboard, and the window-station/desktop + WTS session probes that
+  # let the backend report an honest DesktopState instead of a fabricated
+  # frame (REQ-N-008).
+  "Win32_Graphics_Gdi",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_System_StationsAndDesktops",
+  "Win32_System_RemoteDesktop",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["process", "io-util", "sync", "time", "rt", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

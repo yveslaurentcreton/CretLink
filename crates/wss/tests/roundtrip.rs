@@ -1,0 +1,103 @@
+//! ST-M007-009 — the wss envelope carries an opaque byte stream faithfully and
+//! fails closed on an untrusted server certificate.
+//!
+//! These are the crate-local proofs that the transport seam is sound before the
+//! relay and endpoints compose it: a byte stream written in frame-misaligned
+//! chunks round-trips byte-exact through TLS + WebSocket, and a client that does
+//! not trust the server's certificate gets no connection at all.
+
+// Test binary: `unwrap`/`expect` are assertion vocabulary here.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::net::{Ipv4Addr, SocketAddr};
+
+use cretlink_wss::{
+    CertificateDer, acceptor, client_config, connect, connector, pinned_roots, server_config,
+    testcert,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+fn loopback() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+}
+
+/// Stands up a wss echo server on loopback trusting a fresh self-signed leaf,
+/// returning its address and the certificate a client must pin to reach it.
+async fn start_echo(payload_len: usize) -> (SocketAddr, CertificateDer<'static>) {
+    let (cert, key) = testcert::self_signed("localhost").expect("mint test cert");
+    let server = server_config(vec![cert.clone()], key).expect("server config");
+    let acceptor = acceptor(server);
+
+    let listener = TcpListener::bind(loopback()).await.expect("bind echo");
+    let addr = listener.local_addr().expect("echo addr");
+
+    tokio::spawn(async move {
+        let (tcp, _peer) = listener.accept().await.expect("accept tcp");
+        let mut stream = match cretlink_wss::accept(&acceptor, tcp).await {
+            Ok(stream) => stream,
+            // A client that fails the handshake (fail-closed test) leaves the
+            // server with nothing to echo; that is the expected outcome.
+            Err(_) => return,
+        };
+        let mut got = vec![0u8; payload_len];
+        if stream.read_exact(&mut got).await.is_err() {
+            return;
+        }
+        let _ = stream.write_all(&got).await;
+        let _ = stream.flush().await;
+    });
+
+    (addr, cert)
+}
+
+/// A byte stream survives the wss envelope byte-exact even when written in
+/// chunks that do not align to WebSocket message boundaries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_byte_stream_round_trips_through_the_wss_envelope() {
+    const LEN: usize = 40_000;
+    let (addr, cert) = start_echo(LEN).await;
+
+    let roots = pinned_roots(vec![cert]).expect("pin server cert");
+    let client = client_config(roots).expect("client config");
+    let connector = connector(client);
+
+    let tcp = TcpStream::connect(addr).await.expect("dial echo");
+    let mut stream = connect(&connector, "localhost", tcp)
+        .await
+        .expect("wss connect over a trusted cert");
+
+    let payload: Vec<u8> = (0..LEN as u32).map(|i| (i % 251) as u8).collect();
+    // Frame-misaligned chunks prove the adapter is a byte stream, not a message
+    // relay.
+    for chunk in payload.chunks(1234) {
+        stream.write_all(chunk).await.expect("write chunk");
+    }
+    stream.flush().await.expect("flush");
+
+    let mut echo = vec![0u8; LEN];
+    stream.read_exact(&mut echo).await.expect("read echo");
+    assert_eq!(echo, payload, "the byte stream round-tripped corrupted");
+}
+
+/// A client that does not trust the server's certificate gets no connection:
+/// the TLS handshake fails and no stream is returned (fail closed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_untrusted_server_certificate_fails_closed() {
+    const LEN: usize = 16;
+    let (addr, _server_cert) = start_echo(LEN).await;
+
+    // Trust a *different* self-signed cert, so the server's real cert is
+    // untrusted.
+    let (other_cert, _other_key) = testcert::self_signed("localhost").expect("mint other cert");
+    let roots = pinned_roots(vec![other_cert]).expect("pin the wrong cert");
+    let client = client_config(roots).expect("client config");
+    let connector = connector(client);
+
+    let tcp = TcpStream::connect(addr).await.expect("dial echo");
+    let result = connect(&connector, "localhost", tcp).await;
+    assert!(
+        result.is_err(),
+        "an untrusted server certificate must fail the handshake, not connect"
+    );
+}

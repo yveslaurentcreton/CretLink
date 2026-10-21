@@ -1,0 +1,58 @@
+[package]
+name = "cretlink-shell"
+description = "Standalone same-user terminal client: attaches a host terminal to the CretLink console's selected, consented session (ST-M008-002, ADR-0004, ADR-0013)"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+# The library carries the transport-abstract terminal engine (the tested
+# backbone); the binary is the thin real-terminal host that wires the engine to
+# a live stdin/stdout and the same-user IPC endpoint.
+[lib]
+name = "cretlink_shell"
+path = "src/lib.rs"
+
+# Host-terminal entry point. A Windows Terminal / WezTerm profile launches this
+# executable (`cretlink-shell[.exe]`) directly; it is never installed on, and
+# copies no key material to, the customer computer (REQ-F-023, REQ-S-015).
+[[bin]]
+name = "cretlink-shell"
+path = "src/main.rs"
+
+[dependencies]
+cretlink-protocol.workspace = true
+# The public same-user IPC surface (`ipc::connect`, the versioned wire
+# request/response + `TermFrame` duplex, `IpcEndpoint`). The client is a third
+# same-user IPC consumer beside the MCP bridge and console — it adds no new IPC
+# surface, listener, or protocol variant (REQ-S-023, REQ-N-012).
+cretlink-mcp.workspace = true
+# `net` adds the same-user local IPC carrier used by `ipc::connect`; the other
+# features (io-util, io-std, sync, rt, macros, signal) come from the workspace
+# definition. Feature unification keeps one tokio build across the workspace.
+tokio = { workspace = true, features = ["net"] }
+
+# Windows console raw-mode control for the host terminal: put stdin into raw
+# input and enable VT processing/input so keystrokes stream to the remote pty
+# and its VT output renders locally. Same `windows` 0.62 line already in the
+# lockfile (support-agent, exec); the console mode calls are the only `unsafe`
+# in this crate and are localized and documented in `tty::win`, mirroring the
+# conpty.rs exception to the workspace `unsafe_code` deny.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_Console",
+] }
+
+[dev-dependencies]
+# The real console IPC server, driven with the fail-closed `ClosedRoute`, proves
+# the client authenticates over the genuine same-user transport and fails closed
+# with no consented session (REQ-S-009, REQ-S-023). Apps are deliberately not in
+# [workspace.dependencies]; a path dev-dependency is permitted by cargo.
+cretlink-console = { path = "../console", version = "0.0.0" }
+
+[lints]
+workspace = true

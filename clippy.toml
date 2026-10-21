@@ -1,0 +1,5 @@
+# Workspace lints warn on unwrap/expect/panic in library code (Cargo.toml
+# [workspace.lints.clippy]); tests may use them for concise assertions.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

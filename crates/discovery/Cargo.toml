@@ -1,0 +1,26 @@
+[package]
+name = "cretlink-discovery"
+description = "LAN mDNS/DNS-SD discovery, private-interface scoping, and the manual connection-code fallback for CretLink (ADR-0007)"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+# ProtocolVersion is the only cross-crate type discovery needs: it is what the
+# TXT `v` hint parses into and what the advertiser stringifies.
+cretlink-protocol.workspace = true
+thiserror.workspace = true
+# Standard mDNS/DNS-SD on both endpoints (ADR-0007). Apache-2.0 OR MIT, both in
+# the deny.toml allow set. Minor pinned per ADR-0007 (`0.20` => >=0.20.0,
+# <0.21.0). No async runtime; keeps the customer artifact self-contained.
+mdns-sd.workspace = true
+# Local interface enumeration for REQ-S-010 private-interface scoping.
+# MIT OR BSD-3-Clause, both in the deny.toml allow set.
+if-addrs.workspace = true
+
+[lints]
+workspace = true

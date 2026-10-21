@@ -1,0 +1,74 @@
+[package]
+name = "cretlink-console-gui"
+description = "CretLink Console GUI shell (Tauri v2) over the shared session-UI state model (ST-M002-002)"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/yveslaurentcreton/CretLink"
+authors = ["Yves-Laurent Creton"]
+publish = false
+
+# Detached from the root Cargo workspace on purpose (ADR-0011): Tauri's large
+# dependency tree and the Linux webview system libraries must never enter the
+# portable core's cross-platform `cargo build/test --workspace` matrix. The
+# automated, cross-platform-verified state model lives in `cretlink-console`,
+# which this crate depends on by path.
+[workspace]
+
+[lib]
+# Keep the app logic in a library so it can be unit-tested; `main.rs` is a thin
+# entry point.
+name = "cretlink_console_gui"
+crate-type = ["lib"]
+
+[features]
+# OFF by default so the shipped release exe opens real LAN transport only and
+# compiles OUT the simulated seed targets and the fabricated-consent command
+# (ST-M002-009, AC #4). Enable locally with `--features dev-simulate` to drive
+# the state machine without a peer. Never enabled for a release build.
+dev-simulate = []
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+cretlink-console = { path = "../../console" }
+cretlink-protocol = { path = "../../../crates/protocol" }
+# The real LAN transport (listening host) and the private-interface / connection
+# -code helpers. Wiring these in turns the Tauri shell from a simulator into a
+# real Noise_XX session endpoint (ST-M002-009). The pump task runs on Tauri's own
+# runtime (`tauri::async_runtime`) but `select!`s the live handle against the
+# compare-gate/stop intent channel, so it needs tokio's `macros` and `sync`
+# features directly (ST-M002-013) — matching the agent-gui pump.
+cretlink-session = { path = "../../../crates/session" }
+cretlink-discovery = { path = "../../../crates/discovery" }
+# The same-user local IPC endpoint the MCP bridge dials. Hosting the bridge from
+# the GUI (ST-M004-007) means binding `IpcEndpoint::user_default()` here, so the
+# console GUI — not only the CLI — is the single consented session the bridge and
+# the technician terminal both route through.
+cretlink-mcp = { path = "../../../crates/mcp" }
+tauri = { version = "2", features = [] }
+# `time` adds the bounded teardown timeout used to seal the audit service and the
+# IPC server gracefully when the hosted session ends (ST-M004-007), beside the
+# `macros`/`sync` the compare-gate/stop `select!` already needs (ST-M002-013).
+tokio = { version = "1", features = ["macros", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+
+# Test-only: the audit vocabulary (`Actor`, `Outcome`, `AuditValue`, `AuditArgs`)
+# used to construct sample `AuditEntry` records for the activity-mapping unit
+# tests (ST-M004-007). `cretlink-console` re-exports `AuditEntry` but not these
+# building blocks, so the tests reach them from the shared crate directly. Not a
+# runtime dependency — the mapping functions only *read* an `AuditEntry`.
+[dev-dependencies]
+cretlink-shared = { path = "../../../crates/shared" }
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"

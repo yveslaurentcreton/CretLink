@@ -1,0 +1,37 @@
+# Rust build outputs
+/target/
+
+# Console GUI shell (detached Tauri crate + Vite frontend, ADR-0011)
+apps/console-gui/src-tauri/target/
+apps/console-gui/src-tauri/gen/
+apps/console-gui/dist/
+
+# Agent consent window (detached Tauri crate + Vite frontend, ADR-0011)
+apps/agent-gui/src-tauri/target/
+apps/agent-gui/src-tauri/gen/
+apps/agent-gui/dist/
+
+# Node tooling (semantic-release runs from CI; local installs stay untracked)
+node_modules/
+
+# Local machine state and editor files
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+!.vscode/extensions.json
+
+# Local environment and credentials must never be committed
+.env
+.env.*
+*.pem
+*.pfx
+*.p12
+
+# Release artifacts produced by scripts/gen-artifacts.sh (ST-M006-004)
+/dist/
+
+# Generated SBOM files (scripts/gen-artifacts.sh collects them into dist/)
+*.cdx.json
+cretlink-sbom.json

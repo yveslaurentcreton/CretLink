@@ -1,0 +1,72 @@
+[package]
+name = "cretlink-session"
+description = "Portable attended-LAN session runtime: informed full-control consent and fail-closed revocation over the encrypted channel (ST-M002-005/006)"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+# The session runtime drives the existing schema (control messages, target
+# identity, session id) over the existing Noise pairing and secure channel, and
+# records lifecycle outcomes through the shared audit vocabulary.
+cretlink-protocol.workspace = true
+cretlink-transport.workspace = true
+cretlink-discovery.workspace = true
+cretlink-shared.workspace = true
+# The Active phase runs the execution broker (M003, ADR-0006) at the agent's
+# privilege and forwards its streamed output over the encrypted channel.
+cretlink-exec.workspace = true
+# The endpoint relay dialer (ST-M007-008, ADR-0016 §5) writes the rendezvous
+# preamble that names its single-use ticket before the relay begins forwarding.
+# Only the codec and its `RendezvousTicket`/`AdmissionToken` types are used here;
+# the session runtime itself stays transport-agnostic and holds no relay logic —
+# selecting the relay is a transport (dial) choice, not a session-logic change.
+cretlink-relay.workspace = true
+# The wss-over-TLS endpoint dialer (ST-M007-009, ADR-0016 §3) wraps the same
+# outbound relay leg in an authenticated TLS session and a WebSocket before the
+# rendezvous preamble. `rustls` with `aws-lc-rs` (ADR-0017); `system-roots` is enabled so
+# an endpoint can trust a relay certificate issued by a public CA as well as an
+# operator-pinned one. Only the connect path and its config/trust builders are
+# used here — the session runtime above the stream stays transport-agnostic.
+cretlink-wss = { workspace = true, features = ["system-roots"] }
+serde.workspace = true
+thiserror.workspace = true
+# The console transfer engine hashes local bytes with SHA-256: the rolling hash
+# that verifies a download before the temp file is renamed into place, and the
+# prefix hash that decides whether an interrupted upload can resume (ST-M003-005
+# AC2/AC3, REQ-N-007). Same RustCrypto line the channel key schedule uses.
+sha2.workspace = true
+# `net` (TcpListener/TcpStream for the real LAN control channel) and `fs`
+# (streaming a local file into the transfer engine and renaming the download
+# temp atomically) are added to the workspace tokio feature set; the rest come
+# from the workspace definition. Feature unification keeps a single tokio build.
+tokio = { workspace = true, features = ["net", "fs"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread", "time"] }
+# `cretlink-relay` is a real dependency now (the endpoint dialer writes the
+# rendezvous preamble, ST-M007-008), so it is automatically available to the
+# relay-splice integration tests (ST-M007-003, over_relay.rs) too — no separate
+# dev-dependency entry is needed.
+# The autonomous session-end staging sweep test stages a real artifact through
+# the FileStore, which requires a matching SHA-256 commit digest.
+sha2.workspace = true
+# The terminal-scope e2e test injects a recording audit sink to prove a refused
+# TermClose writes no Actor::Terminal record (ST-M003-009, REQ-S-023).
+cretlink-shared.workspace = true
+# The revoke-mid-transfer test resolves the in-process agent's real staging root
+# via FileStore::for_session(session) — the same pure mapping the agent uses — so
+# it can observe that the interrupted upload part is created and then swept,
+# rather than only that no removal error was reported (ST-M003-007).
+cretlink-exec.workspace = true
+# The in-memory reboot-resume redemption matrix implements a test `AtRestSealer`,
+# whose `unseal` returns the same `Zeroizing<Vec<u8>>` the real DPAPI sealer does
+# (ST-M006-002, ADR-0014).
+zeroize.workspace = true
+
+[lints]
+workspace = true

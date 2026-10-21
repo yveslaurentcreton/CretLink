@@ -1,0 +1,84 @@
+[package]
+name = "cretlink-support-agent"
+description = "CretLink Support: temporary attended support agent for the customer Windows computer"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+# The embedded requireAdministrator manifest (build.rs, REQ-F-002) means this
+# binary — and any test/bench harness built from it — can only launch elevated.
+# All behaviour is tested in the library, so disable the bin's own (empty) test
+# and bench harnesses to keep `cargo test`/`cargo bench` runnable on a
+# non-elevated host and in CI. `cargo build` still produces the elevating binary.
+[[bin]]
+name = "cretlink-support-agent"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# SessionId is minted during pairing and bound to full-control consent
+# (ST-M002-004/005); the agent dials the console and drives the join side of
+# the session runtime (cretlink-session), discovering it or taking a manual
+# connection code (cretlink-discovery).
+cretlink-discovery.workspace = true
+cretlink-protocol.workspace = true
+cretlink-session.workspace = true
+# At startup the agent sweeps any staging trees a prior run left behind (crash
+# recovery, and retry of a removal that failed) using the crate that owns the
+# staging area (ST-M003-005 AC5b, REQ-F-019).
+cretlink-exec.workspace = true
+serde = { workspace = true }
+# The reboot-resume ticket store persists the owned-resource inventory as JSON
+# (ADR-0014 §6, ST-M006-001); a normal dependency because the armer writes it at
+# runtime, not only in tests.
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+# Fresh OS randomness for reboot-resume ticket ids and nonces (matching the
+# transport pairing nonce source), and zeroizing of the transient nonces the
+# armer derives K_rr from (ADR-0014 §2).
+rand.workspace = true
+zeroize.workspace = true
+
+# Windows-only integration is confined to `cfg(windows)` so the workspace test
+# matrix (windows, macos, ubuntu) still builds and tests everywhere. windows-rs
+# is MIT OR Apache-2.0 and winreg is MIT, both in the deny.toml allow set.
+[target.'cfg(windows)'.dependencies]
+# Microsoft's windows-rs bindings for the process-token privilege query
+# (REQ-S-011) and the DPAPI at-rest sealer for reboot-resume key material
+# (ADR-0014 §4, ST-M006-001: Win32_Security_Cryptography for CryptProtectData /
+# CryptUnprotectData, Win32_System_Memory for LocalFree). Matches the
+# windows-core 0.62 line already in the lockfile.
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Cryptography",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+] }
+# Safe, pure-Rust registry reads for the live SystemInfo facts — real Windows
+# version/build, native machine architecture, and the pending-reboot signals
+# (ST-M003-003, REQ-F-016). MIT-licensed and zero-unsafe on our side (the
+# workspace denies unsafe_code); minor pinned, no wildcard (deny.toml bans).
+winreg = "0.56"
+
+[target.'cfg(windows)'.build-dependencies]
+# Embeds the application manifest that requests administrator elevation
+# (REQ-F-002). Pure Rust with no external resource compiler; a Windows-only
+# build-dependency, so non-Windows CI never compiles it.
+embed-manifest = "1.4"
+
+[dev-dependencies]
+# The owned-resource inventory tests stage a real artifact through the public
+# FileStore commit flow (ST-M006-003), which verifies a SHA-256 digest; the same
+# pinned RustCrypto 0.10 line the rest of the crypto stack shares.
+sha2.workspace = true
+
+[lints]
+workspace = true

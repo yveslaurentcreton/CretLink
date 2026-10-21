@@ -1,0 +1,105 @@
+# Release automation for CretLink (ST-M001-005, extended by ST-M006-004).
+#
+# semantic-release derives versions from Conventional Commits on main
+# (REQ-N-018) and publishes ONLY from this workflow on push to main: pull
+# requests never run it and never hold a write-scoped token (REQ-S-020).
+#
+# The `build` matrix compiles the shippable binaries on each platform from the
+# exact commit that semantic-release will tag, and produces, per target, the
+# binaries, their SHA-256 checksums, a dependency inventory, and (when available)
+# a CycloneDX SBOM (REQ-N-016, REQ-N-017, REQ-S-019). The `release` job gathers
+# those artifacts and semantic-release attaches them to the GitHub release, so
+# every official binary traces back to a tag with verifiable integrity.
+#
+# Third-party actions are pinned to full commit SHAs so a moved tag cannot
+# change what runs (REQ-S-019 provenance posture).
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Read-only by default; only the publishing job is granted write, and only to
+# the contents/issues/PRs semantic-release needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build artifacts (${{ matrix.os }})
+    # Guard against forks: only the canonical repository builds release artifacts.
+    if: github.repository == 'yveslaurentcreton/CretLink'
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install cargo-cyclonedx (SBOM generator)
+        shell: bash
+        run: cargo install cargo-cyclonedx --locked --version 0.5.9
+      - name: Generate verifiable artifacts
+        shell: bash
+        env:
+          # Official artifacts must carry their SBOMs; fail rather than ship without.
+          CRETLINK_REQUIRE_SBOM: "1"
+        run: bash scripts/gen-artifacts.sh
+      # Authenticode-sign the Windows binaries when a signing identity is
+      # configured (ST-M006-005). The secrets exist only on this protected
+      # push-to-main path, never in pull-request jobs (REQ-S-019, REQ-S-020); with
+      # no secret present the helper is a clean no-op and the build stays unsigned,
+      # so development builds remain distinguishable from official ones (REQ-N-017).
+      - name: Sign Windows artifacts (gated; no-op without a signing identity)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CRETLINK_SIGN_PFX_BASE64: ${{ secrets.CRETLINK_SIGN_PFX_BASE64 }}
+          CRETLINK_SIGN_PFX_PASSWORD: ${{ secrets.CRETLINK_SIGN_PFX_PASSWORD }}
+          CRETLINK_SIGN_TIMESTAMP_URL: ${{ secrets.CRETLINK_SIGN_TIMESTAMP_URL }}
+        run: pwsh -File scripts/sign-windows.ps1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: artifacts-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: semantic-release
+    needs: build
+    if: github.repository == 'yveslaurentcreton/CretLink'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Gather platform artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: artifacts-*
+          merge-multiple: true
+      - run: npx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

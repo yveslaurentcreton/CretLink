@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  CretLink Support application manifest (ST-M002-001, REQ-F-002).
+
+  Requests administrator elevation so the attended support agent can host the
+  elevated execution broker after visible consent. `uiAccess="false"` keeps the
+  process out of the privileged UI-automation path; it is a normal elevated
+  application, not an accessibility/UIAccess tool. Declining the resulting UAC
+  prompt means the process simply never starts elevated and gains no
+  administrator capability (REQ-F-002). The compatibility block lets the agent
+  observe the real Windows version (Windows 10 and 11, ADR-0002) instead of a
+  virtualised legacy view.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="CretLink.Support"
+      version="1.0.0.0"
+      processorArchitecture="*"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and Windows 11 (ADR-0002). -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>

@@ -1,0 +1,35 @@
+[package]
+name = "cretlink-console"
+description = "CretLink Console: technician-side session management, audit, and MCP bridge host"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+cretlink-discovery.workspace = true
+cretlink-mcp.workspace = true
+cretlink-protocol.workspace = true
+cretlink-session.workspace = true
+cretlink-shared.workspace = true
+cretlink-transport.workspace = true
+async-trait = "0.1"
+serde = { workspace = true }
+thiserror.workspace = true
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+cretlink-simulator.workspace = true
+# The full-chain MCP e2e test (ST-M004-*) drives a real rmcp client against the
+# bridge, decodes base64 tool output, and needs the net-backed IPC transport.
+base64.workspace = true
+rmcp = { workspace = true }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util", "net"] }
+
+[lints]
+workspace = true

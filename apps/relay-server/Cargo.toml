@@ -1,0 +1,52 @@
+[package]
+name = "cretlink-relay-server"
+description = "CretLink internet relay server: a TCP forwarder that composes the portable relay core over a real listener (ST-M007-007, ADR-0016 §5)"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "cretlink-relay-server"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# The whole server is composition over the portable relay leaf core: admission
+# control, the rendezvous matcher, the opaque splice, and the rendezvous-preamble
+# codec. No new protocol logic and no session key ever live here.
+cretlink-relay.workspace = true
+# The wss-over-TLS transport envelope (ST-M007-009): the `serve_wss` path
+# TLS-terminates each accepted connection and upgrades it to a WebSocket before
+# the identical rendezvous pipeline runs, with `rustls` and the `aws-lc-rs`
+# provider (ADR-0017); the raw `serve` path uses none of it. The server presents
+# a certificate and never verifies one, so the `system-roots` trust store that
+# cretlink-wss enables by default goes unused here; it is deny-clean, so there
+# is nothing server-specific to disable.
+cretlink-wss.workspace = true
+# `net` (the real TCP listener and its per-connection streams) is added to the
+# workspace tokio feature set; rt-multi-thread/io-util/time/sync/macros/signal
+# come from the workspace definition. Feature unification keeps a single build.
+tokio = { workspace = true, features = ["net"] }
+
+[dev-dependencies]
+# The integration test drives the *real* end-to-end Noise XX pairing and secure
+# channel (ADR-0003) of two live session endpoints through this server's real
+# TCP path, proving the relay only ever forwards ciphertext and preserves the
+# whole attended-session trust model across the splice.
+cretlink-session.workspace = true
+cretlink-protocol.workspace = true
+# The wss verification suite (ST-M007-009) mints a runtime self-signed leaf with
+# `testcert::self_signed` (feature `test-cert`), stands up `serve_wss` behind it,
+# and drives both endpoints' real `WssRelayDial` through it. Enabling the feature
+# here unifies it onto the same `cretlink-wss` build the crate already links; no
+# key material is committed (REQ-N-017).
+cretlink-wss = { workspace = true, features = ["test-cert"] }
+tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread", "time", "io-util"] }
+
+[lints]
+workspace = true
