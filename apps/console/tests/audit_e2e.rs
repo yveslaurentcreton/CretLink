@@ -247,7 +247,9 @@ async fn unified_audit_correlates_attributes_redacts_and_seals() {
     let mut args = exec_args("echo bridge-mark");
     args.insert("env".to_string(), json!({ "CL_AUDIT_PROBE": ENV_SECRET }));
     let exec = client
-        .call_tool(CallToolRequestParams::new("remote_exec").with_arguments(args))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_exec").with_arguments(args),
+        ))
         .await
         .expect("bridge exec");
     assert_ne!(exec.is_error, Some(true));
@@ -259,7 +261,9 @@ async fn unified_audit_correlates_attributes_redacts_and_seals() {
     let mut args = exec_args(&format!("echo {SENSITIVE_COMMAND_MARKER}"));
     args.insert("sensitive".to_string(), json!(true));
     let sensitive = client
-        .call_tool(CallToolRequestParams::new("remote_exec").with_arguments(args))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_exec").with_arguments(args),
+        ))
         .await
         .expect("sensitive exec");
     assert_ne!(sensitive.is_error, Some(true));
@@ -321,7 +325,9 @@ async fn unified_audit_correlates_attributes_redacts_and_seals() {
     upload_args.insert("source_label".to_string(), json!("test:audit-e2e"));
     upload_args.insert("cleanup".to_string(), json!("on_session_end"));
     let upload = client
-        .call_tool(CallToolRequestParams::new("remote_upload").with_arguments(upload_args))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_upload").with_arguments(upload_args),
+        ))
         .await
         .expect("bridge upload");
     assert_ne!(upload.is_error, Some(true));
@@ -913,4 +919,18 @@ fn manual_command_entries_truncate_and_redact() {
     let entry = console_cancel(session, JobId(9), false);
     assert_eq!(entry.outcome, Outcome::Failed);
     assert_eq!(entry.args.0.get("job_id"), Some(&AuditValue::Int(9)));
+}
+
+/// The stated purpose every test tool call carries (ST-M009-007).
+const TEST_PURPOSE: &str = "Checking the computer for the support request";
+
+/// Adds the required stated `purpose` argument to a tool call that does not set
+/// one (ST-M009-007), so each test states only the arguments it is about.
+fn with_purpose(mut params: CallToolRequestParams) -> CallToolRequestParams {
+    params
+        .arguments
+        .get_or_insert_with(Map::new)
+        .entry("purpose")
+        .or_insert_with(|| Value::String(TEST_PURPOSE.to_string()));
+    params
 }

@@ -57,6 +57,59 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
+      # ST-M009-001: the same `cretlink` built for the Windows GUI subsystem, as
+      # the one application will be (ADR-0018), must still serve MCP over
+      # redirected stdio; the conformance harness runs against it.
+      - name: Test cretlink as a GUI-subsystem build
+        if: runner.os == 'Windows'
+        run: cargo test -p cretlink-cli --features gui-subsystem --locked
+
+  # The one CretLink application (ST-M009-005) is a detached Tauri crate with a
+  # Vite frontend, outside the workspace (ADR-0011), so it gets its own job on
+  # every platform: frontend build, format, lint, tests, and an embedded-asset
+  # build like the release one.
+  app:
+    name: Application (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: apps/app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/app/src-tauri -> target
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Install the webview libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm audit --omit=dev
+      - run: cargo fmt --check
+        working-directory: apps/app/src-tauri
+      - run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: apps/app/src-tauri
+      - run: cargo clippy --locked --all-targets --features dev-simulate -- -D warnings
+        working-directory: apps/app/src-tauri
+      - run: cargo test --locked
+        working-directory: apps/app/src-tauri
+      - run: cargo build --locked --features tauri/custom-protocol
+        working-directory: apps/app/src-tauri
 
   msrv:
     name: Minimum supported Rust version

@@ -1,6 +1,0 @@
-{
-  "identifier": "default",
-  "description": "Core capability for the CretLink agent consent window. The window's own consent commands are app-defined and always available; this grants only the core window/event/webview defaults.",
-  "windows": ["main"],
-  "permissions": ["core:default"]
-}

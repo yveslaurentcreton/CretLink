@@ -4,10 +4,12 @@
 # (REQ-N-018) and publishes ONLY from this workflow on push to main: pull
 # requests never run it and never hold a write-scoped token (REQ-S-020).
 #
-# The `build` matrix compiles the shippable binaries on each platform from the
-# exact commit that semantic-release will tag, and produces, per target, the
-# binaries, their SHA-256 checksums, a dependency inventory, and (when available)
-# a CycloneDX SBOM (REQ-N-016, REQ-N-017, REQ-S-019). The `release` job gathers
+# The `version` job computes the version semantic-release will publish. The
+# `build` matrix compiles the shippable binaries on each platform from the exact
+# commit that semantic-release will tag, stamped with that version, and
+# produces, per target, one archive for the operating system, the loose relay
+# server, SHA-256 checksums, a dependency inventory, and a CycloneDX SBOM per
+# binary (REQ-N-016, REQ-N-017, REQ-N-021, REQ-S-019). The `release` job gathers
 # those artifacts and semantic-release attaches them to the GitHub release, so
 # every official binary traces back to a tag with verifiable integrity.
 #
@@ -30,10 +32,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Determines the version semantic-release will publish before anything is
+  # built, so the binaries and the per-OS archives carry it (ST-M006-014,
+  # ST-M009-004). `semantic-release --dry-run` would need a token that may push;
+  # scripts/next-version.mjs reaches the same decision with read-only access,
+  # and scripts/verify-version.cjs makes semantic-release refuse to publish if
+  # it ever decides differently. An empty version means nothing is released and
+  # the remaining jobs are skipped.
+  version:
+    name: Next version
+    if: github.repository == 'yveslaurentcreton/CretLink'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      - name: Compute the next version
+        id: next
+        shell: bash
+        run: echo "version=$(node scripts/next-version.mjs)" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build artifacts (${{ matrix.os }})
-    # Guard against forks: only the canonical repository builds release artifacts.
-    if: github.repository == 'yveslaurentcreton/CretLink'
+    needs: version
+    # Guard against forks: only the canonical repository builds release
+    # artifacts, and only when there is something to release.
+    if: github.repository == 'yveslaurentcreton/CretLink' && needs.version.outputs.version != ''
     strategy:
       fail-fast: true
       matrix:
@@ -47,15 +78,24 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The application (ST-M009-005) builds its frontend with npm and links
+      # the platform webview.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Install the webview libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
       - name: Install cargo-cyclonedx (SBOM generator)
         shell: bash
         run: cargo install cargo-cyclonedx --locked --version 0.5.9
-      - name: Generate verifiable artifacts
+      - name: Build and stage the binaries
         shell: bash
         env:
-          # Official artifacts must carry their SBOMs; fail rather than ship without.
-          CRETLINK_REQUIRE_SBOM: "1"
-        run: bash scripts/gen-artifacts.sh
+          CRETLINK_VERSION: ${{ needs.version.outputs.version }}
+        run: bash scripts/gen-artifacts.sh --stage "$CRETLINK_VERSION"
       # Authenticode-sign the Windows binaries when a signing identity is
       # configured (ST-M006-005). The secrets exist only on this protected
       # push-to-main path, never in pull-request jobs (REQ-S-019, REQ-S-020); with
@@ -69,6 +109,15 @@ jobs:
           CRETLINK_SIGN_PFX_PASSWORD: ${{ secrets.CRETLINK_SIGN_PFX_PASSWORD }}
           CRETLINK_SIGN_TIMESTAMP_URL: ${{ secrets.CRETLINK_SIGN_TIMESTAMP_URL }}
         run: pwsh -File scripts/sign-windows.ps1
+      # Checksums, the per-OS archive, the dependency inventory and the SBOMs,
+      # over the (possibly signed) staged binaries (ST-M009-004).
+      - name: Pack the archive and its metadata
+        shell: bash
+        env:
+          CRETLINK_VERSION: ${{ needs.version.outputs.version }}
+          # Official artifacts must carry their SBOMs; fail rather than ship without.
+          CRETLINK_REQUIRE_SBOM: "1"
+        run: bash scripts/gen-artifacts.sh --pack "$CRETLINK_VERSION"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: artifacts-${{ matrix.os }}
@@ -77,8 +126,8 @@ jobs:
 
   release:
     name: semantic-release
-    needs: build
-    if: github.repository == 'yveslaurentcreton/CretLink'
+    needs: [version, build]
+    if: github.repository == 'yveslaurentcreton/CretLink' && needs.version.outputs.version != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -100,6 +149,14 @@ jobs:
           path: dist
           pattern: artifacts-*
           merge-multiple: true
+      # One checksum file over the per-OS archives of every target (REQ-N-021).
+      - name: Checksum the archives
+        shell: bash
+        run: |
+          cd dist
+          sha256sum cretlink-*.zip cretlink-*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - run: npx semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CRETLINK_EXPECTED_VERSION: ${{ needs.version.outputs.version }}

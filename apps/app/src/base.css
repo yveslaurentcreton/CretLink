@@ -1,0 +1,19 @@
+/* Shared by every screen of the application (ST-M009-005). */
+
+/* The skip link stays out of sight until a keyboard user tabs to it
+ * (REQ-N-014). */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 8px;
+}
+
+.skip-link:focus {
+  left: 8px;
+  z-index: 100;
+  padding: 6px 10px;
+  border: 2px solid #2563eb;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #141925;
+}

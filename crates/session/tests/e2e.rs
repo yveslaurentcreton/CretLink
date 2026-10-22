@@ -2913,3 +2913,115 @@ async fn reboot_resume_arm_before_consent_is_ignored() {
     }
     wait_until(|| joiner.reboot_resume_armed_until() == Some(NOT_AFTER)).await;
 }
+
+// --- Stated purpose and customer-visible actions (REQ-F-026, ST-M009-007) ---
+
+/// Reads agent events until the next `RequestHandled`, skipping job events.
+async fn next_handled(joiner: &mut JoinHandle) -> SessionEvent {
+    loop {
+        let event = next_event!(joiner);
+        if matches!(event, SessionEvent::RequestHandled { .. }) {
+            return event;
+        }
+    }
+}
+
+/// The agent reports every handled request with who drove it, the caller's
+/// stated purpose (AI only), the real operation, and the honest result; a
+/// started command carries its purpose on `CommandStarted` instead, and a
+/// technician request carries no purpose.
+#[tokio::test]
+async fn agent_reports_each_action_with_source_purpose_operation_and_result() {
+    use cretlink_session::{ActionOutcome, Attribution, Origin, Purpose};
+
+    let (mut host, mut joiner) = connected_pair().await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let ai = |text: &str| Attribution::new(Origin::Mcp, Some(Purpose::new(text).unwrap()));
+
+    // An AI request that succeeds.
+    host.system_info_as(ai("Checking which computer this is"))
+        .await
+        .expect("system info");
+    assert_eq!(
+        next_handled(&mut joiner).await,
+        SessionEvent::RequestHandled {
+            origin: Origin::Mcp,
+            purpose: Some(Purpose::new("Checking which computer this is").unwrap()),
+            operation: "read system information".to_string(),
+            outcome: ActionOutcome::Succeeded,
+        }
+    );
+
+    // A technician request: labelled by its source, no purpose.
+    host.list_jobs().await.expect("list jobs");
+    assert_eq!(
+        next_handled(&mut joiner).await,
+        SessionEvent::RequestHandled {
+            origin: Origin::Console,
+            purpose: None,
+            operation: "list running jobs".to_string(),
+            outcome: ActionOutcome::Succeeded,
+        }
+    );
+
+    // An AI cancellation the agent refuses: the purpose rides the wire
+    // `Cancel`, and the honest failure is reported, never a success.
+    let refused = host
+        .cancel_job_as(JobId(999), ai("Stopping the stuck installer"))
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(
+        next_handled(&mut joiner).await,
+        SessionEvent::RequestHandled {
+            origin: Origin::Mcp,
+            purpose: Some(Purpose::new("Stopping the stuck installer").unwrap()),
+            operation: "stop job 999".to_string(),
+            outcome: ActionOutcome::Failed {
+                code: ErrorCode::UnknownJob
+            },
+        }
+    );
+
+    // A started command carries its purpose on `CommandStarted`, beside the
+    // real command, and is not reported a second time as a handled request.
+    let job = host
+        .run_command_as(
+            ExecRequest::new(Shell::Cmd, "echo purpose"),
+            ai("Checking that commands run"),
+        )
+        .await
+        .expect("run")
+        .job;
+    loop {
+        match next_event!(joiner) {
+            SessionEvent::CommandStarted {
+                command,
+                origin,
+                purpose,
+                ..
+            } => {
+                assert_eq!(command, "echo purpose");
+                assert_eq!(origin, Origin::Mcp);
+                assert_eq!(
+                    purpose.as_ref().map(Purpose::as_str),
+                    Some("Checking that commands run")
+                );
+                break;
+            }
+            SessionEvent::RequestHandled { operation, .. } => {
+                panic!("a started command must not be reported twice: {operation}")
+            }
+            _ => {}
+        }
+    }
+    let _ = collect_exec(&mut host, job).await;
+    host.system_info().await.expect("system info");
+    match next_handled(&mut joiner).await {
+        SessionEvent::RequestHandled { operation, .. } => {
+            assert_eq!(operation, "read system information");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    host.stop().expect("stop");
+}

@@ -25,6 +25,9 @@
 //!
 //! # Layering
 //!
+//! - [`cli`] — argument parsing, the identity banner and the honest end-of-run
+//!   summary, shared by the `cretlink-shell` binary and `cretlink-cli shell`
+//!   (ST-M009-002).
 //! - [`engine`] — the transport-abstract terminal engine: the handshake, the
 //!   fail-closed open/attach, and the bounded duplex pump. It is written against
 //!   the async [`tokio::io`] traits rather than a real terminal, so the whole
@@ -36,5 +39,6 @@
 //!   (validated on real terminals as a maintainer hardware task); it holds no
 //!   protocol logic.
 
+pub mod cli;
 pub mod engine;
 pub mod tty;

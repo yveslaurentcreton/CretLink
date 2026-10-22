@@ -40,7 +40,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 
-use crate::{HostHandle, JobOutcome, SessionError};
+use crate::{Attribution, HostHandle, JobOutcome, Origin, SessionError};
 
 /// The most raw bytes one file-op message may carry over the secure channel.
 ///
@@ -204,8 +204,29 @@ impl HostHandle {
         &self,
         request: UploadRequest,
         cancel: &CancelToken,
+        on_progress: impl FnMut(TransferProgress),
+    ) -> Result<TransferReport, SessionError> {
+        self.upload_file_as(request, Origin::Console, cancel, on_progress)
+            .await
+    }
+
+    /// Like [`Self::upload_file`], but stamps an explicit [`Attribution`] onto
+    /// every request the transfer issues, so the agent attributes an AI-driven
+    /// upload to the AI and shows the caller's stated purpose beside the commit
+    /// (ST-M009-007, REQ-F-026).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::upload_file`].
+    pub async fn upload_file_as(
+        &self,
+        request: UploadRequest,
+        attribution: impl Into<Attribution>,
+        cancel: &CancelToken,
         mut on_progress: impl FnMut(TransferProgress),
     ) -> Result<TransferReport, SessionError> {
+        let attribution = attribution.into();
+        let by = &attribution;
         let UploadRequest {
             source,
             dest,
@@ -236,15 +257,17 @@ impl HostHandle {
 
         // Cancelled before anything is staged: abort idempotently and report.
         if cancel.is_cancelled() {
-            self.abort_part(&dest).await?;
+            self.abort_part(&dest, by).await?;
             return Ok(cancelled_report(total, 0, 0, false));
         }
 
-        let (mut start, mut restarted) =
-            match self.upload_resume_point(&dest, total, overwrite).await? {
-                UploadStart::Fail(report) => return Ok(report),
-                UploadStart::At { start, restarted } => (start, restarted),
-            };
+        let (mut start, mut restarted) = match self
+            .upload_resume_point(&dest, total, overwrite, by)
+            .await?
+        {
+            UploadStart::Fail(report) => return Ok(report),
+            UploadStart::At { start, restarted } => (start, restarted),
+        };
 
         // Stream, then commit. A resumed prefix that turns out not to be ours
         // fails the commit's whole-file digest check; that triggers exactly one
@@ -252,11 +275,11 @@ impl HostHandle {
         loop {
             let resumed_from = start;
             let (sent, digest) = match self
-                .stream_upload_tail(&source, &dest, total, start, cancel, &mut on_progress)
+                .stream_upload_tail(&source, &dest, total, start, cancel, by, &mut on_progress)
                 .await?
             {
                 TailOutcome::Cancelled { sent } => {
-                    self.abort_part(&dest).await?;
+                    self.abort_part(&dest, by).await?;
                     return Ok(cancelled_report(total, sent, resumed_from, restarted));
                 }
                 TailOutcome::WriteFailed { sent, error } => {
@@ -267,15 +290,18 @@ impl HostHandle {
             };
 
             match self
-                .file_op(Operation::FsCommit {
-                    dest: dest.clone(),
-                    len: total,
-                    algo: DigestAlgo::Sha256,
-                    digest: B64Bytes::new(digest.clone()),
-                    overwrite,
-                    source: label.clone(),
-                    cleanup,
-                })
+                .file_op_as(
+                    Operation::FsCommit {
+                        dest: dest.clone(),
+                        len: total,
+                        algo: DigestAlgo::Sha256,
+                        digest: B64Bytes::new(digest.clone()),
+                        overwrite,
+                        source: label.clone(),
+                        cleanup,
+                    },
+                    by.clone(),
+                )
                 .await
             {
                 Ok(OpResult::Committed {
@@ -309,7 +335,7 @@ impl HostHandle {
                     if code == ErrorCode::IntegrityMismatch && start > 0 && !restarted =>
                 {
                     // The resumed prefix was not ours: discard it and resend whole.
-                    self.abort_part(&dest).await?;
+                    self.abort_part(&dest, by).await?;
                     start = 0;
                     restarted = true;
                 }
@@ -339,16 +365,38 @@ impl HostHandle {
         &self,
         request: DownloadRequest,
         cancel: &CancelToken,
+        on_progress: impl FnMut(TransferProgress),
+    ) -> Result<TransferReport, SessionError> {
+        self.download_file_as(request, Origin::Console, cancel, on_progress)
+            .await
+    }
+
+    /// Like [`Self::download_file`], but stamps an explicit [`Attribution`] onto
+    /// every request the transfer issues (ST-M009-007, REQ-F-026).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::download_file`].
+    pub async fn download_file_as(
+        &self,
+        request: DownloadRequest,
+        attribution: impl Into<Attribution>,
+        cancel: &CancelToken,
         mut on_progress: impl FnMut(TransferProgress),
     ) -> Result<TransferReport, SessionError> {
+        let attribution = attribution.into();
+        let by = &attribution;
         let DownloadRequest { source, dest } = request;
         let temp = download_temp_path(&dest);
 
         // Total + existence from a single stat (never errors on absence).
         let total = match self
-            .file_op(Operation::FsStat {
-                path: source.clone(),
-            })
+            .file_op_as(
+                Operation::FsStat {
+                    path: source.clone(),
+                },
+                by.clone(),
+            )
             .await
         {
             Ok(OpResult::PathStat {
@@ -396,7 +444,7 @@ impl HostHandle {
                     .await
                     .map_err(SessionError::Io)?;
                 let local = hasher.clone().finalize().to_vec();
-                let remote = self.prefix_digest(&source, have).await?;
+                let remote = self.prefix_digest(&source, have, by).await?;
                 if remote == local {
                     start = have;
                 } else {
@@ -424,11 +472,14 @@ impl HostHandle {
                     break;
                 }
                 let want = (total - next).min(WIRE_CHUNK_BYTES as u64) as u32;
-                let rx = self.submit_op(Operation::FsRead {
-                    path: source.clone(),
-                    offset: next,
-                    len: want,
-                })?;
+                let rx = self.submit_op(
+                    Operation::FsRead {
+                        path: source.clone(),
+                        offset: next,
+                        len: want,
+                    },
+                    by.clone(),
+                )?;
                 inflight.push_back(rx);
                 next += u64::from(want);
             }
@@ -493,10 +544,13 @@ impl HostHandle {
         // --- Verify the whole-file digest before renaming into place (AC2) ---
         let local_digest = hasher.finalize().to_vec();
         let remote_digest = match self
-            .file_op(Operation::FsDigest {
-                path: source,
-                prefix_len: None,
-            })
+            .file_op_as(
+                Operation::FsDigest {
+                    path: source,
+                    prefix_len: None,
+                },
+                by.clone(),
+            )
             .await
         {
             Ok(OpResult::FileDigest { digest, .. }) => digest.into_inner(),
@@ -558,6 +612,9 @@ impl HostHandle {
 
     /// Streams the source tail from `start`, hashing the whole file for the
     /// commit and reporting progress per acknowledged write.
+    // The attribution joins the transfer's existing inputs (ST-M009-007);
+    // bundling them into a one-use struct would only rename the arguments.
+    #[allow(clippy::too_many_arguments)]
     async fn stream_upload_tail<F: FnMut(TransferProgress)>(
         &self,
         source: &Path,
@@ -565,6 +622,7 @@ impl HostHandle {
         total: u64,
         start: u64,
         cancel: &CancelToken,
+        by: &Attribution,
         on_progress: &mut F,
     ) -> Result<TailOutcome, SessionError> {
         let mut file = fs::File::open(source).await.map_err(SessionError::Io)?;
@@ -615,11 +673,14 @@ impl HostHandle {
                 }
             }
 
-            let rx = self.submit_op(Operation::FsWrite {
-                dest: dest.clone(),
-                offset: wire_offset,
-                data: B64Bytes::new(data),
-            })?;
+            let rx = self.submit_op(
+                Operation::FsWrite {
+                    dest: dest.clone(),
+                    offset: wire_offset,
+                    data: B64Bytes::new(data),
+                },
+                by.clone(),
+            )?;
             inflight.push_back(InFlight { bytes, rx });
         }
 
@@ -652,29 +713,32 @@ impl HostHandle {
         dest: &RemotePath,
         total: u64,
         overwrite: bool,
+        by: &Attribution,
     ) -> Result<UploadStart, SessionError> {
-        let (entry_exists, partial) =
-            match self.file_op(Operation::FsStat { path: dest.clone() }).await {
-                Ok(OpResult::PathStat { entry, partial_len }) => {
-                    (entry.is_some(), partial_len.unwrap_or(0))
-                }
-                Ok(_) => {
-                    return Err(SessionError::Unexpected {
-                        context: "upload stat",
-                    });
-                }
-                Err(SessionError::Remote { code, message }) => {
-                    return Ok(UploadStart::Fail(failed_report(
-                        total,
-                        TransferError {
-                            code,
-                            message,
-                            stage: "stat",
-                        },
-                    )));
-                }
-                Err(other) => return Err(other),
-            };
+        let (entry_exists, partial) = match self
+            .file_op_as(Operation::FsStat { path: dest.clone() }, by.clone())
+            .await
+        {
+            Ok(OpResult::PathStat { entry, partial_len }) => {
+                (entry.is_some(), partial_len.unwrap_or(0))
+            }
+            Ok(_) => {
+                return Err(SessionError::Unexpected {
+                    context: "upload stat",
+                });
+            }
+            Err(SessionError::Remote { code, message }) => {
+                return Ok(UploadStart::Fail(failed_report(
+                    total,
+                    TransferError {
+                        code,
+                        message,
+                        stage: "stat",
+                    },
+                )));
+            }
+            Err(other) => return Err(other),
+        };
 
         if entry_exists && !overwrite {
             return Ok(UploadStart::Fail(failed_report(
@@ -689,7 +753,7 @@ impl HostHandle {
 
         if partial > total {
             // The part is longer than our source: it cannot be a prefix.
-            self.abort_part(dest).await?;
+            self.abort_part(dest, by).await?;
             return Ok(UploadStart::At {
                 start: 0,
                 restarted: true,
@@ -703,9 +767,9 @@ impl HostHandle {
 
     /// Discards a pending part, best-effort and idempotent. A remote refusal is
     /// swallowed (the part may simply not exist); only fatal errors propagate.
-    async fn abort_part(&self, dest: &RemotePath) -> Result<(), SessionError> {
+    async fn abort_part(&self, dest: &RemotePath, by: &Attribution) -> Result<(), SessionError> {
         match self
-            .file_op(Operation::FsAbort { dest: dest.clone() })
+            .file_op_as(Operation::FsAbort { dest: dest.clone() }, by.clone())
             .await
         {
             Ok(OpResult::Ack {}) => Ok(()),
@@ -720,12 +784,16 @@ impl HostHandle {
         &self,
         path: &RemotePath,
         prefix_len: u64,
+        by: &Attribution,
     ) -> Result<Vec<u8>, SessionError> {
         match self
-            .file_op(Operation::FsDigest {
-                path: path.clone(),
-                prefix_len: Some(prefix_len),
-            })
+            .file_op_as(
+                Operation::FsDigest {
+                    path: path.clone(),
+                    prefix_len: Some(prefix_len),
+                },
+                by.clone(),
+            )
             .await?
         {
             OpResult::FileDigest { digest, .. } => Ok(digest.into_inner()),

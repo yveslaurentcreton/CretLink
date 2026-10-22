@@ -48,39 +48,70 @@ After bootstrap, versions and tags are never chosen manually.
   automation or receive write-scoped tokens. Release tooling versions are
   pinned in `package.json`.
 
-### Release artifacts (ST-M006-004)
+### Release version (ST-M006-014)
+
+The `version` job of `release.yml` runs `scripts/next-version.mjs` before
+anything is built. It takes the highest `v<semver>` tag merged into the commit
+and asks `@semantic-release/commit-analyzer`, with the configuration in
+`.releaserc.json`, which release type the commits since then require — the same
+decision semantic-release makes, without the push-capable token its
+`--dry-run` would need. An empty result means nothing is released and the build
+is skipped.
+
+The build passes the version as `CRETLINK_VERSION`; `cretlink_shared::RELEASE_VERSION`
+reads it at compile time, so every binary reports it (`cretlink-cli version`), and
+local builds report `0.0.0-dev`. The local semantic-release plugin
+`scripts/verify-version.cjs` receives the same version as
+`CRETLINK_EXPECTED_VERSION` and makes semantic-release refuse to publish if it
+decides a different one, so a release never carries binaries stamped with
+another version.
+
+### Release artifacts (ST-M006-004, ST-M009-004)
 
 Every release attaches verifiable platform artifacts, built by the `build`
 matrix in `release.yml` from the exact commit semantic-release tags and gathered
 into the GitHub release by `@semantic-release/github`:
 
-- the five shippable binaries for each target triple (Windows x86_64, macOS
-  aarch64, Linux x86_64) — `cretlink-console`, `cretlink-mcp`, and
-  `cretlink-shell` (technician computer),
-  `cretlink-support-agent` (the only binary placed on the customer computer),
-  and `cretlink-relay-server` (operator-hosted public infrastructure, on
-  neither endpoint; see [`docs/relay-server.md`](relay-server.md));
+- one archive per operating system (REQ-N-021):
+  `cretlink-<version>-windows-x86_64.zip`, `cretlink-<version>-macos-aarch64.tar.gz`
+  and `cretlink-<version>-linux-x86_64.tar.gz`. Each holds a folder of the same
+  name with the application `cretlink` (both roles; on Windows also the
+  program the customer runs, ST-M009-005), its console build `cretlink-cli`,
+  and `cretlink-console`, `cretlink-mcp` and `cretlink-shell` — in the Windows
+  archive also the headless `cretlink-support-agent` — plus `README.txt`,
+  `LICENSE` and the target's checksum file;
+- `SHA256SUMS.txt` — SHA-256 over the archives, written by the `release` job;
+- `cretlink-relay-server-<target>[.exe]` — operator-hosted public
+  infrastructure on neither endpoint (see [`docs/relay-server.md`](relay-server.md)),
+  attached on its own and not in the archives;
 - `CHECKSUMS-<target>.txt` — SHA-256 over every binary for that target;
 - `dependency-inventory-<target>.txt` — the resolved normal-dependency graph and
   pinned versions from the locked workspace (`cargo tree --locked`);
-- `sbom-<binary>-<target>.cdx.json` — one CycloneDX SBOM per shipped binary
-  when `cargo-cyclonedx` is available; its absence is a warning, never a silent
+- `sbom-<binary>-<target>.cdx.json` — one CycloneDX SBOM per shipped binary,
+  its own component stamped with the release version. Official artifacts fail
+  without them; locally a missing `cargo-cyclonedx` is a warning, never a silent
   gap, and the dependency inventory is the portable fallback.
 
-`scripts/gen-artifacts.sh` is the single portable producer, runnable both in CI
-and locally in any bash (Linux, macOS, or Git Bash on Windows) so a maintainer
-reproduces the same artifact metadata from the same commit. Binary filenames
-carry the target, not the version: the tag and GitHub release carry the version,
-so the artifact producer never chooses one.
+`scripts/gen-artifacts.sh [--stage | --pack] [VERSION]` is the single portable
+producer, runnable both in CI and locally in any bash (Linux, macOS, or Git Bash
+on Windows) so a maintainer reproduces the same artifacts from the same commit.
+`--stage` builds the binaries with the version and stages them; `--pack` writes
+the checksums, the archive, the inventory and the SBOMs. Without an option it
+does both. The release workflow signs the staged Windows binaries between the
+two phases. The producer never chooses a version: it takes the one it is given,
+`0.0.0-dev` by default.
 
 ### Code signing (ST-M006-005)
 
 Windows artifacts are Authenticode-signed when — and only when — a signing
 identity is configured for the release:
 
-- `scripts/sign-windows.ps1` signs every `dist\cretlink-*.exe` with a timestamp,
-  verifies each signature, then regenerates `CHECKSUMS-<target>.txt` so the
-  published checksums cover the *signed* bytes.
+- `scripts/sign-windows.ps1` signs every staged Windows binary — the archive
+  folder under `target\bundle\` and the loose `dist\cretlink-*.exe` — with a
+  timestamp and verifies each signature. It runs between
+  `gen-artifacts.sh --stage` and `--pack`, so the checksums, the archive and the
+  SBOMs cover the *signed* bytes, and it is the only step that holds the
+  signing secrets.
 - Signing is gated on `CRETLINK_SIGN_PFX_BASE64` (plus optional
   `CRETLINK_SIGN_PFX_PASSWORD` and `CRETLINK_SIGN_TIMESTAMP_URL`). With no
   identity present the helper is a clean no-op and the binaries stay unsigned, so

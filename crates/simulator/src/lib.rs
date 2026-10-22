@@ -449,7 +449,9 @@ impl Connection {
                 }
                 self.handle_request(framed, id, op).await
             }
-            Message::Cancel { id, session, job } => {
+            Message::Cancel {
+                id, session, job, ..
+            } => {
                 if session != self.session {
                     framed
                         .send(&self.error_message(

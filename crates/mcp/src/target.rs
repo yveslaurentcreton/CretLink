@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use cretlink_protocol::{
     B64Bytes, CleanupFailure, CleanupPolicy, CleanupTrigger, DesktopFrameMeta, ErrorCode,
     ErrorStage, FileEntry, ImageFormat, JobId, JobOutcome, JobSummary, KeyAction, PointerAction,
-    PointerButton, RemotePath, SessionId, Shell, StagedEntry, TargetIdentity,
+    PointerButton, Purpose, RemotePath, SessionId, Shell, StagedEntry, TargetIdentity,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -424,6 +424,12 @@ impl From<TargetError> for CallError {
 /// best-effort last-known identity used only to label an *error* envelope (a
 /// fail-closed or lost-link result that carries no routed identity of its own).
 ///
+/// Every operation takes the AI client's stated [`Purpose`] (REQ-F-026,
+/// ST-M009-007): the bridge requires and validates it on every tool call before
+/// anything is sent, and an implementation forwards it to the console so it is
+/// audited and shown to the customer beside the real operation. It is the
+/// caller's claim, never authority.
+///
 /// Implementations must treat all remote output as untrusted input and must
 /// never fabricate a success for a lost session.
 #[async_trait::async_trait]
@@ -435,12 +441,13 @@ pub trait TargetSession: Send + Sync + 'static {
     fn target(&self) -> TargetIdentity;
 
     /// Report the target's identity and basic system state.
-    async fn system_info(&self) -> Result<Routed<SystemInfoReport>, CallError>;
+    async fn system_info(&self, purpose: Purpose) -> Result<Routed<SystemInfoReport>, CallError>;
 
     /// Run a command to completion, capturing output up to `output_cap`
     /// bytes across both streams.
     async fn exec(
         &self,
+        purpose: Purpose,
         params: ExecParams,
         output_cap: usize,
     ) -> Result<Routed<ExecReport>, CallError>;
@@ -451,62 +458,82 @@ pub trait TargetSession: Send + Sync + 'static {
     /// symmetry with `exec` and for any future output-excerpt logging.
     async fn write_stdin(
         &self,
+        purpose: Purpose,
         job: JobId,
         data: Vec<u8>,
         sensitive: bool,
     ) -> Result<Routed<()>, CallError>;
 
     /// Request cancellation of a running job.
-    async fn cancel(&self, job: JobId) -> Result<Routed<()>, CallError>;
+    async fn cancel(&self, purpose: Purpose, job: JobId) -> Result<Routed<()>, CallError>;
 
     /// List the jobs the target currently tracks.
-    async fn list_jobs(&self) -> Result<Routed<Vec<JobSummary>>, CallError>;
+    async fn list_jobs(&self, purpose: Purpose) -> Result<Routed<Vec<JobSummary>>, CallError>;
 
     /// Stat a path on the target. Returns the entry if it exists and any pending
     /// staging part length; never returns file content (REQ-N-007).
-    async fn fs_stat(&self, path: RemotePath) -> Result<Routed<StatReport>, CallError>;
+    async fn fs_stat(
+        &self,
+        purpose: Purpose,
+        path: RemotePath,
+    ) -> Result<Routed<StatReport>, CallError>;
 
     /// List one page of a directory on the target, continuing after the given
     /// entry name for pagination.
     async fn fs_list(
         &self,
+        purpose: Purpose,
         path: RemotePath,
         continue_after: Option<String>,
     ) -> Result<Routed<DirPage>, CallError>;
 
     /// Create a directory on the target.
-    async fn make_dir(&self, path: RemotePath) -> Result<Routed<()>, CallError>;
+    async fn make_dir(&self, purpose: Purpose, path: RemotePath) -> Result<Routed<()>, CallError>;
 
     /// Move (rename) a path on the target. Same-volume only; `overwrite` decides
     /// whether an existing destination file may be replaced.
     async fn fs_move(
         &self,
+        purpose: Purpose,
         from: RemotePath,
         to: RemotePath,
         overwrite: bool,
     ) -> Result<Routed<()>, CallError>;
 
     /// Delete a file or reparse point on the target (never a directory).
-    async fn fs_delete(&self, path: RemotePath) -> Result<Routed<()>, CallError>;
+    async fn fs_delete(&self, purpose: Purpose, path: RemotePath) -> Result<Routed<()>, CallError>;
 
     /// Remove an empty directory on the target.
-    async fn remove_dir(&self, path: RemotePath) -> Result<Routed<()>, CallError>;
+    async fn remove_dir(&self, purpose: Purpose, path: RemotePath)
+    -> Result<Routed<()>, CallError>;
 
     /// Upload a local file into target staging and commit it verified, driven by
     /// the console transfer engine over bounded chunk operations. The completion
     /// carries only the canonical path, length, digest, and outcome — never file
     /// content (REQ-N-007, REQ-S-018).
-    async fn upload(&self, params: UploadParams) -> Result<Routed<UploadReport>, CallError>;
+    async fn upload(
+        &self,
+        purpose: Purpose,
+        params: UploadParams,
+    ) -> Result<Routed<UploadReport>, CallError>;
 
     /// Download a target file to a local path, verified by whole-file digest.
-    async fn download(&self, params: DownloadParams) -> Result<Routed<DownloadReport>, CallError>;
+    async fn download(
+        &self,
+        purpose: Purpose,
+        params: DownloadParams,
+    ) -> Result<Routed<DownloadReport>, CallError>;
 
     /// List the staged artifacts the target currently tracks (REQ-F-019).
-    async fn list_staged(&self) -> Result<Routed<Vec<StagedEntry>>, CallError>;
+    async fn list_staged(&self, purpose: Purpose) -> Result<Routed<Vec<StagedEntry>>, CallError>;
 
     /// Run a staging cleanup for a trigger, reporting honest per-artifact
     /// outcomes (REQ-N-008).
-    async fn cleanup(&self, trigger: CleanupTrigger) -> Result<Routed<CleanupSummary>, CallError>;
+    async fn cleanup(
+        &self,
+        purpose: Purpose,
+        trigger: CleanupTrigger,
+    ) -> Result<Routed<CleanupSummary>, CallError>;
 
     // --- Visual desktop surface (ADR-0015, ST-M005-004) ---
     //
@@ -521,12 +548,14 @@ pub trait TargetSession: Send + Sync + 'static {
     /// desktop is active (ADR-0015).
     async fn capture_desktop(
         &self,
+        purpose: Purpose,
         params: CaptureParams,
     ) -> Result<Routed<CaptureReport>, CallError>;
 
     /// Inject a pointer action at an absolute virtual-desktop coordinate.
     async fn desktop_pointer(
         &self,
+        purpose: Purpose,
         action: PointerAction,
         button: PointerButton,
         x: i32,
@@ -536,6 +565,7 @@ pub trait TargetSession: Send + Sync + 'static {
     /// Inject a scroll (wheel) action at an absolute coordinate.
     async fn desktop_scroll(
         &self,
+        purpose: Purpose,
         x: i32,
         y: i32,
         dx: i32,
@@ -544,22 +574,31 @@ pub trait TargetSession: Send + Sync + 'static {
 
     /// Inject a single key action naming a virtual key. Only *sends* input; no
     /// keylogging primitive exists (REQ-S-013).
-    async fn desktop_key(&self, action: KeyAction, key: String) -> Result<Routed<()>, CallError>;
+    async fn desktop_key(
+        &self,
+        purpose: Purpose,
+        action: KeyAction,
+        key: String,
+    ) -> Result<Routed<()>, CallError>;
 
     /// Type a Unicode string as a sequence of key events.
-    async fn desktop_type(&self, text: String) -> Result<Routed<()>, CallError>;
+    async fn desktop_type(&self, purpose: Purpose, text: String) -> Result<Routed<()>, CallError>;
 
     /// Send a chord of named virtual keys as a single hotkey press.
-    async fn desktop_hotkey(&self, keys: Vec<String>) -> Result<Routed<()>, CallError>;
+    async fn desktop_hotkey(
+        &self,
+        purpose: Purpose,
+        keys: Vec<String>,
+    ) -> Result<Routed<()>, CallError>;
 
     /// Pace the input pipeline by a bounded number of milliseconds.
-    async fn desktop_wait(&self, millis: u64) -> Result<Routed<()>, CallError>;
+    async fn desktop_wait(&self, purpose: Purpose, millis: u64) -> Result<Routed<()>, CallError>;
 
     /// Read the remote clipboard's text, or `None` when it holds no text. The
     /// clipboard exchange is explicit-only and audited (REQ-S-015).
-    async fn clipboard_get(&self) -> Result<Routed<Option<String>>, CallError>;
+    async fn clipboard_get(&self, purpose: Purpose) -> Result<Routed<Option<String>>, CallError>;
 
     /// Replace the remote clipboard's text. CretLink never places session secrets
     /// or provider credentials on the remote clipboard (REQ-F-015, REQ-S-015).
-    async fn clipboard_set(&self, text: String) -> Result<Routed<()>, CallError>;
+    async fn clipboard_set(&self, purpose: Purpose, text: String) -> Result<Routed<()>, CallError>;
 }

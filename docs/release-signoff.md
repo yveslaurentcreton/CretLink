@@ -41,10 +41,12 @@ evidence that satisfies it.
 ### Artifacts and provenance
 
 - [ ] Official artifacts were built by `release.yml` from the tagged commit, not
-      hand-built — the five binaries, `CHECKSUMS-<target>.txt`,
-      `dependency-inventory-<target>.txt`, and the per-binary SBOMs
-      (`sbom-<binary>-<target>.cdx.json`) when available
-      (REQ-N-016, REQ-N-018; ST-M006-004).
+      hand-built — the three per-OS archives and `SHA256SUMS.txt`, the relay
+      server, `CHECKSUMS-<target>.txt`, `dependency-inventory-<target>.txt`,
+      and the per-binary SBOMs (`sbom-<binary>-<target>.cdx.json`)
+      (REQ-N-016, REQ-N-018, REQ-N-021; ST-M006-004, ST-M009-004).
+- [ ] `cretlink version` and `cretlink-cli version` from each archive print the
+      release version (ST-M006-014).
 - [ ] Checksums verify on every platform class against the downloaded binaries
       (REQ-S-019; [`verifying-artifacts.md`](verifying-artifacts.md)).
 - [ ] Windows Authenticode signature verifies as `Valid` with the expected

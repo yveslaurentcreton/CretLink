@@ -1,0 +1,67 @@
+[package]
+name = "cretlink-cli"
+description = "The `cretlink-cli` command: MCP bridge, AI-client registration, technician terminal and version (ST-M009-002, ST-M009-003, ADR-0018)"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+# The dispatch lives in the library so the one CretLink application
+# (ST-M009-005) can run the same subcommands before it opens a window.
+[lib]
+name = "cretlink_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cretlink-cli"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+# `serve_stdio` is the MCP bridge shared with `cretlink-mcp` (ADR-0004).
+cretlink-mcp.workspace = true
+cretlink-shared.workspace = true
+# The technician terminal client shared with `cretlink-shell` (ST-M008-002).
+# Apps are deliberately not in [workspace.dependencies]; a path dependency is
+# permitted by cargo.
+cretlink-shell = { path = "../shell-cli", version = "0.0.0" }
+# Reads the AI clients' JSON configuration (Claude Code, Gemini CLI) read-only.
+serde_json.workspace = true
+tokio = { workspace = true }
+
+# Attaching a GUI-subsystem process to its parent's console, and the elevated
+# relaunch through UAC (ST-M009-001). Same `windows` 0.62 line already in the
+# lockfile (shell-cli, support-agent, exec); the calls are the only `unsafe` in
+# this crate and live in `process::win`.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_Registry",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+# Build `cretlink` for the Windows GUI subsystem, as the one application will be
+# (ADR-0018): no console window on a double-click. The ST-M009-001 spike builds
+# and tests the binary this way on Windows CI. No effect elsewhere.
+gui-subsystem = []
+
+[dev-dependencies]
+# The ST-M004-005 conformance harness of `apps/mcp-bridge`, included as a module,
+# runs against `cretlink mcp`; these are its dependencies.
+cretlink-protocol.workspace = true
+cretlink-session.workspace = true
+cretlink-console = { path = "../console", version = "0.0.0" }
+base64.workspace = true
+tokio = { workspace = true, features = ["process", "net"] }
+jsonschema = { version = "=0.49.9", default-features = false }
+
+[lints]
+workspace = true

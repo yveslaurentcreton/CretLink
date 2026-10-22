@@ -27,6 +27,7 @@ fn exec(id: u64, session: SessionId, command: &str, timeout_ms: Option<u64>) -> 
         id: RequestId(id),
         session,
         origin: Origin::Console,
+        purpose: None,
         op: Operation::Exec {
             shell: Shell::PowerShell,
             command: command.to_string(),
@@ -149,6 +150,7 @@ async fn system_info_reports_the_simulated_identity() {
     framed
         .send(&Message::Request {
             origin: Origin::Console,
+            purpose: None,
             id: RequestId(1),
             session,
             op: Operation::SystemInfo {},
@@ -328,6 +330,7 @@ async fn sim_hang_supports_stdin_echo_listing_and_cancel() {
     framed
         .send(&Message::Request {
             origin: Origin::Console,
+            purpose: None,
             id: RequestId(2),
             session,
             op: Operation::WriteStdin {
@@ -366,6 +369,7 @@ async fn sim_hang_supports_stdin_echo_listing_and_cancel() {
     framed
         .send(&Message::Request {
             origin: Origin::Console,
+            purpose: None,
             id: RequestId(3),
             session,
             op: Operation::ListJobs {},
@@ -390,6 +394,8 @@ async fn sim_hang_supports_stdin_echo_listing_and_cancel() {
         .send(&Message::Cancel {
             id: RequestId(4),
             session,
+            origin: cretlink_protocol::Origin::Console,
+            purpose: None,
             job,
         })
         .await
@@ -424,6 +430,7 @@ async fn sim_hang_supports_stdin_echo_listing_and_cancel() {
     framed
         .send(&Message::Request {
             origin: Origin::Console,
+            purpose: None,
             id: RequestId(5),
             session,
             op: Operation::ListJobs {},
@@ -470,6 +477,7 @@ async fn finished_job_history_is_bounded_and_running_jobs_stay_listed() {
     framed
         .send(&Message::Request {
             origin: Origin::Console,
+            purpose: None,
             id: RequestId(9000),
             session,
             op: Operation::ListJobs {},
@@ -601,6 +609,7 @@ async fn stdin_and_cancel_for_unknown_jobs_are_rejected() {
     framed
         .send(&Message::Request {
             origin: Origin::Console,
+            purpose: None,
             id: RequestId(1),
             session,
             op: Operation::WriteStdin {
@@ -622,6 +631,8 @@ async fn stdin_and_cancel_for_unknown_jobs_are_rejected() {
         .send(&Message::Cancel {
             id: RequestId(2),
             session,
+            origin: cretlink_protocol::Origin::Console,
+            purpose: None,
             job: JobId(42),
         })
         .await
@@ -641,6 +652,7 @@ async fn list_jobs_is_empty_before_any_exec() {
     framed
         .send(&Message::Request {
             origin: Origin::Console,
+            purpose: None,
             id: RequestId(1),
             session,
             op: Operation::ListJobs {},
@@ -681,6 +693,7 @@ async fn op_ok(
     framed
         .send(&Message::Request {
             origin: Origin::Console,
+            purpose: None,
             id: RequestId(id),
             session,
             op,
@@ -824,6 +837,7 @@ async fn simulator_rejects_a_commit_whose_digest_is_wrong() {
     framed
         .send(&Message::Request {
             origin: Origin::Console,
+            purpose: None,
             id: RequestId(2),
             session,
             op: Operation::FsCommit {
@@ -923,6 +937,7 @@ async fn simulator_refuses_to_overwrite_a_committed_artifact() {
     framed
         .send(&Message::Request {
             origin: Origin::Console,
+            purpose: None,
             id: RequestId(4),
             session,
             op: Operation::FsCommit {
@@ -958,6 +973,7 @@ fn term_request(id: u64, session: SessionId, op: Operation) -> Message {
         id: RequestId(id),
         session,
         origin: Origin::Terminal,
+        purpose: None,
         op,
     }
 }

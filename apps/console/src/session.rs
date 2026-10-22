@@ -58,8 +58,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use cretlink_protocol::{
     B64Bytes, CleanupTrigger, ErrorCode, ErrorStage, EventKind, JobId, JobOutcome, JobSummary,
     KeyAction, Message, OpResult, Operation, Origin, OutputStream, PROTOCOL_V1, PointerAction,
-    PointerButton, ProtocolError, ProtocolVersion, RemotePath, RequestId, Role, SessionId, Shell,
-    StagedEntry, TargetIdentity,
+    PointerButton, ProtocolError, ProtocolVersion, Purpose, RemotePath, RequestId, Role, SessionId,
+    Shell, StagedEntry, TargetIdentity,
 };
 use cretlink_transport::{Framed, TransportError};
 use thiserror::Error;
@@ -500,6 +500,7 @@ impl SessionClient {
             // This legacy console wire client is technician-driven (the MCP
             // path routes through `ConsoleSessionService`); it is not the AI.
             origin: Origin::Console,
+            purpose: None,
             op,
         };
         self.send_correlated(id, &message).await
@@ -520,6 +521,9 @@ impl SessionClient {
         let message = Message::Cancel {
             id,
             session: self.session,
+            // Technician-driven, like every request of this legacy client.
+            origin: Origin::Console,
+            purpose: None,
             job,
         };
         match self.send_correlated(id, &message).await? {
@@ -879,6 +883,12 @@ fn append_capped(
 /// Adapts a [`SessionClient`] to the MCP bridge's [`cretlink_mcp::TargetSession`],
 /// so the console can serve the MCP surface bound to exactly the selected
 /// target (REQ-F-013, REQ-F-016).
+///
+/// This in-process adapter drives the simulator over the legacy wire client,
+/// which stamps every request as technician-driven; it does not forward the
+/// AI's stated purpose (ST-M009-007). The production path is the IPC route
+/// through [`crate::ConsoleSessionService`], which audits, shows, and forwards
+/// it.
 #[derive(Debug, Clone)]
 pub struct SessionTarget {
     client: Arc<SessionClient>,
@@ -919,6 +929,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn system_info(
         &self,
+        _purpose: Purpose,
     ) -> Result<cretlink_mcp::Routed<cretlink_mcp::SystemInfoReport>, cretlink_mcp::CallError> {
         let (target, reboot_pending) = self.client.system_info().await.map_err(target_error)?;
         Ok(self.routed(cretlink_mcp::SystemInfoReport {
@@ -929,6 +940,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn exec(
         &self,
+        _purpose: Purpose,
         params: cretlink_mcp::ExecParams,
         output_cap: usize,
     ) -> Result<cretlink_mcp::Routed<cretlink_mcp::ExecReport>, cretlink_mcp::CallError> {
@@ -958,6 +970,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn write_stdin(
         &self,
+        _purpose: Purpose,
         job: JobId,
         data: Vec<u8>,
         _sensitive: bool,
@@ -974,6 +987,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn cancel(
         &self,
+        _purpose: Purpose,
         job: JobId,
     ) -> Result<cretlink_mcp::Routed<()>, cretlink_mcp::CallError> {
         self.client.cancel(job).await.map_err(target_error)?;
@@ -982,6 +996,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn list_jobs(
         &self,
+        _purpose: Purpose,
     ) -> Result<cretlink_mcp::Routed<Vec<JobSummary>>, cretlink_mcp::CallError> {
         let jobs = self.client.list_jobs().await.map_err(target_error)?;
         Ok(self.routed(jobs))
@@ -989,6 +1004,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn fs_stat(
         &self,
+        _purpose: Purpose,
         path: RemotePath,
     ) -> Result<cretlink_mcp::Routed<cretlink_mcp::StatReport>, cretlink_mcp::CallError> {
         match self
@@ -1006,6 +1022,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn fs_list(
         &self,
+        _purpose: Purpose,
         path: RemotePath,
         continue_after: Option<String>,
     ) -> Result<cretlink_mcp::Routed<cretlink_mcp::DirPage>, cretlink_mcp::CallError> {
@@ -1027,6 +1044,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn make_dir(
         &self,
+        _purpose: Purpose,
         path: RemotePath,
     ) -> Result<cretlink_mcp::Routed<()>, cretlink_mcp::CallError> {
         match self
@@ -1042,6 +1060,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn fs_move(
         &self,
+        _purpose: Purpose,
         from: RemotePath,
         to: RemotePath,
         overwrite: bool,
@@ -1063,6 +1082,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn fs_delete(
         &self,
+        _purpose: Purpose,
         path: RemotePath,
     ) -> Result<cretlink_mcp::Routed<()>, cretlink_mcp::CallError> {
         match self
@@ -1078,6 +1098,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn remove_dir(
         &self,
+        _purpose: Purpose,
         path: RemotePath,
     ) -> Result<cretlink_mcp::Routed<()>, cretlink_mcp::CallError> {
         match self
@@ -1093,6 +1114,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn list_staged(
         &self,
+        _purpose: Purpose,
     ) -> Result<cretlink_mcp::Routed<Vec<StagedEntry>>, cretlink_mcp::CallError> {
         match self
             .client
@@ -1107,6 +1129,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn cleanup(
         &self,
+        _purpose: Purpose,
         trigger: CleanupTrigger,
     ) -> Result<cretlink_mcp::Routed<cretlink_mcp::CleanupSummary>, cretlink_mcp::CallError> {
         match self
@@ -1131,6 +1154,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn capture_desktop(
         &self,
+        _purpose: Purpose,
         params: cretlink_mcp::CaptureParams,
     ) -> Result<cretlink_mcp::Routed<cretlink_mcp::CaptureReport>, cretlink_mcp::CallError> {
         let cretlink_mcp::CaptureParams {
@@ -1167,6 +1191,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn desktop_pointer(
         &self,
+        _purpose: Purpose,
         action: PointerAction,
         button: PointerButton,
         x: i32,
@@ -1190,6 +1215,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn desktop_scroll(
         &self,
+        _purpose: Purpose,
         x: i32,
         y: i32,
         dx: i32,
@@ -1208,6 +1234,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn desktop_key(
         &self,
+        _purpose: Purpose,
         action: KeyAction,
         key: String,
     ) -> Result<cretlink_mcp::Routed<()>, cretlink_mcp::CallError> {
@@ -1224,6 +1251,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn desktop_type(
         &self,
+        _purpose: Purpose,
         text: String,
     ) -> Result<cretlink_mcp::Routed<()>, cretlink_mcp::CallError> {
         match self
@@ -1239,6 +1267,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn desktop_hotkey(
         &self,
+        _purpose: Purpose,
         keys: Vec<String>,
     ) -> Result<cretlink_mcp::Routed<()>, cretlink_mcp::CallError> {
         match self
@@ -1254,6 +1283,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn desktop_wait(
         &self,
+        _purpose: Purpose,
         millis: u64,
     ) -> Result<cretlink_mcp::Routed<()>, cretlink_mcp::CallError> {
         match self
@@ -1269,6 +1299,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn clipboard_get(
         &self,
+        _purpose: Purpose,
     ) -> Result<cretlink_mcp::Routed<Option<String>>, cretlink_mcp::CallError> {
         match self
             .client
@@ -1283,6 +1314,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
 
     async fn clipboard_set(
         &self,
+        _purpose: Purpose,
         text: String,
     ) -> Result<cretlink_mcp::Routed<()>, cretlink_mcp::CallError> {
         match self
@@ -1308,6 +1340,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
     /// rather than fabricating a transfer result (REQ-N-008).
     async fn upload(
         &self,
+        _purpose: Purpose,
         _params: cretlink_mcp::UploadParams,
     ) -> Result<cretlink_mcp::Routed<cretlink_mcp::UploadReport>, cretlink_mcp::CallError> {
         Err(cretlink_mcp::TargetError::Unexpected.into())
@@ -1317,6 +1350,7 @@ impl cretlink_mcp::TargetSession for SessionTarget {
     /// [`upload`](cretlink_mcp::TargetSession::upload). Fails closed rather than fabricating a result.
     async fn download(
         &self,
+        _purpose: Purpose,
         _params: cretlink_mcp::DownloadParams,
     ) -> Result<cretlink_mcp::Routed<cretlink_mcp::DownloadReport>, cretlink_mcp::CallError> {
         Err(cretlink_mcp::TargetError::Unexpected.into())

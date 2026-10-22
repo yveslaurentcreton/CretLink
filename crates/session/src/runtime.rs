@@ -47,7 +47,7 @@ use cretlink_exec::{
 use cretlink_protocol::{
     B64Bytes, CAP_DESKTOP_V1, CAP_TERM_V1, CleanupTrigger, ControlMessage, DesktopAccess,
     ErrorCode, ErrorStage, EventKind, JobId, JobOutcome, JobSummary, Message, OpResult, Operation,
-    Origin, OutputStream, ProtocolVersion, RequestId, RevokeReason, SessionId, TargetIdentity,
+    OutputStream, ProtocolVersion, RequestId, RevokeReason, SessionId, TargetIdentity,
     canonical_capabilities, limits,
 };
 use cretlink_shared::{Actor, Outcome};
@@ -60,9 +60,9 @@ use tokio::time::{MissedTickBehavior, timeout};
 
 use crate::reboot::ArmCommand;
 use crate::{
-    ACCEPT_TIMEOUT, CONSENT_TIMEOUT, CleanupReport, DisclosureSummary, HEARTBEAT_INTERVAL,
-    PAIR_TIMEOUT, RebootProbe, RebootResumeArmError, RebootResumeArmer, RebootResumeTicketId,
-    SessionAudit, SessionError, SessionEvent, Shared, TEARDOWN_DRAIN,
+    ACCEPT_TIMEOUT, ActionOutcome, Attribution, CONSENT_TIMEOUT, CleanupReport, DisclosureSummary,
+    HEARTBEAT_INTERVAL, PAIR_TIMEOUT, RebootProbe, RebootResumeArmError, RebootResumeArmer,
+    RebootResumeTicketId, SessionAudit, SessionError, SessionEvent, Shared, TEARDOWN_DRAIN,
 };
 
 /// What the agent's active loop answers a `SystemInfo` request from: the
@@ -109,11 +109,12 @@ pub(crate) struct HostCommand {
     pub(crate) session_override: Option<SessionId>,
     /// What to send.
     pub(crate) kind: Outbound,
-    /// Which local actor drives this request, stamped onto the outbound wire
-    /// `Request` so the agent (and the attended customer surface) can attribute
-    /// it to the AI or the technician (ST-M004-006, REQ-F-017). Ignored for a
-    /// `Cancel`, which is a distinct top-level message with no origin.
-    pub(crate) origin: Origin,
+    /// Which local actor drives this request and, for an AI action, the
+    /// caller's stated purpose, stamped onto the outbound wire `Request` or
+    /// `Cancel` so the agent (and the attended customer surface) can attribute
+    /// it and show why the caller says it is done (ST-M004-006, ST-M009-007,
+    /// REQ-F-017, REQ-F-026).
+    pub(crate) attribution: Attribution,
     /// Where the correlated result is delivered.
     pub(crate) reply: oneshot::Sender<Result<OpResult, SessionError>>,
 }
@@ -214,6 +215,19 @@ fn emit(tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
     let _ = tx.try_send(event);
 }
 
+/// Emits one per-request activity event ([`SessionEvent::RequestHandled`]) on
+/// the agent side only while the bounded channel keeps [`LIFECYCLE_RESERVE`]
+/// slots free, so a burst of remote actions (for example rapid pointer moves)
+/// can never crowd out a stop, revoke, or failure event (REQ-S-004, REQ-N-006).
+/// Under that pressure the activity line is shed (the console's audit still
+/// records every routed AI call); the shed line is never replaced by a
+/// fabricated one.
+fn emit_activity(tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
+    if tx.capacity() > LIFECYCLE_RESERVE {
+        let _ = tx.try_send(event);
+    }
+}
+
 /// Delivers one streamed output chunk to the console under the bounded event
 /// channel's drop-and-mark policy (REQ-N-006).
 ///
@@ -297,20 +311,77 @@ async fn recv_frame<T: AsyncRead + AsyncWrite + Unpin>(channel: &mut SecureChann
     }
 }
 
+/// Where the agent writes one outbound frame: the secure channel itself, or a
+/// [`ReplyTap`] that also notes how a request was answered (ST-M009-007). Every
+/// agent reply helper is generic over it, so the request handler reports each
+/// request's honest outcome without threading it through every branch.
+trait FrameSink {
+    /// Sends one frame, mapping any channel fault to `()`.
+    async fn send_frame(&mut self, message: &Message) -> Result<(), ()>;
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> FrameSink for SecureChannel<T> {
+    async fn send_frame(&mut self, message: &Message) -> Result<(), ()> {
+        self.send(message).await.map_err(|_| ())
+    }
+}
+
+/// Wraps the agent's channel while one request is serviced and records how the
+/// agent answered **that** request — a `Response` (succeeded) or an `Error`
+/// (failed, with its code) carrying its id — so the customer surface reports
+/// the real result beside the stated purpose (REQ-F-026, REQ-N-008). Other
+/// frames (a desktop-activity event) pass through unrecorded. The answer is
+/// noted before the send, because the operation already ran even if the reply
+/// then fails to reach the console.
+struct ReplyTap<'a, C> {
+    inner: &'a mut C,
+    request: RequestId,
+    outcome: Option<ActionOutcome>,
+}
+
+impl<'a, C: FrameSink> ReplyTap<'a, C> {
+    fn new(inner: &'a mut C, request: RequestId) -> Self {
+        Self {
+            inner,
+            request,
+            outcome: None,
+        }
+    }
+
+    /// The recorded answer, or [`ActionOutcome::Unknown`] when none was sent.
+    fn outcome(&self) -> ActionOutcome {
+        self.outcome.unwrap_or(ActionOutcome::Unknown)
+    }
+}
+
+impl<C: FrameSink> FrameSink for ReplyTap<'_, C> {
+    async fn send_frame(&mut self, message: &Message) -> Result<(), ()> {
+        match message {
+            Message::Response { id, .. } if *id == self.request => {
+                self.outcome = Some(ActionOutcome::Succeeded);
+            }
+            Message::Error {
+                id: Some(id), code, ..
+            } if *id == self.request => {
+                self.outcome = Some(ActionOutcome::Failed { code: *code });
+            }
+            _ => {}
+        }
+        self.inner.send_frame(message).await
+    }
+}
+
 /// Sends one already-built message, mapping any channel fault to `()` (the caller
 /// treats a failed send as a terminal disconnect).
-async fn send_message<T: AsyncRead + AsyncWrite + Unpin>(
-    channel: &mut SecureChannel<T>,
-    message: Message,
-) -> Result<(), ()> {
-    channel.send(&message).await.map_err(|_| ())
+async fn send_message<C: FrameSink>(channel: &mut C, message: Message) -> Result<(), ()> {
+    channel.send_frame(&message).await
 }
 
 /// Sends a secret-free wire `Error` for a rejected request (bad session, unknown
 /// job, unsupported op, failed spawn). Never echoes remote command text
 /// (REQ-N-015).
-async fn send_error<T: AsyncRead + AsyncWrite + Unpin>(
-    channel: &mut SecureChannel<T>,
+async fn send_error<C: FrameSink>(
+    channel: &mut C,
     id: Option<RequestId>,
     session: Option<SessionId>,
     code: ErrorCode,
@@ -1283,10 +1354,17 @@ async fn host_active<T: AsyncRead + AsyncWrite + Unpin>(
                     Outbound::Op(op) => Message::Request {
                         id,
                         session: stamp,
-                        origin: command.origin,
+                        origin: command.attribution.origin,
+                        purpose: command.attribution.purpose,
                         op,
                     },
-                    Outbound::Cancel(job) => Message::Cancel { id, session: stamp, job },
+                    Outbound::Cancel(job) => Message::Cancel {
+                        id,
+                        session: stamp,
+                        origin: command.attribution.origin,
+                        purpose: command.attribution.purpose,
+                        job,
+                    },
                 };
                 match channel.send(&message).await {
                     Ok(()) => {
@@ -1966,8 +2044,8 @@ async fn forward_broker_event<T: AsyncRead + AsyncWrite + Unpin>(
 /// (or is about to send) that response, so a channel that breaks here is caught
 /// on the next frame rather than fabricating a failure for an operation that
 /// genuinely ran.
-async fn signal_desktop_activity<T: AsyncRead + AsyncWrite + Unpin>(
-    channel: &mut SecureChannel<T>,
+async fn signal_desktop_activity<C: FrameSink>(
+    channel: &mut C,
     session: SessionId,
     tx: &mpsc::Sender<SessionEvent>,
     access: DesktopAccess,
@@ -2008,6 +2086,7 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
             id,
             session,
             origin,
+            purpose,
             op,
         } => {
             if session != negotiated {
@@ -2024,8 +2103,14 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                 .await;
                 return AgentStep::Continue;
             }
-            handle_agent_request(
-                channel,
+            // Describe the real operation before it moves into the handler, so
+            // the customer sees what was done beside the caller's stated
+            // purpose and the honest result (REQ-F-026, ST-M009-007).
+            let operation = (!crate::is_transfer_step(&op)).then(|| crate::describe_operation(&op));
+            let is_exec = matches!(op, Operation::Exec { .. });
+            let mut tap = ReplyTap::new(channel, id);
+            let step = handle_agent_request(
+                &mut tap,
                 negotiated,
                 broker,
                 file_store,
@@ -2036,14 +2121,37 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                 terminal_enabled,
                 desktop_enabled,
                 id,
-                origin,
+                Attribution::new(origin, purpose.clone()),
                 op,
                 tx,
                 audit,
             )
-            .await
+            .await;
+            let outcome = tap.outcome();
+            // A command that started is reported by `CommandStarted` and later
+            // `ExecFinished`; every other handled request is reported here.
+            if let Some(operation) = operation
+                && !(is_exec && outcome == ActionOutcome::Succeeded)
+            {
+                emit_activity(
+                    tx,
+                    SessionEvent::RequestHandled {
+                        origin,
+                        purpose,
+                        operation,
+                        outcome,
+                    },
+                );
+            }
+            step
         }
-        Message::Cancel { id, session, job } => {
+        Message::Cancel {
+            id,
+            session,
+            origin,
+            purpose,
+            job,
+        } => {
             if session != negotiated {
                 let _ = send_error(
                     channel,
@@ -2056,11 +2164,12 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                 .await;
                 return AgentStep::Continue;
             }
-            match broker.cancel(cretlink_exec::JobId(job.0)) {
-                Ok(()) => reply_ack(channel, negotiated, id).await,
+            let mut tap = ReplyTap::new(channel, id);
+            let step = match broker.cancel(cretlink_exec::JobId(job.0)) {
+                Ok(()) => reply_ack(&mut tap, negotiated, id).await,
                 Err(_) => {
                     let _ = send_error(
-                        channel,
+                        &mut tap,
                         Some(id),
                         Some(negotiated),
                         ErrorCode::UnknownJob,
@@ -2070,7 +2179,17 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                     .await;
                     AgentStep::Continue
                 }
-            }
+            };
+            emit_activity(
+                tx,
+                SessionEvent::RequestHandled {
+                    origin,
+                    purpose,
+                    operation: crate::describe_cancel(job),
+                    outcome: tap.outcome(),
+                },
+            );
+            step
         }
         // The console's heartbeat echo: record liveness (do not echo back).
         Message::Control {
@@ -2092,8 +2211,8 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
 
 /// Services one accepted, session-scoped console request.
 #[allow(clippy::too_many_arguments)]
-async fn handle_agent_request<T: AsyncRead + AsyncWrite + Unpin>(
-    channel: &mut SecureChannel<T>,
+async fn handle_agent_request<C: FrameSink>(
+    channel: &mut C,
     session: SessionId,
     broker: &Broker,
     file_store: &FileStore,
@@ -2104,7 +2223,7 @@ async fn handle_agent_request<T: AsyncRead + AsyncWrite + Unpin>(
     terminal_enabled: bool,
     desktop_enabled: bool,
     id: RequestId,
-    origin: Origin,
+    attribution: Attribution,
     op: Operation,
     tx: &mpsc::Sender<SessionEvent>,
     audit: &dyn SessionAudit,
@@ -2155,7 +2274,8 @@ async fn handle_agent_request<T: AsyncRead + AsyncWrite + Unpin>(
                             job,
                             shell,
                             command,
-                            origin,
+                            origin: attribution.origin,
+                            purpose: attribution.purpose,
                         },
                     );
                     audit.record(Actor::Console, "exec_start", Outcome::Ok);
@@ -2789,11 +2909,7 @@ fn fs_audit_action(op: &Operation) -> Option<&'static str> {
 }
 
 /// Sends a payload-free `Ack` response, mapping a failed send to a disconnect.
-async fn reply_ack<T: AsyncRead + AsyncWrite + Unpin>(
-    channel: &mut SecureChannel<T>,
-    session: SessionId,
-    id: RequestId,
-) -> AgentStep {
+async fn reply_ack<C: FrameSink>(channel: &mut C, session: SessionId, id: RequestId) -> AgentStep {
     if send_message(
         channel,
         Message::Response {
@@ -2833,8 +2949,8 @@ async fn gate_input(governor: &mut cretlink_exec::InputGovernor) {
     governor.begin(Instant::now());
 }
 
-async fn desktop_not_advertised<T: AsyncRead + AsyncWrite + Unpin>(
-    channel: &mut SecureChannel<T>,
+async fn desktop_not_advertised<C: FrameSink>(
+    channel: &mut C,
     id: RequestId,
     session: SessionId,
 ) -> AgentStep {
@@ -2854,8 +2970,8 @@ async fn desktop_not_advertised<T: AsyncRead + AsyncWrite + Unpin>(
 /// present on this platform answers [`ErrorCode::Unsupported`] (never a
 /// fabricated frame or a silently dropped input); anything else is an internal
 /// failure (REQ-N-008, REQ-S-009).
-async fn desktop_backend_error<T: AsyncRead + AsyncWrite + Unpin>(
-    channel: &mut SecureChannel<T>,
+async fn desktop_backend_error<C: FrameSink>(
+    channel: &mut C,
     id: RequestId,
     session: SessionId,
     err: &cretlink_exec::ExecError,

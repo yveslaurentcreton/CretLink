@@ -8,7 +8,7 @@
 //! ([`inventory`]). Command execution, file operations, terminals and the
 //! desktop are served by the `cretlink-session` runtime the agent hosts. The
 //! headless binary in `main.rs` and the graphical consent window
-//! (`apps/agent-gui`) both build on this core; see ADR-0005.
+//! (`apps/app` (Get help)) both build on this core; see ADR-0005.
 //!
 //! # Cross-platform CI
 //!

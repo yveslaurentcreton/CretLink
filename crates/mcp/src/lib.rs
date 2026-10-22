@@ -18,11 +18,13 @@
 mod bridge;
 pub mod ipc;
 mod ipc_target;
+mod stdio;
 mod target;
 
 pub use bridge::{MAX_EXEC_OUTPUT_BYTES, MAX_STDIN_BASE64_CHARS, McpBridge};
 pub use ipc::{IpcEndpoint, IpcError, IpcListener, IpcRequest, IpcResponse, IpcStream, TermFrame};
 pub use ipc_target::IpcTargetSession;
+pub use stdio::serve_stdio;
 pub use target::{
     CallError, CaptureParams, CaptureReport, CleanupSummary, DirPage, DownloadParams,
     DownloadReport, ExecParams, ExecReport, Routed, StatReport, SystemInfoReport, TargetError,

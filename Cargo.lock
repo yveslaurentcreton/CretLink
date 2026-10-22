@@ -329,6 +329,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cretlink-cli"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "cretlink-console",
+ "cretlink-mcp",
+ "cretlink-protocol",
+ "cretlink-session",
+ "cretlink-shared",
+ "cretlink-shell",
+ "jsonschema",
+ "serde_json",
+ "tokio",
+ "windows",
+]
+
+[[package]]
 name = "cretlink-console"
 version = "0.0.0"
 dependencies = [
@@ -401,7 +418,6 @@ dependencies = [
  "cretlink-protocol",
  "cretlink-session",
  "jsonschema",
- "rmcp",
  "serde_json",
  "tokio",
 ]
@@ -441,6 +457,7 @@ dependencies = [
  "cretlink-protocol",
  "cretlink-relay",
  "cretlink-session",
+ "cretlink-shared",
  "cretlink-wss",
  "tokio",
 ]
@@ -505,6 +522,7 @@ dependencies = [
  "cretlink-exec",
  "cretlink-protocol",
  "cretlink-session",
+ "cretlink-shared",
  "embed-manifest",
  "rand 0.9.5",
  "serde",

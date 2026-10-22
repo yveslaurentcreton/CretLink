@@ -42,8 +42,8 @@ use cretlink_protocol::{
     SessionId, Shell, TargetIdentity,
 };
 use cretlink_session::{
-    CancelToken, CleanupTrigger, DownloadRequest, ExecRequest as HostExecRequest, HostHandle,
-    OpResult, Operation, Origin, OutputStream, RemotePath, RevokeReason,
+    Attribution, CancelToken, CleanupTrigger, DownloadRequest, ExecRequest as HostExecRequest,
+    HostHandle, OpResult, Operation, Origin, OutputStream, Purpose, RemotePath, RevokeReason,
     SessionError as HostSessionError, SessionEvent, StagedEntry, StartedJob, TransferReport,
     UploadRequest,
 };
@@ -81,28 +81,30 @@ enum DriverCommand {
     Run {
         request: HostExecRequest,
         /// Which local actor drives this command (console or the AI via the MCP
-        /// bridge), stamped onto the wire request (ST-M004-006, REQ-F-017).
-        origin: Origin,
+        /// bridge) and, for the AI, its stated purpose, stamped onto the wire
+        /// request (ST-M004-006, ST-M009-007, REQ-F-017, REQ-F-026).
+        attribution: Attribution,
         reply: oneshot::Sender<Result<StartedJob, HostSessionError>>,
     },
     /// A live target/context inspection, answered by the agent for this very
     /// request — never from the consent-time cache (ST-M003-003).
     SystemInfo {
-        origin: Origin,
+        attribution: Attribution,
         reply: oneshot::Sender<Result<(TargetIdentity, bool), HostSessionError>>,
     },
     WriteStdin {
         job: JobId,
         data: Vec<u8>,
-        origin: Origin,
+        attribution: Attribution,
         reply: oneshot::Sender<Result<(), HostSessionError>>,
     },
     Cancel {
         job: JobId,
+        attribution: Attribution,
         reply: oneshot::Sender<Result<(), HostSessionError>>,
     },
     ListJobs {
-        origin: Origin,
+        attribution: Attribution,
         reply: oneshot::Sender<Result<Vec<JobSummary>, HostSessionError>>,
     },
     /// A single bounded file operation (stat, list, create/remove dir, move,
@@ -110,7 +112,7 @@ enum DriverCommand {
     /// on the owned handle and answers over `reply` (ST-M004-003).
     FileOp {
         op: Operation,
-        origin: Origin,
+        attribution: Attribution,
         reply: oneshot::Sender<Result<OpResult, HostSessionError>>,
     },
     /// A resumable, verified upload driven inline by the transfer engine
@@ -118,12 +120,14 @@ enum DriverCommand {
     /// transfer gate so a concurrent revoke aborts it within one chunk.
     Upload {
         request: UploadRequest,
+        attribution: Attribution,
         reply: oneshot::Sender<Result<TransferReport, HostSessionError>>,
     },
     /// A resumable, verified download driven inline by the transfer engine
     /// (ST-M004-003, REQ-N-007).
     Download {
         request: DownloadRequest,
+        attribution: Attribution,
         reply: oneshot::Sender<Result<TransferReport, HostSessionError>>,
     },
     Stop {
@@ -527,7 +531,7 @@ impl ConsoleSessionService {
         request: HostExecRequest,
     ) -> Result<StartedJob, HostSessionError> {
         // The interactive CLI path: the technician drives it (ST-M004-006).
-        self.dispatch_run(request, Origin::Console).await
+        self.dispatch_run(request, Origin::Console.into()).await
     }
 
     /// Starts a command, stamping the given [`Origin`] onto the wire request so
@@ -537,7 +541,7 @@ impl ConsoleSessionService {
     async fn dispatch_run(
         &self,
         request: HostExecRequest,
-        origin: Origin,
+        attribution: Attribution,
     ) -> Result<StartedJob, HostSessionError> {
         if !self.is_active() {
             return Err(HostSessionError::NotActive);
@@ -547,7 +551,7 @@ impl ConsoleSessionService {
             .commands
             .send(DriverCommand::Run {
                 request,
-                origin,
+                attribution,
                 reply: reply_tx,
             })
             .map_err(|_| HostSessionError::Disconnected)?;
@@ -562,7 +566,8 @@ impl ConsoleSessionService {
     ///
     /// See [`Self::run_command`].
     pub async fn write_stdin(&self, job: JobId, data: Vec<u8>) -> Result<(), HostSessionError> {
-        self.dispatch_write_stdin(job, data, Origin::Console).await
+        self.dispatch_write_stdin(job, data, Origin::Console.into())
+            .await
     }
 
     /// Feeds bytes to a job's stdin, stamping the given [`Origin`] (ST-M004-006).
@@ -570,7 +575,7 @@ impl ConsoleSessionService {
         &self,
         job: JobId,
         data: Vec<u8>,
-        origin: Origin,
+        attribution: Attribution,
     ) -> Result<(), HostSessionError> {
         if !self.is_active() {
             return Err(HostSessionError::NotActive);
@@ -581,7 +586,7 @@ impl ConsoleSessionService {
             .send(DriverCommand::WriteStdin {
                 job,
                 data,
-                origin,
+                attribution,
                 reply: reply_tx,
             })
             .map_err(|_| HostSessionError::Disconnected)?;
@@ -596,6 +601,16 @@ impl ConsoleSessionService {
     ///
     /// See [`Self::run_command`].
     pub async fn cancel_job(&self, job: JobId) -> Result<(), HostSessionError> {
+        self.dispatch_cancel(job, Origin::Console.into()).await
+    }
+
+    /// Requests cancellation, stamping the given [`Attribution`] onto the wire
+    /// `Cancel` (ST-M009-007).
+    async fn dispatch_cancel(
+        &self,
+        job: JobId,
+        attribution: Attribution,
+    ) -> Result<(), HostSessionError> {
         if !self.is_active() {
             return Err(HostSessionError::NotActive);
         }
@@ -604,6 +619,7 @@ impl ConsoleSessionService {
             .commands
             .send(DriverCommand::Cancel {
                 job,
+                attribution,
                 reply: reply_tx,
             })
             .map_err(|_| HostSessionError::Disconnected)?;
@@ -618,13 +634,13 @@ impl ConsoleSessionService {
     ///
     /// See [`Self::run_command`].
     pub async fn list_jobs(&self) -> Result<Vec<JobSummary>, HostSessionError> {
-        self.dispatch_list_jobs(Origin::Console).await
+        self.dispatch_list_jobs(Origin::Console.into()).await
     }
 
     /// Lists tracked jobs, stamping the given [`Origin`] (ST-M004-006).
     async fn dispatch_list_jobs(
         &self,
-        origin: Origin,
+        attribution: Attribution,
     ) -> Result<Vec<JobSummary>, HostSessionError> {
         if !self.is_active() {
             return Err(HostSessionError::NotActive);
@@ -633,7 +649,7 @@ impl ConsoleSessionService {
         self.inner
             .commands
             .send(DriverCommand::ListJobs {
-                origin,
+                attribution,
                 reply: reply_tx,
             })
             .map_err(|_| HostSessionError::Disconnected)?;
@@ -679,7 +695,10 @@ impl ConsoleSessionService {
     ///
     /// [`TargetError::NoConsentedSession`] when fail-closed, or a mapped error
     /// the agent or transport surfaced.
-    pub async fn system_info(&self) -> Result<SystemInfoReport, TargetError> {
+    pub async fn system_info(
+        &self,
+        purpose: Option<Purpose>,
+    ) -> Result<SystemInfoReport, TargetError> {
         if !self.is_active() {
             return Err(TargetError::NoConsentedSession);
         }
@@ -687,7 +706,7 @@ impl ConsoleSessionService {
         self.inner
             .commands
             .send(DriverCommand::SystemInfo {
-                origin: Origin::Mcp,
+                attribution: mcp(purpose),
                 reply: reply_tx,
             })
             .map_err(|_| TargetError::Disconnected)?;
@@ -716,6 +735,7 @@ impl ConsoleSessionService {
     /// [`TargetError`] if the agent rejects the command or the session ends.
     pub async fn exec(
         &self,
+        purpose: Option<Purpose>,
         params: ExecParams,
         output_cap: usize,
     ) -> Result<ExecReport, TargetError> {
@@ -736,7 +756,7 @@ impl ConsoleSessionService {
         let started_at = Instant::now();
         // The AI drives this via the MCP bridge (ST-M004-006).
         let started = self
-            .dispatch_run(request, Origin::Mcp)
+            .dispatch_run(request, mcp(purpose))
             .await
             .map_err(session_to_target)?;
         collect(
@@ -754,11 +774,16 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn exec_write_stdin(&self, job: JobId, data: Vec<u8>) -> Result<(), TargetError> {
+    pub async fn exec_write_stdin(
+        &self,
+        purpose: Option<Purpose>,
+        job: JobId,
+        data: Vec<u8>,
+    ) -> Result<(), TargetError> {
         if !self.is_active() {
             return Err(TargetError::NoConsentedSession);
         }
-        self.dispatch_write_stdin(job, data, Origin::Mcp)
+        self.dispatch_write_stdin(job, data, mcp(purpose))
             .await
             .map_err(session_to_target)
     }
@@ -768,11 +793,17 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn exec_cancel(&self, job: JobId) -> Result<(), TargetError> {
+    pub async fn exec_cancel(
+        &self,
+        purpose: Option<Purpose>,
+        job: JobId,
+    ) -> Result<(), TargetError> {
         if !self.is_active() {
             return Err(TargetError::NoConsentedSession);
         }
-        self.cancel_job(job).await.map_err(session_to_target)
+        self.dispatch_cancel(job, mcp(purpose))
+            .await
+            .map_err(session_to_target)
     }
 
     /// Lists tracked jobs (MCP-facing mapping).
@@ -780,11 +811,14 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn exec_list_jobs(&self) -> Result<Vec<JobSummary>, TargetError> {
+    pub async fn exec_list_jobs(
+        &self,
+        purpose: Option<Purpose>,
+    ) -> Result<Vec<JobSummary>, TargetError> {
         if !self.is_active() {
             return Err(TargetError::NoConsentedSession);
         }
-        self.dispatch_list_jobs(Origin::Mcp)
+        self.dispatch_list_jobs(mcp(purpose))
             .await
             .map_err(session_to_target)
     }
@@ -800,7 +834,11 @@ impl ConsoleSessionService {
     ///
     /// [`TargetError::NoConsentedSession`] when fail-closed, or a mapped error
     /// the agent or transport surfaced.
-    async fn mcp_file_op(&self, op: Operation) -> Result<OpResult, TargetError> {
+    async fn mcp_file_op(
+        &self,
+        purpose: Option<Purpose>,
+        op: Operation,
+    ) -> Result<OpResult, TargetError> {
         if !self.is_active() {
             return Err(TargetError::NoConsentedSession);
         }
@@ -809,10 +847,9 @@ impl ConsoleSessionService {
             .commands
             .send(DriverCommand::FileOp {
                 op,
-                // A single AI-driven file operation is attributed to the AI;
-                // transfer chunk ops keep the default console origin (see
-                // `HostHandle::submit_op`) (ST-M004-006).
-                origin: Origin::Mcp,
+                // A single AI-driven operation is attributed to the AI, with
+                // its stated purpose (ST-M004-006, ST-M009-007).
+                attribution: mcp(purpose),
                 reply: reply_tx,
             })
             .map_err(|_| TargetError::Disconnected)?;
@@ -828,8 +865,15 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn fs_stat(&self, path: RemotePath) -> Result<StatReport, TargetError> {
-        match self.mcp_file_op(Operation::FsStat { path }).await? {
+    pub async fn fs_stat(
+        &self,
+        purpose: Option<Purpose>,
+        path: RemotePath,
+    ) -> Result<StatReport, TargetError> {
+        match self
+            .mcp_file_op(purpose, Operation::FsStat { path })
+            .await?
+        {
             OpResult::PathStat { entry, partial_len } => Ok(StatReport { entry, partial_len }),
             _ => Err(TargetError::Unexpected),
         }
@@ -843,14 +887,18 @@ impl ConsoleSessionService {
     /// A mapped [`TargetError`]; fail-closed when inactive.
     pub async fn fs_list(
         &self,
+        purpose: Option<Purpose>,
         path: RemotePath,
         continue_after: Option<String>,
     ) -> Result<DirPage, TargetError> {
         match self
-            .mcp_file_op(Operation::FsList {
-                path,
-                continue_after,
-            })
+            .mcp_file_op(
+                purpose,
+                Operation::FsList {
+                    path,
+                    continue_after,
+                },
+            )
             .await?
         {
             OpResult::DirEntries { entries, end } => Ok(DirPage { entries, end }),
@@ -863,8 +911,15 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn make_dir(&self, path: RemotePath) -> Result<(), TargetError> {
-        match self.mcp_file_op(Operation::CreateDir { path }).await? {
+    pub async fn make_dir(
+        &self,
+        purpose: Option<Purpose>,
+        path: RemotePath,
+    ) -> Result<(), TargetError> {
+        match self
+            .mcp_file_op(purpose, Operation::CreateDir { path })
+            .await?
+        {
             OpResult::Ack {} => Ok(()),
             _ => Err(TargetError::Unexpected),
         }
@@ -878,16 +933,20 @@ impl ConsoleSessionService {
     /// A mapped [`TargetError`]; fail-closed when inactive.
     pub async fn fs_move(
         &self,
+        purpose: Option<Purpose>,
         from: RemotePath,
         to: RemotePath,
         overwrite: bool,
     ) -> Result<(), TargetError> {
         match self
-            .mcp_file_op(Operation::FsMove {
-                from,
-                to,
-                overwrite,
-            })
+            .mcp_file_op(
+                purpose,
+                Operation::FsMove {
+                    from,
+                    to,
+                    overwrite,
+                },
+            )
             .await?
         {
             OpResult::Ack {} => Ok(()),
@@ -900,8 +959,15 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn fs_delete(&self, path: RemotePath) -> Result<(), TargetError> {
-        match self.mcp_file_op(Operation::FsDelete { path }).await? {
+    pub async fn fs_delete(
+        &self,
+        purpose: Option<Purpose>,
+        path: RemotePath,
+    ) -> Result<(), TargetError> {
+        match self
+            .mcp_file_op(purpose, Operation::FsDelete { path })
+            .await?
+        {
             OpResult::Ack {} => Ok(()),
             _ => Err(TargetError::Unexpected),
         }
@@ -912,8 +978,15 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn remove_dir(&self, path: RemotePath) -> Result<(), TargetError> {
-        match self.mcp_file_op(Operation::RemoveDir { path }).await? {
+    pub async fn remove_dir(
+        &self,
+        purpose: Option<Purpose>,
+        path: RemotePath,
+    ) -> Result<(), TargetError> {
+        match self
+            .mcp_file_op(purpose, Operation::RemoveDir { path })
+            .await?
+        {
             OpResult::Ack {} => Ok(()),
             _ => Err(TargetError::Unexpected),
         }
@@ -924,8 +997,11 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn list_staged(&self) -> Result<Vec<StagedEntry>, TargetError> {
-        match self.mcp_file_op(Operation::ListStaged {}).await? {
+    pub async fn list_staged(
+        &self,
+        purpose: Option<Purpose>,
+    ) -> Result<Vec<StagedEntry>, TargetError> {
+        match self.mcp_file_op(purpose, Operation::ListStaged {}).await? {
             OpResult::StagedList { entries } => Ok(entries),
             _ => Err(TargetError::Unexpected),
         }
@@ -937,9 +1013,13 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn cleanup(&self, trigger: CleanupTrigger) -> Result<CleanupSummary, TargetError> {
+    pub async fn cleanup(
+        &self,
+        purpose: Option<Purpose>,
+        trigger: CleanupTrigger,
+    ) -> Result<CleanupSummary, TargetError> {
         match self
-            .mcp_file_op(Operation::StagingCleanup { trigger })
+            .mcp_file_op(purpose, Operation::StagingCleanup { trigger })
             .await?
         {
             OpResult::CleanupReport { removed, failed } => Ok(CleanupSummary { removed, failed }),
@@ -961,6 +1041,7 @@ impl ConsoleSessionService {
     /// A mapped [`TargetError`]; fail-closed when inactive.
     pub async fn capture_desktop(
         &self,
+        purpose: Option<Purpose>,
         params: CaptureParams,
     ) -> Result<CaptureReport, TargetError> {
         let CaptureParams {
@@ -971,13 +1052,16 @@ impl ConsoleSessionService {
             quality,
         } = params;
         match self
-            .mcp_file_op(Operation::DesktopCapture {
-                display,
-                format,
-                max_width,
-                max_height,
-                quality,
-            })
+            .mcp_file_op(
+                purpose,
+                Operation::DesktopCapture {
+                    display,
+                    format,
+                    max_width,
+                    max_height,
+                    quality,
+                },
+            )
             .await?
         {
             OpResult::DesktopFrame {
@@ -1000,18 +1084,22 @@ impl ConsoleSessionService {
     /// A mapped [`TargetError`]; fail-closed when inactive.
     pub async fn desktop_pointer(
         &self,
+        purpose: Option<Purpose>,
         action: PointerAction,
         button: PointerButton,
         x: i32,
         y: i32,
     ) -> Result<(), TargetError> {
         match self
-            .mcp_file_op(Operation::DesktopPointer {
-                action,
-                button,
-                x,
-                y,
-            })
+            .mcp_file_op(
+                purpose,
+                Operation::DesktopPointer {
+                    action,
+                    button,
+                    x,
+                    y,
+                },
+            )
             .await?
         {
             OpResult::Ack {} => Ok(()),
@@ -1026,13 +1114,14 @@ impl ConsoleSessionService {
     /// A mapped [`TargetError`]; fail-closed when inactive.
     pub async fn desktop_scroll(
         &self,
+        purpose: Option<Purpose>,
         x: i32,
         y: i32,
         dx: i32,
         dy: i32,
     ) -> Result<(), TargetError> {
         match self
-            .mcp_file_op(Operation::DesktopScroll { x, y, dx, dy })
+            .mcp_file_op(purpose, Operation::DesktopScroll { x, y, dx, dy })
             .await?
         {
             OpResult::Ack {} => Ok(()),
@@ -1045,9 +1134,14 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn desktop_key(&self, action: KeyAction, key: String) -> Result<(), TargetError> {
+    pub async fn desktop_key(
+        &self,
+        purpose: Option<Purpose>,
+        action: KeyAction,
+        key: String,
+    ) -> Result<(), TargetError> {
         match self
-            .mcp_file_op(Operation::DesktopKey { action, key })
+            .mcp_file_op(purpose, Operation::DesktopKey { action, key })
             .await?
         {
             OpResult::Ack {} => Ok(()),
@@ -1060,8 +1154,15 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn desktop_type(&self, text: String) -> Result<(), TargetError> {
-        match self.mcp_file_op(Operation::DesktopType { text }).await? {
+    pub async fn desktop_type(
+        &self,
+        purpose: Option<Purpose>,
+        text: String,
+    ) -> Result<(), TargetError> {
+        match self
+            .mcp_file_op(purpose, Operation::DesktopType { text })
+            .await?
+        {
             OpResult::Ack {} => Ok(()),
             _ => Err(TargetError::Unexpected),
         }
@@ -1072,8 +1173,15 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn desktop_hotkey(&self, keys: Vec<String>) -> Result<(), TargetError> {
-        match self.mcp_file_op(Operation::DesktopHotkey { keys }).await? {
+    pub async fn desktop_hotkey(
+        &self,
+        purpose: Option<Purpose>,
+        keys: Vec<String>,
+    ) -> Result<(), TargetError> {
+        match self
+            .mcp_file_op(purpose, Operation::DesktopHotkey { keys })
+            .await?
+        {
             OpResult::Ack {} => Ok(()),
             _ => Err(TargetError::Unexpected),
         }
@@ -1084,8 +1192,15 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn desktop_wait(&self, millis: u64) -> Result<(), TargetError> {
-        match self.mcp_file_op(Operation::DesktopWait { millis }).await? {
+    pub async fn desktop_wait(
+        &self,
+        purpose: Option<Purpose>,
+        millis: u64,
+    ) -> Result<(), TargetError> {
+        match self
+            .mcp_file_op(purpose, Operation::DesktopWait { millis })
+            .await?
+        {
             OpResult::Ack {} => Ok(()),
             _ => Err(TargetError::Unexpected),
         }
@@ -1096,8 +1211,14 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn clipboard_get(&self) -> Result<Option<String>, TargetError> {
-        match self.mcp_file_op(Operation::ClipboardGet {}).await? {
+    pub async fn clipboard_get(
+        &self,
+        purpose: Option<Purpose>,
+    ) -> Result<Option<String>, TargetError> {
+        match self
+            .mcp_file_op(purpose, Operation::ClipboardGet {})
+            .await?
+        {
             OpResult::ClipboardContents { text } => Ok(text),
             _ => Err(TargetError::Unexpected),
         }
@@ -1108,8 +1229,15 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive.
-    pub async fn clipboard_set(&self, text: String) -> Result<(), TargetError> {
-        match self.mcp_file_op(Operation::ClipboardSet { text }).await? {
+    pub async fn clipboard_set(
+        &self,
+        purpose: Option<Purpose>,
+        text: String,
+    ) -> Result<(), TargetError> {
+        match self
+            .mcp_file_op(purpose, Operation::ClipboardSet { text })
+            .await?
+        {
             OpResult::Ack {} => Ok(()),
             _ => Err(TargetError::Unexpected),
         }
@@ -1123,7 +1251,11 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive or revoked.
-    pub async fn upload(&self, params: UploadParams) -> Result<UploadReport, TargetError> {
+    pub async fn upload(
+        &self,
+        purpose: Option<Purpose>,
+        params: UploadParams,
+    ) -> Result<UploadReport, TargetError> {
         if !self.is_active() {
             return Err(TargetError::NoConsentedSession);
         }
@@ -1139,6 +1271,7 @@ impl ConsoleSessionService {
             .commands
             .send(DriverCommand::Upload {
                 request,
+                attribution: mcp(purpose),
                 reply: reply_tx,
             })
             .map_err(|_| TargetError::Disconnected)?;
@@ -1156,7 +1289,11 @@ impl ConsoleSessionService {
     /// # Errors
     ///
     /// A mapped [`TargetError`]; fail-closed when inactive or revoked.
-    pub async fn download(&self, params: DownloadParams) -> Result<DownloadReport, TargetError> {
+    pub async fn download(
+        &self,
+        purpose: Option<Purpose>,
+        params: DownloadParams,
+    ) -> Result<DownloadReport, TargetError> {
         if !self.is_active() {
             return Err(TargetError::NoConsentedSession);
         }
@@ -1170,6 +1307,7 @@ impl ConsoleSessionService {
             .commands
             .send(DriverCommand::Download {
                 request,
+                attribution: mcp(purpose),
                 reply: reply_tx,
             })
             .map_err(|_| TargetError::Disconnected)?;
@@ -1299,7 +1437,7 @@ impl ConsoleSessionService {
         if !self.is_active() {
             return Err(TargetError::NoConsentedSession);
         }
-        self.dispatch_write_stdin(term, data, Origin::Terminal)
+        self.dispatch_write_stdin(term, data, Origin::Terminal.into())
             .await
             .map_err(session_to_target)
     }
@@ -1451,18 +1589,18 @@ async fn run_command(handle: &HostHandle, inner: &Inner, command: DriverCommand)
     match command {
         DriverCommand::Run {
             request,
-            origin,
+            attribution,
             reply,
         } => {
             if active {
-                let _ = reply.send(handle.run_command_as(request, origin).await);
+                let _ = reply.send(handle.run_command_as(request, attribution).await);
             } else {
                 let _ = reply.send(Err(HostSessionError::NotActive));
             }
         }
-        DriverCommand::SystemInfo { origin, reply } => {
+        DriverCommand::SystemInfo { attribution, reply } => {
             if active {
-                let _ = reply.send(handle.system_info_as(origin).await);
+                let _ = reply.send(handle.system_info_as(attribution).await);
             } else {
                 let _ = reply.send(Err(HostSessionError::NotActive));
             }
@@ -1470,41 +1608,57 @@ async fn run_command(handle: &HostHandle, inner: &Inner, command: DriverCommand)
         DriverCommand::WriteStdin {
             job,
             data,
-            origin,
+            attribution,
             reply,
         } => {
             if active {
-                let _ = reply.send(handle.write_stdin_as(job, data, origin).await);
+                let _ = reply.send(handle.write_stdin_as(job, data, attribution).await);
             } else {
                 let _ = reply.send(Err(HostSessionError::NotActive));
             }
         }
-        DriverCommand::Cancel { job, reply } => {
+        DriverCommand::Cancel {
+            job,
+            attribution,
+            reply,
+        } => {
             if active {
-                let _ = reply.send(handle.cancel_job(job).await);
+                let _ = reply.send(handle.cancel_job_as(job, attribution).await);
             } else {
                 let _ = reply.send(Err(HostSessionError::NotActive));
             }
         }
-        DriverCommand::ListJobs { origin, reply } => {
+        DriverCommand::ListJobs { attribution, reply } => {
             if active {
-                let _ = reply.send(handle.list_jobs_as(origin).await);
+                let _ = reply.send(handle.list_jobs_as(attribution).await);
             } else {
                 let _ = reply.send(Err(HostSessionError::NotActive));
             }
         }
-        DriverCommand::FileOp { op, origin, reply } => {
+        DriverCommand::FileOp {
+            op,
+            attribution,
+            reply,
+        } => {
             if active {
-                let _ = reply.send(handle.file_op_as(op, origin).await);
+                let _ = reply.send(handle.file_op_as(op, attribution).await);
             } else {
                 let _ = reply.send(Err(HostSessionError::NotActive));
             }
         }
-        DriverCommand::Upload { request, reply } => {
-            let _ = reply.send(run_upload(handle, inner, request).await);
+        DriverCommand::Upload {
+            request,
+            attribution,
+            reply,
+        } => {
+            let _ = reply.send(run_upload(handle, inner, request, attribution).await);
         }
-        DriverCommand::Download { request, reply } => {
-            let _ = reply.send(run_download(handle, inner, request).await);
+        DriverCommand::Download {
+            request,
+            attribution,
+            reply,
+        } => {
+            let _ = reply.send(run_download(handle, inner, request, attribution).await);
         }
         DriverCommand::OpenTerminal {
             shell,
@@ -1582,6 +1736,12 @@ fn fanout_terminal(inner: &Inner, event: &SessionEvent) {
     }
 }
 
+/// The attribution of an MCP-bridge call: the AI origin plus the AI client's
+/// stated purpose when it supplied one (ST-M004-006, ST-M009-007).
+fn mcp(purpose: Option<Purpose>) -> Attribution {
+    Attribution::new(Origin::Mcp, purpose)
+}
+
 /// Runs one upload inline on the owned handle, gated against revoke.
 ///
 /// The cancel token is minted and published into the transfer gate under one
@@ -1593,12 +1753,15 @@ async fn run_upload(
     handle: &HostHandle,
     inner: &Inner,
     request: UploadRequest,
+    attribution: Attribution,
 ) -> Result<TransferReport, HostSessionError> {
     let token = match enter_transfer(inner) {
         Some(token) => token,
         None => return Err(HostSessionError::NotActive),
     };
-    let result = handle.upload_file(request, &token, |_| {}).await;
+    let result = handle
+        .upload_file_as(request, attribution, &token, |_| {})
+        .await;
     leave_transfer(inner);
     result
 }
@@ -1609,12 +1772,15 @@ async fn run_download(
     handle: &HostHandle,
     inner: &Inner,
     request: DownloadRequest,
+    attribution: Attribution,
 ) -> Result<TransferReport, HostSessionError> {
     let token = match enter_transfer(inner) {
         Some(token) => token,
         None => return Err(HostSessionError::NotActive),
     };
-    let result = handle.download_file(request, &token, |_| {}).await;
+    let result = handle
+        .download_file_as(request, attribution, &token, |_| {})
+        .await;
     leave_transfer(inner);
     result
 }

@@ -21,6 +21,8 @@ test = false
 bench = false
 
 [dependencies]
+# The release version the binary reports (ST-M006-014).
+cretlink-shared.workspace = true
 # SessionId is minted during pairing and bound to full-control consent
 # (ST-M002-004/005); the agent dials the console and drives the join side of
 # the session runtime (cretlink-session), discovering it or taking a manual

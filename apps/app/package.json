@@ -1,0 +1,24 @@
+{
+  "name": "cretlink-app-ui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "CretLink application frontend: plain TypeScript + Vite over the Rust-owned state models of both roles (ADR-0011, ST-M009-005)",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.7"
+  }
+}

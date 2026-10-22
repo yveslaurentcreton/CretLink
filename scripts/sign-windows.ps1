@@ -13,19 +13,20 @@
 #   CRETLINK_SIGN_PFX_PASSWORD   the PFX password (optional; empty if none)
 #   CRETLINK_SIGN_TIMESTAMP_URL  RFC3161 timestamp server (optional; sane default)
 #
-# On success it signs every dist\cretlink-*.exe with a timestamp, verifies each
-# signature, and regenerates CHECKSUMS-<target>.txt so the published checksums
-# cover the SIGNED bytes. The decoded PFX is written to a temporary file and
-# removed in a finally block whether signing succeeds or fails.
+# On success it signs, with a timestamp, every binary that
+# `scripts/gen-artifacts.sh --stage` staged — the archive folder
+# target\bundle\cretlink-*\cretlink*.exe and the loose dist\cretlink-*.exe —
+# and verifies each signature. It runs between the stage and pack phases, so the
+# checksums, archive and SBOMs that `--pack` writes cover the SIGNED bytes
+# (ST-M009-004). The decoded PFX is written to a temporary file and removed in a
+# finally block whether signing succeeds or fails.
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$distDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'dist'
-if (-not (Test-Path $distDir)) {
-    Write-Host "No dist/ directory: nothing to sign."
-    exit 0
-}
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$distDir = Join-Path $repoRoot 'dist'
+$bundleDir = Join-Path $repoRoot (Join-Path 'target' 'bundle')
 
 $pfxB64 = $env:CRETLINK_SIGN_PFX_BASE64
 if ([string]::IsNullOrWhiteSpace($pfxB64)) {
@@ -39,9 +40,15 @@ if ([string]::IsNullOrWhiteSpace($timestampUrl)) {
     $timestampUrl = 'http://timestamp.digicert.com'
 }
 
-$exes = @(Get-ChildItem -Path $distDir -Filter 'cretlink-*.exe' -File)
+$exes = @()
+if (Test-Path $distDir) {
+    $exes += @(Get-ChildItem -Path $distDir -Filter 'cretlink-*.exe' -File)
+}
+if (Test-Path $bundleDir) {
+    $exes += @(Get-ChildItem -Path $bundleDir -Filter 'cretlink*.exe' -File -Recurse)
+}
 if ($exes.Count -eq 0) {
-    Write-Host "No cretlink-*.exe artifacts in dist/: nothing to sign."
+    Write-Host "No staged cretlink executables: nothing to sign."
     exit 0
 }
 
@@ -67,16 +74,6 @@ try {
         }
         Write-Host ("  signed + verified {0}" -f $exe.Name)
     }
-
-    # Regenerate the checksum manifest so published checksums cover signed bytes.
-    $target = (& rustc -vV | Select-String '^host: ').ToString() -replace '^host: ', ''
-    $checksums = Join-Path $distDir ("CHECKSUMS-{0}.txt" -f $target)
-    $lines = foreach ($exe in ($exes | Sort-Object Name)) {
-        $hash = (Get-FileHash -Path $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-        "{0}  {1}" -f $hash, $exe.Name
-    }
-    Set-Content -Path $checksums -Value $lines -NoNewline:$false -Encoding ascii
-    Write-Host ("Rewrote {0} to cover signed bytes." -f (Split-Path -Leaf $checksums))
 }
 finally {
     if (Test-Path $pfxPath) {

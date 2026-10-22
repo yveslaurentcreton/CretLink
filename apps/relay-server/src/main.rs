@@ -176,7 +176,7 @@ async fn run() -> Result<(), String> {
 
     println!(
         "CretLink relay server {} (ST-M007-007, wss ST-M007-009)",
-        env!("CARGO_PKG_VERSION")
+        cretlink_shared::RELEASE_VERSION
     );
     println!("  listening: {local_addr}");
     println!("  transport: {transport_label}");

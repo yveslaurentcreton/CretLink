@@ -123,7 +123,9 @@ async fn system_info_reports_the_simulated_target_end_to_end() {
     let (client, session) = connect().await;
 
     let result = client
-        .call_tool(CallToolRequestParams::new("remote_system_info"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_system_info",
+        )))
         .await
         .expect("remote_system_info");
     assert_ne!(result.is_error, Some(true));
@@ -153,9 +155,9 @@ async fn exec_sim_ok_streams_output_end_to_end() {
     let (client, session) = connect().await;
 
     let result = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_exec").with_arguments(exec_args("sim:ok hello")),
-        )
+        ))
         .await
         .expect("remote_exec");
     assert_ne!(result.is_error, Some(true));
@@ -189,9 +191,9 @@ async fn exec_sim_fail_reports_the_failed_outcome() {
     let (client, session) = connect().await;
 
     let result = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_exec").with_arguments(exec_args("sim:fail 5")),
-        )
+        ))
         .await
         .expect("remote_exec");
     assert_ne!(result.is_error, Some(true));
@@ -215,9 +217,9 @@ async fn exec_sim_disconnect_reports_unknown_outcome() {
     let (client, session) = connect().await;
 
     let result = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_exec").with_arguments(exec_args("sim:disconnect")),
-        )
+        ))
         .await
         .expect("remote_exec");
     assert_ne!(result.is_error, Some(true));
@@ -237,15 +239,15 @@ async fn list_jobs_reflects_the_finished_job() {
     let (client, session) = connect().await;
 
     let exec = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_exec").with_arguments(exec_args("sim:ok done")),
-        )
+        ))
         .await
         .expect("remote_exec");
     let job = structured(&exec)["result"]["job"].as_u64().expect("job id");
 
     let result = client
-        .call_tool(CallToolRequestParams::new("remote_list_jobs"))
+        .call_tool(with_purpose(CallToolRequestParams::new("remote_list_jobs")))
         .await
         .expect("remote_list_jobs");
     assert_ne!(result.is_error, Some(true));
@@ -272,7 +274,9 @@ async fn system_info_reflects_a_live_reboot_flag_flip() {
     let (client, session, reboot_flag) = connect_with_flag().await;
 
     let first = client
-        .call_tool(CallToolRequestParams::new("remote_system_info"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_system_info",
+        )))
         .await
         .expect("first remote_system_info");
     let body = structured(&first);
@@ -282,7 +286,9 @@ async fn system_info_reflects_a_live_reboot_flag_flip() {
     reboot_flag.store(true, Ordering::SeqCst);
 
     let second = client
-        .call_tool(CallToolRequestParams::new("remote_system_info"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_system_info",
+        )))
         .await
         .expect("second remote_system_info");
     assert_eq!(
@@ -303,7 +309,9 @@ async fn unsupported_command_carries_the_structured_error_code() {
     // The simulator only runs sim:* scripted commands; anything else is an
     // honest remote Unsupported error.
     let result = client
-        .call_tool(CallToolRequestParams::new("remote_exec").with_arguments(exec_args("format c:")))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_exec").with_arguments(exec_args("format c:")),
+        ))
         .await
         .expect("remote_exec returns a result envelope");
     assert_eq!(result.is_error, Some(true));
@@ -331,7 +339,9 @@ async fn desktop_capture_is_refused_unsupported_end_to_end() {
     args.insert("format".to_string(), json!("png"));
 
     let result = client
-        .call_tool(CallToolRequestParams::new("remote_capture_desktop").with_arguments(args))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_capture_desktop").with_arguments(args),
+        ))
         .await
         .expect("remote_capture_desktop returns a result envelope");
     assert_eq!(
@@ -360,4 +370,18 @@ async fn desktop_capture_is_refused_unsupported_end_to_end() {
     );
 
     client.cancel().await.ok();
+}
+
+/// The stated purpose every test tool call carries (ST-M009-007).
+const TEST_PURPOSE: &str = "Checking the computer for the support request";
+
+/// Adds the required stated `purpose` argument to a tool call that does not set
+/// one (ST-M009-007), so each test states only the arguments it is about.
+fn with_purpose(mut params: CallToolRequestParams) -> CallToolRequestParams {
+    params
+        .arguments
+        .get_or_insert_with(Map::new)
+        .entry("purpose")
+        .or_insert_with(|| Value::String(TEST_PURPOSE.to_string()));
+    params
 }

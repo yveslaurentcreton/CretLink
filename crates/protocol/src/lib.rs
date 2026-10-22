@@ -58,6 +58,7 @@ mod ids;
 pub mod limits;
 mod message;
 mod pairing;
+mod purpose;
 mod reboot_resume;
 mod version;
 
@@ -76,6 +77,7 @@ pub use pairing::{
     SAC_NONCE_LEN, SessionApprovalCode, derive_session_approval_code, pairing_prologue,
     sac_commitment,
 };
+pub use purpose::{Purpose, PurposeError};
 pub use reboot_resume::{
     ArmedTicket, AtRestSealer, REBOOT_RESUME_HKDF_SALT, REBOOT_RESUME_KEY_LEN,
     REBOOT_RESUME_NONCE_LEN, REBOOT_RESUME_PROOF_LEN, REBOOT_RESUME_TARGET_LEN,

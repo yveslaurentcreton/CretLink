@@ -457,6 +457,10 @@ scenario exercises those steps.
    - Expected: honest exit code, output, duration, and elevated execution
      identity (REQ-F-007, REQ-S-011); the action is visible in the console
      activity view and audited with the routed `call_id` (REQ-F-017, REQ-S-017).
+   - Expected: the AI's stated `purpose` appears on the customer's command card
+     and in the console activity view, labelled as the AI's reason, next to the
+     real command; the console audit records hold it; a technician console
+     command shows its source and no purpose (REQ-F-026, ST-M009-007).
 8. **Transfer.** `remote_upload` a file into staging, then `remote_download` it
    back, and compare digests.
    - Expected: length + SHA-256 verified in both directions before completion is

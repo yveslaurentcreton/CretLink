@@ -8,7 +8,7 @@
 //! then reports every lifecycle event — the Session Approval Code to compare,
 //! consent, the active session, and revocation — as plain, secret-free text.
 //!
-//! The graphical console (`apps/console-gui`) renders the same runtime; this
+//! The graphical console (`apps/app`, Give help) renders the same runtime; this
 //! CLI is the headless technician console (interactive commands, audit, MCP
 //! bridge host).
 
@@ -498,7 +498,9 @@ fn report_event(handle: &HostHandle, event: &SessionEvent) -> Flow {
         // These only occur inside the interactive loop (handled there); a pre-active
         // sighting is impossible but keeps this match exhaustive. Reboot-resume can
         // only be armed after consent, so its reflections belong to the same group.
+        // `RequestHandled` is agent-side only and never reaches the console.
         SessionEvent::CommandStarted { .. }
+        | SessionEvent::RequestHandled { .. }
         | SessionEvent::ExecOutput { .. }
         | SessionEvent::ExecOutputDropped { .. }
         | SessionEvent::ExecFinished { .. }
@@ -975,6 +977,16 @@ fn render_ai_activity(entry: &AuditEntry) {
     };
     if let Some(line) = line {
         println!("\n[ai] [{line}]");
+        // The AI's stated purpose rides the start line's audit record; show it
+        // under the real operation, labelled as the AI's claim (REQ-F-026,
+        // ST-M009-007). A call from an older bridge carries none.
+        // It is bounded to one line of at most 200 characters, so it is shown
+        // whole rather than clipped like a command preview.
+        if entry.action.ends_with("_start")
+            && let Some(purpose) = entry.args.0.get("purpose")
+        {
+            println!("     stated purpose (from the AI): {purpose}");
+        }
     }
 }
 

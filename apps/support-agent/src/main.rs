@@ -16,7 +16,7 @@
 //! consent still runs after any reconnect — and it is never reachable from the
 //! console or the MCP surface (REQ-S-001, REQ-S-003).
 //!
-//! This binary is the headless stdout agent; `apps/agent-gui` is the graphical
+//! This binary is the headless stdout agent; `apps/app` (Get help) is the graphical
 //! consent window over the same session runtime (it advertises file operations
 //! and, on Windows, the terminal, but not the desktop or reboot-resume). Once
 //! consent is granted the runtime serves command execution, file operations,
@@ -41,8 +41,9 @@ use cretlink_discovery::{Browser, parse_manual_entry};
 use cretlink_exec::FileStore;
 use cretlink_protocol::{PROTOCOL_V1, TargetIdentity};
 use cretlink_session::{
-    AdmissionToken, DesktopAccess, Dial, JoinHandle, NoAudit, Origin, RebootResumeArmer, RelayDial,
-    RendezvousTicket, RevokeReason, SessionError, SessionEvent, SessionJoiner, WssRelayDial,
+    ActionOutcome, AdmissionToken, DesktopAccess, Dial, JoinHandle, NoAudit, Origin,
+    RebootResumeArmer, RelayDial, RendezvousTicket, RevokeReason, SessionError, SessionEvent,
+    SessionJoiner, WssRelayDial,
 };
 use cretlink_support_agent::{
     EffectiveIdentity, Inventory, RecoveryReport, TicketStore, current_identity,
@@ -297,6 +298,7 @@ fn on_event(
             shell,
             command,
             origin,
+            purpose,
         } => {
             let who = match origin {
                 Origin::Mcp => "The technician's AI assistant is running",
@@ -304,6 +306,31 @@ fn on_event(
                 Origin::Console | Origin::Terminal => "The technician is running",
             };
             println!("{who} [job {job}, {shell:?}]: {command}");
+            // The AI's stated purpose is shown beside — never instead of — the
+            // real command above, and labelled as the AI's own claim
+            // (REQ-F-026, ST-M009-007).
+            if let Some(purpose) = purpose {
+                println!("  Stated reason (from the AI, not verified): {purpose}");
+            }
+            Flow::Continue
+        }
+        SessionEvent::RequestHandled {
+            origin,
+            purpose,
+            operation,
+            outcome,
+        } => {
+            // Every other action on this computer: who did it, the real
+            // operation, the honest result, and — for the AI — its stated
+            // reason (REQ-F-017, REQ-F-026, ST-M009-007).
+            println!(
+                "{}: {operation} — {}",
+                source_label(*origin),
+                outcome_label(*outcome)
+            );
+            if let Some(purpose) = purpose {
+                println!("  Stated reason (from the AI, not verified): {purpose}");
+            }
             Flow::Continue
         }
         SessionEvent::ExecOutput { .. } => {
@@ -369,6 +396,24 @@ fn on_event(
             println!("Reboot-resume disarmed.");
             Flow::Continue
         }
+    }
+}
+
+/// Who drove an action, in the customer's words.
+fn source_label(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Mcp => "The technician's AI assistant",
+        Origin::Terminal => "The technician (terminal)",
+        Origin::Console => "The technician",
+    }
+}
+
+/// The honest result of an action, in the customer's words (REQ-N-008).
+fn outcome_label(outcome: ActionOutcome) -> String {
+    match outcome {
+        ActionOutcome::Succeeded => "done".to_string(),
+        ActionOutcome::Failed { code } => format!("refused or failed ({code:?})"),
+        ActionOutcome::Unknown => "result unknown".to_string(),
     }
 }
 
@@ -659,7 +704,7 @@ fn report_cleanup(handle: &JoinHandle) {
 fn print_identity(identity: &EffectiveIdentity) {
     println!(
         "CretLink Support {} — effective identity (REQ-S-011):",
-        env!("CARGO_PKG_VERSION")
+        cretlink_shared::RELEASE_VERSION
     );
     println!("  account:   {}", identity.username);
     if let Some(domain) = identity.domain.as_deref() {
@@ -1134,7 +1179,7 @@ fn build_target_identity(identity: &EffectiveIdentity) -> TargetIdentity {
         arch: sysinfo::machine_arch(),
         elevated: identity.elevated,
         simulated: false,
-        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        agent_version: cretlink_shared::RELEASE_VERSION.to_string(),
     }
 }
 

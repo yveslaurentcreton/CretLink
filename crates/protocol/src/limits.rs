@@ -50,6 +50,15 @@ pub const MAX_DISCLOSURE_BYTES: usize = 8 * 1024;
 /// (consent denial, revocation; ST-M002-005/006). Secret-free and bounded.
 pub const MAX_REASON_BYTES: usize = 1024;
 
+// --- Stated purpose of AI actions (REQ-F-026, ST-M009-007) ---
+
+/// Maximum length of a stated purpose ([`crate::Purpose`]), in Unicode scalar
+/// values (characters) after trimming. A purpose is one short plain-language
+/// sentence a non-technical customer reads next to the real operation, so the
+/// bound is on characters rather than bytes; at most 4 bytes each, a purpose
+/// never exceeds `4 * MAX_PURPOSE_CHARS` bytes on the wire.
+pub const MAX_PURPOSE_CHARS: usize = 200;
+
 // --- File operations and transfer (ADR-0012, ST-M003-004/005) ---
 
 /// Maximum byte length of a single path component (a file or directory name).

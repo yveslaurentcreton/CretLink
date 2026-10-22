@@ -16,9 +16,9 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
+# `serve_stdio` serves the McpBridge over the stdio transport (rmcp server +
+# transport-io), shared with `cretlink mcp` (ST-M009-002).
 cretlink-mcp.workspace = true
-# rmcp serves the McpBridge over the stdio transport (server + transport-io).
-rmcp = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

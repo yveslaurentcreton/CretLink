@@ -1,0 +1,10 @@
+{
+  "identifier": "default",
+  "description": "Core capability for the CretLink window. Each role's own commands are app-defined and registered only in that role's process (ST-M009-005); this grants only the core window/event/webview defaults.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default"
+  ]
+}

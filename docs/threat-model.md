@@ -607,7 +607,8 @@ end-to-end run on maintainer hardware recorded on 2026-08-10.
   command lines, stdin data, working directories and the constrained
   environment-override set (REQ-F-009), file paths and contents, transfer
   sources and destinations, job identifiers, cancellation and timeout
-  parameters.
+  parameters, and the stated `purpose` every tool requires (REQ-F-026,
+  ST-M009-007), a short text the attended customer reads.
 - Reflected content returned to the AI: command stdout and stderr, exit codes,
   file contents, directory listings, filenames, and system metadata from the
   customer computer — the channel through which hostile content on the target
@@ -650,6 +651,10 @@ outward or fetching hostile payloads.
 - *Outcome masking.* A hostile client reports or assumes success for work that
   failed, was cancelled, or never reached the target, so the technician's
   picture of the customer machine diverges from reality.
+- *Misleading stated purpose.* An injected or compromised AI states a harmless
+  reason ("Checking free disk space") for a harmful action, or crafts the text
+  to look like a system message, to talk the customer out of pressing Stop —
+  social engineering through the attended surface itself.
 
 **Mitigations.**
 
@@ -693,7 +698,19 @@ outward or fetching hostile payloads.
   technician-driven ones and hides nothing (REQ-S-002).
   `origin` is **attribution only**: it grants no new authority and changes no
   routing, consent, or fail-closed behaviour — a forged or defaulted origin
-  cannot widen what a session may do. The append-oriented audit trail records
+  cannot widen what a session may do.
+- *Stated purpose as an unverified claim (REQ-F-026, ST-M009-007).* Every AI
+  tool call carries a required, plain-language `purpose`. The bridge rejects a
+  missing or malformed one before anything is sent; it is bounded to one line
+  of at most 200 characters and refused if it contains control, line-break,
+  or text-direction (bidirectional override) characters, so it cannot spill
+  over or visually reorder the line beside it. It travels to the agent as an
+  optional request field (protocol minor 9), is recorded verbatim in the
+  console audit records of the call, and both surfaces show it **labelled as
+  the AI's own unverified reason, next to the real command, path, or action,
+  its source, and its result — never instead of them**. Like `origin`, it grants
+  no authority and is never interpreted: it is display and audit text. A
+  technician's own actions carry no purpose and are labelled by their source. The append-oriented audit trail records
   session identity, actor or source, action, arguments, and results
   (REQ-S-017), so injected or malicious actions are observable during the
   session and reconstructable afterwards.
@@ -735,6 +752,19 @@ outward or fetching hostile payloads.
   reads it, and it depends on the technician actually watching the activity
   view. Model-level safeguards and technician vigilance are assumed, not
   enforced.
+- A misleading stated purpose is not detectable. CretLink cannot check that
+  the AI's reason matches what it does; a prompt-injected or compromised AI can
+  state a reassuring purpose for a harmful action. The mitigation is that the
+  real operation is always shown beside the purpose and the purpose is
+  labelled as the AI's claim, so the customer and technician can see the
+  mismatch and stop the session. Two gaps remain: the customer GUI shows the
+  purpose on command cards only, while other AI actions (file, desktop,
+  clipboard, transfer) reach the agent's session events and the headless
+  agent's text output with their purpose but are not yet rendered in the GUI
+  (ST-M009-008/009); and the console's live activity echo shows the purpose
+  only on the start lines it already renders, while the audit log holds it for
+  every call. A console older than IPC minor 9 receives calls without the
+  purpose, so they are shown and audited without one.
 - Exfiltration by command is not blockable. An AI with consented administrator
   control can move customer data using ordinary commands, including directly
   off the customer computer when that machine has internet access. CretLink
@@ -762,6 +792,16 @@ outward or fetching hostile payloads.
   ADR-0004 threat-model item to close.
 - A fully compromised technician computer defeats this boundary entirely; see
   the consolidated residual risks.
+- MCP client registration (`cretlink-cli mcp install`, ST-M009-003) runs the
+  client command lines it finds on `PATH` (`claude`, `codex`, `gemini`) as the
+  current user, and only adds or removes a `cretlink` entry that starts the
+  running program with the argument `mcp`. It writes no environment variable,
+  credential or session secret, and reads the clients' configuration files only
+  to compare. A hostile program named like a client earlier on `PATH` would run,
+  exactly as when the technician types that name; `cretlink-cli mcp status` prints
+  the resolved path of each client so this stays visible. A registration that
+  points at a location other users can write lets them replace the program that
+  every AI client session starts, so register a copy in a per-user location.
 
 ### The terminal IPC client: a second local consumer of the consented session
 
@@ -1827,6 +1867,52 @@ metadata rather than content.
   on the technician and customer computers; a relay design cannot protect a
   session whose technician computer is already compromised.
 
+### One application, two roles (M009)
+
+**Status.** Implemented in `apps/app` (ST-M009-005, ADR-0018); the UAC prompt
+and a Windows run of both roles against each other are manual checks.
+
+**What changed.** The technician console, the customer's support window and the
+command-line subcommands are one program, `cretlink`. The customer runs the
+same file as the technician, so technician code now sits on the customer
+computer, unused.
+
+**Entry points.** The start screen (Windows), the file name (a copy named
+`CretLink-Support*` opens Get help), the `--role technician | customer`
+argument the start screen uses to start a role, and the subcommands.
+
+**Threats and mitigations.**
+
+- *A customer-side process acts as a technician.* The role is decided before
+  any window opens and is fixed for the life of the process. Each role
+  registers only its own Tauri commands; the commands that bind the MCP
+  bridge's IPC endpoint and the session listener exist only in a technician
+  process, so a customer process has no way to reach them, and the reverse. A
+  `CretLink-Support*` copy refuses subcommands and `--role technician`, so a
+  file handed to a customer cannot serve MCP or open the console
+  (REQ-F-024).
+- *Silent or repeated elevation.* Get help elevates only through the visible
+  UAC prompt (`ShellExecuteExW`, `runas`); declining starts nothing and says
+  so (REQ-F-002). The relaunched process gets exactly `--role customer` and
+  never relaunches again, so there is no prompt loop; it reports its real
+  elevation state (REQ-S-011). Elevation grants no control: pairing, the
+  Session Approval Code and the informed consent still gate everything
+  (REQ-S-001, REQ-S-003).
+- *Something else starts `cretlink --role customer`.* That is the same as the
+  customer double-clicking it: a UAC prompt, a visible window, no session
+  without the customer's actions. It adds no hidden path (REQ-S-002).
+- *Persistence through the application.* Get help installs nothing and adds no
+  auto-start entry (REQ-F-001, REQ-F-019); only the technician role may be
+  installed, per user, in a later story (ST-M009-006).
+- *Missing WebView2 runtime.* The program says so in a native message box and
+  starts nothing, rather than failing in a half-open state.
+
+**Residual risks.** The customer computer carries technician code it never
+runs; a flaw that reached arbitrary code execution inside the customer process
+could use it, but such a flaw would already control an elevated process. The
+customer depends on the WebView2 runtime the technician console already needed
+(ADR-0018).
+
 ### Supply chain and distribution
 
 This surface covers everything between the public CretLink source code and the
@@ -1863,10 +1949,15 @@ marked with its honest implementation status.
   branch-protection configuration, and maintainer accounts.
 - CI jobs: pull-request jobs that execute contributed code, and release jobs
   that hold publishing credentials.
-- Release artifacts: five binaries (`cretlink-console`, `cretlink-mcp`,
-  `cretlink-shell`, `cretlink-support-agent`, `cretlink-relay-server`) on three
-  targets (Windows x86_64, macOS aarch64, Linux x86_64), per-target checksums,
-  the dependency inventory, SBOMs, and the generated release notes.
+- Release artifacts: one archive per operating system (Windows x86_64, macOS
+  aarch64, Linux x86_64) holding the application `cretlink`, `cretlink-cli`,
+  `cretlink-console`, `cretlink-mcp`, `cretlink-shell` and, on Windows,
+  `cretlink-support-agent`;
+  the loose `cretlink-relay-server`; `SHA256SUMS.txt` over the archives,
+  per-target checksums, the dependency inventory, SBOMs, and the generated
+  release notes. The version stamped into the binaries is computed before the
+  build, and semantic-release refuses to publish under any other version
+  (ST-M006-014).
 - The distribution path to the customer: download on the technician computer,
   copy to removable media or a temporary local copy, and visible elevated
   launch on the customer computer (REQ-F-001, REQ-F-002).

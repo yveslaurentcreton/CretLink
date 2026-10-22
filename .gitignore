@@ -1,15 +1,11 @@
 # Rust build outputs
 /target/
 
-# Console GUI shell (detached Tauri crate + Vite frontend, ADR-0011)
-apps/console-gui/src-tauri/target/
-apps/console-gui/src-tauri/gen/
-apps/console-gui/dist/
-
-# Agent consent window (detached Tauri crate + Vite frontend, ADR-0011)
-apps/agent-gui/src-tauri/target/
-apps/agent-gui/src-tauri/gen/
-apps/agent-gui/dist/
+# The CretLink application (detached Tauri crate + Vite frontend, ADR-0011,
+# ST-M009-005)
+apps/app/src-tauri/target/
+apps/app/src-tauri/gen/
+apps/app/dist/
 
 # Node tooling (semantic-release runs from CI; local installs stay untracked)
 node_modules/

@@ -6,6 +6,7 @@
 //! belongs in `cretlink-protocol` instead.
 
 pub mod audit;
+mod version;
 
 pub use audit::{
     AUDIT_SCHEMA_VERSION, Actor, AuditArgs, AuditError, AuditFileMeta, AuditRecord, AuditValue,
@@ -14,3 +15,4 @@ pub use audit::{
     files_to_prune, format_rfc3339_millis, redact, redact_no_digest, session_file_name,
     truncate_field, verify_chain, verify_sealed,
 };
+pub use version::RELEASE_VERSION;

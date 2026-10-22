@@ -5,7 +5,7 @@
 //! control, and the lifecycle phase of that target's session. Both the Windows
 //! and macOS console builds render this exact model, so the two platforms
 //! cannot drift apart (ADR-0005), and the Tauri GUI shell
-//! (`apps/console-gui`) is a thin renderer over these types.
+//! (`apps/app`, Give help) is a thin renderer over these types.
 //!
 //! # Safety invariants enforced here
 //!

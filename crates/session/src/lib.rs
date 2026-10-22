@@ -49,6 +49,7 @@ use cretlink_transport::{PairingError, SecureChannelError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod action;
 mod dial;
 mod host;
 mod joiner;
@@ -57,6 +58,10 @@ mod redeem;
 mod runtime;
 mod transfer;
 
+pub use action::{
+    ActionOutcome, Attribution, MAX_ACTION_DESCRIPTION_CHARS, describe_cancel, describe_operation,
+    is_transfer_step,
+};
 pub use dial::{Dial, DirectDial, RelayDial, WssRelayDial};
 // The wss trust material a retrying endpoint builds once and clones per attempt
 // (see `WssRelayDial::connector`). Re-exported so a caller can name the connector
@@ -81,7 +86,7 @@ pub use cretlink_protocol::RevokeReason;
 // appear in the public `HostHandle` exec API, so they are re-exported too.
 pub use cretlink_protocol::{
     CAP_DESKTOP_V1, CAP_REBOOT_RESUME_V1, CAP_TERM_V1, JobId, JobOutcome, JobSummary, Origin,
-    OutputStream, SessionId, Shell,
+    OutputStream, Purpose, SessionId, Shell,
 };
 // File-operation wire vocabulary surfaced by `HostHandle::file_op` and the
 // transfer engine, re-exported so callers name one crate (ST-M003-004/005).
@@ -332,6 +337,34 @@ pub enum SessionEvent {
         /// customer surface can label AI-driven work distinctly (ST-M004-006,
         /// REQ-F-017, REQ-S-002).
         origin: Origin,
+        /// The caller's stated purpose of the command, as carried on the wire
+        /// request: the AI client's plain-language reason, shown beside the
+        /// real command — never instead of it (REQ-F-026, ST-M009-007). `None`
+        /// for technician-driven commands, which are labelled by `origin`.
+        purpose: Option<Purpose>,
+    },
+    /// The agent handled one console request other than a command it started
+    /// (that one is [`Self::CommandStarted`] and later [`Self::ExecFinished`]).
+    /// Emitted on the agent side only, so the attended customer surface shows
+    /// every action on their computer with who drove it, the caller's stated
+    /// purpose, the real operation, and the honest result (REQ-F-017,
+    /// REQ-F-026, ST-M009-007). Internal file-transfer steps (chunk reads and
+    /// writes, resume digests, aborts) are not reported one by one; a
+    /// transfer's commit is. Delivered under the same lifecycle reserve as
+    /// streamed output, so a burst of actions can never crowd out a stop or
+    /// revoke event.
+    RequestHandled {
+        /// Which local actor drove the request (from the wire `origin`).
+        origin: Origin,
+        /// The caller's stated purpose (from the wire `purpose`): an unverified
+        /// claim, shown beside `operation`, never instead of it. `None` for
+        /// technician-driven requests.
+        purpose: Option<Purpose>,
+        /// The real operation in plain words ([`describe_operation`]), bounded
+        /// and free of typed, clipboard, stdin, or file content.
+        operation: String,
+        /// How the agent answered the request.
+        outcome: ActionOutcome,
     },
     /// A chunk of a running job's output (ST-M003-002). Emitted on the console
     /// side as it streams in. Bytes are raw, untrusted remote output.

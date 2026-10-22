@@ -8,6 +8,13 @@
 //! never be mistaken for a different session or a local machine (REQ-F-016),
 //! and every input is validated against the same [`limits`] the wire protocol
 //! enforces, so a malformed request becomes a tool error rather than a panic.
+//!
+//! Every tool acts on the customer computer, so every tool requires a stated
+//! `purpose`: the AI client's short plain-language reason, validated first
+//! (trimmed, one line, 1 to [`limits::MAX_PURPOSE_CHARS`] characters) so a call
+//! without a valid one is refused before anything reaches the console. It is
+//! forwarded to be audited and shown to the customer beside the real operation;
+//! it is the caller's claim, never authority (REQ-F-026, ST-M009-007).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,7 +23,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use cretlink_protocol::{
     CleanupPolicy, CleanupTrigger, ImageFormat, JobId, KeyAction, PointerAction, PointerButton,
-    RemotePath, SessionId, Shell, TargetIdentity, limits,
+    Purpose, RemotePath, SessionId, Shell, TargetIdentity, limits,
 };
 use rmcp::ServerHandler;
 use rmcp::handler::server::wrapper::Parameters;
@@ -53,6 +60,15 @@ const MIN_DESKTOP_COORD: i32 = -limits::MAX_DESKTOP_COORD;
 /// The inclusive minimum signed wheel delta the scroll tool accepts: the
 /// negative of [`limits::MAX_DESKTOP_SCROLL`] (see [`MIN_DESKTOP_COORD`]).
 const MIN_DESKTOP_SCROLL: i32 = -limits::MAX_DESKTOP_SCROLL;
+
+/// The schema description of the required `purpose` argument every tool takes
+/// (REQ-F-026, ST-M009-007). It asks the AI client for a reason a
+/// non-technical customer understands, because the customer reads it next to
+/// the real operation.
+const PURPOSE_DESCRIPTION: &str = "Why you are doing this, in one short plain-language sentence \
+the customer will read on their screen next to the real operation, for example \
+\"Checking free disk space\". Write it for a non-technical person. 1 to 200 \
+characters on one line.";
 
 /// An rmcp server that bridges MCP tool calls onto one [`TargetSession`].
 #[derive(Clone)]
@@ -94,6 +110,12 @@ impl From<ShellArg> for Shell {
 /// runtime-only).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ExecInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The shell that runs the command.
     shell: ShellArg,
     /// The command text (at most 32 KiB).
@@ -121,6 +143,12 @@ struct ExecInput {
 /// Arguments for the `remote_write_stdin` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WriteStdinInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The job to write to.
     job: u64,
     /// Standard base64 of the raw bytes to write (at most 256 KiB decoded).
@@ -136,6 +164,12 @@ struct WriteStdinInput {
 /// Arguments for the `remote_cancel` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CancelInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The job to cancel.
     job: u64,
 }
@@ -234,6 +268,12 @@ impl From<CleanupTriggerArg> for CleanupTrigger {
 /// Arguments for the `remote_stat` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct StatInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The path to stat.
     path: RemotePathArg,
 }
@@ -241,6 +281,12 @@ struct StatInput {
 /// Arguments for the `remote_list_dir` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ListDirInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The directory to list.
     path: RemotePathArg,
     /// Resume token: the name of the last entry from the previous page.
@@ -252,6 +298,12 @@ struct ListDirInput {
 /// Arguments for the `remote_make_dir` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MakeDirInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The directory to create.
     path: RemotePathArg,
 }
@@ -259,6 +311,12 @@ struct MakeDirInput {
 /// Arguments for the `remote_move` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MoveInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The source path.
     from: RemotePathArg,
     /// The destination path (same volume).
@@ -271,6 +329,12 @@ struct MoveInput {
 /// Arguments for the `remote_delete` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DeleteInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The file or reparse point to delete (never a directory).
     path: RemotePathArg,
 }
@@ -278,6 +342,12 @@ struct DeleteInput {
 /// Arguments for the `remote_remove_dir` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RemoveDirInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The empty directory to remove.
     path: RemotePathArg,
 }
@@ -285,6 +355,12 @@ struct RemoveDirInput {
 /// Arguments for the `remote_upload` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct UploadInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The local file on the technician machine to read.
     #[schemars(length(max = limits::MAX_PATH_BYTES))]
     local_path: String,
@@ -304,6 +380,12 @@ struct UploadInput {
 /// Arguments for the `remote_download` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DownloadInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The source path on the target to read.
     source: RemotePathArg,
     /// The local path on the technician machine to create.
@@ -314,6 +396,12 @@ struct DownloadInput {
 /// Arguments for the `remote_cleanup` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CleanupInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// Which staged artifacts to remove.
     trigger: CleanupTriggerArg,
 }
@@ -424,6 +512,12 @@ impl From<KeyActionArg> for KeyAction {
 /// (REQ-N-012).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CaptureInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The zero-based display index to capture within the session. Defaults to
     /// the primary display (`0`).
     #[serde(default)]
@@ -449,6 +543,12 @@ struct CaptureInput {
 /// Arguments for the `remote_desktop_pointer` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DesktopPointerInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// What to do at the coordinates.
     action: PointerActionArg,
     /// Which button the action concerns (ignored for `move`).
@@ -466,6 +566,12 @@ struct DesktopPointerInput {
 /// Arguments for the `remote_desktop_scroll` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DesktopScrollInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The absolute virtual-desktop x origin (magnitude at most
     /// [`limits::MAX_DESKTOP_COORD`]).
     #[schemars(range(min = MIN_DESKTOP_COORD, max = limits::MAX_DESKTOP_COORD))]
@@ -487,6 +593,12 @@ struct DesktopScrollInput {
 /// Arguments for the `remote_desktop_key` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DesktopKeyInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// What to do with the key.
     action: KeyActionArg,
     /// The virtual-key token (for example `"enter"`, `"f5"`, `"ctrl"`), at most
@@ -498,6 +610,12 @@ struct DesktopKeyInput {
 /// Arguments for the `remote_desktop_type` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DesktopTypeInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The text to type, at most [`limits::MAX_DESKTOP_TEXT_BYTES`] bytes.
     #[schemars(length(max = limits::MAX_DESKTOP_TEXT_BYTES))]
     text: String,
@@ -506,6 +624,12 @@ struct DesktopTypeInput {
 /// Arguments for the `remote_desktop_hotkey` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DesktopHotkeyInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The chord elements (for example `["ctrl", "shift", "esc"]`), at most
     /// [`limits::MAX_DESKTOP_HOTKEY_KEYS`] elements, each at most
     /// [`limits::MAX_DESKTOP_KEY_BYTES`] bytes.
@@ -516,6 +640,12 @@ struct DesktopHotkeyInput {
 /// Arguments for the `remote_desktop_wait` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DesktopWaitInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The pause in milliseconds, at most [`limits::MAX_DESKTOP_WAIT_MS`].
     #[schemars(range(max = limits::MAX_DESKTOP_WAIT_MS))]
     millis: u64,
@@ -524,10 +654,29 @@ struct DesktopWaitInput {
 /// Arguments for the `remote_clipboard_set` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ClipboardSetInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
     /// The text to place on the remote clipboard, at most
     /// [`limits::MAX_CLIPBOARD_BYTES`] bytes.
     #[schemars(length(max = limits::MAX_CLIPBOARD_BYTES))]
     text: String,
+}
+
+/// Arguments for the tools whose only argument is the stated purpose
+/// (`remote_system_info`, `remote_list_jobs`, `remote_list_staged`,
+/// `remote_clipboard_get`).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PurposeInput {
+    /// The stated purpose (see [`PURPOSE_DESCRIPTION`]).
+    #[schemars(
+        description = PURPOSE_DESCRIPTION,
+        length(min = 1, max = limits::MAX_PURPOSE_CHARS)
+    )]
+    purpose: String,
 }
 
 #[tool_router]
@@ -544,8 +693,15 @@ impl McpBridge {
                        elevation) and whether a reboot is pending. Use this first to confirm which \
                        machine you are acting on."
     )]
-    async fn remote_system_info(&self) -> Result<CallToolResult, ErrorData> {
-        match self.session.system_info().await {
+    async fn remote_system_info(
+        &self,
+        Parameters(input): Parameters<PurposeInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
+        match self.session.system_info(purpose).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -574,8 +730,16 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<ExecInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         let params = validate_exec(input)?;
-        match self.session.exec(params, MAX_EXEC_OUTPUT_BYTES).await {
+        match self
+            .session
+            .exec(purpose, params, MAX_EXEC_OUTPUT_BYTES)
+            .await
+        {
             Ok(routed) => {
                 let report = routed.value;
                 Ok(ok_envelope(
@@ -609,6 +773,10 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<WriteStdinInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         // Bound the *encoded* input first, so an over-limit payload is
         // rejected before any decoded buffer is allocated.
         if input.data_base64.len() > MAX_STDIN_BASE64_CHARS {
@@ -641,7 +809,7 @@ impl McpBridge {
         let written = data.len();
         match self
             .session
-            .write_stdin(JobId(input.job), data, input.sensitive)
+            .write_stdin(purpose, JobId(input.job), data, input.sensitive)
             .await
         {
             Ok(routed) => Ok(ok_envelope(
@@ -664,7 +832,11 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<CancelInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        match self.session.cancel(JobId(input.job)).await {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
+        match self.session.cancel(purpose, JobId(input.job)).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -680,8 +852,15 @@ impl McpBridge {
         description = "List the jobs the selected remote target currently tracks, with a command \
                        preview and whether each is still running."
     )]
-    async fn remote_list_jobs(&self) -> Result<CallToolResult, ErrorData> {
-        match self.session.list_jobs().await {
+    async fn remote_list_jobs(
+        &self,
+        Parameters(input): Parameters<PurposeInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
+        match self.session.list_jobs(purpose).await {
             Ok(routed) => {
                 let jobs: Vec<Value> = routed
                     .value
@@ -713,8 +892,12 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<StatInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         input.path.validate("path")?;
-        match self.session.fs_stat(input.path.into()).await {
+        match self.session.fs_stat(purpose, input.path.into()).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -736,13 +919,17 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<ListDirInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         input.path.validate("path")?;
         if let Some(after) = &input.continue_after {
             check("continue_after", after.len(), limits::MAX_NAME_BYTES)?;
         }
         match self
             .session
-            .fs_list(input.path.into(), input.continue_after)
+            .fs_list(purpose, input.path.into(), input.continue_after)
             .await
         {
             Ok(routed) => Ok(ok_envelope(
@@ -764,8 +951,12 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<MakeDirInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         input.path.validate("path")?;
-        match self.session.make_dir(input.path.into()).await {
+        match self.session.make_dir(purpose, input.path.into()).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -784,11 +975,15 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<MoveInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         input.from.validate("from")?;
         input.to.validate("to")?;
         match self
             .session
-            .fs_move(input.from.into(), input.to.into(), input.overwrite)
+            .fs_move(purpose, input.from.into(), input.to.into(), input.overwrite)
             .await
         {
             Ok(routed) => Ok(ok_envelope(
@@ -809,8 +1004,12 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<DeleteInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         input.path.validate("path")?;
-        match self.session.fs_delete(input.path.into()).await {
+        match self.session.fs_delete(purpose, input.path.into()).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -829,8 +1028,12 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<RemoveDirInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         input.path.validate("path")?;
-        match self.session.remove_dir(input.path.into()).await {
+        match self.session.remove_dir(purpose, input.path.into()).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -849,6 +1052,10 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<UploadInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         check("local_path", input.local_path.len(), limits::MAX_PATH_BYTES)?;
         check("dest_name", input.dest_name.len(), limits::MAX_NAME_BYTES)?;
         check(
@@ -865,7 +1072,7 @@ impl McpBridge {
             cleanup: input.cleanup.into(),
             overwrite: input.overwrite,
         };
-        match self.session.upload(params).await {
+        match self.session.upload(purpose, params).await {
             Ok(routed) => {
                 let report = routed.value;
                 Ok(ok_envelope(
@@ -896,13 +1103,17 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<DownloadInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         input.source.validate("source")?;
         check("local_path", input.local_path.len(), limits::MAX_PATH_BYTES)?;
         let params = DownloadParams {
             source: input.source.into(),
             local_path: input.local_path,
         };
-        match self.session.download(params).await {
+        match self.session.download(purpose, params).await {
             Ok(routed) => {
                 let report = routed.value;
                 Ok(ok_envelope(
@@ -929,8 +1140,15 @@ impl McpBridge {
     #[tool(
         description = "List the staged artifacts the selected remote target currently tracks: the committed absolute path, the technician source label bound at commit, size, the verified digest as lowercase hex, the cleanup policy, and creation time."
     )]
-    async fn remote_list_staged(&self) -> Result<CallToolResult, ErrorData> {
-        match self.session.list_staged().await {
+    async fn remote_list_staged(
+        &self,
+        Parameters(input): Parameters<PurposeInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
+        match self.session.list_staged(purpose).await {
             Ok(routed) => {
                 let staged: Vec<Value> = routed
                     .value
@@ -966,7 +1184,11 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<CleanupInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        match self.session.cleanup(input.trigger.into()).await {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
+        match self.session.cleanup(purpose, input.trigger.into()).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -988,6 +1210,10 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<CaptureInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         if let Some(width) = input.max_width {
             check_range(
                 "max_width",
@@ -1019,7 +1245,7 @@ impl McpBridge {
             max_height: input.max_height,
             quality: input.quality,
         };
-        match self.session.capture_desktop(params).await {
+        match self.session.capture_desktop(purpose, params).await {
             Ok(routed) => Ok(capture_envelope(
                 routed.session,
                 &routed.target,
@@ -1038,11 +1264,21 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<DesktopPointerInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         check_magnitude("x", input.x, limits::MAX_DESKTOP_COORD)?;
         check_magnitude("y", input.y, limits::MAX_DESKTOP_COORD)?;
         match self
             .session
-            .desktop_pointer(input.action.into(), input.button.into(), input.x, input.y)
+            .desktop_pointer(
+                purpose,
+                input.action.into(),
+                input.button.into(),
+                input.x,
+                input.y,
+            )
             .await
         {
             Ok(routed) => Ok(ok_envelope(
@@ -1063,13 +1299,17 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<DesktopScrollInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         check_magnitude("x", input.x, limits::MAX_DESKTOP_COORD)?;
         check_magnitude("y", input.y, limits::MAX_DESKTOP_COORD)?;
         check_magnitude("dx", input.dx, limits::MAX_DESKTOP_SCROLL)?;
         check_magnitude("dy", input.dy, limits::MAX_DESKTOP_SCROLL)?;
         match self
             .session
-            .desktop_scroll(input.x, input.y, input.dx, input.dy)
+            .desktop_scroll(purpose, input.x, input.y, input.dx, input.dy)
             .await
         {
             Ok(routed) => Ok(ok_envelope(
@@ -1090,10 +1330,14 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<DesktopKeyInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         check("key", input.key.len(), limits::MAX_DESKTOP_KEY_BYTES)?;
         match self
             .session
-            .desktop_key(input.action.into(), input.key)
+            .desktop_key(purpose, input.action.into(), input.key)
             .await
         {
             Ok(routed) => Ok(ok_envelope(
@@ -1114,8 +1358,12 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<DesktopTypeInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         check("text", input.text.len(), limits::MAX_DESKTOP_TEXT_BYTES)?;
-        match self.session.desktop_type(input.text).await {
+        match self.session.desktop_type(purpose, input.text).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -1134,6 +1382,10 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<DesktopHotkeyInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         check(
             "keys count",
             input.keys.len(),
@@ -1142,7 +1394,7 @@ impl McpBridge {
         for key in &input.keys {
             check("hotkey key", key.len(), limits::MAX_DESKTOP_KEY_BYTES)?;
         }
-        match self.session.desktop_hotkey(input.keys).await {
+        match self.session.desktop_hotkey(purpose, input.keys).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -1161,6 +1413,10 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<DesktopWaitInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         if input.millis > limits::MAX_DESKTOP_WAIT_MS {
             return Err(ErrorData::invalid_params(
                 format!(
@@ -1171,7 +1427,7 @@ impl McpBridge {
                 None,
             ));
         }
-        match self.session.desktop_wait(input.millis).await {
+        match self.session.desktop_wait(purpose, input.millis).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -1186,8 +1442,15 @@ impl McpBridge {
     #[tool(
         description = "Read the selected remote target's clipboard text. Clipboard exchange is explicit-only and audited. Returns `text` (or null when the clipboard holds no text) alongside the routed target and session identity. Refused unless a consented session is live."
     )]
-    async fn remote_clipboard_get(&self) -> Result<CallToolResult, ErrorData> {
-        match self.session.clipboard_get().await {
+    async fn remote_clipboard_get(
+        &self,
+        Parameters(input): Parameters<PurposeInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
+        match self.session.clipboard_get(purpose).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -1206,8 +1469,12 @@ impl McpBridge {
         &self,
         Parameters(input): Parameters<ClipboardSetInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The stated purpose is checked first, so a call without a valid one
+        // is refused before anything reaches the console or the target
+        // (REQ-F-026, ST-M009-007).
+        let purpose = stated_purpose(&input.purpose)?;
         check("text", input.text.len(), limits::MAX_CLIPBOARD_BYTES)?;
-        match self.session.clipboard_set(input.text).await {
+        match self.session.clipboard_set(purpose, input.text).await {
             Ok(routed) => Ok(ok_envelope(
                 routed.session,
                 &routed.target,
@@ -1275,6 +1542,14 @@ fn validate_exec(input: ExecInput) -> Result<ExecParams, ErrorData> {
         timeout_ms: input.timeout_ms,
         sensitive: input.sensitive,
     })
+}
+
+/// Validates a tool call's stated purpose (REQ-F-026, ST-M009-007): trimmed,
+/// one line, 1 to [`limits::MAX_PURPOSE_CHARS`] characters. A violation is an
+/// `invalid_params` tool error whose message tells the AI client what to send,
+/// raised before the call reaches the console, so nothing runs on the target.
+fn stated_purpose(raw: &str) -> Result<Purpose, ErrorData> {
+    Purpose::new(raw).map_err(|err| ErrorData::invalid_params(format!("purpose: {err}"), None))
 }
 
 fn check(field: &str, len: usize, max: usize) -> Result<(), ErrorData> {

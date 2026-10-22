@@ -1,16 +1,26 @@
 # Verifying CretLink release artifacts
 
-Every CretLink GitHub release attaches, per platform target triple:
+Every CretLink GitHub release attaches:
 
-- the five binaries — `cretlink-console`, `cretlink-mcp`, `cretlink-shell`
-  (technician computer), `cretlink-support-agent` (the only binary placed on
-  the customer computer), and `cretlink-relay-server` (operator-hosted public
-  infrastructure, on neither endpoint);
-- `CHECKSUMS-<target>.txt` — SHA-256 over every binary for that target;
+- one archive per operating system — `cretlink-<version>-windows-x86_64.zip`,
+  `cretlink-<version>-macos-aarch64.tar.gz` and
+  `cretlink-<version>-linux-x86_64.tar.gz`. Each holds one folder with the
+  application `cretlink` (Give help, and on Windows Get help, the program the
+  customer runs), its console build `cretlink-cli`, `cretlink-console`,
+  `cretlink-mcp` and `cretlink-shell`, in the Windows archive also the headless
+  `cretlink-support-agent.exe`, plus `README.txt`, `LICENSE` and the target's
+  `CHECKSUMS-<target>.txt`;
+- `SHA256SUMS.txt` — SHA-256 over the archives;
+- `cretlink-relay-server-<target>[.exe]` — the relay server, operator-hosted
+  infrastructure on neither endpoint, so not in the archives;
+- `CHECKSUMS-<target>.txt` — SHA-256 over every program built for that target;
 - `dependency-inventory-<target>.txt` — the resolved, pinned dependency graph the
-  binaries were built from;
-- `sbom-<binary>-<target>.cdx.json` — one CycloneDX SBOM per shipped binary,
-  when available.
+  programs were built from;
+- `sbom-<binary>-<target>.cdx.json` — one CycloneDX SBOM per shipped program,
+  carrying the release version.
+
+Every program reports its release version: `cretlink version` or
+`cretlink-cli version`.
 
 This page tells you how to confirm that the files you downloaded are the ones the
 release published. Do the checksum check on every platform; do the signature
@@ -19,16 +29,34 @@ so far, so the checksums are currently the only integrity check.
 
 ## 1. Verify the SHA-256 checksums
 
-The checksum file covers exactly the bytes each binary shipped with — for a
-signed Windows release, that is the *signed* binary, because signing runs before
-the checksums are written.
+First check the archive you downloaded against `SHA256SUMS.txt`, in the folder
+holding both:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS.txt          # Linux
+shasum -a 256 -c --ignore-missing SHA256SUMS.txt      # macOS
+```
+
+```powershell
+# Windows
+$line = Select-String -Path .\SHA256SUMS.txt -Pattern 'windows-x86_64.zip'
+$expected, $name = $line.Line -split '\s+', 2
+if ((Get-FileHash -Algorithm SHA256 $name).Hash.ToLowerInvariant() -eq $expected) { "OK    $name" } else { "FAIL  $name" }
+```
+
+Then unpack it and check the programs inside against the `CHECKSUMS` file that
+came with them. The checksum file covers exactly the bytes each program shipped
+with — for a signed Windows release, that is the *signed* program, because
+signing runs before the checksums are written. It also lists the relay server,
+which is not in the archive; ignore that line unless you downloaded it.
 
 ### Windows (PowerShell)
 
 ```powershell
-# From the folder holding the downloaded binaries and CHECKSUMS file:
+# From the unpacked folder:
 Get-Content .\CHECKSUMS-x86_64-pc-windows-msvc.txt | ForEach-Object {
     $expected, $name = $_ -split '\s+', 2
+    if (-not (Test-Path $name)) { return }
     $actual = (Get-FileHash -Algorithm SHA256 -Path $name).Hash.ToLowerInvariant()
     if ($actual -eq $expected) { "OK    $name" } else { "FAIL  $name" }
 }
@@ -37,13 +65,13 @@ Get-Content .\CHECKSUMS-x86_64-pc-windows-msvc.txt | ForEach-Object {
 ### Linux
 
 ```sh
-sha256sum -c CHECKSUMS-x86_64-unknown-linux-gnu.txt
+sha256sum -c --ignore-missing CHECKSUMS-x86_64-unknown-linux-gnu.txt
 ```
 
 ### macOS
 
 ```sh
-shasum -a 256 -c CHECKSUMS-aarch64-apple-darwin.txt
+shasum -a 256 -c --ignore-missing CHECKSUMS-aarch64-apple-darwin.txt
 ```
 
 Every line must report `OK`. A `FAIL` means the file differs from what the
@@ -62,7 +90,7 @@ the baseline.
 ### Is a binary signed, and by whom?
 
 ```powershell
-Get-AuthenticodeSignature .\cretlink-support-agent-x86_64-pc-windows-msvc.exe |
+Get-AuthenticodeSignature .\cretlink-support-agent.exe |
     Format-List Status, StatusMessage, SignerCertificate
 ```
 
@@ -74,7 +102,7 @@ Get-AuthenticodeSignature .\cretlink-support-agent-x86_64-pc-windows-msvc.exe |
 Or with the Windows SDK `signtool`:
 
 ```powershell
-signtool verify /pa /v .\cretlink-support-agent-x86_64-pc-windows-msvc.exe
+signtool verify /pa /v .\cretlink-support-agent.exe
 ```
 
 ### Expected signer identity

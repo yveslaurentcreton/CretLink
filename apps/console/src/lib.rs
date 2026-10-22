@@ -2,7 +2,7 @@
 //!
 //! The console owns technician-side session state, the audit trail, the
 //! emergency stop, and hosts the local MCP bridge. The library is shared by the
-//! headless CLI (`main.rs`) and the graphical console (`apps/console-gui`):
+//! headless CLI (`main.rs`) and the graphical console (`apps/app`, Give help):
 //!
 //! - [`state`]: the technician-side session-UI state model;
 //! - [`driver`]: folds a live session event stream into that model;

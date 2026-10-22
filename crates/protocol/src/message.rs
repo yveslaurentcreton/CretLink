@@ -9,6 +9,7 @@ use crate::error::ProtocolError;
 use crate::ids::{JobId, RequestId, SessionId};
 use crate::limits;
 use crate::pairing::{SAC_COMMITMENT_LEN, SAC_NONCE_LEN};
+use crate::purpose::Purpose;
 use crate::version::ProtocolVersion;
 
 /// Which side of the session a `Hello` comes from.
@@ -1201,6 +1202,17 @@ pub enum Message {
         /// request (REQ-N-012). It carries no authority — attribution only.
         #[serde(default, skip_serializing_if = "Origin::is_console")]
         origin: Origin,
+        /// The caller's stated purpose of this action (REQ-F-026,
+        /// ST-M009-007): the AI client's short plain-language reason, carried
+        /// so the attended customer surface shows it beside the real
+        /// operation. It is an unverified **claim**, never authority, and never
+        /// replaces the operation it describes. `None` for technician-driven
+        /// requests, which are labelled by their `origin` instead. Additive
+        /// since minor `9`: omitted when `None`, so an older-minor peer still
+        /// decodes every request without a purpose (REQ-N-012), and validated
+        /// on decode through [`Purpose::new`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<Purpose>,
         /// What to do.
         op: Operation,
     },
@@ -1226,6 +1238,16 @@ pub enum Message {
         id: RequestId,
         /// The session the cancellation belongs to.
         session: SessionId,
+        /// Which local actor asks for the cancellation (REQ-F-017). Additive
+        /// since minor `9`, with the same default-and-omit rule as
+        /// [`Message::Request`]'s `origin`. Attribution only.
+        #[serde(default, skip_serializing_if = "Origin::is_console")]
+        origin: Origin,
+        /// The caller's stated purpose of the cancellation (REQ-F-026), with
+        /// the same rules as [`Message::Request`]'s `purpose`. Additive since
+        /// minor `9`; omitted when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<Purpose>,
         /// The job to cancel.
         job: JobId,
     },
@@ -1315,6 +1337,10 @@ impl Message {
                 }
                 Ok(())
             }
+            // A stated `purpose` (on `Request` and `Cancel`) is bounded by
+            // construction: `Purpose` can only be built through `Purpose::new`,
+            // which serde also uses on decode, so an empty, multi-line, or
+            // over-long purpose never reaches here (ST-M009-007).
             Self::HelloAck { .. } | Self::Cancel { .. } => Ok(()),
             Self::Request { op, .. } => validate_operation(op),
             Self::Response { result, .. } => validate_result(result),

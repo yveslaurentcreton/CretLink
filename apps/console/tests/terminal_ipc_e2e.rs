@@ -39,7 +39,7 @@ use cretlink_mcp::{
 };
 use cretlink_protocol::{
     B64Bytes, CleanupTrigger, JobId, JobOutcome, JobSummary, KeyAction, PointerAction,
-    PointerButton, RemotePath, SessionId, Shell, StagedEntry, TargetIdentity,
+    PointerButton, Purpose, RemotePath, SessionId, Shell, StagedEntry, TargetIdentity,
 };
 use cretlink_shared::Actor;
 use tokio::sync::{mpsc, oneshot};
@@ -172,67 +172,118 @@ impl ConsoleRoute for TerminalTestRoute {
     }
 
     // --- Non-terminal surface: not exercised by these tests. ---
-    async fn system_info(&self) -> Result<SystemInfoReport, TargetError> {
+    async fn system_info(
+        &self,
+        _purpose: Option<Purpose>,
+    ) -> Result<SystemInfoReport, TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn exec(&self, _p: ExecParams, _c: usize) -> Result<ExecReport, TargetError> {
+    async fn exec(
+        &self,
+        _purpose: Option<Purpose>,
+        _p: ExecParams,
+        _c: usize,
+    ) -> Result<ExecReport, TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn write_stdin(&self, _job: JobId, _data: Vec<u8>) -> Result<(), TargetError> {
+    async fn write_stdin(
+        &self,
+        _purpose: Option<Purpose>,
+        _job: JobId,
+        _data: Vec<u8>,
+    ) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn cancel(&self, _job: JobId) -> Result<(), TargetError> {
+    async fn cancel(&self, _purpose: Option<Purpose>, _job: JobId) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn list_jobs(&self) -> Result<Vec<JobSummary>, TargetError> {
+    async fn list_jobs(&self, _purpose: Option<Purpose>) -> Result<Vec<JobSummary>, TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn fs_stat(&self, _path: RemotePath) -> Result<StatReport, TargetError> {
+    async fn fs_stat(
+        &self,
+        _purpose: Option<Purpose>,
+        _path: RemotePath,
+    ) -> Result<StatReport, TargetError> {
         Err(TargetError::Unexpected)
     }
     async fn fs_list(
         &self,
+        _purpose: Option<Purpose>,
         _path: RemotePath,
         _continue_after: Option<String>,
     ) -> Result<DirPage, TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn make_dir(&self, _path: RemotePath) -> Result<(), TargetError> {
+    async fn make_dir(
+        &self,
+        _purpose: Option<Purpose>,
+        _path: RemotePath,
+    ) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
     async fn fs_move(
         &self,
+        _purpose: Option<Purpose>,
         _from: RemotePath,
         _to: RemotePath,
         _overwrite: bool,
     ) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn fs_delete(&self, _path: RemotePath) -> Result<(), TargetError> {
+    async fn fs_delete(
+        &self,
+        _purpose: Option<Purpose>,
+        _path: RemotePath,
+    ) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn remove_dir(&self, _path: RemotePath) -> Result<(), TargetError> {
+    async fn remove_dir(
+        &self,
+        _purpose: Option<Purpose>,
+        _path: RemotePath,
+    ) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn upload(&self, _params: UploadParams) -> Result<UploadReport, TargetError> {
+    async fn upload(
+        &self,
+        _purpose: Option<Purpose>,
+        _params: UploadParams,
+    ) -> Result<UploadReport, TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn download(&self, _params: DownloadParams) -> Result<DownloadReport, TargetError> {
+    async fn download(
+        &self,
+        _purpose: Option<Purpose>,
+        _params: DownloadParams,
+    ) -> Result<DownloadReport, TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn list_staged(&self) -> Result<Vec<StagedEntry>, TargetError> {
+    async fn list_staged(
+        &self,
+        _purpose: Option<Purpose>,
+    ) -> Result<Vec<StagedEntry>, TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn cleanup(&self, _trigger: CleanupTrigger) -> Result<CleanupSummary, TargetError> {
+    async fn cleanup(
+        &self,
+        _purpose: Option<Purpose>,
+        _trigger: CleanupTrigger,
+    ) -> Result<CleanupSummary, TargetError> {
         Err(TargetError::Unexpected)
     }
 
     // --- Visual desktop control: not under test here, stubbed fail-closed. ---
-    async fn capture_desktop(&self, _params: CaptureParams) -> Result<CaptureReport, TargetError> {
+    async fn capture_desktop(
+        &self,
+        _purpose: Option<Purpose>,
+        _params: CaptureParams,
+    ) -> Result<CaptureReport, TargetError> {
         Err(TargetError::Unexpected)
     }
     async fn desktop_pointer(
         &self,
+        _purpose: Option<Purpose>,
         _action: PointerAction,
         _button: PointerButton,
         _x: i32,
@@ -242,6 +293,7 @@ impl ConsoleRoute for TerminalTestRoute {
     }
     async fn desktop_scroll(
         &self,
+        _purpose: Option<Purpose>,
         _x: i32,
         _y: i32,
         _dx: i32,
@@ -249,22 +301,46 @@ impl ConsoleRoute for TerminalTestRoute {
     ) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn desktop_key(&self, _action: KeyAction, _key: String) -> Result<(), TargetError> {
+    async fn desktop_key(
+        &self,
+        _purpose: Option<Purpose>,
+        _action: KeyAction,
+        _key: String,
+    ) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn desktop_type(&self, _text: String) -> Result<(), TargetError> {
+    async fn desktop_type(
+        &self,
+        _purpose: Option<Purpose>,
+        _text: String,
+    ) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn desktop_hotkey(&self, _keys: Vec<String>) -> Result<(), TargetError> {
+    async fn desktop_hotkey(
+        &self,
+        _purpose: Option<Purpose>,
+        _keys: Vec<String>,
+    ) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn desktop_wait(&self, _millis: u64) -> Result<(), TargetError> {
+    async fn desktop_wait(
+        &self,
+        _purpose: Option<Purpose>,
+        _millis: u64,
+    ) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn clipboard_get(&self) -> Result<Option<String>, TargetError> {
+    async fn clipboard_get(
+        &self,
+        _purpose: Option<Purpose>,
+    ) -> Result<Option<String>, TargetError> {
         Err(TargetError::Unexpected)
     }
-    async fn clipboard_set(&self, _text: String) -> Result<(), TargetError> {
+    async fn clipboard_set(
+        &self,
+        _purpose: Option<Purpose>,
+        _text: String,
+    ) -> Result<(), TargetError> {
         Err(TargetError::Unexpected)
     }
 

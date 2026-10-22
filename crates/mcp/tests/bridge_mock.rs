@@ -12,7 +12,7 @@
 //! integration-test crate.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -25,7 +25,8 @@ use cretlink_mcp::{
 use cretlink_protocol::{
     B64Bytes, CleanupFailure, CleanupPolicy, CleanupTrigger, DesktopFrameMeta, DesktopState,
     DigestAlgo, ErrorCode, ErrorStage, FileEntry, FileKind, JobId, JobOutcome, JobSummary,
-    KeyAction, PointerAction, PointerButton, RemotePath, SessionId, StagedEntry, TargetIdentity,
+    KeyAction, PointerAction, PointerButton, Purpose, RemotePath, SessionId, StagedEntry,
+    TargetIdentity,
 };
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
@@ -37,6 +38,8 @@ use serde_json::{Map, Value, json};
 struct MockTarget {
     session: SessionId,
     target: TargetIdentity,
+    /// Every stated purpose the bridge forwarded, in call order (ST-M009-007).
+    purposes: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockTarget {
@@ -44,7 +47,16 @@ impl MockTarget {
         Self {
             session: SessionId::new(),
             target: simulated_identity(),
+            purposes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Records the purpose a call reached the target with.
+    fn saw(&self, purpose: &Purpose) {
+        self.purposes
+            .lock()
+            .unwrap()
+            .push(purpose.as_str().to_string());
     }
 
     /// Labels a value with this target's fixed identity, as a real backend
@@ -82,14 +94,21 @@ impl TargetSession for MockTarget {
         self.target.clone()
     }
 
-    async fn system_info(&self) -> Result<Routed<SystemInfoReport>, CallError> {
+    async fn system_info(&self, purpose: Purpose) -> Result<Routed<SystemInfoReport>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(SystemInfoReport {
             target: self.target.clone(),
             reboot_pending: false,
         }))
     }
 
-    async fn exec(&self, params: ExecParams, _cap: usize) -> Result<Routed<ExecReport>, CallError> {
+    async fn exec(
+        &self,
+        purpose: Purpose,
+        params: ExecParams,
+        _cap: usize,
+    ) -> Result<Routed<ExecReport>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(ExecReport {
             job: JobId(7),
             // Echo the requested directory (or a fixed default) so a test can
@@ -108,18 +127,22 @@ impl TargetSession for MockTarget {
 
     async fn write_stdin(
         &self,
+        purpose: Purpose,
         _job: JobId,
         _data: Vec<u8>,
         _sensitive: bool,
     ) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
-    async fn cancel(&self, _job: JobId) -> Result<Routed<()>, CallError> {
+    async fn cancel(&self, purpose: Purpose, _job: JobId) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
-    async fn list_jobs(&self) -> Result<Routed<Vec<JobSummary>>, CallError> {
+    async fn list_jobs(&self, purpose: Purpose) -> Result<Routed<Vec<JobSummary>>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(vec![JobSummary {
             job: JobId(7),
             command_preview: "sim:ok hello".to_string(),
@@ -127,7 +150,12 @@ impl TargetSession for MockTarget {
         }]))
     }
 
-    async fn fs_stat(&self, path: RemotePath) -> Result<Routed<StatReport>, CallError> {
+    async fn fs_stat(
+        &self,
+        purpose: Purpose,
+        path: RemotePath,
+    ) -> Result<Routed<StatReport>, CallError> {
+        self.saw(&purpose);
         // Echo the addressed authority domain back into the entry name so a test
         // can prove the bridge forwarded the exact `RemotePath` variant.
         Ok(self.routed(StatReport {
@@ -144,9 +172,11 @@ impl TargetSession for MockTarget {
 
     async fn fs_list(
         &self,
+        purpose: Purpose,
         path: RemotePath,
         continue_after: Option<String>,
     ) -> Result<Routed<DirPage>, CallError> {
+        self.saw(&purpose);
         let name = match continue_after {
             Some(after) => format!("{}|after:{after}", echo_path(&path)),
             None => echo_path(&path),
@@ -163,28 +193,46 @@ impl TargetSession for MockTarget {
         }))
     }
 
-    async fn make_dir(&self, _path: RemotePath) -> Result<Routed<()>, CallError> {
+    async fn make_dir(&self, purpose: Purpose, _path: RemotePath) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
     async fn fs_move(
         &self,
+        purpose: Purpose,
         _from: RemotePath,
         _to: RemotePath,
         _overwrite: bool,
     ) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
-    async fn fs_delete(&self, _path: RemotePath) -> Result<Routed<()>, CallError> {
+    async fn fs_delete(
+        &self,
+        purpose: Purpose,
+        _path: RemotePath,
+    ) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
-    async fn remove_dir(&self, _path: RemotePath) -> Result<Routed<()>, CallError> {
+    async fn remove_dir(
+        &self,
+        purpose: Purpose,
+        _path: RemotePath,
+    ) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
-    async fn upload(&self, params: UploadParams) -> Result<Routed<UploadReport>, CallError> {
+    async fn upload(
+        &self,
+        purpose: Purpose,
+        params: UploadParams,
+    ) -> Result<Routed<UploadReport>, CallError> {
+        self.saw(&purpose);
         // The bridge always addresses staging by name; echo it into the
         // committed path so a test can prove the dest was forwarded.
         let name = match params.dest {
@@ -203,7 +251,12 @@ impl TargetSession for MockTarget {
         }))
     }
 
-    async fn download(&self, params: DownloadParams) -> Result<Routed<DownloadReport>, CallError> {
+    async fn download(
+        &self,
+        purpose: Purpose,
+        params: DownloadParams,
+    ) -> Result<Routed<DownloadReport>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(DownloadReport {
             outcome: JobOutcome::Completed,
             local_path: params.local_path,
@@ -216,7 +269,8 @@ impl TargetSession for MockTarget {
         }))
     }
 
-    async fn list_staged(&self) -> Result<Routed<Vec<StagedEntry>>, CallError> {
+    async fn list_staged(&self, purpose: Purpose) -> Result<Routed<Vec<StagedEntry>>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(vec![StagedEntry {
             canonical_path: "C:\\staging\\report.txt".to_string(),
             source: "tech:report".to_string(),
@@ -228,7 +282,12 @@ impl TargetSession for MockTarget {
         }]))
     }
 
-    async fn cleanup(&self, trigger: CleanupTrigger) -> Result<Routed<CleanupSummary>, CallError> {
+    async fn cleanup(
+        &self,
+        purpose: Purpose,
+        trigger: CleanupTrigger,
+    ) -> Result<Routed<CleanupSummary>, CallError> {
+        self.saw(&purpose);
         // Echo the trigger through the removed count so a test can prove it was
         // forwarded, and report one honest failure kept for retry (REQ-N-008).
         let removed = match trigger {
@@ -249,8 +308,10 @@ impl TargetSession for MockTarget {
 
     async fn capture_desktop(
         &self,
+        purpose: Purpose,
         params: CaptureParams,
     ) -> Result<Routed<CaptureReport>, CallError> {
+        self.saw(&purpose);
         // A deterministic, honest "live" frame: `Active` state with a tiny
         // inline PNG signature, echoing the requested display and format so a
         // test can prove the parameters were forwarded (REQ-F-016).
@@ -275,46 +336,69 @@ impl TargetSession for MockTarget {
 
     async fn desktop_pointer(
         &self,
+        purpose: Purpose,
         _action: PointerAction,
         _button: PointerButton,
         _x: i32,
         _y: i32,
     ) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
     async fn desktop_scroll(
         &self,
+        purpose: Purpose,
         _x: i32,
         _y: i32,
         _dx: i32,
         _dy: i32,
     ) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
-    async fn desktop_key(&self, _action: KeyAction, _key: String) -> Result<Routed<()>, CallError> {
+    async fn desktop_key(
+        &self,
+        purpose: Purpose,
+        _action: KeyAction,
+        _key: String,
+    ) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
-    async fn desktop_type(&self, _text: String) -> Result<Routed<()>, CallError> {
+    async fn desktop_type(&self, purpose: Purpose, _text: String) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
-    async fn desktop_hotkey(&self, _keys: Vec<String>) -> Result<Routed<()>, CallError> {
+    async fn desktop_hotkey(
+        &self,
+        purpose: Purpose,
+        _keys: Vec<String>,
+    ) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
-    async fn desktop_wait(&self, _millis: u64) -> Result<Routed<()>, CallError> {
+    async fn desktop_wait(&self, purpose: Purpose, _millis: u64) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 
-    async fn clipboard_get(&self) -> Result<Routed<Option<String>>, CallError> {
+    async fn clipboard_get(&self, purpose: Purpose) -> Result<Routed<Option<String>>, CallError> {
+        self.saw(&purpose);
         // A deterministic, non-secret clipboard payload for round-trip tests.
         Ok(self.routed(Some("mock clipboard".to_string())))
     }
 
-    async fn clipboard_set(&self, _text: String) -> Result<Routed<()>, CallError> {
+    async fn clipboard_set(
+        &self,
+        purpose: Purpose,
+        _text: String,
+    ) -> Result<Routed<()>, CallError> {
+        self.saw(&purpose);
         Ok(self.routed(()))
     }
 }
@@ -331,9 +415,20 @@ fn echo_path(path: &RemotePath) -> String {
 /// Spawns the bridge over one duplex half and returns a connected rmcp client
 /// plus the session id its backing target reports.
 async fn connect() -> (RunningService<RoleClient, ()>, SessionId) {
+    let (client, session, _purposes) = connect_recording().await;
+    (client, session)
+}
+
+/// Like [`connect`], also returning the purposes the mock target received.
+async fn connect_recording() -> (
+    RunningService<RoleClient, ()>,
+    SessionId,
+    Arc<Mutex<Vec<String>>>,
+) {
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let mock = MockTarget::new();
     let session = mock.session_id();
+    let purposes = Arc::clone(&mock.purposes);
     let bridge = McpBridge::new(Arc::new(mock));
 
     tokio::spawn(async move {
@@ -345,7 +440,7 @@ async fn connect() -> (RunningService<RoleClient, ()>, SessionId) {
     let client = serve_client((), client_io)
         .await
         .expect("client initialization");
-    (client, session)
+    (client, session, purposes)
 }
 
 fn structured(result: &rmcp::model::CallToolResult) -> Value {
@@ -425,7 +520,9 @@ async fn system_info_embeds_session_and_simulated_target() {
     let (client, session) = connect().await;
 
     let result = client
-        .call_tool(CallToolRequestParams::new("remote_system_info"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_system_info",
+        )))
         .await
         .expect("remote_system_info");
     assert_ne!(result.is_error, Some(true));
@@ -448,7 +545,9 @@ async fn exec_runs_end_to_end_and_reports_output() {
     args.insert("command".to_string(), json!("sim:ok hello"));
 
     let result = client
-        .call_tool(CallToolRequestParams::new("remote_exec").with_arguments(args))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_exec").with_arguments(args),
+        ))
         .await
         .expect("remote_exec");
     assert_ne!(result.is_error, Some(true));
@@ -485,7 +584,9 @@ async fn oversized_command_is_a_tool_error_not_a_panic() {
     );
 
     let outcome = client
-        .call_tool(CallToolRequestParams::new("remote_exec").with_arguments(args))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_exec").with_arguments(args),
+        ))
         .await;
     assert!(
         outcome.is_err(),
@@ -504,7 +605,9 @@ async fn invalid_base64_stdin_is_rejected() {
     args.insert("data_base64".to_string(), json!("not valid base64 !!!"));
 
     let outcome = client
-        .call_tool(CallToolRequestParams::new("remote_write_stdin").with_arguments(args))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_write_stdin").with_arguments(args),
+        ))
         .await;
     assert!(
         outcome.is_err(),
@@ -528,7 +631,9 @@ async fn oversized_stdin_is_rejected_before_decoding() {
     );
 
     let outcome = client
-        .call_tool(CallToolRequestParams::new("remote_write_stdin").with_arguments(args))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_write_stdin").with_arguments(args),
+        ))
         .await;
     assert!(
         outcome.is_err(),
@@ -615,12 +720,12 @@ async fn stat_distinguishes_absolute_from_staging() {
     // An absolute path and a staging component are disjoint authority domains
     // (ADR-0012); the bridge must forward each variant unchanged.
     let absolute = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_stat").with_arguments(args_of(&[(
                 "path",
                 json!({ "kind": "absolute", "path": "C:\\Windows" }),
             )])),
-        )
+        ))
         .await
         .expect("remote_stat absolute");
     assert_ne!(absolute.is_error, Some(true));
@@ -630,12 +735,12 @@ async fn stat_distinguishes_absolute_from_staging() {
     assert_eq!(body["result"]["entry"]["name"], json!("abs:C:\\Windows"));
 
     let staging = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_stat").with_arguments(args_of(&[(
                 "path",
                 json!({ "kind": "staging", "name": "report.txt" }),
             )])),
-        )
+        ))
         .await
         .expect("remote_stat staging");
     assert_ne!(staging.is_error, Some(true));
@@ -650,12 +755,12 @@ async fn list_dir_forwards_pagination_token() {
     let (client, _session) = connect().await;
 
     let result = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_list_dir").with_arguments(args_of(&[
                 ("path", json!({ "kind": "absolute", "path": "C:\\logs" })),
                 ("continue_after", json!("part-0009")),
             ])),
-        )
+        ))
         .await
         .expect("remote_list_dir");
     assert_ne!(result.is_error, Some(true));
@@ -705,7 +810,9 @@ async fn make_dir_move_delete_remove_dir_acknowledge() {
         ),
     ] {
         let result = client
-            .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+            .call_tool(with_purpose(
+                CallToolRequestParams::new(tool).with_arguments(args),
+            ))
             .await
             .unwrap_or_else(|err| panic!("{tool} failed: {err}"));
         assert_ne!(result.is_error, Some(true), "{tool} returned an error");
@@ -723,14 +830,14 @@ async fn upload_reports_hex_digest_and_forwards_dest() {
     let (client, session) = connect().await;
 
     let result = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_upload").with_arguments(args_of(&[
                 ("local_path", json!("C:\\tech\\report.txt")),
                 ("dest_name", json!("report.txt")),
                 ("source_label", json!("tech:report")),
                 ("cleanup", json!("on_session_end")),
             ])),
-        )
+        ))
         .await
         .expect("remote_upload");
     assert_ne!(result.is_error, Some(true));
@@ -757,7 +864,7 @@ async fn download_reports_hex_digest_and_local_path() {
     let (client, _session) = connect().await;
 
     let result = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_download").with_arguments(args_of(&[
                 (
                     "source",
@@ -765,7 +872,7 @@ async fn download_reports_hex_digest_and_local_path() {
                 ),
                 ("local_path", json!("C:\\tech\\a.txt")),
             ])),
-        )
+        ))
         .await
         .expect("remote_download");
     assert_ne!(result.is_error, Some(true));
@@ -783,7 +890,9 @@ async fn list_staged_reports_hex_digest() {
     let (client, session) = connect().await;
 
     let result = client
-        .call_tool(CallToolRequestParams::new("remote_list_staged"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_list_staged",
+        )))
         .await
         .expect("remote_list_staged");
     assert_ne!(result.is_error, Some(true));
@@ -809,10 +918,10 @@ async fn cleanup_forwards_trigger_and_reports_failures() {
     // The mock echoes the trigger through `removed` (all => 3) so a mismatch
     // would prove the wrong trigger was forwarded.
     let result = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_cleanup")
                 .with_arguments(args_of(&[("trigger", json!("all"))])),
-        )
+        ))
         .await
         .expect("remote_cleanup");
     assert_ne!(result.is_error, Some(true));
@@ -833,7 +942,7 @@ async fn oversized_upload_source_label_is_rejected() {
     let (client, _session) = connect().await;
 
     let result = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_upload").with_arguments(args_of(&[
                 ("local_path", json!("C:\\tech\\report.txt")),
                 ("dest_name", json!("report.txt")),
@@ -843,7 +952,7 @@ async fn oversized_upload_source_label_is_rejected() {
                 ),
                 ("cleanup", json!("on_session_end")),
             ])),
-        )
+        ))
         .await;
     assert!(
         result.is_err(),
@@ -892,12 +1001,13 @@ impl TargetSession for FailingTarget {
         self.target.clone()
     }
 
-    async fn system_info(&self) -> Result<Routed<SystemInfoReport>, CallError> {
+    async fn system_info(&self, _purpose: Purpose) -> Result<Routed<SystemInfoReport>, CallError> {
         self.fail()
     }
 
     async fn exec(
         &self,
+        _purpose: Purpose,
         _params: ExecParams,
         _cap: usize,
     ) -> Result<Routed<ExecReport>, CallError> {
@@ -906,6 +1016,7 @@ impl TargetSession for FailingTarget {
 
     async fn write_stdin(
         &self,
+        _purpose: Purpose,
         _job: JobId,
         _data: Vec<u8>,
         _sensitive: bool,
@@ -913,32 +1024,42 @@ impl TargetSession for FailingTarget {
         self.fail()
     }
 
-    async fn cancel(&self, _job: JobId) -> Result<Routed<()>, CallError> {
+    async fn cancel(&self, _purpose: Purpose, _job: JobId) -> Result<Routed<()>, CallError> {
         self.fail()
     }
 
-    async fn list_jobs(&self) -> Result<Routed<Vec<JobSummary>>, CallError> {
+    async fn list_jobs(&self, _purpose: Purpose) -> Result<Routed<Vec<JobSummary>>, CallError> {
         self.fail()
     }
 
-    async fn fs_stat(&self, _path: RemotePath) -> Result<Routed<StatReport>, CallError> {
+    async fn fs_stat(
+        &self,
+        _purpose: Purpose,
+        _path: RemotePath,
+    ) -> Result<Routed<StatReport>, CallError> {
         self.fail()
     }
 
     async fn fs_list(
         &self,
+        _purpose: Purpose,
         _path: RemotePath,
         _continue_after: Option<String>,
     ) -> Result<Routed<DirPage>, CallError> {
         self.fail()
     }
 
-    async fn make_dir(&self, _path: RemotePath) -> Result<Routed<()>, CallError> {
+    async fn make_dir(
+        &self,
+        _purpose: Purpose,
+        _path: RemotePath,
+    ) -> Result<Routed<()>, CallError> {
         self.fail()
     }
 
     async fn fs_move(
         &self,
+        _purpose: Purpose,
         _from: RemotePath,
         _to: RemotePath,
         _overwrite: bool,
@@ -946,27 +1067,47 @@ impl TargetSession for FailingTarget {
         self.fail()
     }
 
-    async fn fs_delete(&self, _path: RemotePath) -> Result<Routed<()>, CallError> {
+    async fn fs_delete(
+        &self,
+        _purpose: Purpose,
+        _path: RemotePath,
+    ) -> Result<Routed<()>, CallError> {
         self.fail()
     }
 
-    async fn remove_dir(&self, _path: RemotePath) -> Result<Routed<()>, CallError> {
+    async fn remove_dir(
+        &self,
+        _purpose: Purpose,
+        _path: RemotePath,
+    ) -> Result<Routed<()>, CallError> {
         self.fail()
     }
 
-    async fn upload(&self, _params: UploadParams) -> Result<Routed<UploadReport>, CallError> {
+    async fn upload(
+        &self,
+        _purpose: Purpose,
+        _params: UploadParams,
+    ) -> Result<Routed<UploadReport>, CallError> {
         self.fail()
     }
 
-    async fn download(&self, _params: DownloadParams) -> Result<Routed<DownloadReport>, CallError> {
+    async fn download(
+        &self,
+        _purpose: Purpose,
+        _params: DownloadParams,
+    ) -> Result<Routed<DownloadReport>, CallError> {
         self.fail()
     }
 
-    async fn list_staged(&self) -> Result<Routed<Vec<StagedEntry>>, CallError> {
+    async fn list_staged(&self, _purpose: Purpose) -> Result<Routed<Vec<StagedEntry>>, CallError> {
         self.fail()
     }
 
-    async fn cleanup(&self, _trigger: CleanupTrigger) -> Result<Routed<CleanupSummary>, CallError> {
+    async fn cleanup(
+        &self,
+        _purpose: Purpose,
+        _trigger: CleanupTrigger,
+    ) -> Result<Routed<CleanupSummary>, CallError> {
         self.fail()
     }
 
@@ -974,6 +1115,7 @@ impl TargetSession for FailingTarget {
 
     async fn capture_desktop(
         &self,
+        _purpose: Purpose,
         _params: CaptureParams,
     ) -> Result<Routed<CaptureReport>, CallError> {
         self.fail()
@@ -981,6 +1123,7 @@ impl TargetSession for FailingTarget {
 
     async fn desktop_pointer(
         &self,
+        _purpose: Purpose,
         _action: PointerAction,
         _button: PointerButton,
         _x: i32,
@@ -991,6 +1134,7 @@ impl TargetSession for FailingTarget {
 
     async fn desktop_scroll(
         &self,
+        _purpose: Purpose,
         _x: i32,
         _y: i32,
         _dx: i32,
@@ -999,27 +1143,44 @@ impl TargetSession for FailingTarget {
         self.fail()
     }
 
-    async fn desktop_key(&self, _action: KeyAction, _key: String) -> Result<Routed<()>, CallError> {
+    async fn desktop_key(
+        &self,
+        _purpose: Purpose,
+        _action: KeyAction,
+        _key: String,
+    ) -> Result<Routed<()>, CallError> {
         self.fail()
     }
 
-    async fn desktop_type(&self, _text: String) -> Result<Routed<()>, CallError> {
+    async fn desktop_type(
+        &self,
+        _purpose: Purpose,
+        _text: String,
+    ) -> Result<Routed<()>, CallError> {
         self.fail()
     }
 
-    async fn desktop_hotkey(&self, _keys: Vec<String>) -> Result<Routed<()>, CallError> {
+    async fn desktop_hotkey(
+        &self,
+        _purpose: Purpose,
+        _keys: Vec<String>,
+    ) -> Result<Routed<()>, CallError> {
         self.fail()
     }
 
-    async fn desktop_wait(&self, _millis: u64) -> Result<Routed<()>, CallError> {
+    async fn desktop_wait(&self, _purpose: Purpose, _millis: u64) -> Result<Routed<()>, CallError> {
         self.fail()
     }
 
-    async fn clipboard_get(&self) -> Result<Routed<Option<String>>, CallError> {
+    async fn clipboard_get(&self, _purpose: Purpose) -> Result<Routed<Option<String>>, CallError> {
         self.fail()
     }
 
-    async fn clipboard_set(&self, _text: String) -> Result<Routed<()>, CallError> {
+    async fn clipboard_set(
+        &self,
+        _purpose: Purpose,
+        _text: String,
+    ) -> Result<Routed<()>, CallError> {
         self.fail()
     }
 }
@@ -1072,12 +1233,12 @@ async fn error_envelope_distinguishes_the_four_failure_classes() {
     for (error, kind, code) in cases {
         let client = connect_failing(error).await;
         let result = client
-            .call_tool(
+            .call_tool(with_purpose(
                 CallToolRequestParams::new("remote_stat").with_arguments(args_of(&[(
                     "path",
                     json!({ "kind": "absolute", "path": "C:\\Windows" }),
                 )])),
-            )
+            ))
             .await
             .expect("the tool call returns a result envelope");
         assert_eq!(result.is_error, Some(true), "{kind} must be a tool error");
@@ -1118,13 +1279,13 @@ async fn adversarial_working_dir_is_rejected_at_the_bridge() {
 
     for bad in ["C:\\Users\\..\\Windows", "\\\\server\\share", "C:"] {
         let result = client
-            .call_tool(
+            .call_tool(with_purpose(
                 CallToolRequestParams::new("remote_exec").with_arguments(args_of(&[
                     ("shell", json!("cmd")),
                     ("command", json!("echo should-not-run")),
                     ("working_dir", json!(bad)),
                 ])),
-            )
+            ))
             .await;
         assert!(
             result.is_err(),
@@ -1140,13 +1301,13 @@ async fn oversized_absolute_path_is_rejected() {
     let (client, _session) = connect().await;
 
     let result = client
-        .call_tool(CallToolRequestParams::new("remote_stat").with_arguments(args_of(&[(
+        .call_tool(with_purpose(CallToolRequestParams::new("remote_stat").with_arguments(args_of(&[(
             "path",
             json!({
                 "kind": "absolute",
                 "path": "C:\\".to_string() + &"a".repeat(cretlink_protocol::limits::MAX_PATH_BYTES),
             }),
-        )])))
+        )]))))
         .await;
     assert!(
         result.is_err(),
@@ -1193,10 +1354,10 @@ async fn capture_desktop_reports_active_frame_with_inline_image() {
     let (client, session) = connect().await;
 
     let result = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_capture_desktop")
                 .with_arguments(args_of(&[("display", json!(3)), ("format", json!("webp"))])),
-        )
+        ))
         .await
         .expect("remote_capture_desktop");
     assert_ne!(result.is_error, Some(true));
@@ -1243,7 +1404,9 @@ async fn clipboard_get_round_trips_text() {
     let (client, session) = connect().await;
 
     let result = client
-        .call_tool(CallToolRequestParams::new("remote_clipboard_get"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_clipboard_get",
+        )))
         .await
         .expect("remote_clipboard_get");
     assert_ne!(result.is_error, Some(true));
@@ -1300,7 +1463,9 @@ async fn desktop_input_ops_acknowledge_with_identity() {
 
     for (tool, args) in calls {
         let result = client
-            .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+            .call_tool(with_purpose(
+                CallToolRequestParams::new(tool).with_arguments(args),
+            ))
             .await
             .unwrap_or_else(|err| panic!("{tool} must return a result: {err}"));
         assert_ne!(result.is_error, Some(true), "{tool} must acknowledge");
@@ -1335,7 +1500,7 @@ async fn out_of_range_pointer_coordinate_is_rejected_at_the_bridge() {
     let (client, _session) = connect().await;
 
     let result = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_desktop_pointer").with_arguments(args_of(&[
                 ("action", json!("move")),
                 ("button", json!("left")),
@@ -1345,7 +1510,7 @@ async fn out_of_range_pointer_coordinate_is_rejected_at_the_bridge() {
                 ),
                 ("y", json!(0)),
             ])),
-        )
+        ))
         .await;
     assert!(
         result.is_err(),
@@ -1362,16 +1527,131 @@ async fn oversized_desktop_type_is_rejected_at_the_bridge() {
     let (client, _session) = connect().await;
 
     let result = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_desktop_type").with_arguments(args_of(&[(
                 "text",
                 json!("x".repeat(cretlink_protocol::limits::MAX_DESKTOP_TEXT_BYTES + 1)),
             )])),
-        )
+        ))
         .await;
     assert!(
         result.is_err(),
         "type text over the byte limit must be rejected as a protocol error"
+    );
+
+    client.cancel().await.ok();
+}
+
+/// The stated purpose every test tool call carries (ST-M009-007).
+const TEST_PURPOSE: &str = "Checking the computer for the support request";
+
+/// Adds the required stated `purpose` argument to a tool call that does not set
+/// one (ST-M009-007), so each test states only the arguments it is about.
+fn with_purpose(mut params: CallToolRequestParams) -> CallToolRequestParams {
+    params
+        .arguments
+        .get_or_insert_with(Map::new)
+        .entry("purpose")
+        .or_insert_with(|| Value::String(TEST_PURPOSE.to_string()));
+    params
+}
+
+// --- Stated purpose (REQ-F-026, ST-M009-007) -------------------------------
+
+/// Every tool's schema requires `purpose`, and a valid one reaches the target
+/// trimmed, exactly once per call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_tool_requires_a_purpose_and_forwards_it_trimmed() {
+    let (client, _session, purposes) = connect_recording().await;
+
+    let tools = client.list_all_tools().await.expect("list tools");
+    assert_eq!(tools.len(), 24);
+    for tool in &tools {
+        let schema = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            required.contains(&json!("purpose")),
+            "{} must require a purpose: {schema}",
+            tool.name
+        );
+        assert_eq!(
+            schema["properties"]["purpose"]["maxLength"],
+            json!(cretlink_protocol::limits::MAX_PURPOSE_CHARS),
+            "{}",
+            tool.name
+        );
+    }
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("remote_system_info").with_arguments(args_of(&[(
+                "purpose",
+                json!("  Checking which computer this is  "),
+            )])),
+        )
+        .await
+        .expect("system_info");
+    assert_ne!(result.is_error, Some(true));
+    assert_eq!(
+        purposes.lock().unwrap().as_slice(),
+        &["Checking which computer this is".to_string()]
+    );
+
+    client.cancel().await.ok();
+}
+
+/// A call without a valid purpose is refused with an actionable error that
+/// names the argument, and nothing reaches the target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_without_a_valid_purpose_never_reaches_the_target() {
+    let (client, _session, purposes) = connect_recording().await;
+    let too_long = "a".repeat(cretlink_protocol::limits::MAX_PURPOSE_CHARS + 1);
+    let cases: [(&str, Option<Value>); 6] = [
+        ("missing", None),
+        ("empty", Some(json!(""))),
+        ("whitespace", Some(json!(" \t "))),
+        (
+            "multi-line",
+            Some(json!("Checking disk\nand deleting files")),
+        ),
+        ("too long", Some(json!(too_long))),
+        ("not a string", Some(json!(7))),
+    ];
+    for tool in ["remote_exec", "remote_system_info"] {
+        for (case, purpose) in &cases {
+            let mut args = if tool == "remote_exec" {
+                args_of(&[("shell", json!("cmd")), ("command", json!("echo hi"))])
+            } else {
+                Map::new()
+            };
+            if let Some(purpose) = purpose {
+                args.insert("purpose".to_string(), purpose.clone());
+            }
+            let message = match client
+                .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+                .await
+            {
+                Err(err) => err.to_string(),
+                Ok(result) => {
+                    assert_eq!(result.is_error, Some(true), "{tool}/{case}: {result:?}");
+                    assert!(
+                        result.structured_content.is_none(),
+                        "{tool}/{case}: no routed envelope for a refused call"
+                    );
+                    format!("{:?}", result.content)
+                }
+            };
+            // serde's type-mismatch message names the expected type, not the
+            // field; every other rejection names the purpose argument.
+            assert!(
+                message.contains("purpose") || *case == "not a string",
+                "{tool}/{case}: the error must name the purpose: {message}"
+            );
+        }
+    }
+    assert!(
+        purposes.lock().unwrap().is_empty(),
+        "no refused call may reach the target"
     );
 
     client.cancel().await.ok();

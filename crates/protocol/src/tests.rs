@@ -16,6 +16,7 @@ use crate::{
     RequestId, RevokeReason, Role, SAC_COMMITMENT_LEN, SAC_NONCE_LEN, SessionId, Shell,
     StagedEntry, TargetIdentity, canonical_capabilities, limits,
 };
+use crate::{Purpose, PurposeError};
 
 fn simulated_target() -> TargetIdentity {
     TargetIdentity {
@@ -43,6 +44,7 @@ fn request(op: Operation) -> Message {
         id: RequestId(7),
         session: SessionId::new(),
         origin: Origin::Console,
+        purpose: None,
         op,
     }
 }
@@ -282,6 +284,8 @@ fn round_trip_cancel() {
     round_trip(Message::Cancel {
         id: RequestId(5),
         session: SessionId::new(),
+        origin: Origin::Console,
+        purpose: None,
         job: JobId(9),
     });
 }
@@ -691,8 +695,8 @@ fn hello_wire_format_is_stable() {
         value,
         json!({
             "type": "hello",
-            // Deliberately updated with the 1.8 minor bump (ST-M002-013).
-            "protocol": { "major": 1, "minor": 8 },
+            // Deliberately updated with the 1.9 minor bump (ST-M009-007).
+            "protocol": { "major": 1, "minor": 9 },
             "role": "console",
             "capabilities": ["exec"],
         })
@@ -706,6 +710,7 @@ fn exec_request_wire_format_is_stable() {
         id: RequestId(7),
         session,
         origin: Origin::Console,
+        purpose: None,
         op: exec_operation(),
     }
     .encode()
@@ -740,6 +745,7 @@ fn mcp_origin_request_serializes_origin() {
         id: RequestId(7),
         session,
         origin: Origin::Mcp,
+        purpose: None,
         op: Operation::SystemInfo {},
     }
     .encode()
@@ -771,8 +777,191 @@ fn round_trip_request_carries_origin() {
             id: RequestId(7),
             session: SessionId::new(),
             origin,
+            purpose: None,
             op: Operation::SystemInfo {},
         });
+    }
+}
+
+// --- Stated purpose of AI actions (REQ-F-026, ST-M009-007, minor 9) ---
+
+fn purpose(text: &str) -> Purpose {
+    Purpose::new(text).unwrap()
+}
+
+#[test]
+fn purpose_is_trimmed_and_bounded_in_characters() {
+    assert_eq!(
+        purpose("  Checking free disk space  ").as_str(),
+        "Checking free disk space"
+    );
+    // The bound counts characters, not bytes: 200 multi-byte characters pass.
+    let at_limit = "é".repeat(limits::MAX_PURPOSE_CHARS);
+    assert_eq!(purpose(&at_limit).as_str().chars().count(), 200);
+    // Surrounding whitespace does not count against the bound.
+    let padded = format!("  {}  ", "a".repeat(limits::MAX_PURPOSE_CHARS));
+    assert!(Purpose::new(&padded).is_ok());
+}
+
+#[test]
+fn purpose_rejects_empty_whitespace_too_long_and_multi_line() {
+    assert_eq!(Purpose::new(""), Err(PurposeError::Empty));
+    assert_eq!(Purpose::new(" \t  "), Err(PurposeError::Empty));
+    assert_eq!(
+        Purpose::new(&"a".repeat(limits::MAX_PURPOSE_CHARS + 1)),
+        Err(PurposeError::TooLong {
+            chars: limits::MAX_PURPOSE_CHARS + 1,
+            max: limits::MAX_PURPOSE_CHARS,
+        })
+    );
+    for bad in [
+        "Checking disk\nspace",
+        "Checking disk\r\nspace",
+        "Checking\tdisk space",
+        "Checking\u{0}disk",
+        "Checking\u{7f}disk",
+        "Checking\u{85}disk",
+        "Checking\u{2028}disk",
+        "Checking\u{2029}disk",
+        // A right-to-left override could visually reorder the line the
+        // customer reads; it is refused outright.
+        "Checking \u{202e}ksid",
+        "Checking \u{2066}disk\u{2069}",
+    ] {
+        assert_eq!(
+            Purpose::new(bad),
+            Err(PurposeError::NotSingleLine),
+            "{bad:?} must be rejected"
+        );
+    }
+    // Every rejection message tells the caller what to send instead.
+    assert!(PurposeError::Empty.to_string().contains("short sentence"));
+}
+
+#[test]
+fn request_without_purpose_keeps_the_minor_8_wire_form() {
+    // `purpose: None` is omitted, so the frame is byte-for-byte what a minor-8
+    // peer produces and decodes (REQ-N-012).
+    let bytes = request(Operation::SystemInfo {}).encode().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(value.get("purpose").is_none(), "{value}");
+}
+
+#[test]
+fn request_without_purpose_field_decodes_to_none() {
+    // A minor-8-shaped request has no `purpose`; a minor-9 decoder fills `None`
+    // rather than rejecting the frame (REQ-N-012).
+    let payload = json!({
+        "type": "request",
+        "id": 7,
+        "session": SessionId::new().to_string(),
+        "origin": "mcp",
+        "op": { "op": "system_info" },
+    });
+    match Message::decode(payload.to_string().as_bytes()).unwrap() {
+        Message::Request {
+            origin, purpose, ..
+        } => {
+            assert_eq!(origin, Origin::Mcp);
+            assert_eq!(purpose, None);
+        }
+        other => panic!("expected request, got {other:?}"),
+    }
+}
+
+#[test]
+fn round_trip_request_and_cancel_carry_purpose() {
+    let stated = purpose("Checking free disk space");
+    let message = Message::Request {
+        id: RequestId(7),
+        session: SessionId::new(),
+        origin: Origin::Mcp,
+        purpose: Some(stated.clone()),
+        op: Operation::SystemInfo {},
+    };
+    round_trip(message.clone());
+    let value: serde_json::Value = serde_json::from_slice(&message.encode().unwrap()).unwrap();
+    assert_eq!(value["purpose"], json!("Checking free disk space"));
+
+    round_trip(Message::Cancel {
+        id: RequestId(8),
+        session: SessionId::new(),
+        origin: Origin::Mcp,
+        purpose: Some(stated),
+        job: JobId(3),
+    });
+}
+
+#[test]
+fn cancel_without_origin_or_purpose_keeps_the_minor_8_wire_form() {
+    let session = SessionId::new();
+    let bytes = Message::Cancel {
+        id: RequestId(5),
+        session,
+        origin: Origin::Console,
+        purpose: None,
+        job: JobId(9),
+    }
+    .encode()
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value,
+        json!({ "type": "cancel", "id": 5, "session": session.to_string(), "job": 9 })
+    );
+    // And the minor-8 form decodes with the defaults.
+    match Message::decode(&bytes).unwrap() {
+        Message::Cancel {
+            origin, purpose, ..
+        } => {
+            assert_eq!(origin, Origin::Console);
+            assert_eq!(purpose, None);
+        }
+        other => panic!("expected cancel, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_rejects_an_invalid_purpose() {
+    // A peer cannot smuggle an empty, multi-line, or over-long purpose past the
+    // decoder: the frame fails closed as malformed (ST-M009-007).
+    for bad in [
+        json!(""),
+        json!("   "),
+        json!("line one\nline two"),
+        json!("a".repeat(limits::MAX_PURPOSE_CHARS + 1)),
+        json!(42),
+    ] {
+        let payload = json!({
+            "type": "request",
+            "id": 7,
+            "session": SessionId::new().to_string(),
+            "origin": "mcp",
+            "purpose": bad,
+            "op": { "op": "system_info" },
+        });
+        let err = Message::decode(payload.to_string().as_bytes()).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::MalformedMessage, "{bad}: {err}");
+    }
+}
+
+#[test]
+fn decoded_purpose_is_trimmed() {
+    let payload = json!({
+        "type": "request",
+        "id": 7,
+        "session": SessionId::new().to_string(),
+        "origin": "mcp",
+        "purpose": "  Checking free disk space ",
+        "op": { "op": "system_info" },
+    });
+    match Message::decode(payload.to_string().as_bytes()).unwrap() {
+        Message::Request {
+            purpose: decoded, ..
+        } => {
+            assert_eq!(decoded, Some(purpose("Checking free disk space")));
+        }
+        other => panic!("expected request, got {other:?}"),
     }
 }
 
@@ -783,6 +972,7 @@ fn stdin_data_serializes_as_base64_string() {
         id: RequestId(1),
         session,
         origin: Origin::Console,
+        purpose: None,
         op: Operation::WriteStdin {
             job: JobId(3),
             data: B64Bytes::new(vec![1, 2, 3]),
@@ -1277,6 +1467,7 @@ fn payload_free_variants_serialize_as_tag_only() {
         id: RequestId(1),
         session,
         origin: Origin::Console,
+        purpose: None,
         op: Operation::SystemInfo {},
     }
     .encode()
@@ -1310,9 +1501,9 @@ fn negotiation_answers_with_own_minor() {
 }
 
 #[test]
-fn protocol_v1_is_one_dot_eight() {
-    assert_eq!(PROTOCOL_V1, ProtocolVersion::new(1, 8));
-    assert_eq!(PROTOCOL_V1.to_string(), "1.8");
+fn protocol_v1_is_one_dot_nine() {
+    assert_eq!(PROTOCOL_V1, ProtocolVersion::new(1, 9));
+    assert_eq!(PROTOCOL_V1.to_string(), "1.9");
 }
 
 // --- File operations and transfer (ADR-0012, ST-M003-004/005) ---
@@ -1882,6 +2073,7 @@ fn term_open_wire_format_is_stable() {
         id: RequestId(7),
         session,
         origin: Origin::Terminal,
+        purpose: None,
         op: Operation::TermOpen {
             shell: Shell::Cmd,
             cols: 80,

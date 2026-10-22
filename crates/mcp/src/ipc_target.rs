@@ -3,7 +3,9 @@
 //!
 //! The MCP bridge binary backs its [`crate::McpBridge`] with this type. It holds
 //! **no** session authority: every call opens a short-lived connection to the
-//! console's IPC endpoint, forwards one request, and maps the reply. The console
+//! console's IPC endpoint, learns the console's contract version with a `Hello`
+//! on that connection, forwards one request (wrapped with the stated purpose
+//! when the console understands it, ST-M009-007), and maps the reply. The console
 //! is the sole routing authority and answers with the routed session identity
 //! and target, or a fail-closed [`crate::TargetError::NoConsentedSession`] when
 //! no consented active session exists (REQ-S-009). A lost IPC connection is
@@ -18,12 +20,12 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use cretlink_protocol::{
-    B64Bytes, CleanupTrigger, JobId, JobSummary, KeyAction, PointerAction, PointerButton,
+    B64Bytes, CleanupTrigger, JobId, JobSummary, KeyAction, PointerAction, PointerButton, Purpose,
     RemotePath, SessionId, StagedEntry, TargetIdentity,
 };
 
 use crate::ipc::wire::{IpcRequest, IpcResponse, read_message, write_message};
-use crate::ipc::{IPC_PROTOCOL, IpcEndpoint};
+use crate::ipc::{IPC_PROTOCOL, IPC_PURPOSE_MINOR, IpcEndpoint};
 use crate::target::{
     CallError, CaptureParams, CaptureReport, CleanupSummary, DirPage, DownloadParams,
     DownloadReport, ExecParams, ExecReport, Routed, StatReport, SystemInfoReport, TargetError,
@@ -117,10 +119,50 @@ impl IpcTargetSession {
             .map_err(|_| TargetError::Disconnected)
     }
 
-    /// Sends a request and, on a routed reply, refreshes the cached identity so
-    /// later synchronous [`Self::session_id`]/[`Self::target`] stay accurate.
-    async fn call(&self, request: IpcRequest) -> Result<IpcResponse, TargetError> {
-        let response = self.roundtrip(request).await?;
+    /// Sends one routed tool request with the AI client's stated purpose and,
+    /// on a routed reply, refreshes the cached identity so later synchronous
+    /// [`Self::session_id`]/[`Self::target`] stay accurate.
+    ///
+    /// The purpose rides in an [`IpcRequest::WithPurpose`] wrapper only when a
+    /// `Hello` on this same connection reports a console contract minor of at
+    /// least [`IPC_PURPOSE_MINOR`] (ST-M009-007). An older console would close
+    /// the connection on the unknown wrapper, so it receives the bare request
+    /// instead: the purpose is dropped, the call still runs attributed to the
+    /// AI and audited, and the customer sees it without a stated reason. A
+    /// failed handshake is a lost link (unknown outcome), as for any call.
+    async fn call(
+        &self,
+        request: IpcRequest,
+        purpose: Purpose,
+    ) -> Result<IpcResponse, TargetError> {
+        let mut stream = crate::ipc::connect(&self.endpoint)
+            .await
+            .map_err(|_| TargetError::Disconnected)?;
+        write_message(
+            &mut stream,
+            &IpcRequest::Hello {
+                protocol: IPC_PROTOCOL,
+            },
+        )
+        .await
+        .map_err(|_| TargetError::Disconnected)?;
+        let hello: IpcResponse = read_message(&mut stream)
+            .await
+            .map_err(|_| TargetError::Disconnected)?;
+        let request = if console_accepts_purpose(&hello) {
+            IpcRequest::WithPurpose {
+                purpose,
+                call: Box::new(request),
+            }
+        } else {
+            request
+        };
+        write_message(&mut stream, &request)
+            .await
+            .map_err(|_| TargetError::Disconnected)?;
+        let response: IpcResponse = read_message(&mut stream)
+            .await
+            .map_err(|_| TargetError::Disconnected)?;
         if let Some((session, target)) = routed_identity(&response) {
             self.store_identity(session, target.clone());
         }
@@ -144,8 +186,12 @@ impl IpcTargetSession {
     /// [`IpcResponse::DesktopAck`] and maps it onto `Routed<()>`. Shared by the
     /// pointer, scroll, key, type, hotkey, wait, and clipboard-set methods, which
     /// carry no payload and so share one ack shape (ST-M005-004).
-    async fn desktop_ack(&self, request: IpcRequest) -> Result<Routed<()>, CallError> {
-        match self.call(request).await? {
+    async fn desktop_ack(
+        &self,
+        request: IpcRequest,
+        purpose: Purpose,
+    ) -> Result<Routed<()>, CallError> {
+        match self.call(request, purpose).await? {
             IpcResponse::DesktopAck {
                 session,
                 target,
@@ -161,6 +207,18 @@ impl IpcTargetSession {
             }
             _ => Err(TargetError::Unexpected.into()),
         }
+    }
+}
+
+/// Whether a `Hello` answer comes from a console that understands
+/// [`IpcRequest::WithPurpose`]: a compatible major at minor
+/// [`IPC_PURPOSE_MINOR`] or later (ST-M009-007).
+fn console_accepts_purpose(hello: &IpcResponse) -> bool {
+    match hello {
+        IpcResponse::Hello { protocol, .. } => {
+            protocol.is_compatible_with(IPC_PROTOCOL) && protocol.minor >= IPC_PURPOSE_MINOR
+        }
+        _ => false,
     }
 }
 
@@ -248,8 +306,8 @@ impl TargetSession for IpcTargetSession {
         self.snapshot().target
     }
 
-    async fn system_info(&self) -> Result<Routed<SystemInfoReport>, CallError> {
-        match self.call(IpcRequest::SystemInfo {}).await? {
+    async fn system_info(&self, purpose: Purpose) -> Result<Routed<SystemInfoReport>, CallError> {
+        match self.call(IpcRequest::SystemInfo {}, purpose).await? {
             IpcResponse::SystemInfo {
                 session,
                 target,
@@ -270,6 +328,7 @@ impl TargetSession for IpcTargetSession {
 
     async fn exec(
         &self,
+        purpose: Purpose,
         params: ExecParams,
         output_cap: usize,
     ) -> Result<Routed<ExecReport>, CallError> {
@@ -277,7 +336,7 @@ impl TargetSession for IpcTargetSession {
             params,
             output_cap: output_cap as u64,
         };
-        match self.call(request).await? {
+        match self.call(request, purpose).await? {
             IpcResponse::Exec {
                 session,
                 target,
@@ -298,6 +357,7 @@ impl TargetSession for IpcTargetSession {
 
     async fn write_stdin(
         &self,
+        purpose: Purpose,
         job: JobId,
         data: Vec<u8>,
         sensitive: bool,
@@ -307,7 +367,7 @@ impl TargetSession for IpcTargetSession {
             data: B64Bytes::new(data),
             sensitive,
         };
-        match self.call(request).await? {
+        match self.call(request, purpose).await? {
             IpcResponse::WriteStdin {
                 session,
                 target,
@@ -326,8 +386,8 @@ impl TargetSession for IpcTargetSession {
         }
     }
 
-    async fn cancel(&self, job: JobId) -> Result<Routed<()>, CallError> {
-        match self.call(IpcRequest::Cancel { job }).await? {
+    async fn cancel(&self, purpose: Purpose, job: JobId) -> Result<Routed<()>, CallError> {
+        match self.call(IpcRequest::Cancel { job }, purpose).await? {
             IpcResponse::Cancel {
                 session,
                 target,
@@ -345,8 +405,8 @@ impl TargetSession for IpcTargetSession {
         }
     }
 
-    async fn list_jobs(&self) -> Result<Routed<Vec<JobSummary>>, CallError> {
-        match self.call(IpcRequest::ListJobs {}).await? {
+    async fn list_jobs(&self, purpose: Purpose) -> Result<Routed<Vec<JobSummary>>, CallError> {
+        match self.call(IpcRequest::ListJobs {}, purpose).await? {
             IpcResponse::ListJobs {
                 session,
                 target,
@@ -365,8 +425,12 @@ impl TargetSession for IpcTargetSession {
         }
     }
 
-    async fn fs_stat(&self, path: RemotePath) -> Result<Routed<StatReport>, CallError> {
-        match self.call(IpcRequest::FsStat { path }).await? {
+    async fn fs_stat(
+        &self,
+        purpose: Purpose,
+        path: RemotePath,
+    ) -> Result<Routed<StatReport>, CallError> {
+        match self.call(IpcRequest::FsStat { path }, purpose).await? {
             IpcResponse::FsStat {
                 session,
                 target,
@@ -387,6 +451,7 @@ impl TargetSession for IpcTargetSession {
 
     async fn fs_list(
         &self,
+        purpose: Purpose,
         path: RemotePath,
         continue_after: Option<String>,
     ) -> Result<Routed<DirPage>, CallError> {
@@ -394,7 +459,7 @@ impl TargetSession for IpcTargetSession {
             path,
             continue_after,
         };
-        match self.call(request).await? {
+        match self.call(request, purpose).await? {
             IpcResponse::FsList {
                 session,
                 target,
@@ -413,8 +478,8 @@ impl TargetSession for IpcTargetSession {
         }
     }
 
-    async fn make_dir(&self, path: RemotePath) -> Result<Routed<()>, CallError> {
-        match self.call(IpcRequest::MakeDir { path }).await? {
+    async fn make_dir(&self, purpose: Purpose, path: RemotePath) -> Result<Routed<()>, CallError> {
+        match self.call(IpcRequest::MakeDir { path }, purpose).await? {
             IpcResponse::MakeDir {
                 session,
                 target,
@@ -434,6 +499,7 @@ impl TargetSession for IpcTargetSession {
 
     async fn fs_move(
         &self,
+        purpose: Purpose,
         from: RemotePath,
         to: RemotePath,
         overwrite: bool,
@@ -443,7 +509,7 @@ impl TargetSession for IpcTargetSession {
             to,
             overwrite,
         };
-        match self.call(request).await? {
+        match self.call(request, purpose).await? {
             IpcResponse::Move {
                 session,
                 target,
@@ -461,8 +527,8 @@ impl TargetSession for IpcTargetSession {
         }
     }
 
-    async fn fs_delete(&self, path: RemotePath) -> Result<Routed<()>, CallError> {
-        match self.call(IpcRequest::Delete { path }).await? {
+    async fn fs_delete(&self, purpose: Purpose, path: RemotePath) -> Result<Routed<()>, CallError> {
+        match self.call(IpcRequest::Delete { path }, purpose).await? {
             IpcResponse::Delete {
                 session,
                 target,
@@ -480,8 +546,12 @@ impl TargetSession for IpcTargetSession {
         }
     }
 
-    async fn remove_dir(&self, path: RemotePath) -> Result<Routed<()>, CallError> {
-        match self.call(IpcRequest::RemoveDir { path }).await? {
+    async fn remove_dir(
+        &self,
+        purpose: Purpose,
+        path: RemotePath,
+    ) -> Result<Routed<()>, CallError> {
+        match self.call(IpcRequest::RemoveDir { path }, purpose).await? {
             IpcResponse::RemoveDir {
                 session,
                 target,
@@ -499,8 +569,12 @@ impl TargetSession for IpcTargetSession {
         }
     }
 
-    async fn upload(&self, params: UploadParams) -> Result<Routed<UploadReport>, CallError> {
-        match self.call(IpcRequest::Upload { params }).await? {
+    async fn upload(
+        &self,
+        purpose: Purpose,
+        params: UploadParams,
+    ) -> Result<Routed<UploadReport>, CallError> {
+        match self.call(IpcRequest::Upload { params }, purpose).await? {
             IpcResponse::Upload {
                 session,
                 target,
@@ -519,8 +593,12 @@ impl TargetSession for IpcTargetSession {
         }
     }
 
-    async fn download(&self, params: DownloadParams) -> Result<Routed<DownloadReport>, CallError> {
-        match self.call(IpcRequest::Download { params }).await? {
+    async fn download(
+        &self,
+        purpose: Purpose,
+        params: DownloadParams,
+    ) -> Result<Routed<DownloadReport>, CallError> {
+        match self.call(IpcRequest::Download { params }, purpose).await? {
             IpcResponse::Download {
                 session,
                 target,
@@ -539,8 +617,8 @@ impl TargetSession for IpcTargetSession {
         }
     }
 
-    async fn list_staged(&self) -> Result<Routed<Vec<StagedEntry>>, CallError> {
-        match self.call(IpcRequest::ListStaged {}).await? {
+    async fn list_staged(&self, purpose: Purpose) -> Result<Routed<Vec<StagedEntry>>, CallError> {
+        match self.call(IpcRequest::ListStaged {}, purpose).await? {
             IpcResponse::ListStaged {
                 session,
                 target,
@@ -559,8 +637,12 @@ impl TargetSession for IpcTargetSession {
         }
     }
 
-    async fn cleanup(&self, trigger: CleanupTrigger) -> Result<Routed<CleanupSummary>, CallError> {
-        match self.call(IpcRequest::Cleanup { trigger }).await? {
+    async fn cleanup(
+        &self,
+        purpose: Purpose,
+        trigger: CleanupTrigger,
+    ) -> Result<Routed<CleanupSummary>, CallError> {
+        match self.call(IpcRequest::Cleanup { trigger }, purpose).await? {
             IpcResponse::Cleanup {
                 session,
                 target,
@@ -581,9 +663,13 @@ impl TargetSession for IpcTargetSession {
 
     async fn capture_desktop(
         &self,
+        purpose: Purpose,
         params: CaptureParams,
     ) -> Result<Routed<CaptureReport>, CallError> {
-        match self.call(IpcRequest::CaptureDesktop { params }).await? {
+        match self
+            .call(IpcRequest::CaptureDesktop { params }, purpose)
+            .await?
+        {
             IpcResponse::DesktopFrame {
                 session,
                 target,
@@ -604,50 +690,67 @@ impl TargetSession for IpcTargetSession {
 
     async fn desktop_pointer(
         &self,
+        purpose: Purpose,
         action: PointerAction,
         button: PointerButton,
         x: i32,
         y: i32,
     ) -> Result<Routed<()>, CallError> {
-        self.desktop_ack(IpcRequest::DesktopPointer {
-            action,
-            button,
-            x,
-            y,
-        })
+        self.desktop_ack(
+            IpcRequest::DesktopPointer {
+                action,
+                button,
+                x,
+                y,
+            },
+            purpose,
+        )
         .await
     }
 
     async fn desktop_scroll(
         &self,
+        purpose: Purpose,
         x: i32,
         y: i32,
         dx: i32,
         dy: i32,
     ) -> Result<Routed<()>, CallError> {
-        self.desktop_ack(IpcRequest::DesktopScroll { x, y, dx, dy })
+        self.desktop_ack(IpcRequest::DesktopScroll { x, y, dx, dy }, purpose)
             .await
     }
 
-    async fn desktop_key(&self, action: KeyAction, key: String) -> Result<Routed<()>, CallError> {
-        self.desktop_ack(IpcRequest::DesktopKey { action, key })
+    async fn desktop_key(
+        &self,
+        purpose: Purpose,
+        action: KeyAction,
+        key: String,
+    ) -> Result<Routed<()>, CallError> {
+        self.desktop_ack(IpcRequest::DesktopKey { action, key }, purpose)
             .await
     }
 
-    async fn desktop_type(&self, text: String) -> Result<Routed<()>, CallError> {
-        self.desktop_ack(IpcRequest::DesktopType { text }).await
+    async fn desktop_type(&self, purpose: Purpose, text: String) -> Result<Routed<()>, CallError> {
+        self.desktop_ack(IpcRequest::DesktopType { text }, purpose)
+            .await
     }
 
-    async fn desktop_hotkey(&self, keys: Vec<String>) -> Result<Routed<()>, CallError> {
-        self.desktop_ack(IpcRequest::DesktopHotkey { keys }).await
+    async fn desktop_hotkey(
+        &self,
+        purpose: Purpose,
+        keys: Vec<String>,
+    ) -> Result<Routed<()>, CallError> {
+        self.desktop_ack(IpcRequest::DesktopHotkey { keys }, purpose)
+            .await
     }
 
-    async fn desktop_wait(&self, millis: u64) -> Result<Routed<()>, CallError> {
-        self.desktop_ack(IpcRequest::DesktopWait { millis }).await
+    async fn desktop_wait(&self, purpose: Purpose, millis: u64) -> Result<Routed<()>, CallError> {
+        self.desktop_ack(IpcRequest::DesktopWait { millis }, purpose)
+            .await
     }
 
-    async fn clipboard_get(&self) -> Result<Routed<Option<String>>, CallError> {
-        match self.call(IpcRequest::ClipboardGet {}).await? {
+    async fn clipboard_get(&self, purpose: Purpose) -> Result<Routed<Option<String>>, CallError> {
+        match self.call(IpcRequest::ClipboardGet {}, purpose).await? {
             IpcResponse::ClipboardContents {
                 session,
                 target,
@@ -666,7 +769,110 @@ impl TargetSession for IpcTargetSession {
         }
     }
 
-    async fn clipboard_set(&self, text: String) -> Result<Routed<()>, CallError> {
-        self.desktop_ack(IpcRequest::ClipboardSet { text }).await
+    async fn clipboard_set(&self, purpose: Purpose, text: String) -> Result<Routed<()>, CallError> {
+        self.desktop_ack(IpcRequest::ClipboardSet { text }, purpose)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use cretlink_protocol::ProtocolVersion;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    use super::*;
+    use crate::ipc::IpcListener;
+
+    fn unique_endpoint() -> IpcEndpoint {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        IpcEndpoint::named(format!("cretlink-purpose-{}-{n}", std::process::id()))
+    }
+
+    fn identity() -> TargetIdentity {
+        TargetIdentity {
+            hostname: "SIMULATED-TARGET".to_string(),
+            os_version: "Simulated".to_string(),
+            arch: "x86_64".to_string(),
+            elevated: false,
+            simulated: true,
+            agent_version: "test".to_string(),
+        }
+    }
+
+    /// A fake console that answers `Hello` with `minor` and records every other
+    /// request it receives, answering it as a routed `ListJobs`.
+    fn fake_console(minor: u16) -> (IpcEndpoint, Arc<AsyncMutex<Vec<IpcRequest>>>) {
+        let endpoint = unique_endpoint();
+        let mut listener = IpcListener::bind(&endpoint).unwrap();
+        let seen = Arc::new(AsyncMutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let session = SessionId::new();
+            while let Ok(mut stream) = listener.accept().await {
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    while let Ok(request) = read_message::<_, IpcRequest>(&mut stream).await {
+                        let response = match request {
+                            IpcRequest::Hello { .. } => IpcResponse::Hello {
+                                protocol: ProtocolVersion::new(IPC_PROTOCOL.major, minor),
+                                session: Some(session),
+                                target: Some(identity()),
+                            },
+                            other => {
+                                recorded.lock().await.push(other);
+                                IpcResponse::ListJobs {
+                                    session,
+                                    target: identity(),
+                                    call_id: 1,
+                                    jobs: Vec::new(),
+                                }
+                            }
+                        };
+                        if write_message(&mut stream, &response).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (endpoint, seen)
+    }
+
+    /// A console on IPC minor 9 or later receives the stated purpose in the
+    /// `WithPurpose` wrapper (ST-M009-007).
+    #[tokio::test]
+    async fn purpose_is_sent_to_a_console_that_understands_it() {
+        let (endpoint, seen) = fake_console(IPC_PURPOSE_MINOR);
+        let target = IpcTargetSession::connect(endpoint).await;
+        let purpose = Purpose::new("Checking running jobs").unwrap();
+        target.list_jobs(purpose.clone()).await.unwrap();
+        assert_eq!(
+            seen.lock().await.as_slice(),
+            &[IpcRequest::WithPurpose {
+                purpose,
+                call: Box::new(IpcRequest::ListJobs {}),
+            }]
+        );
+    }
+
+    /// A console on an older IPC minor would close the connection on the
+    /// unknown wrapper, so it receives the bare request: the purpose is dropped
+    /// and the call still runs (ST-M009-007, REQ-N-012).
+    #[tokio::test]
+    async fn purpose_is_dropped_for_an_older_console_and_the_call_still_runs() {
+        let (endpoint, seen) = fake_console(IPC_PURPOSE_MINOR - 1);
+        let target = IpcTargetSession::connect(endpoint).await;
+        let routed = target
+            .list_jobs(Purpose::new("Checking running jobs").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(routed.call_id, 1);
+        assert_eq!(seen.lock().await.as_slice(), &[IpcRequest::ListJobs {}]);
     }
 }

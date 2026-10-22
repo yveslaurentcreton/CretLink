@@ -16,6 +16,8 @@ test = false
 bench = false
 
 [dependencies]
+# The release version the binary reports (ST-M006-014).
+cretlink-shared.workspace = true
 # The whole server is composition over the portable relay leaf core: admission
 # control, the rendezvous matcher, the opaque splice, and the rendezvous-preamble
 # codec. No new protocol logic and no session key ever live here.

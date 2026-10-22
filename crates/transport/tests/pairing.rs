@@ -30,6 +30,7 @@ fn request(id: u64, op: Operation) -> Message {
         id: RequestId(id),
         session: SessionId::new(),
         origin: cretlink_protocol::Origin::Console,
+        purpose: None,
         op,
     }
 }

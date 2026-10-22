@@ -24,7 +24,8 @@ use std::collections::BTreeMap;
 
 use cretlink_protocol::{
     B64Bytes, CleanupTrigger, JobId, JobOutcome, JobSummary, KeyAction, PROTOCOL_V1, PointerAction,
-    PointerButton, ProtocolVersion, RemotePath, SessionId, Shell, StagedEntry, TargetIdentity,
+    PointerButton, ProtocolVersion, Purpose, RemotePath, SessionId, Shell, StagedEntry,
+    TargetIdentity,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -67,7 +68,24 @@ use crate::target::{
 /// issues a desktop request is unaffected. The agent serves them only where it
 /// advertised `desktop.v1`, so an unequipped target answers a mapped
 /// `Unsupported` remote error rather than a fabricated frame (REQ-N-008).
+///
+/// Minor `9` adds the additive [`IpcRequest::WithPurpose`] wrapper, which
+/// carries the AI client's stated [`Purpose`] beside one routed tool request
+/// (REQ-F-026, ST-M009-007). The console records the purpose in the call's
+/// audit records, shows it in its activity view, and forwards it on the session
+/// request so the attended customer sees it. Because every request rejects
+/// unknown variants, a console on an older minor would close the connection on
+/// the wrapper, so the bridge sends it only after a `Hello` on the same
+/// connection reports a console minor of at least [`IPC_PURPOSE_MINOR`]; to an
+/// older console it sends the bare request and the purpose is dropped (the call
+/// still runs, attributed to the AI, and is audited without a purpose). A
+/// console on minor `9` accepts both forms, so an older bridge keeps working
+/// and its calls show no purpose (REQ-N-012).
 pub const IPC_PROTOCOL: ProtocolVersion = PROTOCOL_V1;
+
+/// The first IPC contract minor whose console understands
+/// [`IpcRequest::WithPurpose`] (ST-M009-007).
+pub const IPC_PURPOSE_MINOR: u16 = 9;
 
 /// Maximum size of one IPC frame, checked from the length prefix before any
 /// allocation. Sized to hold a full [`ExecReport`] whose captured output is at
@@ -86,6 +104,19 @@ pub enum IpcRequest {
     Hello {
         /// The bridge's IPC contract version.
         protocol: ProtocolVersion,
+    },
+    /// One routed tool request together with the AI client's stated purpose
+    /// (IPC minor `9`, REQ-F-026, ST-M009-007). `call` must be one of the
+    /// routed tool requests (never a `Hello`, a terminal message, or another
+    /// `WithPurpose`); the console refuses anything else with
+    /// [`IpcError::Malformed`] and runs nothing. The purpose is the caller's
+    /// unverified claim: it is recorded and shown beside the real operation,
+    /// never instead of it, and grants no authority.
+    WithPurpose {
+        /// The validated, single-line stated purpose.
+        purpose: Purpose,
+        /// The routed tool request the purpose belongs to.
+        call: Box<IpcRequest>,
     },
     /// Report the routed target's identity and basic system state.
     SystemInfo {},
@@ -301,6 +332,27 @@ pub enum IpcRequest {
         /// The terminal job.
         term: JobId,
     },
+}
+
+impl IpcRequest {
+    /// Whether this is a routed tool request that may carry a stated purpose
+    /// inside [`IpcRequest::WithPurpose`]: one of the MCP bridge's tool calls,
+    /// not the authority-free `Hello`, a technician terminal message (those are
+    /// labelled by their source instead, REQ-F-026), or a nested wrapper.
+    #[must_use]
+    pub fn is_tool_call(&self) -> bool {
+        !matches!(
+            self,
+            Self::Hello { .. }
+                | Self::WithPurpose { .. }
+                | Self::TermOpen { .. }
+                | Self::TermAttach { .. }
+                | Self::TermInput { .. }
+                | Self::TermResize { .. }
+                | Self::TermDetach { .. }
+                | Self::TermClose { .. }
+        )
+    }
 }
 
 /// A response from the console to the bridge.
@@ -1080,6 +1132,83 @@ mod tests {
             "unexpected": true,
         });
         assert!(serde_json::from_value::<TermFrame>(json).is_err());
+    }
+
+    /// A stated purpose rides beside one routed tool call in the minor-9
+    /// `WithPurpose` wrapper and round-trips unchanged; the bare request keeps
+    /// its earlier wire form, so an older console still decodes a call that
+    /// carries no purpose (ST-M009-007, REQ-N-012).
+    #[tokio::test]
+    async fn purpose_wrapper_round_trips_and_bare_requests_are_unchanged() {
+        let purpose = Purpose::new("Checking free disk space").unwrap();
+        let request = IpcRequest::WithPurpose {
+            purpose: purpose.clone(),
+            call: Box::new(IpcRequest::ListJobs {}),
+        };
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        write_message(&mut a, &request).await.unwrap();
+        let decoded: IpcRequest = read_message(&mut b).await.unwrap();
+        assert_eq!(decoded, request);
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "request": "with_purpose",
+                "purpose": "Checking free disk space",
+                "call": { "request": "list_jobs" },
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(IpcRequest::ListJobs {}).unwrap(),
+            serde_json::json!({ "request": "list_jobs" })
+        );
+    }
+
+    /// An invalid purpose inside the wrapper fails the decode, like any other
+    /// out-of-contract field (ST-M009-007).
+    #[test]
+    fn purpose_wrapper_rejects_an_invalid_purpose() {
+        for bad in ["", "   ", "two\nlines"] {
+            let json = serde_json::json!({
+                "request": "with_purpose",
+                "purpose": bad,
+                "call": { "request": "list_jobs" },
+            });
+            assert!(
+                serde_json::from_value::<IpcRequest>(json).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        let json = serde_json::json!({
+            "request": "with_purpose",
+            "purpose": "a".repeat(cretlink_protocol::limits::MAX_PURPOSE_CHARS + 1),
+            "call": { "request": "list_jobs" },
+        });
+        assert!(serde_json::from_value::<IpcRequest>(json).is_err());
+    }
+
+    /// Only routed tool calls may carry a purpose: a handshake, a terminal
+    /// message, or a nested wrapper is not a tool call (ST-M009-007).
+    #[test]
+    fn only_tool_calls_may_carry_a_purpose() {
+        assert!(IpcRequest::ListJobs {}.is_tool_call());
+        assert!(IpcRequest::DesktopWait { millis: 1 }.is_tool_call());
+        assert!(
+            !IpcRequest::Hello {
+                protocol: IPC_PROTOCOL
+            }
+            .is_tool_call()
+        );
+        assert!(!IpcRequest::TermAttach { term: JobId(1) }.is_tool_call());
+        assert!(
+            !IpcRequest::WithPurpose {
+                purpose: Purpose::new("x").unwrap(),
+                call: Box::new(IpcRequest::ListJobs {}),
+            }
+            .is_tool_call()
+        );
+        const { assert!(IPC_PROTOCOL.minor >= IPC_PURPOSE_MINOR) };
     }
 
     /// Reboot-resume can be armed **only** by the attended local gesture on the

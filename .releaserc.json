@@ -12,6 +12,7 @@
         ]
       }
     ],
+    "./scripts/verify-version.cjs",
     [
       "@semantic-release/release-notes-generator",
       {

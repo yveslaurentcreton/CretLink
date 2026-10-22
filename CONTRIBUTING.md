@@ -11,9 +11,11 @@ intended behaviour in the issue or pull request first.
 
 ```text
 apps/
-  agent-gui/        CretLink Support consent window (Tauri v2, detached package)
+  app/              The CretLink application `cretlink`: Give help and Get help
+                    (Tauri v2, detached package)
+  cli/              The console build `cretlink-cli` of the subcommands (MCP
+                    bridge, AI-client registration, terminal, version)
   console/          CretLink Console core and CLI (session state, audit, MCP host)
-  console-gui/      CretLink Console GUI (Tauri v2, detached package)
   mcp-bridge/       Builds the `cretlink-mcp` stdio MCP bridge binary
   relay-server/     Operator-hosted relay server (`cretlink-relay-server`)
   shell-cli/        Experimental technician terminal client (`cretlink-shell`)
@@ -61,27 +63,25 @@ All routine tests run without administrator rights against the simulated
 target (`crates/simulator`). Privileged Windows tests are opt-in and never run
 automatically for untrusted contributions.
 
-### GUI applications (Tauri)
+### The application (Tauri)
 
-The console GUI (`apps/console-gui`) and the agent consent window
-(`apps/agent-gui`) are **detached** Cargo packages, each with its own
+The application (`apps/app`) is a **detached** Cargo package with its own
 `Cargo.lock` (ADR-0011): Tauri's dependency tree and the Linux webview system
-libraries are deliberately kept out of the workspace commands above. Their
+libraries are deliberately kept out of the workspace commands above. Its
 cross-platform-verified state models live in `apps/console` and
-`apps/support-agent` and are covered by the workspace tests. Building either
-GUI needs Node.js 20+ and npm in addition to the Rust toolchain:
+`apps/support-agent` and are covered by the workspace tests. Building it needs
+Node.js 20+ and npm in addition to the Rust toolchain, and on Linux the webview
+libraries (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`):
 
 ```sh
-cd apps/console-gui         # or apps/agent-gui
+cd apps/app
 npm install                 # first time only
 npm run build               # type-check + bundle the frontend (Vite → dist/)
-npm run tauri dev           # run the GUI in development
-npm run tauri build         # produce a platform bundle
+npm run tauri dev           # run it in development
 ```
 
-See [`apps/console-gui/README.md`](apps/console-gui/README.md) and
-[`apps/agent-gui/README.md`](apps/agent-gui/README.md) for details and the
-remaining manual accessibility verification.
+See [`apps/app/README.md`](apps/app/README.md) for the roles, the release build
+and the remaining manual accessibility verification.
 
 ## Branches, commits, and releases
 

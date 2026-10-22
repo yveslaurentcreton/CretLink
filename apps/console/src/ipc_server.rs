@@ -59,7 +59,8 @@ use cretlink_mcp::{
 };
 use cretlink_protocol::{
     B64Bytes, CleanupPolicy, CleanupTrigger, JobId, JobOutcome, JobSummary, KeyAction,
-    PointerAction, PointerButton, RemotePath, SessionId, Shell, StagedEntry, TargetIdentity,
+    PointerAction, PointerButton, Purpose, RemotePath, SessionId, Shell, StagedEntry,
+    TargetIdentity,
 };
 use cretlink_shared::{Actor, AuditArgs, AuditValue, Outcome, redact_no_digest, truncate_field};
 
@@ -74,68 +75,110 @@ pub trait ConsoleRoute: Send + Sync + 'static {
     fn consented(&self) -> Option<(SessionId, TargetIdentity)>;
 
     /// Report the routed target's identity and basic system state.
-    async fn system_info(&self) -> Result<SystemInfoReport, TargetError>;
+    async fn system_info(&self, purpose: Option<Purpose>) -> Result<SystemInfoReport, TargetError>;
 
     /// Run a command to completion, collecting output up to `output_cap` bytes.
-    async fn exec(&self, params: ExecParams, output_cap: usize) -> Result<ExecReport, TargetError>;
+    async fn exec(
+        &self,
+        purpose: Option<Purpose>,
+        params: ExecParams,
+        output_cap: usize,
+    ) -> Result<ExecReport, TargetError>;
 
     /// Feed bytes to a running job's standard input.
-    async fn write_stdin(&self, job: JobId, data: Vec<u8>) -> Result<(), TargetError>;
+    async fn write_stdin(
+        &self,
+        purpose: Option<Purpose>,
+        job: JobId,
+        data: Vec<u8>,
+    ) -> Result<(), TargetError>;
 
     /// Request cancellation of a running job.
-    async fn cancel(&self, job: JobId) -> Result<(), TargetError>;
+    async fn cancel(&self, purpose: Option<Purpose>, job: JobId) -> Result<(), TargetError>;
 
     /// List the jobs the routed target currently tracks.
-    async fn list_jobs(&self) -> Result<Vec<JobSummary>, TargetError>;
+    async fn list_jobs(&self, purpose: Option<Purpose>) -> Result<Vec<JobSummary>, TargetError>;
 
     /// Stat a path on the routed target (never returns content).
-    async fn fs_stat(&self, path: RemotePath) -> Result<StatReport, TargetError>;
+    async fn fs_stat(
+        &self,
+        purpose: Option<Purpose>,
+        path: RemotePath,
+    ) -> Result<StatReport, TargetError>;
 
     /// List one page of a directory on the routed target.
     async fn fs_list(
         &self,
+        purpose: Option<Purpose>,
         path: RemotePath,
         continue_after: Option<String>,
     ) -> Result<DirPage, TargetError>;
 
     /// Create a directory on the routed target.
-    async fn make_dir(&self, path: RemotePath) -> Result<(), TargetError>;
+    async fn make_dir(&self, purpose: Option<Purpose>, path: RemotePath)
+    -> Result<(), TargetError>;
 
     /// Move (rename) a path on the routed target.
     async fn fs_move(
         &self,
+        purpose: Option<Purpose>,
         from: RemotePath,
         to: RemotePath,
         overwrite: bool,
     ) -> Result<(), TargetError>;
 
     /// Delete a file or reparse point on the routed target (never a directory).
-    async fn fs_delete(&self, path: RemotePath) -> Result<(), TargetError>;
+    async fn fs_delete(
+        &self,
+        purpose: Option<Purpose>,
+        path: RemotePath,
+    ) -> Result<(), TargetError>;
 
     /// Remove an empty directory on the routed target.
-    async fn remove_dir(&self, path: RemotePath) -> Result<(), TargetError>;
+    async fn remove_dir(
+        &self,
+        purpose: Option<Purpose>,
+        path: RemotePath,
+    ) -> Result<(), TargetError>;
 
     /// Upload a local file into target staging and commit it verified.
-    async fn upload(&self, params: UploadParams) -> Result<UploadReport, TargetError>;
+    async fn upload(
+        &self,
+        purpose: Option<Purpose>,
+        params: UploadParams,
+    ) -> Result<UploadReport, TargetError>;
 
     /// Download a target file to a local path, verified by whole-file digest.
-    async fn download(&self, params: DownloadParams) -> Result<DownloadReport, TargetError>;
+    async fn download(
+        &self,
+        purpose: Option<Purpose>,
+        params: DownloadParams,
+    ) -> Result<DownloadReport, TargetError>;
 
     /// List the staged artifacts the routed target currently tracks.
-    async fn list_staged(&self) -> Result<Vec<StagedEntry>, TargetError>;
+    async fn list_staged(&self, purpose: Option<Purpose>) -> Result<Vec<StagedEntry>, TargetError>;
 
     /// Run a staging cleanup for a trigger, reporting honest per-artifact
     /// outcomes.
-    async fn cleanup(&self, trigger: CleanupTrigger) -> Result<CleanupSummary, TargetError>;
+    async fn cleanup(
+        &self,
+        purpose: Option<Purpose>,
+        trigger: CleanupTrigger,
+    ) -> Result<CleanupSummary, TargetError>;
 
     // --- Visual desktop control (ADR-0015, ST-M005-004) ---
 
     /// Capture one desktop frame from the routed session.
-    async fn capture_desktop(&self, params: CaptureParams) -> Result<CaptureReport, TargetError>;
+    async fn capture_desktop(
+        &self,
+        purpose: Option<Purpose>,
+        params: CaptureParams,
+    ) -> Result<CaptureReport, TargetError>;
 
     /// Inject a pointer action on the routed session's current input desktop.
     async fn desktop_pointer(
         &self,
+        purpose: Option<Purpose>,
         action: PointerAction,
         button: PointerButton,
         x: i32,
@@ -143,25 +186,46 @@ pub trait ConsoleRoute: Send + Sync + 'static {
     ) -> Result<(), TargetError>;
 
     /// Inject a scroll action at the given origin on the routed session.
-    async fn desktop_scroll(&self, x: i32, y: i32, dx: i32, dy: i32) -> Result<(), TargetError>;
+    async fn desktop_scroll(
+        &self,
+        purpose: Option<Purpose>,
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+    ) -> Result<(), TargetError>;
 
     /// Inject a single-key action on the routed session.
-    async fn desktop_key(&self, action: KeyAction, key: String) -> Result<(), TargetError>;
+    async fn desktop_key(
+        &self,
+        purpose: Option<Purpose>,
+        action: KeyAction,
+        key: String,
+    ) -> Result<(), TargetError>;
 
     /// Type a Unicode string on the routed session.
-    async fn desktop_type(&self, text: String) -> Result<(), TargetError>;
+    async fn desktop_type(&self, purpose: Option<Purpose>, text: String)
+    -> Result<(), TargetError>;
 
     /// Send a hotkey chord on the routed session.
-    async fn desktop_hotkey(&self, keys: Vec<String>) -> Result<(), TargetError>;
+    async fn desktop_hotkey(
+        &self,
+        purpose: Option<Purpose>,
+        keys: Vec<String>,
+    ) -> Result<(), TargetError>;
 
     /// Pause the routed session's input pipeline for a bounded interval.
-    async fn desktop_wait(&self, millis: u64) -> Result<(), TargetError>;
+    async fn desktop_wait(&self, purpose: Option<Purpose>, millis: u64) -> Result<(), TargetError>;
 
     /// Read the routed session's clipboard text (explicit-only, audited).
-    async fn clipboard_get(&self) -> Result<Option<String>, TargetError>;
+    async fn clipboard_get(&self, purpose: Option<Purpose>) -> Result<Option<String>, TargetError>;
 
     /// Set the routed session's clipboard text (explicit-only, audited).
-    async fn clipboard_set(&self, text: String) -> Result<(), TargetError>;
+    async fn clipboard_set(
+        &self,
+        purpose: Option<Purpose>,
+        text: String,
+    ) -> Result<(), TargetError>;
 
     // --- Interactive terminal (ST-M003-009) ---
 
@@ -201,115 +265,184 @@ impl ConsoleRoute for crate::ConsoleSessionService {
         crate::ConsoleSessionService::consented(self)
     }
 
-    async fn system_info(&self) -> Result<SystemInfoReport, TargetError> {
-        crate::ConsoleSessionService::system_info(self).await
+    async fn system_info(&self, purpose: Option<Purpose>) -> Result<SystemInfoReport, TargetError> {
+        crate::ConsoleSessionService::system_info(self, purpose).await
     }
 
-    async fn exec(&self, params: ExecParams, output_cap: usize) -> Result<ExecReport, TargetError> {
-        crate::ConsoleSessionService::exec(self, params, output_cap).await
+    async fn exec(
+        &self,
+        purpose: Option<Purpose>,
+        params: ExecParams,
+        output_cap: usize,
+    ) -> Result<ExecReport, TargetError> {
+        crate::ConsoleSessionService::exec(self, purpose, params, output_cap).await
     }
 
-    async fn write_stdin(&self, job: JobId, data: Vec<u8>) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::exec_write_stdin(self, job, data).await
+    async fn write_stdin(
+        &self,
+        purpose: Option<Purpose>,
+        job: JobId,
+        data: Vec<u8>,
+    ) -> Result<(), TargetError> {
+        crate::ConsoleSessionService::exec_write_stdin(self, purpose, job, data).await
     }
 
-    async fn cancel(&self, job: JobId) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::exec_cancel(self, job).await
+    async fn cancel(&self, purpose: Option<Purpose>, job: JobId) -> Result<(), TargetError> {
+        crate::ConsoleSessionService::exec_cancel(self, purpose, job).await
     }
 
-    async fn list_jobs(&self) -> Result<Vec<JobSummary>, TargetError> {
-        crate::ConsoleSessionService::exec_list_jobs(self).await
+    async fn list_jobs(&self, purpose: Option<Purpose>) -> Result<Vec<JobSummary>, TargetError> {
+        crate::ConsoleSessionService::exec_list_jobs(self, purpose).await
     }
 
-    async fn fs_stat(&self, path: RemotePath) -> Result<StatReport, TargetError> {
-        crate::ConsoleSessionService::fs_stat(self, path).await
+    async fn fs_stat(
+        &self,
+        purpose: Option<Purpose>,
+        path: RemotePath,
+    ) -> Result<StatReport, TargetError> {
+        crate::ConsoleSessionService::fs_stat(self, purpose, path).await
     }
 
     async fn fs_list(
         &self,
+        purpose: Option<Purpose>,
         path: RemotePath,
         continue_after: Option<String>,
     ) -> Result<DirPage, TargetError> {
-        crate::ConsoleSessionService::fs_list(self, path, continue_after).await
+        crate::ConsoleSessionService::fs_list(self, purpose, path, continue_after).await
     }
 
-    async fn make_dir(&self, path: RemotePath) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::make_dir(self, path).await
+    async fn make_dir(
+        &self,
+        purpose: Option<Purpose>,
+        path: RemotePath,
+    ) -> Result<(), TargetError> {
+        crate::ConsoleSessionService::make_dir(self, purpose, path).await
     }
 
     async fn fs_move(
         &self,
+        purpose: Option<Purpose>,
         from: RemotePath,
         to: RemotePath,
         overwrite: bool,
     ) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::fs_move(self, from, to, overwrite).await
+        crate::ConsoleSessionService::fs_move(self, purpose, from, to, overwrite).await
     }
 
-    async fn fs_delete(&self, path: RemotePath) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::fs_delete(self, path).await
+    async fn fs_delete(
+        &self,
+        purpose: Option<Purpose>,
+        path: RemotePath,
+    ) -> Result<(), TargetError> {
+        crate::ConsoleSessionService::fs_delete(self, purpose, path).await
     }
 
-    async fn remove_dir(&self, path: RemotePath) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::remove_dir(self, path).await
+    async fn remove_dir(
+        &self,
+        purpose: Option<Purpose>,
+        path: RemotePath,
+    ) -> Result<(), TargetError> {
+        crate::ConsoleSessionService::remove_dir(self, purpose, path).await
     }
 
-    async fn upload(&self, params: UploadParams) -> Result<UploadReport, TargetError> {
-        crate::ConsoleSessionService::upload(self, params).await
+    async fn upload(
+        &self,
+        purpose: Option<Purpose>,
+        params: UploadParams,
+    ) -> Result<UploadReport, TargetError> {
+        crate::ConsoleSessionService::upload(self, purpose, params).await
     }
 
-    async fn download(&self, params: DownloadParams) -> Result<DownloadReport, TargetError> {
-        crate::ConsoleSessionService::download(self, params).await
+    async fn download(
+        &self,
+        purpose: Option<Purpose>,
+        params: DownloadParams,
+    ) -> Result<DownloadReport, TargetError> {
+        crate::ConsoleSessionService::download(self, purpose, params).await
     }
 
-    async fn list_staged(&self) -> Result<Vec<StagedEntry>, TargetError> {
-        crate::ConsoleSessionService::list_staged(self).await
+    async fn list_staged(&self, purpose: Option<Purpose>) -> Result<Vec<StagedEntry>, TargetError> {
+        crate::ConsoleSessionService::list_staged(self, purpose).await
     }
 
-    async fn cleanup(&self, trigger: CleanupTrigger) -> Result<CleanupSummary, TargetError> {
-        crate::ConsoleSessionService::cleanup(self, trigger).await
+    async fn cleanup(
+        &self,
+        purpose: Option<Purpose>,
+        trigger: CleanupTrigger,
+    ) -> Result<CleanupSummary, TargetError> {
+        crate::ConsoleSessionService::cleanup(self, purpose, trigger).await
     }
 
-    async fn capture_desktop(&self, params: CaptureParams) -> Result<CaptureReport, TargetError> {
-        crate::ConsoleSessionService::capture_desktop(self, params).await
+    async fn capture_desktop(
+        &self,
+        purpose: Option<Purpose>,
+        params: CaptureParams,
+    ) -> Result<CaptureReport, TargetError> {
+        crate::ConsoleSessionService::capture_desktop(self, purpose, params).await
     }
 
     async fn desktop_pointer(
         &self,
+        purpose: Option<Purpose>,
         action: PointerAction,
         button: PointerButton,
         x: i32,
         y: i32,
     ) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::desktop_pointer(self, action, button, x, y).await
+        crate::ConsoleSessionService::desktop_pointer(self, purpose, action, button, x, y).await
     }
 
-    async fn desktop_scroll(&self, x: i32, y: i32, dx: i32, dy: i32) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::desktop_scroll(self, x, y, dx, dy).await
+    async fn desktop_scroll(
+        &self,
+        purpose: Option<Purpose>,
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+    ) -> Result<(), TargetError> {
+        crate::ConsoleSessionService::desktop_scroll(self, purpose, x, y, dx, dy).await
     }
 
-    async fn desktop_key(&self, action: KeyAction, key: String) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::desktop_key(self, action, key).await
+    async fn desktop_key(
+        &self,
+        purpose: Option<Purpose>,
+        action: KeyAction,
+        key: String,
+    ) -> Result<(), TargetError> {
+        crate::ConsoleSessionService::desktop_key(self, purpose, action, key).await
     }
 
-    async fn desktop_type(&self, text: String) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::desktop_type(self, text).await
+    async fn desktop_type(
+        &self,
+        purpose: Option<Purpose>,
+        text: String,
+    ) -> Result<(), TargetError> {
+        crate::ConsoleSessionService::desktop_type(self, purpose, text).await
     }
 
-    async fn desktop_hotkey(&self, keys: Vec<String>) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::desktop_hotkey(self, keys).await
+    async fn desktop_hotkey(
+        &self,
+        purpose: Option<Purpose>,
+        keys: Vec<String>,
+    ) -> Result<(), TargetError> {
+        crate::ConsoleSessionService::desktop_hotkey(self, purpose, keys).await
     }
 
-    async fn desktop_wait(&self, millis: u64) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::desktop_wait(self, millis).await
+    async fn desktop_wait(&self, purpose: Option<Purpose>, millis: u64) -> Result<(), TargetError> {
+        crate::ConsoleSessionService::desktop_wait(self, purpose, millis).await
     }
 
-    async fn clipboard_get(&self) -> Result<Option<String>, TargetError> {
-        crate::ConsoleSessionService::clipboard_get(self).await
+    async fn clipboard_get(&self, purpose: Option<Purpose>) -> Result<Option<String>, TargetError> {
+        crate::ConsoleSessionService::clipboard_get(self, purpose).await
     }
 
-    async fn clipboard_set(&self, text: String) -> Result<(), TargetError> {
-        crate::ConsoleSessionService::clipboard_set(self, text).await
+    async fn clipboard_set(
+        &self,
+        purpose: Option<Purpose>,
+        text: String,
+    ) -> Result<(), TargetError> {
+        crate::ConsoleSessionService::clipboard_set(self, purpose, text).await
     }
 
     async fn open_terminal(
@@ -355,44 +488,67 @@ impl ConsoleRoute for ClosedRoute {
         None
     }
 
-    async fn system_info(&self) -> Result<SystemInfoReport, TargetError> {
+    async fn system_info(
+        &self,
+        _purpose: Option<Purpose>,
+    ) -> Result<SystemInfoReport, TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn exec(&self, _params: ExecParams, _cap: usize) -> Result<ExecReport, TargetError> {
+    async fn exec(
+        &self,
+        _purpose: Option<Purpose>,
+        _params: ExecParams,
+        _cap: usize,
+    ) -> Result<ExecReport, TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn write_stdin(&self, _job: JobId, _data: Vec<u8>) -> Result<(), TargetError> {
+    async fn write_stdin(
+        &self,
+        _purpose: Option<Purpose>,
+        _job: JobId,
+        _data: Vec<u8>,
+    ) -> Result<(), TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn cancel(&self, _job: JobId) -> Result<(), TargetError> {
+    async fn cancel(&self, _purpose: Option<Purpose>, _job: JobId) -> Result<(), TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn list_jobs(&self) -> Result<Vec<JobSummary>, TargetError> {
+    async fn list_jobs(&self, _purpose: Option<Purpose>) -> Result<Vec<JobSummary>, TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn fs_stat(&self, _path: RemotePath) -> Result<StatReport, TargetError> {
+    async fn fs_stat(
+        &self,
+        _purpose: Option<Purpose>,
+        _path: RemotePath,
+    ) -> Result<StatReport, TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
     async fn fs_list(
         &self,
+        _purpose: Option<Purpose>,
         _path: RemotePath,
         _continue_after: Option<String>,
     ) -> Result<DirPage, TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn make_dir(&self, _path: RemotePath) -> Result<(), TargetError> {
+    async fn make_dir(
+        &self,
+        _purpose: Option<Purpose>,
+        _path: RemotePath,
+    ) -> Result<(), TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
     async fn fs_move(
         &self,
+        _purpose: Option<Purpose>,
         _from: RemotePath,
         _to: RemotePath,
         _overwrite: bool,
@@ -400,36 +556,64 @@ impl ConsoleRoute for ClosedRoute {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn fs_delete(&self, _path: RemotePath) -> Result<(), TargetError> {
+    async fn fs_delete(
+        &self,
+        _purpose: Option<Purpose>,
+        _path: RemotePath,
+    ) -> Result<(), TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn remove_dir(&self, _path: RemotePath) -> Result<(), TargetError> {
+    async fn remove_dir(
+        &self,
+        _purpose: Option<Purpose>,
+        _path: RemotePath,
+    ) -> Result<(), TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn upload(&self, _params: UploadParams) -> Result<UploadReport, TargetError> {
+    async fn upload(
+        &self,
+        _purpose: Option<Purpose>,
+        _params: UploadParams,
+    ) -> Result<UploadReport, TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn download(&self, _params: DownloadParams) -> Result<DownloadReport, TargetError> {
+    async fn download(
+        &self,
+        _purpose: Option<Purpose>,
+        _params: DownloadParams,
+    ) -> Result<DownloadReport, TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn list_staged(&self) -> Result<Vec<StagedEntry>, TargetError> {
+    async fn list_staged(
+        &self,
+        _purpose: Option<Purpose>,
+    ) -> Result<Vec<StagedEntry>, TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn cleanup(&self, _trigger: CleanupTrigger) -> Result<CleanupSummary, TargetError> {
+    async fn cleanup(
+        &self,
+        _purpose: Option<Purpose>,
+        _trigger: CleanupTrigger,
+    ) -> Result<CleanupSummary, TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn capture_desktop(&self, _params: CaptureParams) -> Result<CaptureReport, TargetError> {
+    async fn capture_desktop(
+        &self,
+        _purpose: Option<Purpose>,
+        _params: CaptureParams,
+    ) -> Result<CaptureReport, TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
     async fn desktop_pointer(
         &self,
+        _purpose: Option<Purpose>,
         _action: PointerAction,
         _button: PointerButton,
         _x: i32,
@@ -440,6 +624,7 @@ impl ConsoleRoute for ClosedRoute {
 
     async fn desktop_scroll(
         &self,
+        _purpose: Option<Purpose>,
         _x: i32,
         _y: i32,
         _dx: i32,
@@ -448,27 +633,51 @@ impl ConsoleRoute for ClosedRoute {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn desktop_key(&self, _action: KeyAction, _key: String) -> Result<(), TargetError> {
+    async fn desktop_key(
+        &self,
+        _purpose: Option<Purpose>,
+        _action: KeyAction,
+        _key: String,
+    ) -> Result<(), TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn desktop_type(&self, _text: String) -> Result<(), TargetError> {
+    async fn desktop_type(
+        &self,
+        _purpose: Option<Purpose>,
+        _text: String,
+    ) -> Result<(), TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn desktop_hotkey(&self, _keys: Vec<String>) -> Result<(), TargetError> {
+    async fn desktop_hotkey(
+        &self,
+        _purpose: Option<Purpose>,
+        _keys: Vec<String>,
+    ) -> Result<(), TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn desktop_wait(&self, _millis: u64) -> Result<(), TargetError> {
+    async fn desktop_wait(
+        &self,
+        _purpose: Option<Purpose>,
+        _millis: u64,
+    ) -> Result<(), TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn clipboard_get(&self) -> Result<Option<String>, TargetError> {
+    async fn clipboard_get(
+        &self,
+        _purpose: Option<Purpose>,
+    ) -> Result<Option<String>, TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
-    async fn clipboard_set(&self, _text: String) -> Result<(), TargetError> {
+    async fn clipboard_set(
+        &self,
+        _purpose: Option<Purpose>,
+        _text: String,
+    ) -> Result<(), TargetError> {
         Err(TargetError::NoConsentedSession)
     }
 
@@ -1141,6 +1350,23 @@ async fn route_request(
     call_ids: &AtomicU64,
     request: IpcRequest,
 ) -> IpcResponse {
+    // A stated purpose arrives wrapped around exactly one routed tool call (IPC
+    // minor 9, ST-M009-007). Anything else inside the wrapper — a handshake, a
+    // terminal message, or another wrapper — is refused before anything runs.
+    // A bare request (an older bridge) carries no purpose and is served as
+    // before (REQ-N-012).
+    let (request, purpose) = match request {
+        IpcRequest::WithPurpose { purpose, call } if call.is_tool_call() => (*call, Some(purpose)),
+        IpcRequest::WithPurpose { .. } => {
+            return IpcResponse::Error {
+                error: IpcError::Malformed {
+                    message: "a stated purpose may only wrap a routed tool call".to_string(),
+                },
+                call_id: 0,
+            };
+        }
+        other => (other, None),
+    };
     match request {
         IpcRequest::Hello { protocol } => {
             if !IPC_PROTOCOL.is_compatible_with(protocol) {
@@ -1166,13 +1392,14 @@ async fn route_request(
         IpcRequest::SystemInfo {} => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_system_info_start",
                 "mcp_remote_system_info",
                 AuditArgs::new(),
             );
-            let result = route.system_info().await;
+            let result = route.system_info(purpose.clone()).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(
@@ -1199,13 +1426,16 @@ async fn route_request(
             }
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_exec_start",
                 "mcp_remote_exec",
                 args,
             );
-            let result = route.exec(params, output_cap as usize).await;
+            let result = route
+                .exec(purpose.clone(), params, output_cap as usize)
+                .await;
             let (routed, call_id, mut entry) = call.complete(&result);
             if let Ok(report) = &result {
                 // Correlation (ST-M003-006): the job id, honest job outcome,
@@ -1247,13 +1477,16 @@ async fn route_request(
                 .with("input_len", len_value(written));
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_write_stdin_start",
                 "mcp_remote_write_stdin",
                 args,
             );
-            let result = route.write_stdin(job, data.into_inner()).await;
+            let result = route
+                .write_stdin(purpose.clone(), job, data.into_inner())
+                .await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(
@@ -1271,13 +1504,14 @@ async fn route_request(
         IpcRequest::Cancel { job } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_cancel_start",
                 "mcp_remote_cancel",
                 AuditArgs::new().with("job_id", job_id_value(job)),
             );
-            let result = route.cancel(job).await;
+            let result = route.cancel(purpose.clone(), job).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1291,13 +1525,14 @@ async fn route_request(
         IpcRequest::ListJobs {} => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_list_jobs_start",
                 "mcp_remote_list_jobs",
                 AuditArgs::new(),
             );
-            let result = route.list_jobs().await;
+            let result = route.list_jobs(purpose.clone()).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, jobs| {
@@ -1312,13 +1547,14 @@ async fn route_request(
         IpcRequest::FsStat { path } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_fs_stat_start",
                 "mcp_remote_fs_stat",
                 AuditArgs::new().with("path", remote_path_value(&path)),
             );
-            let result = route.fs_stat(path).await;
+            let result = route.fs_stat(purpose.clone(), path).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(
@@ -1339,13 +1575,14 @@ async fn route_request(
         } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_fs_list_start",
                 "mcp_remote_fs_list",
                 AuditArgs::new().with("path", remote_path_value(&path)),
             );
-            let result = route.fs_list(path, continue_after).await;
+            let result = route.fs_list(purpose.clone(), path, continue_after).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, page| {
@@ -1360,13 +1597,14 @@ async fn route_request(
         IpcRequest::MakeDir { path } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_make_dir_start",
                 "mcp_remote_make_dir",
                 AuditArgs::new().with("path", remote_path_value(&path)),
             );
-            let result = route.make_dir(path).await;
+            let result = route.make_dir(purpose.clone(), path).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1386,6 +1624,7 @@ async fn route_request(
             // the destination (ADR-0008 Appendix A).
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_move_start",
@@ -1394,7 +1633,7 @@ async fn route_request(
                     .with("path", remote_path_value(&from))
                     .with("to", remote_path_value(&to)),
             );
-            let result = route.fs_move(from, to, overwrite).await;
+            let result = route.fs_move(purpose.clone(), from, to, overwrite).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1408,13 +1647,14 @@ async fn route_request(
         IpcRequest::Delete { path } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_delete_start",
                 "mcp_remote_delete",
                 AuditArgs::new().with("path", remote_path_value(&path)),
             );
-            let result = route.fs_delete(path).await;
+            let result = route.fs_delete(purpose.clone(), path).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1428,13 +1668,14 @@ async fn route_request(
         IpcRequest::RemoveDir { path } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_remove_dir_start",
                 "mcp_remote_remove_dir",
                 AuditArgs::new().with("path", remote_path_value(&path)),
             );
-            let result = route.remove_dir(path).await;
+            let result = route.remove_dir(purpose.clone(), path).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1448,6 +1689,7 @@ async fn route_request(
         IpcRequest::Upload { params } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_upload_start",
@@ -1459,7 +1701,7 @@ async fn route_request(
                         AuditValue::String(policy_label(params.cleanup).to_string()),
                     ),
             );
-            let result = route.upload(params).await;
+            let result = route.upload(purpose.clone(), params).await;
             let (routed, call_id, mut entry) = call.complete(&result);
             if let Ok(report) = &result {
                 transfer_detail(
@@ -1489,13 +1731,14 @@ async fn route_request(
         IpcRequest::Download { params } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_download_start",
                 "mcp_remote_download",
                 AuditArgs::new().with("path", remote_path_value(&params.source)),
             );
-            let result = route.download(params).await;
+            let result = route.download(purpose.clone(), params).await;
             let (routed, call_id, mut entry) = call.complete(&result);
             if let Ok(report) = &result {
                 transfer_detail(
@@ -1525,13 +1768,14 @@ async fn route_request(
         IpcRequest::ListStaged {} => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_list_staged_start",
                 "mcp_remote_list_staged",
                 AuditArgs::new(),
             );
-            let result = route.list_staged().await;
+            let result = route.list_staged(purpose.clone()).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(
@@ -1549,6 +1793,7 @@ async fn route_request(
         IpcRequest::Cleanup { trigger } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_cleanup_start",
@@ -1558,7 +1803,7 @@ async fn route_request(
                     AuditValue::String(trigger_label(trigger).to_string()),
                 ),
             );
-            let result = route.cleanup(trigger).await;
+            let result = route.cleanup(purpose.clone(), trigger).await;
             let (routed, call_id, mut entry) = call.complete(&result);
             if let Ok(summary) = &result {
                 entry
@@ -1593,6 +1838,7 @@ async fn route_request(
         IpcRequest::CaptureDesktop { params } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_capture_desktop_start",
@@ -1601,7 +1847,7 @@ async fn route_request(
                     .with("display", len_value(u64::from(params.display)))
                     .with("format", AuditValue::String(format!("{:?}", params.format))),
             );
-            let result = route.capture_desktop(params).await;
+            let result = route.capture_desktop(purpose.clone(), params).await;
             let (routed, call_id, mut entry) = call.complete(&result);
             if let Ok(report) = &result {
                 // Honest frame provenance: the desktop's liveness state, and
@@ -1642,6 +1888,7 @@ async fn route_request(
         } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_pointer_start",
@@ -1652,7 +1899,9 @@ async fn route_request(
                     .with("x", AuditValue::Int(i64::from(x)))
                     .with("y", AuditValue::Int(i64::from(y))),
             );
-            let result = route.desktop_pointer(action, button, x, y).await;
+            let result = route
+                .desktop_pointer(purpose.clone(), action, button, x, y)
+                .await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1666,6 +1915,7 @@ async fn route_request(
         IpcRequest::DesktopScroll { x, y, dx, dy } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_scroll_start",
@@ -1676,7 +1926,7 @@ async fn route_request(
                     .with("dx", AuditValue::Int(i64::from(dx)))
                     .with("dy", AuditValue::Int(i64::from(dy))),
             );
-            let result = route.desktop_scroll(x, y, dx, dy).await;
+            let result = route.desktop_scroll(purpose.clone(), x, y, dx, dy).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1690,6 +1940,7 @@ async fn route_request(
         IpcRequest::DesktopKey { action, key } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_key_start",
@@ -1700,7 +1951,7 @@ async fn route_request(
                     .with("action", AuditValue::String(format!("{action:?}")))
                     .with("key", truncate_field(&key)),
             );
-            let result = route.desktop_key(action, key).await;
+            let result = route.desktop_key(purpose.clone(), action, key).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1714,6 +1965,7 @@ async fn route_request(
         IpcRequest::DesktopType { text } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_type_start",
@@ -1722,7 +1974,7 @@ async fn route_request(
                 // length is recorded, never the content (REQ-S-018).
                 AuditArgs::new().with("text_len", len_value(text.len() as u64)),
             );
-            let result = route.desktop_type(text).await;
+            let result = route.desktop_type(purpose.clone(), text).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1736,6 +1988,7 @@ async fn route_request(
         IpcRequest::DesktopHotkey { keys } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_hotkey_start",
@@ -1744,7 +1997,7 @@ async fn route_request(
                 // identifier rather than content, so it is recorded in the clear.
                 AuditArgs::new().with("keys", truncate_field(&keys.join("+"))),
             );
-            let result = route.desktop_hotkey(keys).await;
+            let result = route.desktop_hotkey(purpose.clone(), keys).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1758,13 +2011,14 @@ async fn route_request(
         IpcRequest::DesktopWait { millis } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_wait_start",
                 "mcp_remote_desktop_wait",
                 AuditArgs::new().with("millis", len_value(millis)),
             );
-            let result = route.desktop_wait(millis).await;
+            let result = route.desktop_wait(purpose.clone(), millis).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1778,13 +2032,14 @@ async fn route_request(
         IpcRequest::ClipboardGet {} => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_clipboard_get_start",
                 "mcp_remote_clipboard_get",
                 AuditArgs::new(),
             );
-            let result = route.clipboard_get().await;
+            let result = route.clipboard_get(purpose.clone()).await;
             let (routed, call_id, mut entry) = call.complete(&result);
             if let Ok(text) = &result {
                 // The clipboard may hold secrets: only the returned length is
@@ -1805,6 +2060,7 @@ async fn route_request(
         IpcRequest::ClipboardSet { text } => {
             let call = CallAudit::begin(
                 audit,
+                purpose.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_clipboard_set_start",
@@ -1813,7 +2069,7 @@ async fn route_request(
                 // recorded, never the content (REQ-S-018).
                 AuditArgs::new().with("text_len", len_value(text.len() as u64)),
             );
-            let result = route.clipboard_set(text).await;
+            let result = route.clipboard_set(purpose.clone(), text).await;
             let (routed, call_id, entry) = call.complete(&result);
             audit.record(entry);
             respond(call_id, routed, result, |session, target, call_id, ()| {
@@ -1876,6 +2132,13 @@ async fn route_request(
             },
             call_id: 0,
         },
+        // Unwrapped above; a wrapper inside a wrapper is refused there too.
+        IpcRequest::WithPurpose { .. } => IpcResponse::Error {
+            error: IpcError::Malformed {
+                message: "a stated purpose may only wrap a routed tool call".to_string(),
+            },
+            call_id: 0,
+        },
     }
 }
 
@@ -1934,14 +2197,25 @@ struct CallAudit {
 
 impl CallAudit {
     /// Begins an [`Actor::Mcp`]-attributed routed call (the MCP bridge surface).
+    ///
+    /// The AI client's stated purpose, when it supplied one, is recorded as
+    /// the `purpose` argument of both the start and the completion record: it
+    /// is the caller's own claim, kept verbatim beside the real arguments it
+    /// describes and never in place of them (REQ-F-026, ST-M009-007). It lives
+    /// in `args`, the record's caller-supplied argument map, so the ADR-0008
+    /// record schema and its hash chain are unchanged.
     fn begin(
         audit: &dyn IpcAudit,
+        purpose: Option<&Purpose>,
         routed: Option<(SessionId, TargetIdentity)>,
         call_ids: &AtomicU64,
         action_start: &'static str,
         action: &'static str,
-        args: AuditArgs,
+        mut args: AuditArgs,
     ) -> Self {
+        if let Some(purpose) = purpose {
+            args.insert("purpose", truncate_field(purpose.as_str()));
+        }
         Self::begin_as(
             Actor::Mcp,
             audit,
@@ -2216,6 +2490,101 @@ mod tests {
             "env audit value must stay bounded, got {} bytes",
             serialized.len()
         );
+    }
+
+    /// A stated purpose arriving in the IPC wrapper is recorded verbatim as the
+    /// `purpose` argument of both audit records of the call, beside the real
+    /// arguments — here a fail-closed call, which is still audited
+    /// (ST-M009-007, REQ-F-026).
+    #[tokio::test]
+    async fn purpose_is_recorded_in_both_audit_records() {
+        let (audit, drain_rx) = ChannelAudit::bounded(16);
+        let call_ids = AtomicU64::new(1);
+        let request = IpcRequest::WithPurpose {
+            purpose: Purpose::new("Looking for the printer log").unwrap(),
+            call: Box::new(IpcRequest::FsStat {
+                path: RemotePath::Absolute {
+                    path: "C:\\Logs\\printer.log".to_string(),
+                },
+            }),
+        };
+        let response = route_request(&ClosedRoute, &audit, &call_ids, request).await;
+        assert!(
+            matches!(
+                response,
+                IpcResponse::Error {
+                    error: IpcError::NoConsentedSession,
+                    ..
+                }
+            ),
+            "{response:?}"
+        );
+        for expected in ["mcp_remote_fs_stat_start", "mcp_remote_fs_stat"] {
+            let entry = drain_rx.try_recv().unwrap();
+            assert_eq!(entry.action, expected);
+            assert_eq!(
+                entry.args.0.get("purpose"),
+                Some(&truncate_field("Looking for the printer log")),
+                "{expected} must hold the stated purpose"
+            );
+            assert!(entry.args.0.contains_key("path"), "the real path stays");
+        }
+    }
+
+    /// A bare request (an older bridge) carries no purpose and is audited
+    /// without one; nothing is invented (ST-M009-007, REQ-N-012).
+    #[tokio::test]
+    async fn bare_request_is_audited_without_a_purpose() {
+        let (audit, drain_rx) = ChannelAudit::bounded(16);
+        let call_ids = AtomicU64::new(1);
+        let _ = route_request(&ClosedRoute, &audit, &call_ids, IpcRequest::ListJobs {}).await;
+        for _ in 0..2 {
+            let entry = drain_rx.try_recv().unwrap();
+            assert!(!entry.args.0.contains_key("purpose"), "{entry:?}");
+        }
+    }
+
+    /// The purpose wrapper may only carry a routed tool call: wrapped around a
+    /// terminal message, a handshake, or another wrapper it is refused as
+    /// malformed, nothing is routed, and nothing is audited (ST-M009-007).
+    #[tokio::test]
+    async fn purpose_wrapper_around_a_non_tool_request_is_refused() {
+        let purpose = Purpose::new("Opening a terminal").unwrap();
+        for call in [
+            IpcRequest::TermOpen {
+                shell: Shell::Cmd,
+                cols: 80,
+                rows: 24,
+                working_dir: None,
+                env: BTreeMap::new(),
+            },
+            IpcRequest::Hello {
+                protocol: IPC_PROTOCOL,
+            },
+            IpcRequest::WithPurpose {
+                purpose: purpose.clone(),
+                call: Box::new(IpcRequest::ListJobs {}),
+            },
+        ] {
+            let (audit, drain_rx) = ChannelAudit::bounded(16);
+            let call_ids = AtomicU64::new(1);
+            let request = IpcRequest::WithPurpose {
+                purpose: purpose.clone(),
+                call: Box::new(call),
+            };
+            let response = route_request(&ClosedRoute, &audit, &call_ids, request).await;
+            assert!(
+                matches!(
+                    response,
+                    IpcResponse::Error {
+                        error: IpcError::Malformed { .. },
+                        ..
+                    }
+                ),
+                "{response:?}"
+            );
+            assert!(drain_rx.try_recv().is_err(), "nothing may be audited");
+        }
     }
 
     /// The live activity echo (REQ-F-017) forwards bridge-originated entries

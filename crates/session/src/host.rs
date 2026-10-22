@@ -17,9 +17,9 @@ use tokio::task::JoinHandle as SpawnedTask;
 
 use crate::runtime::{CompareDecision, HostCommand, Outbound};
 use crate::{
-    CleanupReport, ConsoleHints, DesktopCaptureRequest, DesktopFrame, Dial, DisclosureSummary,
-    ExecRequest, NoAudit, RevokeReason, SessionAudit, SessionError, SessionEvent, Shared,
-    StartedJob, runtime,
+    Attribution, CleanupReport, ConsoleHints, DesktopCaptureRequest, DesktopFrame, Dial,
+    DisclosureSummary, ExecRequest, NoAudit, RevokeReason, SessionAudit, SessionError,
+    SessionEvent, Shared, StartedJob, runtime,
 };
 
 /// The console side of a session (the Noise **responder**, ADR-0003).
@@ -362,16 +362,21 @@ impl HostHandle {
     pub async fn run_command_as(
         &self,
         request: ExecRequest,
-        origin: Origin,
+        attribution: impl Into<Attribution>,
     ) -> Result<StartedJob, SessionError> {
-        self.exec_op(None, request.into_operation(), "run_command", origin)
-            .await
-            .and_then(|result| match result {
-                OpResult::ExecStarted { job, working_dir } => Ok(StartedJob { job, working_dir }),
-                _ => Err(SessionError::Unexpected {
-                    context: "run_command",
-                }),
-            })
+        self.exec_op(
+            None,
+            request.into_operation(),
+            "run_command",
+            attribution.into(),
+        )
+        .await
+        .and_then(|result| match result {
+            OpResult::ExecStarted { job, working_dir } => Ok(StartedJob { job, working_dir }),
+            _ => Err(SessionError::Unexpected {
+                context: "run_command",
+            }),
+        })
     }
 
     /// Like [`Self::run_command`], but stamps the request with an explicit
@@ -388,7 +393,7 @@ impl HostHandle {
             Some(session),
             request.into_operation(),
             "run_command",
-            Origin::Console,
+            Origin::Console.into(),
         )
         .await
         .and_then(|result| match result {
@@ -418,10 +423,15 @@ impl HostHandle {
     /// See [`Self::run_command`].
     pub async fn system_info_as(
         &self,
-        origin: Origin,
+        attribution: impl Into<Attribution>,
     ) -> Result<(TargetIdentity, bool), SessionError> {
         match self
-            .exec_op(None, Operation::SystemInfo {}, "system_info", origin)
+            .exec_op(
+                None,
+                Operation::SystemInfo {},
+                "system_info",
+                attribution.into(),
+            )
             .await?
         {
             OpResult::SystemInfo {
@@ -454,7 +464,7 @@ impl HostHandle {
         &self,
         job: JobId,
         data: Vec<u8>,
-        origin: Origin,
+        attribution: impl Into<Attribution>,
     ) -> Result<(), SessionError> {
         match self
             .exec_op(
@@ -464,7 +474,7 @@ impl HostHandle {
                     data: B64Bytes::new(data),
                 },
                 "write_stdin",
-                origin,
+                attribution.into(),
             )
             .await?
         {
@@ -484,10 +494,24 @@ impl HostHandle {
     ///
     /// See [`Self::run_command`].
     pub async fn cancel_job(&self, job: JobId) -> Result<(), SessionError> {
-        // A `Cancel` is a distinct top-level message with no origin field; the
-        // origin passed here is ignored by the outbound loop.
+        self.cancel_job_as(job, Origin::Console).await
+    }
+
+    /// Like [`Self::cancel_job`], but stamps an explicit [`Attribution`] onto
+    /// the wire `Cancel` (protocol minor `9`), so the agent and the attended
+    /// customer surface can attribute the cancellation and show the caller's
+    /// stated purpose (ST-M009-007, REQ-F-026).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::cancel_job`].
+    pub async fn cancel_job_as(
+        &self,
+        job: JobId,
+        attribution: impl Into<Attribution>,
+    ) -> Result<(), SessionError> {
         match self
-            .dispatch(None, Outbound::Cancel(job), Origin::Console)
+            .dispatch(None, Outbound::Cancel(job), attribution.into())
             .await?
         {
             OpResult::Ack {} => Ok(()),
@@ -510,9 +534,17 @@ impl HostHandle {
     /// # Errors
     ///
     /// See [`Self::run_command`].
-    pub async fn list_jobs_as(&self, origin: Origin) -> Result<Vec<JobSummary>, SessionError> {
+    pub async fn list_jobs_as(
+        &self,
+        attribution: impl Into<Attribution>,
+    ) -> Result<Vec<JobSummary>, SessionError> {
         match self
-            .exec_op(None, Operation::ListJobs {}, "list_jobs", origin)
+            .exec_op(
+                None,
+                Operation::ListJobs {},
+                "list_jobs",
+                attribution.into(),
+            )
             .await?
         {
             OpResult::Jobs { jobs } => Ok(jobs),
@@ -560,7 +592,7 @@ impl HostHandle {
                     env,
                 },
                 "open_terminal",
-                Origin::Terminal,
+                Origin::Terminal.into(),
             )
             .await?
         {
@@ -592,7 +624,7 @@ impl HostHandle {
                 None,
                 Operation::TermResize { job, cols, rows },
                 "resize_terminal",
-                Origin::Terminal,
+                Origin::Terminal.into(),
             )
             .await?
         {
@@ -617,7 +649,7 @@ impl HostHandle {
                 None,
                 Operation::TermClose { job },
                 "close_terminal",
-                Origin::Terminal,
+                Origin::Terminal.into(),
             )
             .await?
         {
@@ -664,7 +696,7 @@ impl HostHandle {
                 None,
                 request.into_operation(),
                 "capture_desktop",
-                Origin::Console,
+                Origin::Console.into(),
             )
             .await?
         {
@@ -802,7 +834,7 @@ impl HostHandle {
                 None,
                 Operation::ClipboardGet {},
                 "clipboard_get",
-                Origin::Console,
+                Origin::Console.into(),
             )
             .await?
         {
@@ -832,7 +864,10 @@ impl HostHandle {
     /// any other shape to [`SessionError::Unexpected`]. Shared by every
     /// input-injection and clipboard-set method above.
     async fn desktop_ack(&self, op: Operation, context: &'static str) -> Result<(), SessionError> {
-        match self.exec_op(None, op, context, Origin::Console).await? {
+        match self
+            .exec_op(None, op, context, Origin::Console.into())
+            .await?
+        {
             OpResult::Ack {} => Ok(()),
             _ => Err(SessionError::Unexpected { context }),
         }
@@ -873,9 +908,9 @@ impl HostHandle {
     pub async fn file_op_as(
         &self,
         op: Operation,
-        origin: Origin,
+        attribution: impl Into<Attribution>,
     ) -> Result<OpResult, SessionError> {
-        self.exec_op(None, op, "file_op", origin).await
+        self.exec_op(None, op, "file_op", attribution.into()).await
     }
 
     /// Like [`Self::file_op`], but stamps the request with an explicit session
@@ -888,7 +923,7 @@ impl HostHandle {
         session: SessionId,
         op: Operation,
     ) -> Result<OpResult, SessionError> {
-        self.exec_op(Some(session), op, "file_op", Origin::Console)
+        self.exec_op(Some(session), op, "file_op", Origin::Console.into())
             .await
     }
 
@@ -903,15 +938,17 @@ impl HostHandle {
         session_override: Option<SessionId>,
         op: Operation,
         context: &'static str,
-        origin: Origin,
+        attribution: Attribution,
     ) -> Result<OpResult, SessionError> {
         let _ = context;
-        // Validate against the protocol limits via a throwaway probe (the id and
-        // session do not affect field-limit validation).
+        // Validate against the protocol limits via a throwaway probe (the id,
+        // session, and attribution do not affect field-limit validation; a
+        // `Purpose` is valid by construction).
         Message::Request {
             id: RequestId(0),
             session: SessionId::new(),
-            origin,
+            origin: attribution.origin,
+            purpose: None,
             op: op.clone(),
         }
         .validate()
@@ -921,21 +958,21 @@ impl HostHandle {
             code: error.code(),
             message: error.to_string(),
         })?;
-        self.dispatch(session_override, Outbound::Op(op), origin)
+        self.dispatch(session_override, Outbound::Op(op), attribution)
             .await
     }
 
     /// Queues one outbound command for the session task and awaits its reply.
     /// Refuses before the session is active so a caller never blocks on a reply
-    /// that cannot come. `origin` is stamped onto a wire `Request` (ignored for
+    /// that cannot come. `attribution` is stamped onto the wire `Request` or
     /// a `Cancel`, which is a distinct message).
     async fn dispatch(
         &self,
         session_override: Option<SessionId>,
         kind: Outbound,
-        origin: Origin,
+        attribution: Attribution,
     ) -> Result<OpResult, SessionError> {
-        let reply = self.submit(session_override, kind, origin)?;
+        let reply = self.submit(session_override, kind, attribution)?;
         match reply.await {
             Ok(result) => result,
             Err(_) => Err(SessionError::Disconnected),
@@ -954,22 +991,25 @@ impl HostHandle {
     pub(crate) fn submit_op(
         &self,
         op: Operation,
+        attribution: Attribution,
     ) -> Result<oneshot::Receiver<Result<OpResult, SessionError>>, SessionError> {
-        // File-transfer chunk operations compose the file surface; they carry
-        // the default console origin at the wire level. AI attribution for a
-        // transfer is captured console-side (audit `call_id`, the in-flight
-        // indicator) rather than on each chunk (ST-M004-006).
-        self.submit(None, Outbound::Op(op), Origin::Console)
+        // File-transfer chunk operations carry the transfer's own attribution:
+        // the technician's for a manual transfer, the AI's (with its stated
+        // purpose) for a bridge-driven one, so the wire never misattributes an
+        // AI transfer to the technician (ST-M004-006, ST-M009-007). The agent
+        // does not report each chunk to the customer; it reports the commit.
+        self.submit(None, Outbound::Op(op), attribution)
     }
 
     /// Queues one outbound command and returns the reply channel without awaiting
     /// it. Refuses before the session is active so a caller never holds a reply
-    /// that cannot come (fail closed). `origin` is stamped onto a wire `Request`.
+    /// that cannot come (fail closed). `attribution` is stamped onto the wire
+    /// `Request` or `Cancel`.
     fn submit(
         &self,
         session_override: Option<SessionId>,
         kind: Outbound,
-        origin: Origin,
+        attribution: Attribution,
     ) -> Result<oneshot::Receiver<Result<OpResult, SessionError>>, SessionError> {
         if !self.shared.control_active() {
             return Err(SessionError::NotActive);
@@ -978,7 +1018,7 @@ impl HostHandle {
         let command = HostCommand {
             session_override,
             kind,
-            origin,
+            attribution,
             reply: reply_tx,
         };
         if self.command_tx.send(command).is_err() {

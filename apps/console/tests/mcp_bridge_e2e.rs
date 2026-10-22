@@ -57,7 +57,7 @@ use cretlink_console::{
     ChannelAudit, ClosedRoute, ConsoleRoute, ConsoleSessionService, IpcAudit, IpcServer,
 };
 use cretlink_mcp::{ExecParams, IpcEndpoint, IpcListener, IpcTargetSession, McpBridge};
-use cretlink_protocol::{PROTOCOL_V1, SessionId, TargetIdentity};
+use cretlink_protocol::{PROTOCOL_V1, Purpose, SessionId, TargetIdentity};
 use cretlink_session::{
     ConsoleHints, ExecRequest, HostHandle, JoinHandle, Origin, RevokeReason, SessionEvent,
     SessionHost, SessionJoiner, Shell,
@@ -239,7 +239,9 @@ async fn full_chain_lists_tools_runs_exec_and_fails_closed_after_revoke() {
     // remote_system_info returns the simulated target identity, embedding the
     // routed session id and target (REQ-F-016).
     let info = client
-        .call_tool(CallToolRequestParams::new("remote_system_info"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_system_info",
+        )))
         .await
         .expect("remote_system_info");
     assert_ne!(info.is_error, Some(true));
@@ -251,9 +253,9 @@ async fn full_chain_lists_tools_runs_exec_and_fails_closed_after_revoke() {
     // remote_exec runs a portable echo end to end and returns streamed output
     // with a Completed outcome; the result carries the routed identity.
     let exec = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_exec").with_arguments(exec_args("echo hello")),
-        )
+        ))
         .await
         .expect("remote_exec");
     assert_ne!(exec.is_error, Some(true));
@@ -280,7 +282,7 @@ async fn full_chain_lists_tools_runs_exec_and_fails_closed_after_revoke() {
     // structured envelope: invalid_path, never a collapsed limit_exceeded
     // (ST-M003-003, REQ-N-015).
     let invalid = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_stat").with_arguments(
                 [(
                     "path".to_string(),
@@ -289,7 +291,7 @@ async fn full_chain_lists_tools_runs_exec_and_fails_closed_after_revoke() {
                 .into_iter()
                 .collect::<Map<String, Value>>(),
             ),
-        )
+        ))
         .await
         .expect("remote_stat returns a result envelope");
     assert_eq!(invalid.is_error, Some(true));
@@ -325,7 +327,9 @@ async fn full_chain_lists_tools_runs_exec_and_fails_closed_after_revoke() {
     // closed and nothing runs (ST-M004-004, REQ-S-009).
     service.revoke(RevokeReason::TechnicianRequested);
     let after = client
-        .call_tool(CallToolRequestParams::new("remote_system_info"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_system_info",
+        )))
         .await
         .expect("tool call still returns a result after revoke");
     assert_eq!(
@@ -341,10 +345,10 @@ async fn full_chain_lists_tools_runs_exec_and_fails_closed_after_revoke() {
     // after revoke, proving no remote work runs on a revoked session
     // (ST-M004-004: revocation invalidates outstanding authority immediately).
     let exec_after = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_exec")
                 .with_arguments(exec_args("echo should-not-run")),
-        )
+        ))
         .await
         .expect("exec tool call still returns a result after revoke");
     assert_eq!(
@@ -390,7 +394,9 @@ async fn no_consented_session_fails_closed() {
     assert_eq!(tools.len(), 24);
 
     let info = client
-        .call_tool(CallToolRequestParams::new("remote_system_info"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_system_info",
+        )))
         .await
         .expect("call returns a result");
     assert_eq!(info.is_error, Some(true));
@@ -400,7 +406,9 @@ async fn no_consented_session_fails_closed() {
     );
 
     let exec = client
-        .call_tool(CallToolRequestParams::new("remote_exec").with_arguments(exec_args("echo nope")))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_exec").with_arguments(exec_args("echo nope")),
+        ))
         .await
         .expect("call returns a result");
     assert_eq!(exec.is_error, Some(true));
@@ -412,7 +420,9 @@ async fn no_consented_session_fails_closed() {
     // The file and transfer surface must fail closed too: a no-argument
     // inspection and an argument-bearing transfer both refuse (REQ-S-009).
     let staged = client
-        .call_tool(CallToolRequestParams::new("remote_list_staged"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_list_staged",
+        )))
         .await
         .expect("call returns a result");
     assert_eq!(staged.is_error, Some(true));
@@ -427,7 +437,9 @@ async fn no_consented_session_fails_closed() {
     upload_args.insert("source_label".to_string(), json!("tech:x"));
     upload_args.insert("cleanup".to_string(), json!("on_session_end"));
     let upload = client
-        .call_tool(CallToolRequestParams::new("remote_upload").with_arguments(upload_args))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_upload").with_arguments(upload_args),
+        ))
         .await
         .expect("call returns a result");
     assert_eq!(upload.is_error, Some(true));
@@ -443,9 +455,9 @@ async fn no_consented_session_fails_closed() {
     capture_args.insert("display".to_string(), json!(0));
     capture_args.insert("format".to_string(), json!("png"));
     let capture = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_capture_desktop").with_arguments(capture_args),
-        )
+        ))
         .await
         .expect("call returns a result");
     assert_eq!(capture.is_error, Some(true));
@@ -467,9 +479,9 @@ async fn no_consented_session_fails_closed() {
     pointer_args.insert("x".to_string(), json!(10));
     pointer_args.insert("y".to_string(), json!(10));
     let pointer = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_desktop_pointer").with_arguments(pointer_args),
-        )
+        ))
         .await
         .expect("call returns a result");
     assert_eq!(pointer.is_error, Some(true));
@@ -521,7 +533,7 @@ async fn staging_path_traversal_is_rejected_at_the_mcp_surface() {
     // forwarded to the target and never a panic.
     for bad in ["..\\escape.bin", "sub/escape.bin", ".."] {
         let result = client
-            .call_tool(
+            .call_tool(with_purpose(
                 CallToolRequestParams::new("remote_stat").with_arguments(
                     [(
                         "path".to_string(),
@@ -530,7 +542,7 @@ async fn staging_path_traversal_is_rejected_at_the_mcp_surface() {
                     .into_iter()
                     .collect::<Map<String, Value>>(),
                 ),
-            )
+            ))
             .await
             .expect("remote_stat returns a result envelope");
         assert_eq!(
@@ -553,9 +565,12 @@ async fn staging_path_traversal_is_rejected_at_the_mcp_surface() {
 }
 
 /// Reads agent-side events until the `CommandStarted` for `command` and returns
-/// the [`Origin`] the agent saw on the wire — the attribution the customer-facing
-/// surface renders (ST-M004-006).
-async fn next_command_origin(joiner: &mut JoinHandle, command: &str) -> Origin {
+/// the [`Origin`] and stated purpose the agent saw on the wire — the attribution
+/// the customer-facing surface renders (ST-M004-006, ST-M009-007).
+async fn next_command_attribution(
+    joiner: &mut JoinHandle,
+    command: &str,
+) -> (Origin, Option<Purpose>) {
     loop {
         let event = timeout(STEP, joiner.next_event())
             .await
@@ -564,11 +579,12 @@ async fn next_command_origin(joiner: &mut JoinHandle, command: &str) -> Origin {
         if let SessionEvent::CommandStarted {
             command: seen,
             origin,
+            purpose,
             ..
         } = event
             && seen == command
         {
-            return origin;
+            return (origin, purpose);
         }
     }
 }
@@ -589,14 +605,18 @@ async fn console_and_bridge_paths_reach_the_agent_with_distinct_origin() {
         .await
         .expect("console-path run_command");
     assert_eq!(
-        next_command_origin(&mut joiner, "echo from-console").await,
-        Origin::Console,
-        "a command from the console path must reach the agent as console origin"
+        next_command_attribution(&mut joiner, "echo from-console").await,
+        (Origin::Console, None),
+        "a command from the console path must reach the agent as console origin, \
+         labelled by its source with no stated purpose (ST-M009-007)"
     );
 
-    // Bridge path (the MCP-facing collected exec): AI-driven.
+    // Bridge path (the MCP-facing collected exec): AI-driven, with the AI's
+    // stated purpose carried to the agent beside the real command.
+    let purpose = Purpose::new("Checking that the network works").unwrap();
     let _ = service
         .exec(
+            Some(purpose.clone()),
             ExecParams {
                 shell: Shell::Cmd,
                 command: "echo from-ai".to_string(),
@@ -610,9 +630,10 @@ async fn console_and_bridge_paths_reach_the_agent_with_distinct_origin() {
         .await
         .expect("bridge-path exec");
     assert_eq!(
-        next_command_origin(&mut joiner, "echo from-ai").await,
-        Origin::Mcp,
-        "the same command from the bridge path must reach the agent as mcp origin"
+        next_command_attribution(&mut joiner, "echo from-ai").await,
+        (Origin::Mcp, Some(purpose)),
+        "the same command from the bridge path must reach the agent as mcp origin \
+         with the AI's stated purpose"
     );
 
     drop(service);
@@ -647,7 +668,9 @@ async fn audit_record_and_tool_result_share_call_id_and_correlation() {
 
     // exec: the result carries a non-zero call_id and the agent-assigned job id.
     let exec = client
-        .call_tool(CallToolRequestParams::new("remote_exec").with_arguments(exec_args("echo hi")))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_exec").with_arguments(exec_args("echo hi")),
+        ))
         .await
         .expect("remote_exec");
     let body = structured(&exec);
@@ -676,7 +699,9 @@ async fn audit_record_and_tool_result_share_call_id_and_correlation() {
     upload_args.insert("source_label".to_string(), json!("tech:payload"));
     upload_args.insert("cleanup".to_string(), json!("on_session_end"));
     let upload = client
-        .call_tool(CallToolRequestParams::new("remote_upload").with_arguments(upload_args))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_upload").with_arguments(upload_args),
+        ))
         .await
         .expect("remote_upload");
     let up = structured(&upload);
@@ -698,7 +723,7 @@ async fn audit_record_and_tool_result_share_call_id_and_correlation() {
     // and the error result carries the same call_id the audit record was written
     // under (ST-M004-006).
     let failed = client
-        .call_tool(
+        .call_tool(with_purpose(
             CallToolRequestParams::new("remote_delete").with_arguments(
                 [(
                     "path".to_string(),
@@ -707,7 +732,7 @@ async fn audit_record_and_tool_result_share_call_id_and_correlation() {
                 .into_iter()
                 .collect::<Map<String, Value>>(),
             ),
-        )
+        ))
         .await
         .expect("remote_delete returns a result envelope");
     assert_eq!(failed.is_error, Some(true));
@@ -723,6 +748,16 @@ async fn audit_record_and_tool_result_share_call_id_and_correlation() {
     let mut upload_ok = false;
     let mut failed_ok = false;
     while let Ok(entry) = audit_rx.try_recv() {
+        // Every routed bridge call's audit records hold the AI's stated purpose
+        // as given, beside the real arguments (REQ-F-026, ST-M009-007).
+        if entry.actor == Actor::Mcp && entry.action.starts_with("mcp_remote_") {
+            assert_eq!(
+                entry.args.0.get("purpose"),
+                Some(&AuditValue::String(TEST_PURPOSE.to_string())),
+                "{} must record the stated purpose",
+                entry.action
+            );
+        }
         match entry.action {
             "mcp_remote_exec" => {
                 assert_eq!(audit_u64(&entry, "call_id"), exec_call_id);
@@ -801,7 +836,9 @@ async fn customer_side_revoke_mid_exec_reports_honestly_then_fails_closed() {
     let exec_client = Arc::clone(&client);
     let exec_task = tokio::spawn(async move {
         exec_client
-            .call_tool(CallToolRequestParams::new("remote_exec").with_arguments(exec_args("sort")))
+            .call_tool(with_purpose(
+                CallToolRequestParams::new("remote_exec").with_arguments(exec_args("sort")),
+            ))
             .await
     });
 
@@ -809,7 +846,7 @@ async fn customer_side_revoke_mid_exec_reports_honestly_then_fails_closed() {
     // mid-exec without a sleep-based race.
     let mut running = false;
     for _ in 0..100 {
-        if let Ok(jobs) = service.exec_list_jobs().await
+        if let Ok(jobs) = service.exec_list_jobs(None).await
             && jobs.iter().any(|job| job.running)
         {
             running = true;
@@ -844,7 +881,9 @@ async fn customer_side_revoke_mid_exec_reports_honestly_then_fails_closed() {
 
     // Every subsequent call fails closed with the explicit no-session error.
     let after = client
-        .call_tool(CallToolRequestParams::new("remote_system_info"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_system_info",
+        )))
         .await
         .expect("returns a result after revoke");
     assert_eq!(after.is_error, Some(true));
@@ -853,7 +892,9 @@ async fn customer_side_revoke_mid_exec_reports_honestly_then_fails_closed() {
         json!("no_consented_session")
     );
     let exec_after = client
-        .call_tool(CallToolRequestParams::new("remote_exec").with_arguments(exec_args("echo nope")))
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_exec").with_arguments(exec_args("echo nope")),
+        ))
         .await
         .expect("returns a result after revoke");
     assert_eq!(exec_after.is_error, Some(true));
@@ -901,13 +942,15 @@ async fn console_side_revoke_mid_exec_reports_honestly_then_fails_closed() {
     let exec_client = Arc::clone(&client);
     let exec_task = tokio::spawn(async move {
         exec_client
-            .call_tool(CallToolRequestParams::new("remote_exec").with_arguments(exec_args("sort")))
+            .call_tool(with_purpose(
+                CallToolRequestParams::new("remote_exec").with_arguments(exec_args("sort")),
+            ))
             .await
     });
 
     let mut running = false;
     for _ in 0..100 {
-        if let Ok(jobs) = service.exec_list_jobs().await
+        if let Ok(jobs) = service.exec_list_jobs(None).await
             && jobs.iter().any(|job| job.running)
         {
             running = true;
@@ -936,7 +979,9 @@ async fn console_side_revoke_mid_exec_reports_honestly_then_fails_closed() {
     );
 
     let after = client
-        .call_tool(CallToolRequestParams::new("remote_system_info"))
+        .call_tool(with_purpose(CallToolRequestParams::new(
+            "remote_system_info",
+        )))
         .await
         .expect("returns a result after stop");
     assert_eq!(after.is_error, Some(true));
@@ -948,4 +993,18 @@ async fn console_side_revoke_mid_exec_reports_honestly_then_fails_closed() {
     server.abort();
     drop(joiner);
     drop(client);
+}
+
+/// The stated purpose every test tool call carries (ST-M009-007).
+const TEST_PURPOSE: &str = "Checking the computer for the support request";
+
+/// Adds the required stated `purpose` argument to a tool call that does not set
+/// one (ST-M009-007), so each test states only the arguments it is about.
+fn with_purpose(mut params: CallToolRequestParams) -> CallToolRequestParams {
+    params
+        .arguments
+        .get_or_insert_with(Map::new)
+        .entry("purpose")
+        .or_insert_with(|| Value::String(TEST_PURPOSE.to_string()));
+    params
 }

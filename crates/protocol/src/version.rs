@@ -79,7 +79,22 @@ use crate::error::ProtocolError;
 /// closed rather than silently skipping the gate — so the compare step cannot
 /// be downgraded away, and same-major peers that both speak minor 8 interoperate
 /// (REQ-S-008, REQ-S-009, REQ-N-012).
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 8 };
+///
+/// Minor `9` adds the additive, optional [`crate::Purpose`] field on
+/// [`crate::Message::Request`] and [`crate::Message::Cancel`] — the AI client's
+/// stated, plain-language reason for the action, shown to the attended customer
+/// beside the real operation (REQ-F-026, ST-M009-007) — and the additive
+/// [`crate::Origin`] on `Cancel`. Both are omitted on the wire at their
+/// defaults (no purpose, console origin), so a request or cancellation without
+/// a purpose keeps its minor-8 wire form and an older-minor decoder still
+/// accepts it (REQ-N-012). A purpose itself only ever reaches a minor-9 agent:
+/// the pairing prologue ([`crate::pairing_prologue`]) commits both endpoints to
+/// the identical version, so a console and an agent on different minors never
+/// reach the request phase. The agent never treats a purpose as authority. It
+/// is validated on decode (trimmed, single line, 1 to
+/// [`crate::limits::MAX_PURPOSE_CHARS`] characters), so a malformed one fails
+/// the frame closed like any other out-of-contract field.
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 9 };
 
 /// A `major.minor` protocol version.
 ///

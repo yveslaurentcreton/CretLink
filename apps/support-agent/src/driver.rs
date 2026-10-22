@@ -208,6 +208,7 @@ pub fn apply_session_event(
         // command broker, not the session-lifecycle UI, so it never drives a
         // phase transition.
         SessionEvent::CommandStarted { .. }
+        | SessionEvent::RequestHandled { .. }
         | SessionEvent::ExecOutput { .. }
         | SessionEvent::ExecOutputDropped { .. }
         | SessionEvent::ExecFinished { .. }
@@ -454,6 +455,13 @@ mod tests {
                 shell: cretlink_protocol::Shell::PowerShell,
                 command: "Get-Process".to_string(),
                 origin: cretlink_protocol::Origin::Console,
+                purpose: None,
+            },
+            SessionEvent::RequestHandled {
+                origin: cretlink_protocol::Origin::Mcp,
+                purpose: cretlink_protocol::Purpose::new("Checking free disk space").ok(),
+                operation: "read system information".to_string(),
+                outcome: cretlink_session::ActionOutcome::Succeeded,
             },
             SessionEvent::ExecOutputDropped {
                 job: cretlink_protocol::JobId(2),
