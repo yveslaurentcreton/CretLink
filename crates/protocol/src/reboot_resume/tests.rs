@@ -37,6 +37,7 @@ fn identity() -> TargetIdentity {
         elevated: true,
         simulated: false,
         agent_version: "0.1.0".to_owned(),
+        account: None,
     }
 }
 

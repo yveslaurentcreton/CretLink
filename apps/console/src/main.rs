@@ -1,4 +1,5 @@
-//! CretLink Console command-line entry point (ST-M002-002 wiring).
+//! The headless `cretlink-console` binary (ST-M002-002 wiring), a development
+//! and test tool.
 //!
 //! The console is the listening side of an attended LAN session (ADR-0003: the
 //! agent dials, the console listens). This binary hosts one session with the
@@ -8,9 +9,13 @@
 //! then reports every lifecycle event — the Session Approval Code to compare,
 //! consent, the active session, and revocation — as plain, secret-free text.
 //!
-//! The graphical console (`apps/app`, Give help) renders the same runtime; this
-//! CLI is the headless technician console (interactive commands, audit, MCP
-//! bridge host).
+//! The application `cretlink` (`apps/app`, Give help) renders the same runtime;
+//! this binary is the headless technician console (interactive commands, audit,
+//! MCP bridge host) for development and tests. It is not shipped: the release
+//! archives hold only `cretlink` and `cretlink-cli` (ST-M009-010, ADR-0018).
+//! Its relay options (`--relay`, `--ticket`, `--token`, `--relay-tls`,
+//! `--relay-ca`) stay available to developers until M007 brings the relay into
+//! the application.
 
 use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
@@ -20,8 +25,8 @@ use std::time::Duration;
 
 use cretlink_console::{
     AUDIT_CHANNEL_CAPACITY, AuditEntry, AuditServiceConfig, ChannelAudit, ConsoleRoute,
-    ConsoleSessionService, IpcAudit, IpcServer, ManualActivity, SessionAuditStart,
-    open_session_log, prune_audit_dir, report_prune, spawn_audit_service,
+    ConsoleSessionService, IpcAudit, IpcServer, LiveEcho, ManualActivity, SessionAuditStart,
+    open_session_log, prune_audit_dir, report_prune, spawn_audit_service, technician_display_name,
 };
 use cretlink_discovery::{Advertiser, ConnectionCode, private_interface_addrs};
 use cretlink_mcp::{IpcEndpoint, IpcListener};
@@ -122,6 +127,10 @@ async fn run_session(
 ) -> Result<(), String> {
     let hints = ConsoleHints {
         label: "This computer (technician)".to_string(),
+        // The account's full name, else its user name, sent to the customer
+        // side in the pairing handshake as what this computer says
+        // (ST-M009-011).
+        display_name: technician_display_name(),
     };
     // Open the one session's transport. On the LAN the console binds a private
     // listener and advertises itself over mDNS; over the relay it dials outbound
@@ -321,11 +330,19 @@ fn announce_lan(handle: &HostHandle) -> Result<Option<Advertiser>, String> {
     let local_addr = handle
         .local_addr()
         .ok_or_else(|| "the console listener reported no local address".to_string())?;
+    // The advertised name is the technician's display name (ST-M009-011),
+    // falling back to the product name when the account reports none. It is
+    // an untrusted hint on the customer side; trust comes only from the
+    // Session Approval Code (REQ-S-006).
+    let advertised_name = technician_display_name().map_or_else(
+        || "CretLink Console".to_string(),
+        |name| name.as_str().to_string(),
+    );
     let advertiser = match Advertiser::advertise(
         "cretlink-console",
         local_addr.port(),
         PROTOCOL_V1,
-        "CretLink Console",
+        &advertised_name,
     ) {
         Ok(advertiser) => Some(advertiser),
         Err(error) => {
@@ -333,12 +350,14 @@ fn announce_lan(handle: &HostHandle) -> Result<Option<Advertiser>, String> {
             None
         }
     };
-    println!("CretLink Console — waiting for the customer agent to connect.");
+    println!("cretlink-console (development tool) — waiting for the customer agent to connect.");
     println!("  Listening on: {local_addr}");
     if let SocketAddr::V4(v4) = local_addr {
         println!("  Manual connection code: {}", ConnectionCode::encode(v4));
     }
-    println!("  Give the customer the address or code above, then start CretLink Support there.");
+    println!(
+        "  Give the customer the address or code above, then start CretLink (Get help) or cretlink-support-agent there."
+    );
     println!("  Press Ctrl+C to stop and revoke at any time.\n");
     Ok(advertiser)
 }
@@ -351,7 +370,9 @@ fn announce_lan(handle: &HostHandle) -> Result<Option<Advertiser>, String> {
 /// routing metadata (the relay address and whether an admission token was
 /// presented) is shown.
 fn announce_relay(relay: SocketAddr, has_token: bool, is_wss: bool) {
-    println!("CretLink Console — connected to the relay, waiting for the customer agent.");
+    println!(
+        "cretlink-console (development tool) — connected to the relay, waiting for the customer agent."
+    );
     println!("  Relay: {relay}");
     println!(
         "  Transport: {}",
@@ -369,7 +390,7 @@ fn announce_relay(relay: SocketAddr, has_token: bool, is_wss: bool) {
             "none (open relay)"
         }
     );
-    println!("  The customer must start CretLink Support with the SAME rendezvous ticket.");
+    println!("  The customer must start cretlink-support-agent with the SAME rendezvous ticket.");
     println!("  Press Ctrl+C to stop and revoke at any time.\n");
 }
 
@@ -498,9 +519,11 @@ fn report_event(handle: &HostHandle, event: &SessionEvent) -> Flow {
         // These only occur inside the interactive loop (handled there); a pre-active
         // sighting is impossible but keeps this match exhaustive. Reboot-resume can
         // only be armed after consent, so its reflections belong to the same group.
-        // `RequestHandled` is agent-side only and never reaches the console.
+        // `RequestHandled` and `ActivityShed` are agent-side only and never
+        // reach the console.
         SessionEvent::CommandStarted { .. }
         | SessionEvent::RequestHandled { .. }
+        | SessionEvent::ActivityShed { .. }
         | SessionEvent::ExecOutput { .. }
         | SessionEvent::ExecOutputDropped { .. }
         | SessionEvent::ExecFinished { .. }
@@ -538,7 +561,7 @@ async fn run_active(
     let (live_tx, live_rx) = tokio::sync::mpsc::channel(LIVE_ECHO_CAPACITY);
     audit.set_live_sender(live_tx);
 
-    // Best-effort MCP bridge endpoint: an MCP client spawns `cretlink-mcp`,
+    // Best-effort MCP bridge endpoint: an MCP client spawns `cretlink-cli mcp`,
     // which connects here and routes tool calls to this session (ADR-0004). A
     // failure to bind never blocks interactive control. Routed calls are
     // audited with correlation args (call id, job id, command, paths, digests)
@@ -548,7 +571,7 @@ async fn run_active(
         Ok(listener) => {
             println!("\nMCP bridge endpoint ready ('{}').", endpoint.name());
             println!(
-                "  Point your MCP client at the `cretlink-mcp` bridge; its tools run on THIS session."
+                "  Point your MCP client at `cretlink-cli mcp`; its tools run on THIS session."
             );
             let route: Arc<dyn ConsoleRoute> = Arc::new(service.clone());
             let ipc_audit: Arc<dyn IpcAudit> = Arc::new(audit.clone());
@@ -626,7 +649,7 @@ async fn interactive_session(
     service: &ConsoleSessionService,
     audit: &ChannelAudit,
     session: SessionId,
-    mut live_rx: tokio::sync::mpsc::Receiver<AuditEntry>,
+    mut live_rx: tokio::sync::mpsc::Receiver<LiveEcho>,
 ) -> Result<(), String> {
     println!(
         "\nSession active — attended full control. Type a command to run on the remote target."
@@ -712,8 +735,16 @@ async fn interactive_session(
             // records are echoed here so the technician sees what the AI does
             // the moment it starts, not only after it finishes.
             live = live_rx.recv() => {
-                if let Some(entry) = live {
-                    render_ai_activity(&entry);
+                if let Some(echo) = live {
+                    // Echo lines dropped under pressure are counted, never
+                    // silent (ST-M009-011, REQ-N-008).
+                    if echo.shed_before > 0 {
+                        println!(
+                            "\n[ai] [{} activity line(s) were not shown here; the audit log has them]",
+                            echo.shed_before
+                        );
+                    }
+                    render_ai_activity(&echo.entry);
                 }
             }
         }

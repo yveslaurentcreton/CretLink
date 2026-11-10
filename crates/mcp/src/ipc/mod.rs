@@ -15,6 +15,7 @@ pub mod wire;
 
 pub use transport::{IpcEndpoint, IpcListener, IpcStream, connect};
 pub use wire::{
-    IPC_PROTOCOL, IPC_PURPOSE_MINOR, IpcCodecError, IpcError, IpcRequest, IpcResponse,
-    MAX_IPC_FRAME_BYTES, TermFrame, read_message, write_message,
+    ClientName, IPC_ACCOUNT_MINOR, IPC_CLIENT_MINOR, IPC_PROTOCOL, IPC_PURPOSE_MINOR,
+    IpcCodecError, IpcError, IpcRequest, IpcResponse, MAX_IPC_FRAME_BYTES, TermFrame, read_message,
+    write_message,
 };

@@ -1,22 +1,18 @@
-// Typed bridge to the Rust backend (ADR-0011).
+// Typed bridge to the customer role's Rust backend (ADR-0011, ST-M009-009).
 //
-// These types mirror the `serde` types in `cretlink_support_agent` (its
-// `state` and `privilege` modules) and the GUI crate's `ConsentView` /
-// `CommandError`. The Rust side is authoritative: the frontend renders whatever
-// `ConsentView` snapshot it is given and forwards the customer's decision
-// through the narrow command set below. Keep these types in step with the Rust
-// definitions when the state model changes.
+// These types mirror the `serde` types of the customer module of the
+// application crate (`ConsentView`, `DiscoveredConsoleView`, `LaunchView`,
+// `RelaunchOutcome`, `CommandError`) and of `cretlink_support_agent` (its
+// `state` and `privilege` modules). The Rust side is authoritative: the
+// frontend renders whatever snapshot it is given and forwards the customer's
+// decisions through the narrow command set below. The activity feed and the
+// end report use the shared contract (`../shared/contract`).
 
 import { invoke } from "@tauri-apps/api/core";
+import type { ActivityEntry, CustomerReport } from "../shared/contract";
 
 // Mirrors `cretlink_support_agent::privilege::IntegrityLevel` (snake_case).
-export type IntegrityLevel =
-  | "untrusted"
-  | "low"
-  | "medium"
-  | "high"
-  | "system"
-  | "unknown";
+export type IntegrityLevel = "untrusted" | "low" | "medium" | "high" | "system" | "unknown";
 
 // Mirrors `cretlink_support_agent::privilege::EffectiveIdentity`.
 export interface EffectiveIdentity {
@@ -40,16 +36,16 @@ export type AgentPhase =
   | { phase: "idle" }
   | { phase: "announced" }
   | { phase: "pairing" }
-  // The wire's held compare gate: the customer and technician read the same
-  // Session Approval Code aloud before consent. The live dialed session parks
-  // here (not `pairing`, which is the momentary post-connect step) until the
-  // technician confirms the codes match (ST-M002-013).
+  // The wire's held compare gate: both sides read the same Session Approval
+  // Code aloud before consent (ST-M002-013).
   | { phase: "awaiting_approval_compare" }
   | { phase: "awaiting_consent" }
   | { phase: "full_control"; session: string }
   | { phase: "stopping" }
   | { phase: "stopped"; reason: StopReason }
   | { phase: "failed"; stage: string; message: string };
+
+export type PhaseName = AgentPhase["phase"];
 
 // Mirrors `cretlink_support_agent::state::VisibleStatus`.
 export interface VisibleStatus {
@@ -58,19 +54,56 @@ export interface VisibleStatus {
   control_active: boolean;
 }
 
-// Mirrors the GUI crate's `ConsentView`.
+// The technician's display name from the pairing handshake: what their
+// computer says, never a verified identity (ST-M009-011).
+export interface TechnicianNameView {
+  display_name: string;
+  provenance: string;
+}
+
+// When the screen was last observed or controlled, Unix ms, from the agent's
+// `DesktopActivity` signals (ST-M009-009).
+export interface ScreenUseView {
+  observed_at_ms: number | null;
+  controlled_at_ms: number | null;
+}
+
+// Files from an earlier session that the startup sweep could not remove, with
+// the command that lists and removes them (ST-M009-010). Mirrors
+// `StartupCleanupView`.
+export interface StartupCleanupView {
+  failed: number;
+  // Runnable as written in an administrator Windows PowerShell, with the full
+  // path: `& '…\cretlink-cli.exe' recover --remove` when the console build sits
+  // next to this program, else `& '…\<this program>.exe' recover --remove |
+  // Out-Host` (a GUI program PowerShell waits for only when its output is piped).
+  command: string;
+}
+
+// Mirrors the application crate's `ConsentView`.
 export interface ConsentView {
   status: VisibleStatus;
+  // This computer's host name.
+  hostname: string;
+  // Whether a session exists: Stop, Escape, the compact bar and the close
+  // question exist only then (ST-M009-009).
+  session_active: boolean;
+  // When full control was granted, Unix ms.
+  control_since_ms: number | null;
+  screen: ScreenUseView;
   approval_code: string | null;
+  // `DisclosureSummary::DEFAULT_TEXT`, verbatim (REQ-S-016).
   disclosure: string;
   simulated: boolean;
   can_connect: boolean;
+  technician: TechnicianNameView | null;
+  // `null` when the startup sweep kept nothing (or has not finished).
+  startup_cleanup: StartupCleanupView | null;
 }
 
-// Mirrors the GUI crate's `DiscoveredConsoleView`: one technician console found
-// advertising itself on the LAN (ST-M002-012). This is a transient,
-// unauthenticated candidate — never preselected or dialed automatically. Trust
-// only ever comes from comparing the Session Approval Code after dialing.
+// One technician console found on the LAN (ADR-0007). Untrusted: never
+// preselected or dialed automatically; trust comes only from comparing the
+// Session Approval Code after dialing.
 export interface DiscoveredConsoleView {
   instance_name: string;
   display_name: string | null;
@@ -79,109 +112,67 @@ export interface DiscoveredConsoleView {
   dialable: boolean;
 }
 
+// The admin step before the UAC prompt (`#c-admin`, ST-M009-009).
+export interface LaunchView {
+  // `admin`: explain the prompt; `declined`: the customer declined it;
+  // `ready`: past the step.
+  step: "admin" | "declined" | "ready";
+  // Where Back goes: the start screen, or close this copy.
+  back: "start" | "close";
+  elevated: boolean;
+  // Whether Continue shows the real UAC prompt. `false` only in a
+  // development build off Windows, where it is simulated.
+  uac: boolean;
+  // Whether this is a development build with the simulated demo.
+  demo: boolean;
+}
+
+export interface RelaunchOutcome {
+  outcome: "started" | "declined" | "failed";
+  message: string;
+  launch: LaunchView;
+}
+
 export interface CommandError {
   stage: string;
   message: string;
 }
 
 export function isCommandError(value: unknown): value is CommandError {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "stage" in value &&
-    "message" in value
-  );
+  return typeof value === "object" && value !== null && "stage" in value && "message" in value;
 }
 
 export const api = {
   getView: () => invoke<ConsentView>("get_view"),
+  getActivity: () => invoke<ActivityEntry[]>("get_activity"),
+  getLaunch: () => invoke<LaunchView>("get_launch"),
+  relaunchElevated: () => invoke<RelaunchOutcome>("relaunch_elevated"),
+  continueWithoutAdmin: () => invoke<LaunchView>("continue_without_admin"),
+  goBack: () => invoke<void>("go_back"),
   grantConsent: () => invoke<ConsentView>("grant_consent"),
   declineConsent: () => invoke<ConsentView>("decline_consent"),
   stopSession: () => invoke<ConsentView>("stop_session"),
+  // Dev-only commands (`dev-simulate`); a release build does not register them.
   simulateTechnicianStop: () => invoke<ConsentView>("simulate_technician_stop"),
   resetDemo: () => invoke<ConsentView>("reset_demo"),
-  // Dials a real listening technician console using the connection code the
-  // technician reads out (ST-M002-009). The returned snapshot is the "reaching
-  // out" state; live progress then arrives as `"agent-view"` events (see
-  // `main.ts`), never as the return value here.
-  startLiveSession: (code: string) =>
-    invoke<ConsentView>("start_live_session", { code }),
-  // Browses the local network for advertising technician consoles (ST-M002-012).
-  // Returns a transient candidate list; it is not part of the authoritative
-  // `ConsentView` because it carries no session authority.
+  // Dials the technician from the connection code they read out. Live
+  // progress then arrives as `agent-view` events.
+  startLiveSession: (code: string) => invoke<ConsentView>("start_live_session", { code }),
   browseConsoles: () => invoke<DiscoveredConsoleView[]>("browse_consoles"),
-  // Dials a console discovered on the LAN. `address` is the candidate's
-  // "ip:port", which funnels through the same `SessionJoiner::join` as a typed
-  // connection code — selecting a candidate grants no authority by itself.
-  connectConsole: (address: string) =>
-    invoke<ConsentView>("connect_console", { address }),
+  // Dials a picked console through the same path as a typed code.
+  connectConsole: (address: string) => invoke<ConsentView>("connect_console", { address }),
+  getEndReport: () => invoke<CustomerReport | null>("get_end_report"),
+  saveReport: () => invoke<string | null>("save_report"),
+  openSavedReport: (path: string) => invoke<void>("open_saved_report", { path }),
+  makeSmall: () => invoke<void>("make_small"),
+  openMain: () => invoke<void>("open_main"),
+  dragWindow: () => invoke<void>("drag_window"),
+  stopAndClose: () => invoke<void>("stop_and_close"),
 };
 
-// The Tauri event name the backend emits a whole `ConsentView` on during a live
-// session. Both sides must agree on this exact string.
+// The events of the backend, to both windows.
 export const AGENT_VIEW_EVENT = "agent-view";
-
-// One non-authoritative activity delta, mirroring
-// `cretlink_agent_gui::session_driver::ActivityDelta` (which serialises
-// `camelCase`). It is the customer-visible mirror of exactly what the customer
-// side of `cretlink-session` emits: a command starting (`started`, carrying the
-// command text, shell label, and `origin` attribution) and a command ending
-// (`finished`, carrying the exit code, honest outcome, and success flag). There
-// is deliberately no per-line output or duration here — those are console-side
-// only — so the mirror can never fabricate activity the customer never saw
-// (REQ-F-017, REQ-S-002). Every string is backend-built; the frontend writes it
-// with `textContent`, never as HTML (REQ-S-016, REQ-S-018).
-export interface ActivityDelta {
-  job: number;
-  kind: "started" | "finished";
-  command?: string;
-  shell?: string;
-  origin?: "console" | "mcp" | "terminal";
-  // The AI's stated reason for the command, on `started` when it gave one
-  // (ST-M009-007). An unverified claim, shown beside the real command.
-  purpose?: string;
-  exitCode?: number;
-  outcome?: string;
-  ok?: boolean;
-}
-
-// A separate channel for live activity deltas (ST-M004-008). Kept distinct from
-// `"agent-view"` so the higher-frequency command stream never forces a whole
-// `ConsentView` re-render. The backend emits one `ActivityDelta` per event.
 export const AGENT_ACTIVITY_EVENT = "agent-activity";
-
-// A coarse control level derived from the visible status, so the view can label
-// authority without a second round-trip. `control_active` is authoritative for
-// "full"; the pre-decision phases render as "pending".
-export type ControlLevel = "none" | "pending" | "full";
-
-export function controlLevel(view: ConsentView): ControlLevel {
-  if (view.status.control_active) return "full";
-  switch (view.status.phase.phase) {
-    case "announced":
-    case "pairing":
-    case "awaiting_approval_compare":
-    case "awaiting_consent":
-    case "stopping":
-      return "pending";
-    default:
-      return "none";
-  }
-}
-
-// Whether the phase is a live session that a stop should still act on. Terminal
-// phases (stopped, failed) are not.
-export function sessionIsLive(view: ConsentView): boolean {
-  switch (view.status.phase.phase) {
-    case "stopped":
-    case "failed":
-      return false;
-    default:
-      return true;
-  }
-}
-
-// Whether the customer is currently being asked to decide.
-export function awaitingConsent(view: ConsentView): boolean {
-  return view.status.phase.phase === "awaiting_consent";
-}
+// To the main window, when a close or an exit was held because a session
+// exists.
+export const CLOSE_REQUESTED_EVENT = "customer-close-requested";

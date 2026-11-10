@@ -94,7 +94,37 @@ use crate::error::ProtocolError;
 /// is validated on decode (trimmed, single line, 1 to
 /// [`crate::limits::MAX_PURPOSE_CHARS`] characters), so a malformed one fails
 /// the frame closed like any other out-of-contract field.
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 9 };
+///
+/// Minor `10` adds the additive, optional [`crate::DisplayName`] on the
+/// console's [`crate::PairingMessage::Nonce`]: the name the technician's
+/// operating-system account reports, which the customer side shows as what the
+/// technician's computer says (ST-M009-011). It is an unverified label, not an
+/// identity: it grants no authority and is not part of the Session Approval
+/// Code derivation, which still alone establishes trust (REQ-S-006). It is
+/// omitted when `None`, so a nonce without a name keeps its minor-9 wire form,
+/// and validated on decode (trimmed, single line, 1 to
+/// [`crate::limits::MAX_DISPLAY_NAME_CHARS`] characters). The same minor is the
+/// IPC contract minor at which the MCP bridge passes the AI client's
+/// `clientInfo.name` to the console; that label stays on the technician
+/// computer and is never sent to the customer computer.
+///
+/// Minor `11` adds the agent-to-console [`crate::ControlMessage::CleanupReported`]:
+/// the agent's honest teardown report, sent while the channel is still up at
+/// the end of an active session, so the console can record what was cleaned up
+/// or left behind on the customer computer in the session's audit file
+/// (ST-M009-012, REQ-F-019). Its notes are bounded in number and size and must
+/// be single lines; a console that receives none records the cleanup as
+/// unknown. The same minor adds the optional `account` of
+/// [`crate::TargetIdentity`]: the account the agent's process runs as
+/// (`DOMAIN\user`, [`crate::AccountName`]), the customer's own account name,
+/// shown to the technician in the live identity line (ST-M009-008). It is
+/// omitted when unknown, so an identity without it keeps its minor-10 wire
+/// form, and validated on decode (trimmed, single line, 1 to
+/// [`crate::limits::MAX_ACCOUNT_NAME_CHARS`] characters).
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion {
+    major: 1,
+    minor: 11,
+};
 
 /// A `major.minor` protocol version.
 ///

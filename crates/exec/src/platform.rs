@@ -52,8 +52,10 @@ use std::process::ExitStatus;
 use process_wrap::tokio::ChildWrapper;
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 
+use crate::JobSpec;
+#[cfg(not(windows))]
+use crate::Shell;
 use crate::error::ExecError;
-use crate::{JobSpec, Shell};
 
 /// A spawned child with its stdio handles, behind a platform-neutral surface.
 ///
@@ -135,34 +137,34 @@ impl Drop for Spawned {
     }
 }
 
-/// Builds the argument vector for a shell invocation.
-///
-/// Windows maps to the two real shells; every other platform routes through
-/// `sh -c` (documented fallback for tests and simulated hosts).
+/// Builds the argument vector for a shell invocation off Windows, where both
+/// logical shells route through `sh -c` (documented fallback for tests and
+/// simulated hosts). Windows starts the two real shells itself (see `win`).
+#[cfg(not(windows))]
 fn shell_argv(shell: Shell, command: &str) -> (&'static str, Vec<String>) {
-    #[cfg(windows)]
-    {
-        match shell {
-            Shell::PowerShell => (
-                "powershell",
-                vec![
-                    "-NoProfile".to_string(),
-                    "-NonInteractive".to_string(),
-                    "-Command".to_string(),
-                    command.to_string(),
-                ],
-            ),
-            Shell::Cmd => ("cmd", vec!["/C".to_string(), command.to_string()]),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        // Both logical shells run through `sh -c` off Windows. `shell` is
-        // recorded for parity with the wire schema but does not change the
-        // portable fallback.
-        let _ = shell;
-        ("sh", vec!["-c".to_string(), command.to_string()])
-    }
+    // `shell` is recorded for parity with the wire schema but does not change
+    // the portable fallback.
+    let _ = shell;
+    ("sh", vec!["-c".to_string(), command.to_string()])
+}
+
+/// The tail of a `cmd.exe` command line that runs `command`: `/S /C "<command>"`
+/// with the command exactly as written (ST-M003-001).
+///
+/// `cmd.exe` does not read the C runtime's quoting. Handed the command as one
+/// argument quoted by those rules, it strips the outer quotes and passes every
+/// escaped `\"` on, so a program inside the command receives a quoted literal
+/// instead of its argument. With `/S` it strips exactly the first and the last
+/// quote of what follows `/C` and runs the rest verbatim. The command therefore
+/// needs no escaping at all: a quote, a backslash before a quote, `&`, `|`, `^`
+/// and `%` reach `cmd.exe` as the caller wrote them.
+///
+/// Both Windows backends append this tail to the command line **raw**, never as
+/// a quoted argument: the piped backend through `raw_arg`, the pseudo-console
+/// backend in the command line it builds itself.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows backends call it outside tests
+pub(crate) fn cmd_raw_tail(command: &str) -> String {
+    format!("/S /C \"{command}\"")
 }
 
 /// Spawns `spec` with separated piped stdio and process-tree containment.
@@ -244,9 +246,9 @@ mod win {
     };
     use windows::core::PCWSTR;
 
-    use super::shell_argv;
-    use crate::JobSpec;
+    use super::cmd_raw_tail;
     use crate::error::ExecError;
+    use crate::{JobSpec, Shell};
 
     /// A kill-on-close Job Object that contains one piped job's whole process tree.
     ///
@@ -281,6 +283,29 @@ mod win {
         }
     }
 
+    /// The shell process that runs `command`, before its stdio and containment
+    /// are set up.
+    ///
+    /// PowerShell takes the command as one argument, quoted by the C runtime
+    /// rules that `powershell.exe` reads. `cmd.exe` does not read those rules,
+    /// so a Command Prompt command is appended to the command line raw, as
+    /// `/S /C "<command>"`, and reaches `cmd.exe` exactly as written
+    /// (ST-M003-001; see [`cmd_raw_tail`]).
+    fn shell_command(shell: Shell, command: &str) -> Command {
+        match shell {
+            Shell::PowerShell => {
+                let mut process = Command::new("powershell");
+                process.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+                process
+            }
+            Shell::Cmd => {
+                let mut process = Command::new("cmd");
+                process.raw_arg(cmd_raw_tail(command));
+                process
+            }
+        }
+    }
+
     /// Spawns `spec` as a piped-stdio child contained in a kill-on-close Job
     /// Object, returning the tokio [`Child`] (for stdio and `wait`) and the [`Job`].
     ///
@@ -289,11 +314,8 @@ mod win {
     /// escapes the job (REQ-S-014), matching the ConPTY path. Once contained, its
     /// initial thread is resumed.
     pub(crate) fn spawn(spec: &JobSpec) -> Result<(Child, Job), ExecError> {
-        let (program, args) = shell_argv(spec.shell, &spec.command);
-
-        let mut command = Command::new(program);
+        let mut command = shell_command(spec.shell, &spec.command);
         command
-            .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -477,5 +499,44 @@ impl Spawned {
     /// OS-equivalent close of the Job Object handle.
     pub(crate) fn simulate_hard_kill(self) {
         win::simulate_hard_kill(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cmd_raw_tail;
+
+    /// A Command Prompt command is wrapped in one pair of quotes behind
+    /// `/S /C` and is otherwise passed exactly as written, so `cmd.exe`, which
+    /// strips that one pair, runs what the caller wrote (ST-M003-001).
+    #[test]
+    fn a_cmd_command_is_passed_as_written() {
+        for (command, tail) in [
+            // A plain command.
+            ("echo hello", r#"/S /C "echo hello""#),
+            // A quoted path with a space: no quote is escaped.
+            (
+                r#"dir "C:\Program Files""#,
+                r#"/S /C "dir "C:\Program Files"""#,
+            ),
+            // A program inside the command with a quoted argument of its own.
+            (
+                r#"powershell -Command "Write-Output 1""#,
+                r#"/S /C "powershell -Command "Write-Output 1"""#,
+            ),
+            // A path that ends in a backslash before the quote: no backslash is
+            // doubled.
+            (
+                r#"dir "C:\Program Files\""#,
+                r#"/S /C "dir "C:\Program Files\"""#,
+            ),
+            // The characters cmd.exe gives a meaning to stay for cmd.exe.
+            (
+                "echo a & echo b | findstr b ^& echo %PATH%",
+                r#"/S /C "echo a & echo b | findstr b ^& echo %PATH%""#,
+            ),
+        ] {
+            assert_eq!(cmd_raw_tail(command), tail, "{command}");
+        }
     }
 }

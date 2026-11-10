@@ -43,6 +43,7 @@ jobs:
     name: Next version
     if: github.repository == 'yveslaurentcreton/CretLink'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.next.outputs.version }}
     steps:
@@ -68,8 +69,11 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        # Linux builds on the oldest runner with webkit2gtk 4.1, so the archive
+        # runs on glibc 2.35 or newer (ST-M009-013, REQ-N-021).
+        os: [windows-latest, macos-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -118,6 +122,19 @@ jobs:
           # Official artifacts must carry their SBOMs; fail rather than ship without.
           CRETLINK_REQUIRE_SBOM: "1"
         run: bash scripts/gen-artifacts.sh --pack "$CRETLINK_VERSION"
+      # Every shipped Linux binary — the archive and the loose relay server —
+      # stays within the glibc 2.35 baseline, and the archive starts on
+      # Debian 12 with the release version (ST-M009-013, REQ-N-021).
+      - name: Check the glibc baseline (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/check-glibc.sh dist/cretlink-*-linux-*.tar.gz dist/cretlink-relay-server-*
+      - name: Start the archive on Debian 12 (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CRETLINK_VERSION: ${{ needs.version.outputs.version }}
+        run: bash scripts/smoke-debian.sh --expect "$CRETLINK_VERSION" dist/cretlink-*-linux-*.tar.gz
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: artifacts-${{ matrix.os }}
@@ -129,6 +146,7 @@ jobs:
     needs: [version, build]
     if: github.repository == 'yveslaurentcreton/CretLink' && needs.version.outputs.version != ''
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       issues: write

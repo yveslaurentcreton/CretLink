@@ -3,15 +3,14 @@
 **Status:** Living document (ST-M004-005, REQ-F-014, REQ-F-015, REQ-N-001)
 
 CretLink exposes its remote-computer tools to an MCP-capable AI client through a
-thin local bridge that the client spawns over stdio (ADR-0004): `cretlink-cli mcp`
-(ST-M009-002), or the older separate `cretlink-mcp` binary, which behaves the
-same and is removed in ST-M009-010.
+thin local bridge that the client spawns over stdio (ADR-0004): `cretlink mcp`
+in the application, or `cretlink-cli mcp` in its console build (ST-M009-002).
 This page is the authoritative, per-client setup and validation record for the
 clients in the ADR-0002 compatibility matrix.
 
 The tool surface is deliberately generic and client-neutral: it contains no
 client-, provider-, or model-specific behaviour, and an automated conformance
-test (`apps/mcp-bridge/tests/conformance/mod.rs`) proves that any independent
+test (`apps/cli/tests/conformance/mod.rs`) proves that any independent
 JSON-RPC client discovers the **same exact tool set** with schemas that validate
 as JSON Schema. That set is the **fifteen** generic exec, file, and transfer
 tools defined by M004 plus the **nine** desktop and clipboard tools added by
@@ -26,15 +25,16 @@ per release to satisfy REQ-F-014's two-client evidence.
 
 ## Where things run (and where they never run)
 
-- The **console**, the **`cretlink-cli mcp` bridge**, and the **MCP client** all run
-  on the **technician** computer.
+- CretLink in the **Give help** role, the **`cretlink mcp`** (or
+  **`cretlink-cli mcp`**) bridge, and the **MCP client** all run on the
+  **technician** computer.
 - **AI credentials, provider tokens, and account/login state stay on the
   technician host.** They are never copied to, and never reach, the customer
   (target) computer. The bridge holds no session authority and forwards only
   tool calls to the console over same-user local IPC; it never reads provider
   credentials from its own environment into a tool call.
 - The customer computer needs **no** Codex CLI, Claude client, AI account, or API
-  key — only the CretLink Support agent.
+  key — only CretLink in the **Get help** role.
 
 ## Prerequisites
 
@@ -55,10 +55,12 @@ per release to satisfy REQ-F-014's two-client evidence.
      Windows). The application is built from `apps/app` (see its README).
 
    Put it where it will stay, in a folder only you can write to: the AI clients
-   start it from that absolute path. If you move it, register it again.
+   start it from that absolute path. If you move it, register it again. The
+   simplest way is **Install for me** on the application's start screen, which
+   copies it to a fixed per-user location that updates keep (ST-M009-006).
 
-2. Run CretLink and choose **Give help** (or run the **CretLink Console**) as
-   the **same OS user** that runs the MCP client. The bridge connects to the
+2. Run CretLink and choose **Give help** as the **same OS user** that runs the
+   MCP client. The bridge connects to the
    console over a per-user endpoint (a same-user Windows named pipe or a
    `0700`-directory Unix socket); a different user cannot reach it.
 
@@ -103,7 +105,33 @@ every command before it runs it:
 - The configuration files are only read, to compare. Nothing writes an API key,
   token or session secret.
 
-Claude Desktop is not supported by `install` yet; configure it by hand below.
+Claude Desktop has no row of its own. Its **Code** tab runs Claude Code and
+reads the same registration, so the Claude Code row serves it with no extra
+step. Its **Chat** tab reads a configuration file of its own, which `install`
+does not write: add that entry by hand, as described under
+[Claude Desktop](#claude-desktop) below.
+
+### From the application (ST-M009-006)
+
+The application shows the same information and runs the same commands:
+
+- **Install for me** on the start screen lists each client with what was found
+  and the exact command install would run, planned against the *installed*
+  path, and connects the ones you select after copying CretLink to its fixed
+  per-user location (see the [README](../README.md#run-once-or-install)).
+  Because the location never changes, an update in place keeps every
+  registration working. A registration that starts another program is only
+  replaced when you select it.
+- **AI assistants** in the technician window connects or disconnects a client
+  from the copy you are running. From a copy that runs once, the screen warns
+  that the registration points at that copy and breaks when it is moved or
+  deleted. From the installed copy, the registration is added to the install
+  record. The Claude Code entry says that it also serves the Code tab of
+  Claude Desktop; there is no separate Claude Desktop entry.
+- **Uninstall** (Settings, `cretlink uninstall`, or the Windows *Installed
+  apps* entry) removes the registrations the install recorded, but only those
+  that still start the installed program; one you changed by hand is left
+  alone and the uninstall says so.
 
 ## Manual setup
 
@@ -157,10 +185,28 @@ In `~/.gemini/settings.json`:
 
 Start Gemini CLI and confirm `/mcp` lists the `remote_*` tools.
 
-### Claude Desktop (documented; smoke run optional)
+### Claude Desktop
 
-Claude Desktop accepts only stdio server entries in its configuration file. Add
-the bridge to `claude_desktop_config.json`:
+Claude Desktop can use CretLink from two of its tabs, and each has its own
+registration.
+
+**Code tab: nothing to add.** The Code tab runs Claude Code and reads the
+same registration as the `claude` command line: the user-scope entry in
+`~/.claude.json`, or a project's `.mcp.json`. The registration that
+`cretlink mcp install` makes for Claude Code, or the manual Claude Code entry
+above, therefore serves the Code tab too, with no extra step.
+
+- Claude Desktop runs its own copy of Claude Code, so its version can differ
+  from the `claude` in your terminal. `/status` in a Code tab session shows
+  it; record that version when validating.
+- `install` goes through the `claude` command line. On a computer that has
+  Claude Desktop but no `claude` on `PATH`, `install` skips Claude Code and
+  prints the entry to add by hand to `~/.claude.json`, the file the Code tab
+  reads.
+
+**Chat tab: add the entry by hand (documented; smoke run optional).** The
+Chat tab reads its own file, `claude_desktop_config.json`, which accepts only
+stdio server entries and which `cretlink mcp install` does not write:
 
 ```json
 {
@@ -173,6 +219,10 @@ the bridge to `claude_desktop_config.json`:
 }
 ```
 
+Claude Desktop also loads the servers of this file into the Code tab's local
+sessions, and when both files define `cretlink` the Code tab uses this one. So
+keep its path current, or leave the entry out when you only use the Code tab.
+
 Claude Desktop publishes no semantic version; record the build string reported by
 the installed app when validating.
 
@@ -181,8 +231,8 @@ the installed app when validating.
 Run this once per client after configuration. It is the manual, hardware part
 of the release validation.
 
-1. Start the CretLink Console; connect the CretLink Support agent on the target;
-   compare the session code and grant full control.
+1. Start CretLink and choose **Give help**; on the target, start CretLink and
+   choose **Get help**; compare the session code and grant full control.
 2. Start the MCP client so it spawns `cretlink-cli mcp`.
 3. **List tools.** Confirm exactly the twenty-four `remote_*` tools are present.
 4. **`remote_system_info`** (with a `purpose`, as every tool requires).
@@ -245,7 +295,7 @@ to 200 characters after trimming, with no control, line-break, or
 text-direction characters.
 
 - **It is shown to the customer.** The purpose travels with the request to the
-  customer's CretLink Support window and is shown next to the real command,
+  customer's CretLink window (Get help) and is shown next to the real command,
   path, or action and its result, labelled as the AI's own reason. The
   technician's console shows it beside the same operation, and the console's
   audit log records it with the call.
@@ -258,6 +308,26 @@ text-direction characters.
 - **Older console.** If the bridge talks to a console older than this contract
   (IPC minor 9), it sends the call without the purpose so the call still works;
   that call is audited and shown without a stated reason.
+
+### The console names your client (ST-M009-011)
+
+The bridge passes the name your client reports in the MCP `initialize` request
+(`clientInfo.name`) to the console with each call (IPC minor 10). The console
+records it in the session's audit log and labels the client's actions in its
+activity feed: **Claude Code** (`claude-code`), **Codex CLI** (`codex…`),
+**Gemini CLI** (`gemini-cli…`), or **AI assistant** for any other or no name.
+The name is the client's own claim and grants nothing. It stays on the
+technician computer: the customer sees "AI assistant" with the technician's
+name, never the client's name. A console older than IPC minor 10 receives the
+call without it and labels the client "AI assistant".
+
+### Older bridges against a newer console (ST-M009-008)
+
+Every result carries the routed target identity, which an older bridge decodes
+strictly. From IPC minor 11 the identity may name the customer's account
+(`account`, `DOMAIN\user`); the console sends it only on a connection whose
+`Hello` reported minor 11 or later and leaves it out for an older bridge or
+terminal client, or one that sent no `Hello`, so they keep working.
 - The technician's own actions (console commands, the interactive terminal,
   manual transfers) carry no purpose; they are labelled with their source
   instead.
@@ -265,7 +335,8 @@ text-direction characters.
 ## Client-specific limitations
 
 These are recorded here and stay out of the remote protocol, which carries no
-client identifiers (the IPC wire is versioned and client-neutral).
+client identifiers (the IPC wire is versioned and carries only the client's own
+`clientInfo.name`, for the console's activity label).
 
 - **Structured vs. text results.** Every tool result is returned both as a
   pretty-printed JSON text block and as MCP `structuredContent` (no
@@ -274,8 +345,12 @@ client identifiers (the IPC wire is versioned and client-neutral).
   `structuredContent` would see less. Prefer clients that read either.
 - **Codex CLI.** `cretlink-cli mcp install` uses `codex mcp add`; the manual
   `config.toml` entry above is equivalent.
-- **Claude Desktop.** stdio-only configuration; no semantic version (record the
-  build string). Optional MCPB extension packaging is not provided.
+- **Claude Desktop.** The Code tab uses the Claude Code registration and its
+  own copy of Claude Code, which can be another version than the `claude` in
+  your terminal (record the one `/status` shows). The Chat tab has its own
+  stdio-only configuration file, which `cretlink mcp install` does not write.
+  The app has no semantic version (record the build string). Optional MCPB
+  extension packaging is not provided.
 - **Windows spawn.** Some clients do not resolve `PATH` for stdio servers on
   Windows; always configure the absolute path to `cretlink-cli.exe`, as
   `cretlink-cli mcp install` does.
@@ -298,6 +373,18 @@ client identifiers (the IPC wire is versioned and client-neutral).
   blocking for input. Pipe input only to programs that read stdin
   non-interactively; prompt-driven interactive sessions belong to the terminal
   backend (ST-M003-009), not the piped `remote_exec` surface.
+- **A command's processes end with the command.** Every process a
+  `remote_exec` command starts belongs to that command's job, and the whole job
+  is ended when the command ends: on its normal return as well as on cancel,
+  timeout and stop. This is process containment (REQ-S-014): no process a
+  command started stays behind unnoticed on the customer computer. A program
+  that must keep running — an installer, an upgrade that continues in the
+  background — therefore does not survive a command that starts it and returns,
+  and the result of that command does not report it. Wait for such work inside
+  the command: run it in the foreground, or wait for its process before the
+  command ends. A deadline set with `timeout_ms` has to be long enough for it,
+  because the timeout ends those processes too. The `remote_exec` tool
+  description tells the AI the same (ST-M004-002).
 
 ## Validation record
 
@@ -309,17 +396,20 @@ for REQ-F-014; Codex CLI is the independent client).
 | Client | Version / build | Console platform | Target OS | tools/list | `remote_system_info` | Representative workflow | Date | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Claude Code | 2.1.228 | Windows 11 Pro (10.0.26200) | Windows 11 Home 22H2 (22621.900), elevated, non-simulated | yes — all 15 `remote_*` exercised live (pre-ST-M005-004 binary; 15-tool surface) | yes — target was a Windows 11 Home test laptop; result carried the routed `session_id`/target | `remote_exec` + `remote_upload`→`remote_list_staged`→`remote_download` with SHA-256 matched in both directions (local `cmp` identical); full `make_dir`/`move`/`list_dir`/`stat`/`delete`/`remove_dir` chain; `remote_cleanup` honest on a dangling record; `timeout_ms` kill reaped the whole tree (0 survivors) | 2026-08-12 | Pass; `remote_write_stdin`/`remote_cancel` mid-job use needs a concurrent controller (see limitations) |
+| Claude Desktop (Code tab) | not recorded | Windows 11 | Windows 11 Pro 25H2 (build 26200), elevated, non-simulated | not recorded separately | yes — the result named the target and reported it elevated and not simulated | `remote_exec` in both shells, with exit code 3 reported as failed; `remote_upload` and `remote_download` verified by SHA-256; a 180-second command ended by the customer's stop | 2026-11-10 | Pass, on the pull request preview `0.0.0-pr.6.gc6b7c0b`. The Code tab runs its own Claude Code; its version was not recorded, so this row does not stand in for the per-release Claude Code row |
 | Codex CLI | _pending_ | | | | | | | |
-| Claude Desktop | _optional_ | | | | | | | |
+| Claude Desktop (Chat tab) | _optional_ | | | | | | | |
 
-> This row predates the desktop and clipboard tools (ST-M005-004) and observed
-> 15 tools; current builds expose 24. Codex CLI validation is pending.
+> The first row predates the desktop and clipboard tools (ST-M005-004) and
+> observed 15 tools; current builds expose 24. Codex CLI validation is pending.
 
 ## Automated evidence
 
 The client-neutral conformance harness
-(`apps/mcp-bridge/tests/conformance/mod.rs`) runs on every CI platform against
-both `cretlink-cli mcp` and `cretlink-mcp`. It spawns the shipped binary with a
+(`apps/cli/tests/conformance/mod.rs`) runs on every CI platform against
+`cretlink-cli mcp`, and on Windows also against its GUI-subsystem build, which
+starts the same way as `cretlink mcp` in the application (ST-M009-001). It
+spawns the shipped binary with a
 hand-rolled JSON-RPC client (no rmcp client types). It asserts: `initialize`
 across two protocol versions; `tools/list` equals exactly the twenty-four tools
 above; each input schema compiles as JSON Schema and carries the shared `limits`

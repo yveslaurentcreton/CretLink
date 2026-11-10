@@ -96,6 +96,7 @@ fn loopback() -> SocketAddr {
 fn console_hints() -> ConsoleHints {
     ConsoleHints {
         label: "This computer (technician)".to_string(),
+        display_name: None,
     }
 }
 
@@ -108,6 +109,7 @@ fn agent_identity() -> TargetIdentity {
         elevated: false,
         simulated: false,
         agent_version: "0.0.0".to_string(),
+        account: None,
     }
 }
 

@@ -50,7 +50,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use cretlink_mcp::ipc::wire::{IPC_PROTOCOL, read_message, write_message};
+use cretlink_mcp::ipc::wire::{
+    ClientName, IPC_PROTOCOL, identity_for_peer, read_message, write_message,
+};
 use cretlink_mcp::ipc::{IpcListener, IpcStream};
 use cretlink_mcp::{
     CaptureParams, CaptureReport, CleanupSummary, DirPage, DownloadParams, DownloadReport,
@@ -833,7 +835,21 @@ pub struct ChannelAudit {
     dropped: Arc<AtomicU64>,
     degraded_warned: Arc<AtomicBool>,
     drain_gone_warned: Arc<AtomicBool>,
-    live: Arc<OnceLock<tokio::sync::mpsc::Sender<AuditEntry>>>,
+    live: Arc<OnceLock<tokio::sync::mpsc::Sender<LiveEcho>>>,
+    /// Live echoes dropped since the last one delivered (ST-M009-011).
+    live_shed: Arc<AtomicU64>,
+}
+
+/// One record on the live activity echo, with how many echoes were dropped
+/// right before it because the bounded echo channel was full, so a consumer
+/// shows a gap at the place they were dropped instead of silently missing them
+/// (ST-M009-011, REQ-N-008).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveEcho {
+    /// Echoes dropped immediately before this one.
+    pub shed_before: u64,
+    /// The audit record.
+    pub entry: AuditEntry,
 }
 
 impl ChannelAudit {
@@ -849,6 +865,7 @@ impl ChannelAudit {
                 degraded_warned: Arc::new(AtomicBool::new(false)),
                 drain_gone_warned: Arc::new(AtomicBool::new(false)),
                 live: Arc::new(OnceLock::new()),
+                live_shed: Arc::new(AtomicU64::new(0)),
             },
             AuditReceiver { rx, dropped },
         )
@@ -866,8 +883,15 @@ impl ChannelAudit {
     /// still fully recorded there.
     ///
     /// [`record_entry`]: ChannelAudit::record_entry
-    pub fn set_live_sender(&self, tx: tokio::sync::mpsc::Sender<AuditEntry>) {
+    pub fn set_live_sender(&self, tx: tokio::sync::mpsc::Sender<LiveEcho>) {
         let _ = self.live.set(tx);
+    }
+
+    /// Takes the count of live echoes dropped since the last delivered one, so
+    /// a consumer can show the trailing gap when the session ends.
+    #[must_use]
+    pub fn take_live_shed(&self) -> u64 {
+        self.live_shed.swap(0, Ordering::SeqCst)
     }
 
     /// How many entries were dropped so far because the drain stalled.
@@ -882,14 +906,25 @@ impl ChannelAudit {
     /// the count again as a final `audit_degraded` record. A gone drain
     /// discards with one warning.
     pub fn record_entry(&self, entry: AuditEntry) {
-        // Live echo first: near-real-time visibility of AI activity must not
-        // depend on drain health. Bounded + non-blocking — the echo is
-        // cosmetic, so a full channel just drops the line (the durable log
-        // still records it in full), keeping the echo bounded (REQ-N-006).
-        if entry.actor == Actor::Mcp
+        // Live echo first: near-real-time visibility of activity must not
+        // depend on drain health. Every actor that acts on the customer
+        // computer is echoed — the AI, the technician terminal, and manual
+        // console commands (ST-M009-011) — but not the agent or system
+        // lifecycle records. Bounded + non-blocking: a full channel drops the
+        // echo (the durable log still records it in full), keeping the echo
+        // bounded (REQ-N-006), and the drop is counted and delivered with the
+        // next echo so the feed shows the gap (REQ-N-008).
+        if matches!(entry.actor, Actor::Mcp | Actor::Terminal | Actor::Console)
             && let Some(live) = self.live.get()
         {
-            let _ = live.try_send(entry.clone());
+            let shed_before = self.live_shed.swap(0, Ordering::SeqCst);
+            let echo = LiveEcho {
+                shed_before,
+                entry: entry.clone(),
+            };
+            if live.try_send(echo).is_err() {
+                self.live_shed.fetch_add(shed_before + 1, Ordering::SeqCst);
+            }
         }
         match self.tx.try_send(entry) {
             Ok(()) => {}
@@ -1046,19 +1081,34 @@ async fn handle_connection(
         },
     ));
 
+    // The client's IPC minor, from its `Hello` on this connection: what it
+    // can decode. Unknown until then, and treated as the oldest (REQ-N-012).
+    let mut peer_minor: Option<u16> = None;
     loop {
         let request: IpcRequest = match read_message(&mut stream).await {
             Ok(request) => request,
             // EOF or any framing error: close this connection fail-closed.
             Err(_) => return,
         };
+        if let IpcRequest::Hello { protocol } = &request
+            && IPC_PROTOCOL.is_compatible_with(*protocol)
+        {
+            peer_minor = Some(protocol.minor);
+        }
         // A successful `TermAttach` switches this connection into terminal duplex
         // stream mode for the rest of its life (ST-M003-009); on refusal it keeps
         // serving request/response. Terminal clients are the second, distinct
         // class of local IPC consumer (attributed to `Actor::Terminal`).
         if let IpcRequest::TermAttach { term } = request {
-            match handle_term_attach(&mut stream, route.as_ref(), audit.as_ref(), &call_ids, term)
-                .await
+            match handle_term_attach(
+                &mut stream,
+                route.as_ref(),
+                audit.as_ref(),
+                &call_ids,
+                term,
+                peer_minor,
+            )
+            .await
             {
                 AttachOutcome::Refused => continue,
                 AttachOutcome::Stream(attachment, call_id) => {
@@ -1068,6 +1118,7 @@ async fn handle_connection(
                         Arc::clone(&audit),
                         attachment,
                         call_id,
+                        peer_minor,
                     )
                     .await;
                     return;
@@ -1092,6 +1143,8 @@ async fn handle_connection(
             let _active = counts_as_ai.then(|| InFlight::enter(&in_flight));
             route_request(route.as_ref(), audit.as_ref(), &call_ids, request).await
         };
+        // Nothing the client's minor cannot decode (ST-M009-008).
+        let response = response.for_peer(peer_minor);
         if write_message(&mut stream, &response).await.is_err() {
             return;
         }
@@ -1122,6 +1175,7 @@ async fn handle_term_attach(
     audit: &dyn IpcAudit,
     call_ids: &AtomicU64,
     term: JobId,
+    peer_minor: Option<u16>,
 ) -> AttachOutcome {
     let routed = route.consented();
     let call_id = call_ids.fetch_add(1, Ordering::SeqCst);
@@ -1151,7 +1205,8 @@ async fn handle_term_attach(
                 target: attachment.target.clone(),
                 call_id,
                 term,
-            };
+            }
+            .for_peer(peer_minor);
             if write_message(stream, &response).await.is_err() {
                 // The client vanished right after attaching: detach at once so
                 // the registry never keeps a dead consumer.
@@ -1194,6 +1249,7 @@ async fn run_terminal_duplex(
     audit: Arc<dyn IpcAudit>,
     attachment: TermAttachment,
     call_id: u64,
+    peer_minor: Option<u16>,
 ) {
     let TermAttachment {
         session,
@@ -1204,6 +1260,10 @@ async fn run_terminal_duplex(
         overrun,
     } = attachment;
     let routed = Some((session, target.clone()));
+    // The frames carry only what the client's minor decodes (ST-M009-008);
+    // the audit keeps the full identity.
+    let mut target = target;
+    identity_for_peer(&mut target, peer_minor);
 
     let (read_half, write_half) = tokio::io::split(stream);
 
@@ -1355,8 +1415,15 @@ async fn route_request(
     // terminal message, or another wrapper — is refused before anything runs.
     // A bare request (an older bridge) carries no purpose and is served as
     // before (REQ-N-012).
-    let (request, purpose) = match request {
-        IpcRequest::WithPurpose { purpose, call } if call.is_tool_call() => (*call, Some(purpose)),
+    // The AI client's `clientInfo.name` rides in the same wrapper (IPC minor
+    // 10, ST-M009-011); it is recorded in the call's audit records and labels
+    // the technician's activity feed, and never goes onto the session protocol.
+    let (request, purpose, client) = match request {
+        IpcRequest::WithPurpose {
+            purpose,
+            client,
+            call,
+        } if call.is_tool_call() => (*call, Some(purpose), client),
         IpcRequest::WithPurpose { .. } => {
             return IpcResponse::Error {
                 error: IpcError::Malformed {
@@ -1365,7 +1432,7 @@ async fn route_request(
                 call_id: 0,
             };
         }
-        other => (other, None),
+        other => (other, None, None),
     };
     match request {
         IpcRequest::Hello { protocol } => {
@@ -1393,6 +1460,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_system_info_start",
@@ -1427,6 +1495,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_exec_start",
@@ -1478,6 +1547,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_write_stdin_start",
@@ -1505,6 +1575,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_cancel_start",
@@ -1526,6 +1597,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_list_jobs_start",
@@ -1548,6 +1620,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_fs_stat_start",
@@ -1576,6 +1649,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_fs_list_start",
@@ -1598,6 +1672,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_make_dir_start",
@@ -1625,6 +1700,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_move_start",
@@ -1648,6 +1724,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_delete_start",
@@ -1669,6 +1746,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_remove_dir_start",
@@ -1690,6 +1768,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_upload_start",
@@ -1732,6 +1811,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_download_start",
@@ -1769,6 +1849,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_list_staged_start",
@@ -1794,6 +1875,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_cleanup_start",
@@ -1839,6 +1921,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_capture_desktop_start",
@@ -1889,6 +1972,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_pointer_start",
@@ -1916,6 +2000,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_scroll_start",
@@ -1941,6 +2026,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_key_start",
@@ -1966,6 +2052,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_type_start",
@@ -1989,6 +2076,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_hotkey_start",
@@ -2012,6 +2100,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_desktop_wait_start",
@@ -2033,6 +2122,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_clipboard_get_start",
@@ -2061,6 +2151,7 @@ async fn route_request(
             let call = CallAudit::begin(
                 audit,
                 purpose.as_ref(),
+                client.as_ref(),
                 route.consented(),
                 call_ids,
                 "mcp_remote_clipboard_set_start",
@@ -2204,9 +2295,16 @@ impl CallAudit {
     /// describes and never in place of them (REQ-F-026, ST-M009-007). It lives
     /// in `args`, the record's caller-supplied argument map, so the ADR-0008
     /// record schema and its hash chain are unchanged.
+    ///
+    /// The AI client's self-reported name, when the bridge passed one (IPC
+    /// minor 10), is recorded as the `client` argument of both records, so the
+    /// technician's feed can label the client (ST-M009-011). It stays in the
+    /// console's local audit and is never sent to the customer computer.
+    #[allow(clippy::too_many_arguments)]
     fn begin(
         audit: &dyn IpcAudit,
         purpose: Option<&Purpose>,
+        client: Option<&ClientName>,
         routed: Option<(SessionId, TargetIdentity)>,
         call_ids: &AtomicU64,
         action_start: &'static str,
@@ -2215,6 +2313,9 @@ impl CallAudit {
     ) -> Self {
         if let Some(purpose) = purpose {
             args.insert("purpose", truncate_field(purpose.as_str()));
+        }
+        if let Some(client) = client {
+            args.insert("client", truncate_field(client.as_str()));
         }
         Self::begin_as(
             Actor::Mcp,
@@ -2502,6 +2603,7 @@ mod tests {
         let call_ids = AtomicU64::new(1);
         let request = IpcRequest::WithPurpose {
             purpose: Purpose::new("Looking for the printer log").unwrap(),
+            client: None,
             call: Box::new(IpcRequest::FsStat {
                 path: RemotePath::Absolute {
                     path: "C:\\Logs\\printer.log".to_string(),
@@ -2563,6 +2665,7 @@ mod tests {
             },
             IpcRequest::WithPurpose {
                 purpose: purpose.clone(),
+                client: None,
                 call: Box::new(IpcRequest::ListJobs {}),
             },
         ] {
@@ -2570,6 +2673,7 @@ mod tests {
             let call_ids = AtomicU64::new(1);
             let request = IpcRequest::WithPurpose {
                 purpose: purpose.clone(),
+                client: None,
                 call: Box::new(call),
             };
             let response = route_request(&ClosedRoute, &audit, &call_ids, request).await;
@@ -2587,37 +2691,66 @@ mod tests {
         }
     }
 
-    /// The live activity echo (REQ-F-017) forwards bridge-originated entries
-    /// to the CLI renderer and nothing else, without touching the drain
-    /// channel's delivery.
+    /// The live activity echo (REQ-F-017) forwards the records of every actor
+    /// that acts on the customer computer — the AI, the technician terminal,
+    /// and manual console commands (ST-M009-011) — but not agent or system
+    /// lifecycle records, without touching the drain channel's delivery.
     #[tokio::test]
-    async fn live_echo_forwards_only_bridge_entries() {
+    async fn live_echo_forwards_ai_terminal_and_console_entries() {
         let (audit, drain_rx) = ChannelAudit::bounded(16);
         let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(16);
         audit.set_live_sender(live_tx);
 
-        audit.record_entry(AuditEntry::event(
-            Actor::Mcp,
-            None,
-            "mcp_remote_exec_start",
-            Outcome::Ok,
-        ));
-        audit.record_entry(AuditEntry::event(
-            Actor::Console,
-            None,
-            "console_exec_start",
-            Outcome::Ok,
-        ));
+        for (actor, action) in [
+            (Actor::Mcp, "mcp_remote_exec_start"),
+            (Actor::Console, "console_exec_start"),
+            (Actor::Terminal, "terminal_open_start"),
+            (Actor::Agent, "consent_granted"),
+            (Actor::System, "fs_cleanup"),
+        ] {
+            audit.record_entry(AuditEntry::event(actor, None, action, Outcome::Ok));
+        }
 
-        // The drain sees both, in order.
-        assert_eq!(drain_rx.try_recv().unwrap().action, "mcp_remote_exec_start");
-        assert_eq!(drain_rx.try_recv().unwrap().action, "console_exec_start");
-        // The live echo sees only the bridge entry.
-        assert_eq!(live_rx.try_recv().unwrap().action, "mcp_remote_exec_start");
+        // The drain sees all five, in order.
+        for _ in 0..5 {
+            assert!(drain_rx.try_recv().is_ok());
+        }
+        // The live echo sees the three actors that act on the target.
+        for expected in [
+            "mcp_remote_exec_start",
+            "console_exec_start",
+            "terminal_open_start",
+        ] {
+            let echo = live_rx.try_recv().unwrap();
+            assert_eq!(echo.entry.action, expected);
+            assert_eq!(echo.shed_before, 0);
+        }
         assert!(
             live_rx.try_recv().is_err(),
-            "console entries are not echoed"
+            "lifecycle records are not echoed"
         );
+    }
+
+    /// The AI client's name from the IPC wrapper (minor 10) is recorded as the
+    /// `client` argument of both audit records of the call (ST-M009-011).
+    #[tokio::test]
+    async fn client_name_is_recorded_in_both_audit_records() {
+        let (audit, drain_rx) = ChannelAudit::bounded(16);
+        let call_ids = AtomicU64::new(1);
+        let request = IpcRequest::WithPurpose {
+            purpose: Purpose::new("Checking running jobs").unwrap(),
+            client: Some(ClientName::new("claude-code").unwrap()),
+            call: Box::new(IpcRequest::ListJobs {}),
+        };
+        let _ = route_request(&ClosedRoute, &audit, &call_ids, request).await;
+        for expected in ["mcp_remote_list_jobs_start", "mcp_remote_list_jobs"] {
+            let entry = drain_rx.try_recv().unwrap();
+            assert_eq!(entry.action, expected);
+            assert_eq!(
+                entry.args.0.get("client"),
+                Some(&truncate_field("claude-code"))
+            );
+        }
     }
 
     /// The live echo is bounded and non-blocking: once its channel is full,
@@ -2654,5 +2787,16 @@ mod tests {
             echoed += 1;
         }
         assert_eq!(echoed, 1, "the echo is capped at its channel capacity");
+
+        // The drops were counted, never silent: the next echo that fits
+        // carries the count of the seven dropped before it (ST-M009-011).
+        audit.record_entry(AuditEntry::event(
+            Actor::Mcp,
+            None,
+            "mcp_remote_exec_start",
+            Outcome::Ok,
+        ));
+        assert_eq!(live_rx.try_recv().unwrap().shed_before, 7);
+        assert_eq!(audit.take_live_shed(), 0);
     }
 }

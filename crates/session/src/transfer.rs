@@ -25,6 +25,13 @@
 //! Cancellation and remote failures are honest: a cancelled upload issues an
 //! idempotent `FsAbort`, a cancelled download keeps its temp for a later resume,
 //! and a genuine failure never reads as success.
+//!
+//! An error on the technician's own file — an upload's source, a download's
+//! destination — is that transfer's failure, reported in the stage `local` with
+//! the local path and the reason (ST-M003-005). The connection is not involved,
+//! so it is never reported as a lost session and the session stays usable. Only
+//! an error of the session itself (not active, revoked, disconnected) ends a
+//! transfer with a [`SessionError`].
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -95,15 +102,23 @@ pub struct TransferProgress {
     pub total: u64,
 }
 
-/// The agent-reported error that ended a failed transfer (secret-free).
+/// The error that ended a failed transfer (secret-free): the agent's report of
+/// an operation it refused, or an error on the technician's own file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferError {
-    /// The machine-readable category the agent returned.
+    /// The machine-readable category: the one the agent returned, or, in the
+    /// `local` stage, the cause of the error on the technician's own file
+    /// (a missing path, denied access, exhausted storage).
     pub code: ErrorCode,
-    /// The agent's human-readable, secret-free description.
+    /// The human-readable, secret-free description: the agent's, or, in the
+    /// `local` stage, the local path and the reason, with the statement that
+    /// the file is on the technician computer.
     pub message: String,
-    /// The transfer stage the failure occurred in (`stat`, `write`, `read`,
-    /// `commit`, `digest`, or `verify`).
+    /// The transfer stage the failure occurred in: `stat`, `write`, `read`,
+    /// `commit`, `digest`, or `verify` on the target, or `local` for an error
+    /// on the technician's own file (the upload's source, the download's
+    /// destination). A `local` failure says nothing about the session, which
+    /// stays usable.
     pub stage: &'static str,
 }
 
@@ -124,7 +139,7 @@ pub struct TransferReport {
     pub resumed_from: u64,
     /// Whether a mismatch forced an abort-and-restart from zero.
     pub restarted: bool,
-    /// The agent error that ended a `Failed` transfer, if any.
+    /// The error that ended a `Failed` transfer, if any.
     pub error: Option<TransferError>,
 }
 
@@ -184,11 +199,27 @@ enum UploadStart {
 enum TailOutcome {
     /// The whole source was streamed; carries the bytes sent and the full digest.
     Streamed { sent: u64, digest: Vec<u8> },
-    /// A write was refused mid-stream; the part is left for a later resume.
-    WriteFailed { sent: u64, error: TransferError },
+    /// The agent refused a write, or the source could not be read, after `sent`
+    /// bytes; the part is left for a later resume.
+    Failed { sent: u64, error: TransferError },
     /// Cancellation stopped the stream after `sent` bytes.
     Cancelled { sent: u64 },
 }
+
+/// What a transfer was doing with the technician's own file when the operating
+/// system refused it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalStep {
+    /// Reading an upload's source, or the partial download an earlier run left.
+    Read,
+    /// Creating the file a download writes into.
+    Create,
+    /// Writing a download's bytes, or moving the verified file into place.
+    Write,
+}
+
+/// The [`TransferError::stage`] of an error on the technician's own file.
+const LOCAL_STAGE: &str = "local";
 
 impl HostHandle {
     /// Uploads `request.source` to the target and commits it, returning an honest
@@ -197,9 +228,16 @@ impl HostHandle {
     /// (ST-M003-005 AC1-3).
     ///
     /// `on_progress` is called with a [`TransferProgress`] as each write is
-    /// acknowledged. Returns `Err` only when the transfer could not run (session
-    /// not active, disconnected, or a local file error); an operation the agent
-    /// refused is reported as a `Failed` [`TransferReport`].
+    /// acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// `Err` only when the session could not carry the transfer (not active,
+    /// revoked, disconnected) or the request itself is invalid. An operation the
+    /// agent refused is a `Failed` [`TransferReport`], and so is an error on the
+    /// source file on the technician computer (missing, unreadable): that one
+    /// carries the stage `local`, the local path and the reason, and leaves the
+    /// session usable (ST-M003-005).
     pub async fn upload_file(
         &self,
         request: UploadRequest,
@@ -245,7 +283,17 @@ impl HostHandle {
             });
         }
 
-        let total = fs::metadata(&source).await.map_err(SessionError::Io)?.len();
+        let total = match fs::metadata(&source).await {
+            Ok(meta) => meta.len(),
+            // Nothing reached the target and the session is untouched: a source
+            // that cannot be read is this transfer's failure (ST-M003-005).
+            Err(err) => {
+                return Ok(failed_report(
+                    0,
+                    local_failure(LocalStep::Read, &source, &err),
+                ));
+            }
+        };
         if total > MAX_TRANSFER_BYTES {
             return Err(SessionError::Invalid {
                 code: cretlink_protocol::ErrorCode::LimitExceeded,
@@ -282,7 +330,7 @@ impl HostHandle {
                     self.abort_part(&dest, by).await?;
                     return Ok(cancelled_report(total, sent, resumed_from, restarted));
                 }
-                TailOutcome::WriteFailed { sent, error } => {
+                TailOutcome::Failed { sent, error } => {
                     // Leave the part in place so a later upload can resume it.
                     return Ok(failed_transfer(total, sent, resumed_from, restarted, error));
                 }
@@ -361,6 +409,15 @@ impl HostHandle {
     /// honest [`TransferReport`]. Pipelines reads with a bounded window, resumes a
     /// matching local temp, verifies the whole-file digest against the rolling
     /// console hash, and only then renames the temp into place (AC1-3).
+    ///
+    /// # Errors
+    ///
+    /// `Err` only when the session could not carry the transfer (not active,
+    /// revoked, disconnected). An operation the agent refused is a `Failed`
+    /// [`TransferReport`], and so is an error on the destination on the
+    /// technician computer (a missing folder, denied access, a full disk): that
+    /// one carries the stage `local`, the local path and the reason, and leaves
+    /// the session usable (ST-M003-005).
     pub async fn download_file(
         &self,
         request: DownloadRequest,
@@ -440,9 +497,14 @@ impl HostHandle {
         if let Ok(meta) = fs::metadata(&temp).await {
             let have = meta.len();
             if have > 0 && have <= total {
-                feed_prefix(&mut hasher, &temp, have)
-                    .await
-                    .map_err(SessionError::Io)?;
+                if let Err(err) = feed_prefix(&mut hasher, &temp, have).await {
+                    // The partial download an earlier run left cannot be read.
+                    // Nothing was written this run, so it is left as it is.
+                    return Ok(failed_report(
+                        total,
+                        local_failure(LocalStep::Read, &temp, &err),
+                    ));
+                }
                 let local = hasher.clone().finalize().to_vec();
                 let remote = self.prefix_digest(&source, have, by).await?;
                 if remote == local {
@@ -456,7 +518,20 @@ impl HostHandle {
             }
         }
 
-        let mut temp_file = open_temp(&temp, start).await.map_err(SessionError::Io)?;
+        let mut temp_file = match open_temp(&temp, start).await {
+            Ok(file) => file,
+            // Nothing was written: a destination that cannot be created (its
+            // folder is missing, access is denied) is this transfer's failure,
+            // never a lost session (ST-M003-005).
+            Err(err) => {
+                let step = if start == 0 {
+                    LocalStep::Create
+                } else {
+                    LocalStep::Write
+                };
+                return Ok(failed_report(total, local_failure(step, &dest, &err)));
+            }
+        };
         let mut transferred = start;
         let mut next = start; // next offset to request
         let mut inflight: VecDeque<Reply> = VecDeque::new();
@@ -493,7 +568,12 @@ impl HostHandle {
                 Ok(OpResult::FileData { data, .. }) => {
                     let bytes = data.as_bytes();
                     hasher.update(bytes);
-                    temp_file.write_all(bytes).await.map_err(SessionError::Io)?;
+                    if let Err(err) = temp_file.write_all(bytes).await {
+                        // The technician's disk refused the bytes (it is full,
+                        // for example): the same end as a refused read.
+                        failure = Some(local_failure(LocalStep::Write, &dest, &err));
+                        break;
+                    }
                     transferred += bytes.len() as u64;
                     on_progress(TransferProgress { transferred, total });
                 }
@@ -520,14 +600,21 @@ impl HostHandle {
         inflight.clear();
 
         if cancelled {
-            // Keep the temp so a later download can resume from it.
-            temp_file.flush().await.map_err(SessionError::Io)?;
-            return Ok(cancelled_report(
-                total,
-                transferred - start,
-                start,
-                restarted,
-            ));
+            // Keep the temp so a later download can resume from it. Its last
+            // bytes may still be on their way to the disk: when they cannot be
+            // written, the kept part is not what was counted, and the download
+            // ends like any other with an error on the technician's own file.
+            match temp_file.flush().await {
+                Ok(()) => {
+                    return Ok(cancelled_report(
+                        total,
+                        transferred - start,
+                        start,
+                        restarted,
+                    ));
+                }
+                Err(err) => failure = Some(local_failure(LocalStep::Write, &dest, &err)),
+            }
         }
         if let Some(error) = failure {
             drop(temp_file);
@@ -595,9 +682,19 @@ impl HostHandle {
             ));
         }
 
-        temp_file.sync_all().await.map_err(SessionError::Io)?;
-        drop(temp_file);
-        fs::rename(&temp, &dest).await.map_err(SessionError::Io)?;
+        // Nothing is published before the verified bytes are on the disk. A
+        // destination that cannot be written or replaced (a full disk, denied
+        // access) fails the download like any other error; its temp goes too.
+        if let Err(err) = publish_temp(temp_file, &temp, &dest).await {
+            let _ = fs::remove_file(&temp).await;
+            return Ok(failed_transfer(
+                total,
+                transferred - start,
+                start,
+                restarted,
+                local_failure(LocalStep::Write, &dest, &err),
+            ));
+        }
         Ok(TransferReport {
             outcome: JobOutcome::Completed,
             total,
@@ -625,7 +722,15 @@ impl HostHandle {
         by: &Attribution,
         on_progress: &mut F,
     ) -> Result<TailOutcome, SessionError> {
-        let mut file = fs::File::open(source).await.map_err(SessionError::Io)?;
+        let mut file = match fs::File::open(source).await {
+            Ok(file) => file,
+            Err(err) => {
+                return Ok(TailOutcome::Failed {
+                    sent: 0,
+                    error: local_failure(LocalStep::Read, source, &err),
+                });
+            }
+        };
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; WIRE_CHUNK_BYTES];
         let mut pos: u64 = 0;
@@ -636,9 +741,19 @@ impl HostHandle {
         on_progress(TransferProgress { transferred, total });
 
         loop {
-            let n = read_chunk(&mut file, &mut buf)
-                .await
-                .map_err(SessionError::Io)?;
+            let n = match read_chunk(&mut file, &mut buf).await {
+                Ok(n) => n,
+                Err(err) => {
+                    // The source stopped being readable mid-stream. The writes
+                    // already in flight are abandoned as after a refused write,
+                    // and the part stays for a later resume.
+                    inflight.clear();
+                    return Ok(TailOutcome::Failed {
+                        sent,
+                        error: local_failure(LocalStep::Read, source, &err),
+                    });
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -668,7 +783,7 @@ impl HostHandle {
                     }
                     WriteStep::Failed(error) => {
                         inflight.clear();
-                        return Ok(TailOutcome::WriteFailed { sent, error });
+                        return Ok(TailOutcome::Failed { sent, error });
                     }
                 }
             }
@@ -693,7 +808,7 @@ impl HostHandle {
                 }
                 WriteStep::Failed(error) => {
                     inflight.clear();
-                    return Ok(TailOutcome::WriteFailed { sent, error });
+                    return Ok(TailOutcome::Failed { sent, error });
                 }
             }
         }
@@ -888,6 +1003,19 @@ async fn open_temp(path: &Path, start: u64) -> std::io::Result<fs::File> {
     Ok(file)
 }
 
+/// Puts the verified download on the disk and moves it into place.
+///
+/// The flush comes first because the file is written in the background: the
+/// error of the last write (a full disk, for example) is reported by the flush,
+/// not by the write that only filled the buffer, and a sync alone would drop it
+/// and let a short file be published.
+async fn publish_temp(mut temp_file: fs::File, temp: &Path, dest: &Path) -> std::io::Result<()> {
+    temp_file.flush().await?;
+    temp_file.sync_all().await?;
+    drop(temp_file);
+    fs::rename(temp, dest).await
+}
+
 /// The sibling temp path a download streams into before the verified rename.
 fn download_temp_path(dest: &Path) -> PathBuf {
     let mut name = dest
@@ -915,7 +1043,50 @@ fn cancelled_report(total: u64, sent: u64, resumed_from: u64, restarted: bool) -
     }
 }
 
-/// A `Failed` report carrying the agent error that ended the transfer.
+/// The failure of a transfer whose own file on the technician computer could
+/// not be read or written (ST-M003-005).
+///
+/// The connection is not involved, so this is the transfer's failure and never
+/// a lost session. The message names the local path, says that the file is on
+/// the technician computer, and gives the reason, so the caller can act on it
+/// (REQ-N-015): plain words where the cause is certain, the operating system's
+/// own otherwise. It quotes no file content and is not sent to the target.
+fn local_failure(step: LocalStep, path: &Path, err: &std::io::Error) -> TransferError {
+    use std::io::ErrorKind;
+
+    let (code, reason) = match (err.kind(), step) {
+        (ErrorKind::NotFound, LocalStep::Create) => (
+            ErrorCode::PathNotFound,
+            "the folder does not exist".to_owned(),
+        ),
+        (ErrorKind::NotFound, LocalStep::Read) => (
+            ErrorCode::PathNotFound,
+            "the file does not exist".to_owned(),
+        ),
+        (ErrorKind::NotFound, LocalStep::Write) => (ErrorCode::PathNotFound, err.to_string()),
+        (ErrorKind::PermissionDenied, _) => {
+            (ErrorCode::AccessDenied, "access is denied".to_owned())
+        }
+        (ErrorKind::StorageFull, _) => (ErrorCode::StorageExhausted, "the disk is full".to_owned()),
+        (ErrorKind::QuotaExceeded, _) => (ErrorCode::StorageExhausted, err.to_string()),
+        _ => (ErrorCode::Internal, err.to_string()),
+    };
+    let verb = match step {
+        LocalStep::Read => "read",
+        LocalStep::Create => "create",
+        LocalStep::Write => "write",
+    };
+    TransferError {
+        code,
+        message: format!(
+            "cannot {verb} {} on the technician computer: {reason}",
+            path.display()
+        ),
+        stage: LOCAL_STAGE,
+    }
+}
+
+/// A `Failed` report carrying the error that ended the transfer.
 fn failed_transfer(
     total: u64,
     sent: u64,
@@ -938,4 +1109,97 @@ fn failed_transfer(
 /// A `Failed` report for a failure before any bytes were sent.
 fn failed_report(total: u64, error: TransferError) -> TransferReport {
     failed_transfer(total, 0, 0, false, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::*;
+
+    /// A sample path on the technician computer.
+    const LOCAL: &str = r"C:\Users\sam\Downloads\out\hosts";
+
+    fn local(step: LocalStep, kind: io::ErrorKind) -> TransferError {
+        local_failure(step, Path::new(LOCAL), &io::Error::from(kind))
+    }
+
+    /// An error on the technician's own file keeps its cause as the category,
+    /// and is always in the `local` stage (ST-M003-005).
+    #[test]
+    fn a_local_file_error_keeps_its_cause_and_is_in_the_local_stage() {
+        use io::ErrorKind as Kind;
+
+        for (step, kind, code) in [
+            (LocalStep::Create, Kind::NotFound, ErrorCode::PathNotFound),
+            (LocalStep::Read, Kind::NotFound, ErrorCode::PathNotFound),
+            (LocalStep::Write, Kind::NotFound, ErrorCode::PathNotFound),
+            (
+                LocalStep::Create,
+                Kind::PermissionDenied,
+                ErrorCode::AccessDenied,
+            ),
+            (
+                LocalStep::Read,
+                Kind::PermissionDenied,
+                ErrorCode::AccessDenied,
+            ),
+            (
+                LocalStep::Write,
+                Kind::PermissionDenied,
+                ErrorCode::AccessDenied,
+            ),
+            (
+                LocalStep::Write,
+                Kind::StorageFull,
+                ErrorCode::StorageExhausted,
+            ),
+            (
+                LocalStep::Write,
+                Kind::QuotaExceeded,
+                ErrorCode::StorageExhausted,
+            ),
+            // A cause without a category of its own is never guessed at.
+            (LocalStep::Read, Kind::IsADirectory, ErrorCode::Internal),
+            (LocalStep::Write, Kind::Other, ErrorCode::Internal),
+        ] {
+            let error = local(step, kind);
+            assert_eq!(error.code, code, "{step:?} / {kind:?}");
+            assert_eq!(error.stage, "local", "{step:?} / {kind:?}");
+        }
+    }
+
+    /// The message names the local path, says which computer the file is on,
+    /// and gives the reason in plain words (REQ-N-015).
+    #[test]
+    fn a_local_file_error_names_the_path_the_computer_and_the_reason() {
+        assert_eq!(
+            local(LocalStep::Create, io::ErrorKind::NotFound).message,
+            format!("cannot create {LOCAL} on the technician computer: the folder does not exist")
+        );
+        assert_eq!(
+            local(LocalStep::Read, io::ErrorKind::NotFound).message,
+            format!("cannot read {LOCAL} on the technician computer: the file does not exist")
+        );
+        assert_eq!(
+            local(LocalStep::Read, io::ErrorKind::PermissionDenied).message,
+            format!("cannot read {LOCAL} on the technician computer: access is denied")
+        );
+        assert_eq!(
+            local(LocalStep::Write, io::ErrorKind::StorageFull).message,
+            format!("cannot write {LOCAL} on the technician computer: the disk is full")
+        );
+    }
+
+    /// A cause without plain words of its own is reported in the operating
+    /// system's words, never replaced by a guess.
+    #[test]
+    fn an_uncommon_local_file_error_keeps_the_operating_systems_reason() {
+        let cause = io::Error::from(io::ErrorKind::IsADirectory);
+        let error = local_failure(LocalStep::Read, Path::new(LOCAL), &cause);
+        assert_eq!(
+            error.message,
+            format!("cannot read {LOCAL} on the technician computer: {cause}")
+        );
+    }
 }

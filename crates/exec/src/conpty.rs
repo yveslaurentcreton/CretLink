@@ -76,6 +76,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::error::ExecError;
+use crate::platform::cmd_raw_tail;
 use crate::{JobSpec, READ_CHUNK_BYTES, Shell, TermSize};
 
 /// Bounded depth of the merged-output channel from the reader thread to the
@@ -542,23 +543,17 @@ fn win_io(e: windows::core::Error) -> ExecError {
     ExecError::Io(std::io::Error::from_raw_os_error(e.code().0))
 }
 
-/// Builds the child command line as a mutable, null-terminated UTF-16 buffer,
-/// quoting each token by the MSVC `CommandLineToArgvW` rules.
+/// Builds the child command line as a mutable, null-terminated UTF-16 buffer.
 fn command_line_utf16(spec: &JobSpec) -> Vec<u16> {
-    let (program, args) = shell_argv(spec.shell, &spec.command);
-    let mut line = String::new();
-    append_quoted(program, &mut line);
-    for arg in &args {
-        line.push(' ');
-        append_quoted(arg, &mut line);
-    }
-    let mut wide: Vec<u16> = line.encode_utf16().collect();
+    let mut wide: Vec<u16> = command_line(spec.shell, &spec.command)
+        .encode_utf16()
+        .collect();
     wide.push(0);
     wide
 }
 
-/// The program and argument vector for a shell invocation, mirroring the piped
-/// backend's mapping for a non-empty command.
+/// The command line of a shell invocation, mirroring the piped backend's
+/// mapping for a non-empty command.
 ///
 /// An **empty** command opens the shell's own interactive REPL under the
 /// pseudo-console — the human-terminal case (an interactive `TermOpen` carries
@@ -566,22 +561,22 @@ fn command_line_utf16(spec: &JobSpec) -> Vec<u16> {
 /// `/C`/`-Command` gives a live prompt that renders and echoes input; the piped
 /// `/C ""` form would instead exit immediately. A non-empty command keeps the
 /// one-shot `-Command`/`/C` semantics, so this only changes the terminal case.
-fn shell_argv(shell: Shell, command: &str) -> (&'static str, Vec<String>) {
+///
+/// A non-empty PowerShell command is one argument, quoted by the MSVC
+/// `CommandLineToArgvW` rules that `powershell.exe` reads. `cmd.exe` does not
+/// read those rules, so a non-empty Command Prompt command is appended raw, as
+/// `/S /C "<command>"`, and reaches `cmd.exe` exactly as written (ST-M003-001;
+/// see [`cmd_raw_tail`]).
+fn command_line(shell: Shell, command: &str) -> String {
     match (shell, command.is_empty()) {
-        (Shell::PowerShell, true) => (
-            "powershell.exe",
-            vec!["-NoProfile".to_string(), "-NoLogo".to_string()],
-        ),
-        (Shell::PowerShell, false) => (
-            "powershell.exe",
-            vec![
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                command.to_string(),
-            ],
-        ),
-        (Shell::Cmd, true) => ("cmd.exe", Vec::new()),
-        (Shell::Cmd, false) => ("cmd.exe", vec!["/C".to_string(), command.to_string()]),
+        (Shell::PowerShell, true) => "powershell.exe -NoProfile -NoLogo".to_string(),
+        (Shell::PowerShell, false) => {
+            let mut line = "powershell.exe -NoProfile -Command ".to_string();
+            append_quoted(command, &mut line);
+            line
+        }
+        (Shell::Cmd, true) => "cmd.exe".to_string(),
+        (Shell::Cmd, false) => format!("cmd.exe {}", cmd_raw_tail(command)),
     }
 }
 

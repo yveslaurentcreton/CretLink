@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generate verifiable release artifacts for CretLink (ST-M006-004, ST-M006-014,
-# ST-M009-004).
+# ST-M009-004, ST-M009-010).
 #
 # Portable across the release matrix (windows / macos / ubuntu runners, all of
 # which provide a bash shell) and runnable locally in any bash (Linux, macOS, or
@@ -23,16 +23,16 @@
 #
 # Under dist/ it writes, for the host target triple:
 #   - cretlink-<version>-<os>-<arch>.zip (Windows) or .tar.gz (macOS, Linux):
-#     one folder with the application `cretlink`, the console build
-#     `cretlink-cli` and the other technician binaries — and on Windows the
-#     headless support agent — plus README.txt, LICENSE and the checksum file
+#     one folder with the application `cretlink` and its console build
+#     `cretlink-cli`, plus README.txt, LICENSE and the checksum file
 #     (REQ-N-021);
 #   - cretlink-relay-server-<target>[.exe]: the relay server, which runs on
 #     neither endpoint and so is not in the technician archive;
 #   - CHECKSUMS-<target>.txt   SHA-256 over every binary for this target;
 #   - dependency-inventory-<target>.txt   the exact normal and build dependency
 #     graph and pinned versions of the shipped packages (cargo tree, locked);
-#   - sbom-<binary>-<target>.cdx.json   a CycloneDX SBOM per shipped binary,
+#   - sbom-<binary>-<target>.cdx.json   a CycloneDX SBOM per shipped binary
+#     (`cretlink`, `cretlink-cli`, `cretlink-relay-server`),
 #     when cargo-cyclonedx is installed, carrying the version. The release
 #     workflow installs it and sets CRETLINK_REQUIRE_SBOM=1, so official
 #     artifacts fail rather than ship without SBOMs; locally a missing tool is
@@ -69,25 +69,19 @@ mkdir -p "$out"
 bundle_name="cretlink-$version-$os-$arch"
 stage="$repo_root/target/bundle/$bundle_name"
 
-# The shippable binaries and their owning packages, as
+# The shippable workspace binaries and their owning packages, as
 # <binary>:<package>:<package directory>:<placement>. Placement `bundle` goes
-# into the technician archive; `loose` is attached on its own. The `cretlink-cli`
-# command, the console, the MCP bridge and the host shell run on the technician
-# computer; the support agent is the only binary placed on the customer computer
-# and ships in the Windows archive only, because it is Windows-only; the relay
-# server runs on neither endpoint — it is operator-hosted infrastructure that
-# forwards opaque end-to-end Noise sessions and holds no session key
-# (ST-M007-007).
+# into the technician archive; `loose` is attached on its own. `cretlink-cli` is
+# the console build of the application's subcommands (`mcp`, `shell`, `version`,
+# …). The relay server runs on neither endpoint — it is operator-hosted
+# infrastructure that forwards opaque end-to-end Noise sessions and holds no
+# session key (ST-M007-007). `cretlink-console` and `cretlink-support-agent` are
+# development tools and are not shipped (ST-M009-010): the application holds
+# both roles (ADR-0018).
 bins=(
   "cretlink-cli:cretlink-cli:apps/cli:bundle"
-  "cretlink-console:cretlink-console:apps/console:bundle"
-  "cretlink-mcp:cretlink-mcp-bridge:apps/mcp-bridge:bundle"
-  "cretlink-shell:cretlink-shell:apps/shell-cli:bundle"
   "cretlink-relay-server:cretlink-relay-server:apps/relay-server:loose"
 )
-if [[ "$os" == windows ]]; then
-  bins+=("cretlink-support-agent:cretlink-support-agent:apps/support-agent:bundle")
-fi
 
 # The application `cretlink` (ST-M009-005, ADR-0018): both roles and the
 # subcommands in one program, built from the detached Tauri crate with its
@@ -179,31 +173,35 @@ done
   if [[ "$os" == windows ]]; then
     echo "      or, on the computer that needs it, to get help. Renamed to"
     echo "      CretLink-Support.exe it opens Get help straight away."
+    echo "      'cretlink recover' lists what CretLink left on this computer;"
+    echo "      'cretlink recover --remove' removes it (run it as administrator)."
   else
     echo "      (getting help needs Windows)."
   fi
   echo "      'cretlink mcp install' connects your AI assistants."
   echo "  cretlink-cli$exe"
-  echo "      The same commands for a terminal, without a window; use it for"
-  echo "      'shell' on Windows. The CretLink command line. 'cretlink-cli mcp install' registers"
-  echo "      CretLink with Claude Code, Codex CLI and Gemini CLI;"
-  echo "      'cretlink-cli mcp status' shows where it is registered;"
-  echo "      'cretlink-cli shell' opens a terminal on the consented session;"
-  echo "      'cretlink-cli version' prints the version."
-  echo "  cretlink-console$exe"
-  echo "      The technician console that pairs with the customer's computer."
-  echo "  cretlink-mcp$exe, cretlink-shell$exe"
-  echo "      The MCP bridge and terminal client as separate programs; they"
-  echo "      behave like 'cretlink-cli mcp' and 'cretlink-cli shell'."
+  echo "      The same commands for a terminal, without a window."
   if [[ "$os" == windows ]]; then
-    echo "  cretlink-support-agent$exe"
-    echo "      The program the customer runs on the Windows computer that needs"
-    echo "      help. It asks for administrator rights and for consent."
+    echo "      Use it for 'shell' on Windows."
   fi
+  echo "      'cretlink-cli mcp install' registers CretLink with Claude Code,"
+  echo "      Codex CLI and Gemini CLI; 'cretlink-cli mcp status' shows where"
+  echo "      it is registered; 'cretlink-cli shell' opens a terminal on the"
+  echo "      consented session; 'cretlink-cli recover [--remove]' lists or"
+  echo "      removes what CretLink left on a computer; 'cretlink-cli version'"
+  echo "      prints the version."
   echo "  $checksum_name"
   echo "      SHA-256 checksums of the programs built for this platform."
   echo "  LICENSE"
   echo "      The MIT license."
+  if [[ "$os" == linux ]]; then
+    echo
+    echo "Requirements"
+    echo
+    echo "  glibc 2.35 or newer (Ubuntu 22.04 LTS, Debian 12 and later)."
+    echo "  cretlink also needs the WebKitGTK 4.1 webview: on Debian and Ubuntu,"
+    echo "  'sudo apt install libwebkit2gtk-4.1-0'."
+  fi
   echo
   echo "Getting started"
   echo

@@ -59,6 +59,39 @@ pub const MAX_REASON_BYTES: usize = 1024;
 /// never exceeds `4 * MAX_PURPOSE_CHARS` bytes on the wire.
 pub const MAX_PURPOSE_CHARS: usize = 200;
 
+// --- Technician display name (ST-M009-011, minor 10) ---
+
+/// Maximum length of the technician's display name ([`crate::DisplayName`]),
+/// in Unicode scalar values (characters) after trimming. It is the name the
+/// technician's operating-system account reports (a full name, else the user
+/// name), shown to the customer as what the technician's computer says; at
+/// most 4 bytes each, it never exceeds `4 * MAX_DISPLAY_NAME_CHARS` bytes on
+/// the wire.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
+
+// --- The customer's account in the target identity (ST-M009-008, minor 11) ---
+
+/// Maximum length of the account in a [`crate::TargetIdentity`]
+/// ([`crate::AccountName`]), in Unicode scalar values (characters) after
+/// trimming: `DOMAIN\user`, where a Windows domain name is at most 255
+/// characters and a user name far less. At most 4 bytes each, it never exceeds
+/// `4 * MAX_ACCOUNT_NAME_CHARS` bytes on the wire.
+pub const MAX_ACCOUNT_NAME_CHARS: usize = 256;
+
+// --- The agent's cleanup report (ST-M009-012, minor 11) ---
+
+/// Maximum number of notes in a `CleanupReported` control message. A
+/// `CleanupReported` must fit one secure-channel record (about 64 KiB), so
+/// notes are bounded in number and size; an agent with more notes than this
+/// folds the rest into one counted note rather than dropping them
+/// (REQ-F-019).
+pub const MAX_CLEANUP_NOTES: usize = 32;
+
+/// Maximum byte length of one note in a `CleanupReported` control message. A
+/// note is one line without control characters, so JSON escaping at most
+/// doubles it and [`MAX_CLEANUP_NOTES`] notes stay inside one record.
+pub const MAX_CLEANUP_NOTE_BYTES: usize = 512;
+
 // --- File operations and transfer (ADR-0012, ST-M003-004/005) ---
 
 /// Maximum byte length of a single path component (a file or directory name).

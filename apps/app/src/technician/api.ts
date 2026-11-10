@@ -7,6 +7,15 @@
 // definitions when the state model changes.
 
 import { invoke } from "@tauri-apps/api/core";
+import type {
+  ActivityEntry,
+  AiClientStatus,
+  AppInfo,
+  AuditEntryView,
+  BridgeStatus,
+  ClientId,
+  SessionSummary,
+} from "../shared/contract";
 
 export type DiscoverySource = "discovered" | "manual" | "simulated";
 
@@ -25,12 +34,19 @@ export interface TargetIdentity {
   elevated: boolean;
   simulated: boolean;
   agent_version: string;
+  // The account the customer's agent runs as (`DOMAIN\user`), protocol
+  // minor 11; absent when the agent could not read it (ST-M009-008).
+  account?: string;
 }
 
 export interface TechnicianHost {
   label: string;
   hostname: string;
   os: string;
+  // The technician's display name from the operating-system account, which
+  // the customer sees in the discovery list (ST-M009-011). Optional until the
+  // backend sends it; the interface falls back to the hostname.
+  display_name?: string;
 }
 
 export interface DiscoveredTarget {
@@ -61,22 +77,6 @@ export interface ConsoleState {
   selected?: string;
   session?: string;
   phase: SessionPhase;
-}
-
-// One live activity line, mirroring `cretlink_console_gui::session_driver::ActivityLine`
-// (which serialises `camelCase`). The backend builds every string; the frontend
-// writes it with `textContent`, never as HTML, because job output and paths are
-// untrusted remote input (REQ-S-016, REQ-S-018).
-export interface ActivityLine {
-  source: "claude" | "session" | "note";
-  kind: "start" | "finished" | "dropped" | "desktop" | "note";
-  text: string;
-  job?: number;
-  exitCode?: number;
-  ok?: boolean;
-  // The AI's stated purpose of a bridge call, on its start line (ST-M009-007).
-  // An unverified claim, shown beside `text` (the real operation).
-  purpose?: string;
 }
 
 // The interactive terminal handle returned by `open_terminal`, mirroring the
@@ -145,16 +145,44 @@ export const api = {
   termResize: (term: number, cols: number, rows: number) =>
     invoke<void>("term_resize", { term, cols, rows }),
   termClose: (term: number) => invoke<void>("term_close", { term }),
+
+  // The interfaces of ST-M009-008, ST-M009-006 and ST-M009-012. A command
+  // the backend does not offer yet rejects; the controller then shows the
+  // data as unavailable instead of failing.
+  getAppInfo: () => invoke<AppInfo>("get_app_info"),
+  getActivity: () => invoke<ActivityEntry[]>("get_activity"),
+  // The local MCP bridge for the rail (ST-M009-008); changes arrive as
+  // `console-bridge` events.
+  getBridgeStatus: () => invoke<BridgeStatus>("get_bridge_status"),
+  // Newest first, within the audit retention.
+  listSessions: () => invoke<SessionSummary[]>("list_sessions"),
+  // This session's audit entries, oldest first (the Live tab Audit).
+  getSessionAudit: () => invoke<AuditEntryView[]>("get_session_audit"),
+  aiClients: () => invoke<AiClientStatus[]>("ai_clients"),
+  aiClientInstall: (client: ClientId) =>
+    invoke<AiClientStatus[]>("ai_client_install", { client }),
+  aiClientUninstall: (client: ClientId) =>
+    invoke<AiClientStatus[]>("ai_client_uninstall", { client }),
+  // Without a session: opens the audit folder; with one: that session's file.
+  openAudit: (session?: string) =>
+    invoke<void>("open_audit", session === undefined ? {} : { session }),
+  uninstallPlan: () => invoke<string[]>("uninstall_plan"),
+  uninstallApp: () => invoke<void>("uninstall_app"),
 };
 
 // The Tauri event name the backend emits a whole `ConsoleState` on during a
 // live session. Both sides must agree on this exact string.
 export const CONSOLE_STATE_EVENT = "console-state";
 
-// A separate channel for live activity lines (ST-M004-007). Kept distinct from
+// A separate channel for live activity (ST-M004-007). Kept distinct from
 // `"console-state"` so streaming job output never forces a whole-state
-// re-render. The backend emits one `ActivityLine` per event.
+// re-render. Each event carries one `ActivityEvent` of the shared contract
+// (ST-M009-011): an item, upserted by id, or a gap marker.
 export const CONSOLE_ACTIVITY_EVENT = "console-activity";
+
+// The local MCP bridge's status for the rail (ST-M009-008): one
+// `BridgeStatus` of the shared contract per change.
+export const CONSOLE_BRIDGE_EVENT = "console-bridge";
 
 // The raw terminal frame channel (ST-M008-001). Distinct again so high-frequency
 // VT output never re-renders state or the activity feed; the terminal panel

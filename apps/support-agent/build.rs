@@ -1,4 +1,5 @@
-//! Build script for CretLink Support (ST-M002-001, REQ-F-002).
+//! Build script for the `cretlink-support-agent` development binary
+//! (ST-M002-001, REQ-F-002).
 //!
 //! On a Windows *target* it embeds the application manifest that requests
 //! administrator elevation (`requestedExecutionLevel level="requireAdministrator"`).
@@ -40,7 +41,7 @@ fn embed_manifest_for_windows_target() {
     if let Err(error) = embed_manifest::embed_manifest_file("cretlink-support.manifest") {
         // Without the manifest the binary would silently fail to request
         // elevation, so fail the build loudly rather than ship that.
-        println!("cargo:warning=CretLink Support manifest embed failed: {error}");
+        println!("cargo:warning=cretlink-support-agent manifest embed failed: {error}");
         std::process::exit(1);
     }
 }
@@ -53,7 +54,7 @@ fn embed_manifest_for_windows_target() {
 fn embed_manifest_for_windows_target() {
     if target_is_windows() {
         println!(
-            "cargo:warning=CretLink Support: a Windows target cannot embed its \
+            "cargo:warning=cretlink-support-agent: a Windows target cannot embed its \
              requireAdministrator elevation manifest (REQ-F-002) when built on a non-Windows \
              host; build official Windows artifacts on Windows (ADR-0001)."
         );

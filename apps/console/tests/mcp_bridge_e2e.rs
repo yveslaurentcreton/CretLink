@@ -35,7 +35,7 @@
 //!
 //! This drives `McpBridge` through an in-process rmcp client over
 //! `tokio::io::duplex`, so it exercises the whole console-side chain over real
-//! local IPC but does **not** spawn the shipped `cretlink-mcp` binary. The
+//! local IPC but does **not** spawn the shipped `cretlink-cli mcp` bridge. The
 //! binary's real `stdio()` transport, `IpcEndpoint::user_default()`, panic hook,
 //! and stderr-only banners are built but not run here, and the ADR-0004
 //! stdout-purity consequence (the binary emits nothing but JSON-RPC frames on
@@ -56,8 +56,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use cretlink_console::{
     ChannelAudit, ClosedRoute, ConsoleRoute, ConsoleSessionService, IpcAudit, IpcServer,
 };
+use cretlink_mcp::ipc::{IPC_ACCOUNT_MINOR, IpcRequest};
 use cretlink_mcp::{ExecParams, IpcEndpoint, IpcListener, IpcTargetSession, McpBridge};
-use cretlink_protocol::{PROTOCOL_V1, Purpose, SessionId, TargetIdentity};
+use cretlink_protocol::{
+    AccountName, PROTOCOL_V1, ProtocolVersion, Purpose, SessionId, TargetIdentity,
+};
 use cretlink_session::{
     ConsoleHints, ExecRequest, HostHandle, JoinHandle, Origin, RevokeReason, SessionEvent,
     SessionHost, SessionJoiner, Shell,
@@ -87,6 +90,7 @@ fn simulated_identity() -> TargetIdentity {
         elevated: false,
         simulated: true,
         agent_version: "e2e-agent".to_string(),
+        account: None,
     }
 }
 
@@ -108,8 +112,16 @@ async fn next_event(handle: &mut HostHandle) -> SessionEvent {
 /// `simulated_identity`, grants consent, and returns the active handle plus the
 /// live agent handle (kept alive to hold the session open).
 async fn active_session() -> (HostHandle, JoinHandle, SessionId, TargetIdentity) {
+    active_session_as(simulated_identity()).await
+}
+
+/// [`active_session`] with the agent presenting `agent_identity`.
+async fn active_session_as(
+    agent_identity: TargetIdentity,
+) -> (HostHandle, JoinHandle, SessionId, TargetIdentity) {
     let hints = ConsoleHints {
         label: "This computer (technician)".to_string(),
+        display_name: None,
     };
     let mut host = SessionHost::host(loopback(), hints, PROTOCOL_V1, Vec::new())
         .await
@@ -117,7 +129,7 @@ async fn active_session() -> (HostHandle, JoinHandle, SessionId, TargetIdentity)
     let addr = host
         .local_addr()
         .expect("a LAN-bound console reports its local listener address");
-    let mut joiner = SessionJoiner::join(addr, simulated_identity(), PROTOCOL_V1, Vec::new())
+    let mut joiner = SessionJoiner::join(addr, agent_identity, PROTOCOL_V1, Vec::new())
         .await
         .expect("dial agent");
 
@@ -167,7 +179,7 @@ fn structured(result: &rmcp::model::CallToolResult) -> Value {
 
 fn exec_args(command: &str) -> Map<String, Value> {
     let mut args = Map::new();
-    // `cmd` maps to the portable `sh -c` on non-Windows and `cmd /c` on Windows
+    // `cmd` maps to the portable `sh -c` on non-Windows and `cmd /S /C` on Windows
     // via the broker, so `echo` behaves the same on every CI OS.
     args.insert("shell".to_string(), json!("cmd"));
     args.insert("command".to_string(), json!(command));
@@ -1007,4 +1019,391 @@ fn with_purpose(mut params: CallToolRequestParams) -> CallToolRequestParams {
         .entry("purpose")
         .or_insert_with(|| Value::String(TEST_PURPOSE.to_string()));
     params
+}
+
+/// Spawns the bridge and connects an rmcp client that introduces itself as
+/// `name` in `initialize` (its `clientInfo.name`).
+async fn bridge_client_named(
+    endpoint: IpcEndpoint,
+    name: &str,
+) -> RunningService<RoleClient, rmcp::model::ClientConfig> {
+    let target = IpcTargetSession::connect(endpoint).await;
+    let bridge = McpBridge::new(Arc::new(target));
+    let (server_io, client_io) = tokio::io::duplex(256 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = serve_server(bridge, server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let info = rmcp::model::ClientConfig::new(
+        rmcp::model::ClientCapabilities::default(),
+        rmcp::model::Implementation::new(name, "1.0.0"),
+    );
+    serve_client(info, client_io)
+        .await
+        .expect("rmcp client initialization")
+}
+
+/// ST-M009-011 end to end: an AI download of a file from the customer computer
+/// yields a "file sent" item with its byte count on **both** sides — on the
+/// technician side from the console's audit records (labelled with the AI
+/// client's name passed over IPC minor 10), and on the customer side from the
+/// agent's activity events — and the client name never reaches the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_download_is_a_file_sent_item_with_its_byte_count_on_both_sides() {
+    use cretlink_console::TechnicianActivity;
+    use cretlink_session::{
+        ActivityEntry, ActivityItem, ActivityKind, ActivitySource, ActivityState, CustomerActivity,
+    };
+
+    let (host, mut joiner, session, identity) = active_session().await;
+    let (service, _driver): (ConsoleSessionService, TokioTask<()>) =
+        ConsoleSessionService::start(host, session, identity.clone());
+    let endpoint = unique_endpoint();
+    let listener = IpcListener::bind(&endpoint).expect("bind IPC endpoint");
+    let (channel_audit, audit_rx) = ChannelAudit::bounded(1024);
+    let route: Arc<dyn ConsoleRoute> = Arc::new(service.clone());
+    let audit: Arc<dyn IpcAudit> = Arc::new(channel_audit);
+    let in_flight = service.activity_counter();
+    let (_ipc_shutdown_tx, ipc_shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(IpcServer::serve(
+        listener,
+        route,
+        audit,
+        in_flight,
+        ipc_shutdown_rx,
+    ));
+    let client = bridge_client_named(endpoint, "claude-code").await;
+
+    // Stage a file on the customer computer, then download it back.
+    let payload = vec![0x5a_u8; 300_000];
+    let dir = std::env::temp_dir().join(format!("cretlink-activity-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let local = dir.join("payload.bin");
+    std::fs::write(&local, &payload).expect("write payload");
+    let mut upload_args = Map::new();
+    upload_args.insert("local_path".to_string(), json!(local.to_string_lossy()));
+    upload_args.insert("dest_name".to_string(), json!("activity.bin"));
+    upload_args.insert("source_label".to_string(), json!("tech:activity"));
+    upload_args.insert("cleanup".to_string(), json!("on_session_end"));
+    let upload = client
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_upload").with_arguments(upload_args),
+        ))
+        .await
+        .expect("remote_upload");
+    assert_eq!(structured(&upload)["result"]["outcome"], json!("completed"));
+    let back = dir.join("downloaded.bin");
+    let mut download_args = Map::new();
+    download_args.insert(
+        "source".to_string(),
+        json!({ "kind": "staging", "name": "activity.bin" }),
+    );
+    download_args.insert("local_path".to_string(), json!(back.to_string_lossy()));
+    let download = client
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_download").with_arguments(download_args),
+        ))
+        .await
+        .expect("remote_download");
+    assert_eq!(
+        structured(&download)["result"]["outcome"],
+        json!("completed")
+    );
+    let total = payload.len() as u64;
+
+    let file_sent = |entries: Vec<ActivityEntry>| -> Vec<ActivityItem> {
+        entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                ActivityEntry::Item { item } if item.kind == ActivityKind::FileSent => Some(item),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Technician side: the console's own audit records.
+    let mut technician = TechnicianActivity::new();
+    while let Ok(entry) = audit_rx.try_recv() {
+        technician.apply(&entry, 0);
+    }
+    let sent = file_sent(technician.entries());
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].source, ActivitySource::Ai);
+    assert_eq!(sent[0].bytes, Some(total));
+    assert_eq!(sent[0].state, ActivityState::Done { exit_code: None });
+    assert_eq!(sent[0].purpose.as_deref(), Some(TEST_PURPOSE));
+    assert_eq!(sent[0].client_label.as_deref(), Some("Claude Code"));
+
+    // Customer side: the agent's own activity events.
+    let mut customer = CustomerActivity::new();
+    while let Ok(Some(event)) = timeout(Duration::from_millis(500), joiner.next_event()).await {
+        customer.apply(&event, 0);
+    }
+    let sent = file_sent(customer.entries());
+    assert_eq!(sent.len(), 1, "one item, updated in place: {sent:?}");
+    assert_eq!(sent[0].source, ActivitySource::Ai);
+    assert_eq!(sent[0].bytes, Some(total));
+    assert_eq!(sent[0].state, ActivityState::Done { exit_code: None });
+    assert_eq!(sent[0].purpose.as_deref(), Some(TEST_PURPOSE));
+    // The client name stays on the technician computer.
+    assert_eq!(sent[0].client_label, None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    client.cancel().await.ok();
+    server.abort();
+}
+
+/// Asserts a transfer tool result is the honest report of an error on the
+/// technician's own file at `local`: a failed transfer in the stage `local`
+/// whose message names the path, the computer and `reason`, and never a lost
+/// session (ST-M003-005).
+fn assert_failed_on_the_local_file(
+    result: &rmcp::model::CallToolResult,
+    local: &std::path::Path,
+    reason: &str,
+) {
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a failed transfer is a report, not an error of the call"
+    );
+    let body = structured(result);
+    assert_eq!(body["ok"], json!(true), "{body}");
+    assert!(
+        body.get("error_kind").is_none(),
+        "an error on the technician's own file is never a lost session: {body}"
+    );
+    assert_eq!(body["result"]["outcome"], json!("failed"), "{body}");
+    let error = &body["result"]["error"];
+    assert_eq!(error["stage"], json!("local"), "{body}");
+    assert_eq!(error["code"], json!("path_not_found"), "{body}");
+    let message = error["message"]
+        .as_str()
+        .expect("the failure has a message");
+    assert!(
+        message.contains(&*local.to_string_lossy()),
+        "the message names the local path: {message}"
+    );
+    assert!(
+        message.contains("on the technician computer") && message.contains(reason),
+        "the message says where the file is and why it failed: {message}"
+    );
+}
+
+/// ST-M003-005 end to end: an error on the technician's own file reaches the AI
+/// as a failed transfer with the local path and the reason, never as a lost
+/// session, and the session stays usable. A `remote_upload` of a file that does
+/// not exist and a `remote_download` into a folder that does not exist are each
+/// followed by calls that succeed, and the console's audit records both as
+/// failures with their reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_file_error_is_a_failed_transfer_and_the_session_stays_usable() {
+    let (host, joiner, session, identity) = active_session().await;
+    let (service, _driver): (ConsoleSessionService, TokioTask<()>) =
+        ConsoleSessionService::start(host, session, identity.clone());
+    let endpoint = unique_endpoint();
+    let listener = IpcListener::bind(&endpoint).expect("bind IPC endpoint");
+    let (channel_audit, audit_rx) = ChannelAudit::bounded(1024);
+    let route: Arc<dyn ConsoleRoute> = Arc::new(service.clone());
+    let audit: Arc<dyn IpcAudit> = Arc::new(channel_audit);
+    let in_flight = service.activity_counter();
+    let (_ipc_shutdown_tx, ipc_shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(IpcServer::serve(
+        listener,
+        route,
+        audit,
+        in_flight,
+        ipc_shutdown_rx,
+    ));
+    let client = bridge_client(endpoint).await;
+
+    let dir = std::env::temp_dir().join(format!("cretlink-local-error-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let upload = |local: &std::path::Path| {
+        let mut args = Map::new();
+        args.insert("local_path".to_string(), json!(local.to_string_lossy()));
+        args.insert("dest_name".to_string(), json!("local-error.bin"));
+        args.insert("source_label".to_string(), json!("tech:local-error"));
+        args.insert("cleanup".to_string(), json!("on_session_end"));
+        with_purpose(CallToolRequestParams::new("remote_upload").with_arguments(args))
+    };
+    let download = |local: &std::path::Path| {
+        let mut args = Map::new();
+        args.insert(
+            "source".to_string(),
+            json!({ "kind": "staging", "name": "local-error.bin" }),
+        );
+        args.insert("local_path".to_string(), json!(local.to_string_lossy()));
+        with_purpose(CallToolRequestParams::new("remote_download").with_arguments(args))
+    };
+
+    // An upload of a file that does not exist fails on the technician's file.
+    let payload = dir.join("payload.bin");
+    let failed_upload = client
+        .call_tool(upload(&payload))
+        .await
+        .expect("remote_upload returns a result");
+    assert_failed_on_the_local_file(&failed_upload, &payload, "the file does not exist");
+
+    // The same call completes once the file exists.
+    std::fs::write(&payload, b"local-error-bytes").expect("write payload");
+    let uploaded = client
+        .call_tool(upload(&payload))
+        .await
+        .expect("remote_upload");
+    assert_eq!(
+        structured(&uploaded)["result"]["outcome"],
+        json!("completed")
+    );
+
+    // A download into a folder that does not exist fails on the technician's
+    // file, and creates nothing.
+    let folder = dir.join("no-such-folder");
+    let missing = folder.join("download.bin");
+    let failed_download = client
+        .call_tool(download(&missing))
+        .await
+        .expect("remote_download returns a result");
+    assert_failed_on_the_local_file(&failed_download, &missing, "the folder does not exist");
+    assert!(!folder.exists(), "a failed download creates no folder");
+
+    // The session is intact: a command runs, and the same download into a
+    // folder that exists completes.
+    let exec = client
+        .call_tool(with_purpose(
+            CallToolRequestParams::new("remote_exec")
+                .with_arguments(exec_args("echo still-usable")),
+        ))
+        .await
+        .expect("remote_exec");
+    assert_eq!(structured(&exec)["result"]["outcome"], json!("completed"));
+    let landed = dir.join("download.bin");
+    let downloaded = client
+        .call_tool(download(&landed))
+        .await
+        .expect("remote_download");
+    assert_eq!(
+        structured(&downloaded)["result"]["outcome"],
+        json!("completed")
+    );
+    assert_eq!(
+        std::fs::read(&landed).expect("read the download"),
+        b"local-error-bytes"
+    );
+
+    // The console's own record holds each failure as a failure, with its
+    // reason, beside the calls that succeeded.
+    let mut failed = Vec::new();
+    let mut succeeded = Vec::new();
+    while let Ok(entry) = audit_rx.try_recv() {
+        if !matches!(entry.action, "mcp_remote_upload" | "mcp_remote_download") {
+            continue;
+        }
+        if entry.outcome == cretlink_shared::Outcome::Failed {
+            let reason = match entry.args.0.get("reason") {
+                Some(AuditValue::String(reason)) => reason.clone(),
+                other => panic!("a failed transfer records its reason, got {other:?}"),
+            };
+            failed.push((entry.action, reason));
+        } else {
+            succeeded.push(entry.action);
+        }
+    }
+    assert_eq!(
+        succeeded,
+        ["mcp_remote_upload", "mcp_remote_download"],
+        "the calls that worked are recorded as such"
+    );
+    assert_eq!(failed.len(), 2, "{failed:?}");
+    assert_eq!(failed[0].0, "mcp_remote_upload");
+    assert!(
+        failed[0].1.contains(&*payload.to_string_lossy()),
+        "{failed:?}"
+    );
+    assert_eq!(failed[1].0, "mcp_remote_download");
+    assert!(
+        failed[1].1.contains(&*missing.to_string_lossy()),
+        "{failed:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    client.cancel().await.ok();
+    server.abort();
+    drop(joiner);
+}
+
+/// Sends `request` on `stream` and reads the raw JSON answer.
+async fn raw_roundtrip(stream: &mut cretlink_mcp::ipc::IpcStream, request: &IpcRequest) -> Value {
+    cretlink_mcp::ipc::write_message(stream, request)
+        .await
+        .expect("write request");
+    timeout(STEP, cretlink_mcp::ipc::read_message::<_, Value>(stream))
+        .await
+        .expect("timed out waiting for the answer")
+        .expect("read answer")
+}
+
+/// An older bridge or terminal client (IPC minor 10) decodes every answer of
+/// a 1.11 console: `target.account`, which its `deny_unknown_fields`
+/// [`TargetIdentity`] would refuse, is sent only to a client whose `Hello`
+/// reported minor 11 or later, and never on a connection without a `Hello`
+/// (ST-M009-008, REQ-N-012).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_bridge_never_receives_the_account_it_cannot_decode() {
+    let mut agent = simulated_identity();
+    agent.account = Some(AccountName::new(r"ACME\ann").unwrap());
+    let (host, joiner, session, identity) = active_session_as(agent).await;
+    assert!(identity.account.is_some(), "the console knows the account");
+    let (service, _driver): (ConsoleSessionService, TokioTask<()>) =
+        ConsoleSessionService::start(host, session, identity.clone());
+    let endpoint = unique_endpoint();
+    let listener = IpcListener::bind(&endpoint).expect("bind IPC endpoint");
+    let (channel_audit, _audit_rx) = ChannelAudit::bounded(1024);
+    let (_ipc_shutdown_tx, ipc_shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(IpcServer::serve(
+        listener,
+        Arc::new(service.clone()),
+        Arc::new(channel_audit),
+        service.activity_counter(),
+        ipc_shutdown_rx,
+    ));
+
+    let old = ProtocolVersion {
+        major: PROTOCOL_V1.major,
+        minor: IPC_ACCOUNT_MINOR - 1,
+    };
+    let mut stream = cretlink_mcp::ipc::connect(&endpoint).await.unwrap();
+    let hello = raw_roundtrip(&mut stream, &IpcRequest::Hello { protocol: old }).await;
+    assert_eq!(hello["response"], "hello", "{hello}");
+    assert_eq!(hello["target"]["hostname"], "SIMULATED-TARGET");
+    assert!(hello["target"].get("account").is_none(), "{hello}");
+    let jobs = raw_roundtrip(&mut stream, &IpcRequest::ListJobs {}).await;
+    assert_eq!(jobs["response"], "list_jobs", "{jobs}");
+    assert!(jobs["target"].get("account").is_none(), "{jobs}");
+    // The minor-10 identity type decodes it.
+    let target: TargetIdentity = serde_json::from_value(jobs["target"].clone()).unwrap();
+    assert_eq!(target.account, None);
+
+    // No `Hello` on the connection: the client's minor is unknown.
+    let mut bare = cretlink_mcp::ipc::connect(&endpoint).await.unwrap();
+    let jobs = raw_roundtrip(&mut bare, &IpcRequest::ListJobs {}).await;
+    assert!(jobs["target"].get("account").is_none(), "{jobs}");
+
+    // A current client gets the account.
+    let mut current = cretlink_mcp::ipc::connect(&endpoint).await.unwrap();
+    let hello = raw_roundtrip(
+        &mut current,
+        &IpcRequest::Hello {
+            protocol: PROTOCOL_V1,
+        },
+    )
+    .await;
+    assert_eq!(hello["target"]["account"], r"ACME\ann", "{hello}");
+    let jobs = raw_roundtrip(&mut current, &IpcRequest::ListJobs {}).await;
+    assert_eq!(jobs["target"]["account"], r"ACME\ann", "{jobs}");
+
+    drop(joiner);
+    server.abort();
 }

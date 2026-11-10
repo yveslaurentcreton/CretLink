@@ -86,6 +86,62 @@ pub fn format_rfc3339_millis(unix_millis: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
+/// Parses the exact form [`format_rfc3339_millis`] writes
+/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`) back into Unix milliseconds, or `None` for
+/// anything else. Used to read audit timestamps back (ST-M009-012); it is not
+/// a general RFC 3339 parser.
+#[must_use]
+pub fn parse_rfc3339_millis(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 24
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'.'
+        || bytes[23] != b'Z'
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let part = text.get(range)?;
+        if !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        part.parse().ok()
+    };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second, millis) = (
+        number(11..13)?,
+        number(14..16)?,
+        number(17..19)?,
+        number(20..23)?,
+    );
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(((days * 86_400 + hour * 3600 + minute * 60 + second) * 1000) + millis)
+}
+
+/// The inverse of [`civil_from_days`]: Howard Hinnant's public-domain
+/// `days_from_civil` algorithm, in safe integer arithmetic.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400; // [0, 399]
+    let mp = if month > 2 { month - 3 } else { month + 9 }; // Mar=0..Feb=11
+    let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
 /// Formats `unix_millis` as a compact, filesystem-safe UTC timestamp,
 /// e.g. `20260807T123456789Z`.
 ///

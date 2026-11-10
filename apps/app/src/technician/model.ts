@@ -1,0 +1,602 @@
+// The technician interface's state snapshot and its pure derivations
+// (ST-M009-008).
+//
+// Every screen is a function of one `TechnicianSnapshot`. The Rust backend
+// stays authoritative for the session (`ConsoleState`); the snapshot adds what
+// the window itself remembers: the activity feed of the current or last
+// session, the session history, the AI clients, this copy's details, which
+// page or tab is shown, and a pending confirmation. Nothing here talks to
+// Tauri, so all of it is tested in jsdom.
+
+import type {
+  ActivityEntry,
+  ActivityItem,
+  AiClientStatus,
+  AppInfo,
+  AuditActor,
+  AuditEntryView,
+  AuditOutcome,
+  BridgeStatus,
+  CleanupResult,
+  ClientId,
+  EndedBy,
+  SessionSummary,
+} from "../shared/contract";
+import {
+  FEED_LIMIT,
+  formatBytes,
+  formatClock,
+  formatElapsed,
+  formatTime,
+  groupCode,
+  isActivityEvent,
+  isFailure,
+  plural,
+  trimFeed,
+  upsertActivity,
+} from "../shared/feed";
+import { type ConsoleState, type StopReason, type TargetIdentity, selectedTarget } from "./api";
+
+// The role-neutral feed helpers live in `../shared/feed` (ST-M009-009).
+export {
+  FEED_LIMIT,
+  formatBytes,
+  formatClock,
+  formatElapsed,
+  formatTime,
+  groupCode,
+  isActivityEvent,
+  isFailure,
+  plural,
+  trimFeed,
+  upsertActivity,
+};
+
+export type NavPage = "home" | "sessions" | "ai" | "settings";
+
+export type LiveTab = "overview" | "terminal" | "files" | "audit";
+
+/** A plain-language error with a next step, shown in an assertive alert. */
+export interface UiError {
+  title: string;
+  message: string;
+  next: string;
+}
+
+/** What the window remembers about the current or most recent session. */
+export interface LastSession {
+  id: string;
+  target?: TargetIdentity;
+  // Local clock (ms) when full control began and when the session ended.
+  since?: number;
+  endedAt?: number;
+  reason?: StopReason;
+  failure?: { stage: string; message: string };
+}
+
+/** The confirm step of the AI page: the exact commands, before anything runs. */
+export interface AiConfirm {
+  client: ClientId;
+  action: "install" | "uninstall";
+  // Installing over a registration that points at another program.
+  replace: boolean;
+}
+
+export interface TechnicianSnapshot {
+  console: ConsoleState;
+  // The feed of the current or last session, oldest first.
+  activity: ActivityEntry[];
+  // The audit entries of the current or last session, oldest first
+  // (ST-M009-008); refreshed, throttled, as the feed changes.
+  audit: AuditEntryView[];
+  // `null` while unavailable (the backend has no such command yet, or it
+  // failed): the screens then say so calmly instead of guessing.
+  sessions: SessionSummary[] | null;
+  clients: AiClientStatus[] | null;
+  // The local MCP bridge for the rail (ST-M009-008); `null` until the
+  // backend has said, and again while a new session's endpoint starts.
+  bridge: BridgeStatus | null;
+  app: AppInfo | null;
+  // The release version from `get_role`, when `app` is unavailable.
+  version: string | null;
+  nav: NavPage;
+  tab: LiveTab;
+  // A report opened from the Sessions page.
+  openReport?: string;
+  last?: LastSession;
+  // Done was pressed on the end report of `last`.
+  endDismissed: boolean;
+  // The end report is still being read from the sealed audit file.
+  reportPending: boolean;
+  confirm?: AiConfirm;
+  // The uninstall plan, shown before anything is removed; `null` while loading.
+  uninstall?: { plan: string[] | null };
+  uninstalled?: boolean;
+  // An action in flight, to disable its control.
+  busy?: string;
+  // A polite announcement of the last change (aria-live).
+  notice?: string;
+  error?: UiError;
+  now: number;
+}
+
+/** The screen a snapshot shows. */
+export type Screen =
+  | "home"
+  | "sessions"
+  | "report"
+  | "ai"
+  | "settings"
+  | "wait"
+  | "connecting"
+  | "compare"
+  | "consent"
+  | "live"
+  | "stopping"
+  | "end";
+
+
+export function initialSnapshot(console: ConsoleState, now: number): TechnicianSnapshot {
+  return {
+    console,
+    activity: [],
+    audit: [],
+    sessions: null,
+    clients: null,
+    bridge: null,
+    app: null,
+    version: null,
+    nav: "home",
+    tab: "overview",
+    endDismissed: false,
+    reportPending: false,
+    now,
+  };
+}
+
+/** A console state for the moment before `get_state` has answered. */
+export function placeholderConsole(): ConsoleState {
+  return {
+    technician: { label: "This computer", hostname: "", os: "" },
+    targets: [],
+    phase: { phase: "idle" },
+  };
+}
+
+// --- Phases ---
+
+type PhaseName = ConsoleState["phase"]["phase"];
+
+const SESSION_PHASES: readonly PhaseName[] = [
+  "listening",
+  "connecting",
+  "awaiting_approval_code",
+  "awaiting_consent",
+  "full_control",
+  "stopping",
+];
+
+/** Phases in which `Escape` and Stop end the session (REQ-F-018). */
+const STOPPABLE_PHASES: readonly PhaseName[] = [
+  "listening",
+  "connecting",
+  "awaiting_approval_code",
+  "awaiting_consent",
+  "full_control",
+];
+
+export function inSession(console: ConsoleState): boolean {
+  return SESSION_PHASES.includes(console.phase.phase);
+}
+
+export function canStop(console: ConsoleState): boolean {
+  return STOPPABLE_PHASES.includes(console.phase.phase);
+}
+
+function isRestPhase(phase: PhaseName): boolean {
+  return phase === "idle" || phase === "discovered" || phase === "stopped" || phase === "failed";
+}
+
+function isEndPhase(phase: PhaseName): boolean {
+  return phase === "stopped" || phase === "failed";
+}
+
+export function screenFor(s: TechnicianSnapshot): Screen {
+  const phase = s.console.phase.phase;
+  if (phase === "full_control") return "live";
+  if (phase === "stopping") return "stopping";
+  if (SESSION_PHASES.includes(phase) && s.nav === "home") {
+    switch (phase) {
+      case "listening":
+        return "wait";
+      case "connecting":
+        return "connecting";
+      case "awaiting_approval_code":
+        return "compare";
+      default:
+        return "consent";
+    }
+  }
+  if (isEndPhase(phase) && s.last && !s.endDismissed) return "end";
+  if (s.nav === "sessions" && s.openReport !== undefined) return "report";
+  return s.nav;
+}
+
+/**
+ * Folds a new `ConsoleState` into the snapshot. Returns the new snapshot and
+ * whether the session just ended (the caller then refreshes the history).
+ *
+ * - A new session (a rest phase giving way to `listening`) clears the feed of
+ *   the last one; nothing else does (the feed survives tab switches and the
+ *   end of the session).
+ * - The session id and the target identity are remembered, because the
+ *   console clears them when the session ends.
+ * - A phase change of a session brings the session screen back to the front.
+ */
+export function applyConsole(
+  s: TechnicianSnapshot,
+  next: ConsoleState,
+  now: number,
+): { snapshot: TechnicianSnapshot; ended: boolean } {
+  const before = s.console.phase.phase;
+  const after = next.phase.phase;
+  let out: TechnicianSnapshot = { ...s, console: next, now };
+  let ended = false;
+  if (isRestPhase(before) && after === "listening") {
+    out = {
+      ...out,
+      activity: [],
+      audit: [],
+      last: undefined,
+      endDismissed: false,
+      reportPending: false,
+      openReport: undefined,
+      tab: "overview",
+    };
+  }
+  if (next.session) {
+    const target = selectedTarget(next)?.identity;
+    const last: LastSession =
+      out.last && out.last.id === next.session ? { ...out.last } : { id: next.session };
+    if (target) last.target = target;
+    out.last = last;
+  } else if (out.last) {
+    const target = selectedTarget(next)?.identity;
+    if (target && !out.last.target) out.last = { ...out.last, target };
+  }
+  if (after === "full_control" && before !== "full_control" && out.last) {
+    out.last = { ...out.last, since: out.last.since ?? now };
+    out.tab = "overview";
+  }
+  if (isEndPhase(after) && !isEndPhase(before)) {
+    ended = true;
+    if (out.last) {
+      const last: LastSession = { ...out.last, endedAt: now };
+      if (next.phase.phase === "stopped") last.reason = next.phase.reason;
+      if (next.phase.phase === "failed") {
+        last.failure = { stage: next.phase.stage, message: next.phase.message };
+      }
+      out.last = last;
+      out.endDismissed = false;
+      out.reportPending = true;
+    }
+  }
+  if (before !== after && SESSION_PHASES.includes(after)) {
+    out.nav = "home";
+    out.openReport = undefined;
+  }
+  return { snapshot: out, ended };
+}
+
+// --- Activity feed (ST-M009-011) ---
+
+export function feedItems(feed: readonly ActivityEntry[]): ActivityItem[] {
+  const items: ActivityItem[] = [];
+  for (const entry of feed) if (entry.entry === "item") items.push(entry.item);
+  return items;
+}
+
+export interface SessionCounts {
+  total: number;
+  ai: number;
+  terminal: number;
+  technician: number;
+  filesSent: number;
+  filesReceived: number;
+  failed: number;
+  running: number;
+  // Entries that were not shown (gap markers).
+  notShown: number;
+  // The AI clients that acted in this session, by label.
+  clients: string[];
+  firstFailure?: ActivityItem;
+}
+
+export function sessionCounts(feed: readonly ActivityEntry[]): SessionCounts {
+  const counts: SessionCounts = {
+    total: 0,
+    ai: 0,
+    terminal: 0,
+    technician: 0,
+    filesSent: 0,
+    filesReceived: 0,
+    failed: 0,
+    running: 0,
+    notShown: 0,
+    clients: [],
+  };
+  for (const entry of feed) {
+    if (entry.entry === "gap") {
+      counts.notShown += entry.count;
+      continue;
+    }
+    const item = entry.item;
+    counts.total += 1;
+    counts[item.source] += 1;
+    // Only a finished transfer counts as a file sent or received, as in the
+    // history reader and the customer's counts (ST-M009-012).
+    const finished = item.state.state === "done";
+    if (finished && item.kind === "file_sent") counts.filesSent += 1;
+    if (finished && item.kind === "file_received") counts.filesReceived += 1;
+    if (isFailure(item.state)) {
+      counts.failed += 1;
+      counts.firstFailure ??= item;
+    }
+    if (item.state.state === "running") counts.running += 1;
+    if (item.source === "ai") {
+      const label = clientLabel(item);
+      if (!counts.clients.includes(label)) counts.clients.push(label);
+    }
+  }
+  return counts;
+}
+
+export function clientLabel(item: ActivityItem): string {
+  return item.clientLabel?.trim() || "AI assistant";
+}
+
+/** Who started an action, in words. */
+export function sourceLabel(item: ActivityItem): string {
+  switch (item.source) {
+    case "ai":
+      return clientLabel(item);
+    case "terminal":
+      return "Terminal";
+    case "technician":
+      return "You";
+  }
+}
+
+const AUDIT_ACTORS: readonly AuditActor[] = ["ai", "technician", "terminal", "agent", "system"];
+const AUDIT_OUTCOMES: readonly AuditOutcome[] = ["ok", "failed", "cancelled", "timeout", "unknown"];
+
+/** Whether `value` is an audit entry of the contract; anything else is dropped. */
+export function isAuditEntry(value: unknown): value is AuditEntryView {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Partial<Record<keyof AuditEntryView, unknown>>;
+  return (
+    typeof v.seq === "number" &&
+    typeof v.at === "string" &&
+    typeof v.action === "string" &&
+    typeof v.summary === "string" &&
+    AUDIT_ACTORS.includes(v.actor as AuditActor) &&
+    AUDIT_OUTCOMES.includes(v.outcome as AuditOutcome)
+  );
+}
+
+/** Who an audit record is attributed to, in words. */
+export function auditActorWords(actor: AuditActor): string {
+  switch (actor) {
+    case "ai":
+      return "AI assistant";
+    case "technician":
+      return "You";
+    case "terminal":
+      return "Terminal";
+    case "agent":
+      return "Customer computer";
+    case "system":
+      return "CretLink";
+  }
+}
+
+/** A record kind in words: `consent_granted` reads "consent granted". */
+export function auditActionWords(action: string): string {
+  return action.replace(/_/g, " ");
+}
+
+/** An audit outcome in words; an unknown one never reads as a success. */
+export function auditOutcomeWords(outcome: AuditOutcome): string {
+  switch (outcome) {
+    case "ok":
+      return "ok";
+    case "failed":
+      return "failed";
+    case "cancelled":
+      return "cancelled";
+    case "timeout":
+      return "timed out";
+    case "unknown":
+      return "unknown, not confirmed";
+  }
+}
+
+/** The result of an action in words; never "done" for unknown work. */
+export function stateWords(item: ActivityItem, now: number): string {
+  const state = item.state;
+  switch (state.state) {
+    case "running": {
+      const started = Date.parse(item.startedAt);
+      return Number.isNaN(started)
+        ? "running"
+        : `running · ${formatElapsed(Math.max(0, now - started))}`;
+    }
+    case "done":
+      return state.exitCode === undefined ? "done" : `exit ${state.exitCode}`;
+    case "failed":
+      if (state.exitCode !== undefined) return `failed · exit ${state.exitCode}`;
+      return state.message ? `failed: ${state.message}` : "failed";
+    case "cancelled":
+      return "cancelled";
+    case "timed_out":
+      return "timed out";
+  }
+}
+
+// --- Words for the end of a session and its cleanup (ST-M009-012) ---
+
+export function cleanupWords(cleanup: CleanupResult): string {
+  switch (cleanup.state) {
+    case "cleaned_up":
+      return "Cleaned up";
+    case "residuals":
+      return `${cleanup.residuals} ${cleanup.residuals === 1 ? "residual" : "residuals"}`;
+    case "failed":
+      return "Cleanup failed";
+    case "unknown":
+      return "Cleanup unknown";
+  }
+}
+
+export function endedByWords(endedBy: EndedBy | undefined): string {
+  switch (endedBy) {
+    case "technician":
+      return "ended by you";
+    case "customer":
+      return "ended by the customer";
+    case "connection_lost":
+      return "the connection was lost";
+    case "failure":
+      return "ended by a failure";
+    default:
+      return "end not recorded";
+  }
+}
+
+export function stopReasonEndedBy(last: LastSession | undefined): EndedBy | undefined {
+  if (!last) return undefined;
+  if (last.failure) return "failure";
+  switch (last.reason) {
+    case "technician_requested":
+      return "technician";
+    case "customer_requested":
+      return "customer";
+    case "target_stale":
+    case "disconnected":
+      return "connection_lost";
+    default:
+      return undefined;
+  }
+}
+
+/** The summary of `id` in the history, if it has been read yet. */
+export function summaryFor(
+  s: TechnicianSnapshot,
+  id: string | undefined,
+): SessionSummary | undefined {
+  if (id === undefined || !s.sessions) return undefined;
+  return s.sessions.find((summary) => summary.id === id);
+}
+
+// --- Names and formatting ---
+
+export function shortId(id: string): string {
+  return id.slice(0, 6);
+}
+
+/** What the customer picks in their list: the display name and hostname. */
+export function technicianPick(console: ConsoleState): string {
+  const host = console.technician.hostname;
+  const name = console.technician.display_name?.trim();
+  if (name && host) return `${name} · ${host}`;
+  return name || host || "this computer";
+}
+
+/** How the customer's terminal header names the technician. */
+export function technicianName(console: ConsoleState): string {
+  return console.technician.display_name?.trim() || console.technician.hostname || "Technician";
+}
+
+export function targetName(s: TechnicianSnapshot): string {
+  return (
+    selectedTarget(s.console)?.identity?.hostname ??
+    s.last?.target?.hostname ??
+    selectedTarget(s.console)?.display_name ??
+    "the customer computer"
+  );
+}
+
+export function currentTarget(s: TechnicianSnapshot): TargetIdentity | undefined {
+  return selectedTarget(s.console)?.identity ?? s.last?.target;
+}
+
+export function formatDuration(ms: number | undefined): string {
+  if (ms === undefined || Number.isNaN(ms)) return "duration unknown";
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 1) return "less than a minute";
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  return minutes % 60 === 0 ? `${hours} h` : `${hours} h ${minutes % 60} min`;
+}
+
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** "Today 14:02", "Yesterday", "Monday", "3 Oct 2026". */
+export function formatDay(at: string | undefined, now: number): string {
+  if (at === undefined) return "Date unknown";
+  const date = new Date(at);
+  if (Number.isNaN(date.getTime())) return "Date unknown";
+  const startOfDay = (d: Date): number =>
+    new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((startOfDay(new Date(now)) - startOfDay(date)) / 86400000);
+  if (days === 0) return `Today ${formatTime(at)}`;
+  if (days === 1) return "Yesterday";
+  if (days > 1 && days < 7) return WEEKDAYS[date.getDay()] ?? "";
+  return `${date.getDate()} ${MONTHS[date.getMonth()] ?? ""} ${date.getFullYear()}`;
+}
+
+/** "Today 14:02", "Yesterday 09:15", "Monday 16:40", "3 Oct 2026 11:00". */
+export function formatWhen(at: string | undefined, now: number): string {
+  const day = formatDay(at, now);
+  if (at === undefined || day === "Date unknown" || day.startsWith("Today")) return day;
+  return `${day} ${formatTime(at)}`;
+}
+
+/** What a polite live region says for the current phase (REQ-N-013). */
+export function phaseAnnouncement(s: TechnicianSnapshot): string {
+  const phase = s.console.phase;
+  switch (phase.phase) {
+    case "listening":
+      return "Waiting for the customer. No access.";
+    case "connecting":
+      return "The customer is connecting. No access yet.";
+    case "awaiting_approval_code":
+      return `Compare the approval code with the customer. ${targetName(s)} has no session yet.`;
+    case "awaiting_consent":
+      return `Codes match. ${targetName(s)} is deciding whether to grant full control.`;
+    case "full_control":
+      return `Full control of ${targetName(s)}.`;
+    case "stopping":
+      return "Ending the session.";
+    case "stopped":
+      return "The session has ended. No access.";
+    case "failed":
+      return "The session failed. No access.";
+    default:
+      return "Ready to help. No session.";
+  }
+}
+
+/** Whether a value is a `BridgeStatus` of the contract (ST-M009-008). */
+export function isBridgeStatus(value: unknown): value is BridgeStatus {
+  if (typeof value !== "object" || value === null) return false;
+  const status = value as Record<string, unknown>;
+  return (
+    (status.endpoint === "ready" || status.endpoint === "unavailable") &&
+    typeof status.tools === "number" &&
+    Array.isArray(status.clients) &&
+    status.clients.every((label) => typeof label === "string") &&
+    (status.message === undefined || typeof status.message === "string")
+  );
+}

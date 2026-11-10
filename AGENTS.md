@@ -119,6 +119,10 @@ feat(mcp): bind tools to the selected session (ST-M004-004)
 - Update documentation and threat-model sections with the code.
 - Keep local and remote paths, hosts, sessions, and identities explicit.
 - Never report unknown, disconnected, cancelled, or timed-out work as success.
+- Keep private data out of every file, commit message, and pull request text:
+  no real names, addresses, or paths, only the sample values under "Sample
+  data" in [`CONTRIBUTING.md`](CONTRIBUTING.md). Run
+  `node scripts/check-private-data.mjs` before pushing.
 - Keep the project personal; do not add company branding or ownership claims.
 - Keep source and documentation compatible with the MIT license and retain
   third-party notices.

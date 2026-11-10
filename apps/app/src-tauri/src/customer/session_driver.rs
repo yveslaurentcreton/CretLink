@@ -31,10 +31,9 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use cretlink_protocol::{JobOutcome, Origin, RevokeReason, Shell};
-use cretlink_session::{JoinHandle, SessionEvent};
+use cretlink_protocol::{RevokeReason, SessionId};
+use cretlink_session::{ActivityEntry, CleanupReport, EndedBy, JoinHandle, SessionEvent};
 use cretlink_support_agent::{AgentPhase, EventContext, EventOutcome, apply_session_event};
-use serde::Serialize;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::{ConsentSession, ConsentView};
@@ -73,132 +72,25 @@ pub trait ViewSink: Send + Sync + 'static {
     /// Renders one snapshot of the consent view.
     fn emit(&self, view: &ConsentView);
 
-    /// Renders one non-authoritative activity delta (a command starting or
-    /// finishing) on a channel separate from [`emit`](ViewSink::emit), so this
-    /// higher-frequency stream never forces a whole [`ConsentView`] re-render.
+    /// Renders one changed, non-authoritative activity entry (the frontend's
+    /// `ActivityEvent`, ST-M009-011) on a channel separate from
+    /// [`emit`](ViewSink::emit), so this higher-frequency stream never forces a
+    /// whole [`ConsentView`] re-render. An item whose id was emitted before
+    /// replaces the earlier one in place.
     ///
     /// Defaulted to a no-op: the activity mirror is additive, so test sinks and
     /// any sink that does not surface activity need not implement it. The live
     /// Tauri sink overrides it to emit an `"agent-activity"` event.
-    fn activity(&self, _delta: &ActivityDelta) {}
+    fn activity(&self, _entry: &ActivityEntry) {}
 }
 
-/// One non-authoritative activity delta tapped off the live event stream so the
-/// attending customer sees which commands run and how they end (REQ-F-017,
-/// REQ-S-002).
-///
-/// This mirrors **only** what the customer side of `cretlink-session` actually
-/// emits locally: [`SessionEvent::CommandStarted`] (the command, its shell, and
-/// its `origin` attribution) and [`SessionEvent::ExecFinished`] (exit code and
-/// outcome). Per-line `ExecOutput` and the coalesced `ExecOutputDropped` marker
-/// are console-side only, and the customer-side `ExecFinished` carries no
-/// duration (see `crates/session/src/runtime.rs`), so the mirror never fabricates
-/// a stream, a truncation marker, or a duration it did not receive. The command
-/// text is untrusted remote input; the frontend writes it with `textContent`,
-/// never as HTML (REQ-S-016, REQ-S-018).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActivityDelta {
-    /// The job this delta belongs to; the frontend keys one card per job.
-    pub job: u64,
-    /// Whether the job is `started` (opens the card) or `finished` (closes it).
-    pub kind: ActivityKind,
-    /// The command line, present on `started`. Untrusted remote text.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    /// A short shell badge label (`"PowerShell"` / `"Command Prompt"`), present
-    /// on `started`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shell: Option<String>,
-    /// Who drove the job — the attribution chip. Present on `started`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<Origin>,
-    /// The AI's stated purpose of the command, present on `started` when the AI
-    /// supplied one (REQ-F-026, ST-M009-007). An unverified claim shown beside
-    /// the real `command`, never instead of it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub purpose: Option<String>,
-    /// The process exit code when one exists, present on `finished`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-    /// The honest terminal outcome label, present on `finished`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<String>,
-    /// Whether the job ended successfully, present on `finished`, so the frontend
-    /// picks the `ok`/`bad` status style without re-parsing `outcome`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ok: Option<bool>,
-}
-
-/// Whether an [`ActivityDelta`] opens a job card or closes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActivityKind {
-    /// A command started running.
-    Started,
-    /// A command ended, with its honest outcome.
-    Finished,
-}
-
-/// Builds the activity delta for the two events the customer side mirrors, or
-/// `None` for lifecycle, desktop, and console-only events that carry no job card.
-/// Pure and side-effect free, so it is unit-tested directly.
-pub(crate) fn activity_delta(event: &SessionEvent) -> Option<ActivityDelta> {
-    match event {
-        SessionEvent::CommandStarted {
-            job,
-            shell,
-            command,
-            origin,
-            purpose,
-        } => Some(ActivityDelta {
-            job: job.0,
-            kind: ActivityKind::Started,
-            command: Some(command.clone()),
-            shell: Some(shell_label(*shell).to_string()),
-            origin: Some(*origin),
-            purpose: purpose.as_ref().map(|p| p.as_str().to_string()),
-            exit_code: None,
-            outcome: None,
-            ok: None,
-        }),
-        SessionEvent::ExecFinished {
-            job,
-            exit_code,
-            outcome,
-        } => Some(ActivityDelta {
-            job: job.0,
-            kind: ActivityKind::Finished,
-            command: None,
-            shell: None,
-            origin: None,
-            purpose: None,
-            exit_code: *exit_code,
-            outcome: Some(outcome_label(*outcome).to_string()),
-            ok: Some(matches!(outcome, JobOutcome::Completed)),
-        }),
-        _ => None,
-    }
-}
-
-/// A short, human-readable badge for the shell that runs a command.
-fn shell_label(shell: Shell) -> &'static str {
-    match shell {
-        Shell::PowerShell => "PowerShell",
-        Shell::Cmd => "Command Prompt",
-    }
-}
-
-/// The honest, plain-language label for a job's terminal outcome — never a
-/// fabricated success (REQ-N-008).
-fn outcome_label(outcome: JobOutcome) -> &'static str {
-    match outcome {
-        JobOutcome::Completed => "completed",
-        JobOutcome::Failed => "failed",
-        JobOutcome::Cancelled => "cancelled",
-        JobOutcome::TimedOut => "timed out",
-        JobOutcome::Unknown => "unknown",
-    }
+/// The current time in Unix milliseconds (UTC), for activity timestamps.
+pub(crate) fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 /// Locks the shared session, recovering the inner value if a prior holder
@@ -244,33 +136,159 @@ pub fn step(
             true
         }
     };
-    // Non-authoritative activity tap: mirror the customer-visible commands and
-    // their outcomes onto a separate channel, beside — never inside — the
-    // security-relevant lifecycle fold above (ADR-0011). Only the two events the
-    // customer side actually emits produce a card; everything else is `None`.
-    if let Some(delta) = activity_delta(event) {
-        sink.activity(&delta);
+    // Non-authoritative activity tap: fold every customer-visible action into
+    // the session's feed and emit what changed on a separate channel, beside —
+    // never inside — the security-relevant lifecycle fold above (ADR-0011,
+    // ST-M009-011). A shed marker becomes a gap; the session's end closes any
+    // item still running as failed, never as done.
+    let now = now_unix_millis();
+    for entry in session.activity.apply(event, now) {
+        sink.activity(&entry);
     }
+    // What the end report needs: when the session began and whether control
+    // was granted (ST-M009-012); and what the live screen shows beside the
+    // feed: when control began and how the screen is used (ST-M009-009).
+    session.report.observe(event, now);
+    session.observe(event, now);
     sink.emit(&session.view());
     terminal
+}
+
+/// The live session as the [`pump`] and the teardown
+/// ([`settle`](super::report::settle)) use it. [`JoinHandle`] is the one real
+/// implementation; tests substitute a scripted wire so the ordering of events
+/// and intents can be asserted without a transport.
+pub(crate) trait Wire: Send {
+    /// The next lifecycle event, or `None` once the session task has ended.
+    fn next_event(&mut self) -> impl Future<Output = Option<SessionEvent>> + Send;
+    /// The negotiated session id, once control is active.
+    fn session(&self) -> Option<SessionId>;
+    /// The Session Approval Code to compare, once connected.
+    fn approval_code(&self) -> Option<String>;
+    /// What the technician's computer says its user is called (ST-M009-011).
+    fn technician_display_name(&self) -> Option<String>;
+    /// Sends the customer's consent.
+    fn grant_consent(&self);
+    /// Sends the customer's decline.
+    fn deny_consent(&self, reason: String);
+    /// Revokes the session on the wire (REQ-S-004).
+    fn revoke(&self, reason: RevokeReason);
+    /// Who ended the session, once it has torn down (ST-M009-012).
+    fn ended_by(&self) -> Option<EndedBy>;
+    /// The agent's own cleanup report, once it has torn down (REQ-F-019).
+    fn cleanup_report(&self) -> Option<CleanupReport>;
+}
+
+impl Wire for JoinHandle {
+    fn next_event(&mut self) -> impl Future<Output = Option<SessionEvent>> + Send {
+        JoinHandle::next_event(self)
+    }
+
+    fn session(&self) -> Option<SessionId> {
+        JoinHandle::session(self)
+    }
+
+    fn approval_code(&self) -> Option<String> {
+        JoinHandle::approval_code(self).map(|code| code.to_string())
+    }
+
+    fn technician_display_name(&self) -> Option<String> {
+        JoinHandle::technician_display_name(self).map(|name| name.as_str().to_string())
+    }
+
+    fn grant_consent(&self) {
+        // A session that already ended has nothing to grant; the event stream
+        // reports the end.
+        let _ = JoinHandle::grant_consent(self);
+    }
+
+    fn deny_consent(&self, reason: String) {
+        let _ = JoinHandle::deny_consent(self, reason);
+    }
+
+    fn revoke(&self, reason: RevokeReason) {
+        // `Disconnected` means the session task is already gone: nothing is
+        // left to revoke.
+        let _ = JoinHandle::revoke(self, reason);
+    }
+
+    fn ended_by(&self) -> Option<EndedBy> {
+        JoinHandle::ended_by(self)
+    }
+
+    fn cleanup_report(&self) -> Option<CleanupReport> {
+        JoinHandle::cleanup_report(self)
+    }
+}
+
+/// Performs one customer intent on the wire.
+fn perform(wire: &impl Wire, intent: Intent) {
+    match intent {
+        Intent::Grant => wire.grant_consent(),
+        Intent::Decline(reason) => wire.deny_consent(reason),
+        Intent::Stop(reason) => wire.revoke(reason),
+    }
+}
+
+/// Performs every intent already queued, so a Stop or a decline the customer
+/// pressed is on the wire before the window waits for the teardown
+/// (REQ-F-018). A grant queued behind a local stop is not sent: the session is
+/// over on this side.
+pub(crate) fn drain_intents(wire: &impl Wire, intents: &mut UnboundedReceiver<Intent>) {
+    while let Ok(intent) = intents.try_recv() {
+        if matches!(intent, Intent::Grant) {
+            continue;
+        }
+        perform(wire, intent);
+    }
+}
+
+/// Locks the shared session only while it is still the state of the dial
+/// `generation`: a later dial replaces the state, and an earlier dial's pump,
+/// teardown and failure path must then leave the new session alone.
+pub(crate) fn lock_current(
+    shared: &Mutex<ConsentSession>,
+    generation: u64,
+) -> Option<MutexGuard<'_, ConsentSession>> {
+    let session = lock(shared);
+    (session.generation == generation).then_some(session)
 }
 
 /// Pumps `handle`'s live event stream into the shared consent session until a
 /// terminal event or the transport closing, while routing button intents to the
 /// wire.
 ///
+/// The select is `biased` towards the intents: a Stop the customer pressed is
+/// always sent before a wire event that arrived at the same time is looked at,
+/// and every loop exit drains what is still queued, so a local stop always
+/// revokes on the wire before the window waits for the cleanup (REQ-F-018,
+/// REQ-S-004). Only the state of this dial's `generation` is ever written.
+///
 /// The `next_event` await and the `intents.recv()` await both happen *before*
 /// the state lock is taken, so the lock is never held across `.await` and the
 /// synchronous Tauri commands never block on the network.
 pub async fn pump(
-    mut handle: JoinHandle,
+    mut handle: impl Wire,
     shared: Arc<Mutex<ConsentSession>>,
+    generation: u64,
     sink: Arc<dyn ViewSink>,
     mut intents: UnboundedReceiver<Intent>,
 ) {
     let mut terminated = false;
     loop {
         tokio::select! {
+            biased;
+            maybe_intent = intents.recv() => {
+                let Some(intent) = maybe_intent else {
+                    // Every command handle was dropped without ending the
+                    // session; fail closed below rather than pump forever.
+                    break;
+                };
+                // Turn the button press into a real wire action. The model only
+                // moves when the wire echoes the resulting lifecycle event and
+                // the event branch below folds it — control is never fabricated.
+                perform(&handle, intent);
+            }
             maybe_event = handle.next_event() => {
                 let Some(event) = maybe_event else {
                     // The stream ended without a terminal event: the transport
@@ -280,12 +298,25 @@ pub async fn pump(
                 // The out-of-band values each event references are read straight
                 // off the live handle just before the fold.
                 let ctx = EventContext { session: handle.session() };
-                let sac = handle.approval_code().map(|code| code.to_string());
-                let mut session = lock(&shared);
+                let sac = handle.approval_code();
+                // What the technician's computer says its user is called, from
+                // the pairing handshake (ST-M009-011): a label, not identity.
+                let technician = handle.technician_display_name();
+                let Some(mut session) = lock_current(&shared, generation) else {
+                    // A later dial replaced this session's state, which it does
+                    // only once this one ended: stop writing.
+                    terminated = true;
+                    break;
+                };
+                session.set_technician_name(technician);
                 if is_terminal(&session) {
                     // A local emergency stop or decline already ended the model.
                     // Do not fold further wire events (a late `Active` could flip
-                    // a clean `Stopped` into `Failed`); the session is over.
+                    // a clean `Stopped` into `Failed`); the session is over. The
+                    // feed still shows how its actions ended.
+                    for entry in session.activity.apply(&event, now_unix_millis()) {
+                        sink.activity(&entry);
+                    }
                     sink.emit(&session.view());
                     terminated = true;
                     break;
@@ -295,31 +326,12 @@ pub async fn pump(
                     break;
                 }
             }
-            maybe_intent = intents.recv() => {
-                let Some(intent) = maybe_intent else {
-                    // Every command handle was dropped without ending the
-                    // session; fail closed below rather than pump forever.
-                    break;
-                };
-                // Turn the button press into a real wire action. The model only
-                // moves when the wire echoes the resulting lifecycle event and
-                // the event branch above folds it — control is never fabricated.
-                match intent {
-                    Intent::Grant => {
-                        let _ = handle.grant_consent();
-                    }
-                    Intent::Decline(reason) => {
-                        let _ = handle.deny_consent(reason);
-                    }
-                    Intent::Stop(reason) => {
-                        let _ = handle.revoke(reason);
-                    }
-                }
-            }
         }
     }
-    if !terminated {
-        let mut session = lock(&shared);
+    // The stop that ended the model locally is queued (it is sent under the
+    // same lock that stops the model): put it on the wire now.
+    drain_intents(&handle, &mut intents);
+    if !terminated && let Some(mut session) = lock_current(&shared, generation) {
         if !is_terminal(&session) {
             // Fail closed so the UI shows an honest end, not a frozen
             // "connected" surface (REQ-S-009).
@@ -329,15 +341,33 @@ pub async fn pump(
         }
         sink.emit(&session.view());
     }
+    // The window is already safe; let the session task finish its teardown
+    // (stop the jobs, sweep the staging area) instead of aborting it by
+    // dropping the handle, then build the end report from its own cleanup
+    // report (ST-M009-012, REQ-F-019).
+    super::report::settle(
+        &mut handle,
+        &shared,
+        generation,
+        sink.as_ref(),
+        &mut intents,
+    )
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use cretlink_protocol::{JobId, RevokeReason, SessionId, TargetIdentity};
-    use cretlink_session::OutputStream;
+    use cretlink_protocol::{
+        JobId, JobOutcome, Origin, RevokeReason, SessionId, Shell, TargetIdentity,
+    };
+    use cretlink_session::{
+        ActivityItem, ActivityKind, ActivitySource, ActivityState, OutputStream,
+    };
     use tokio::sync::mpsc::unbounded_channel;
 
     /// Records emitted views so tests can assert both the re-render count and
@@ -348,7 +378,7 @@ mod tests {
     struct RecordingSink {
         count: AtomicUsize,
         last: Mutex<Option<ConsentView>>,
-        activities: Mutex<Vec<ActivityDelta>>,
+        activities: Mutex<Vec<ActivityEntry>>,
     }
 
     impl RecordingSink {
@@ -363,7 +393,7 @@ mod tests {
                 .clone()
         }
 
-        fn activities(&self) -> Vec<ActivityDelta> {
+        fn activities(&self) -> Vec<ActivityEntry> {
             self.activities
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -377,11 +407,11 @@ mod tests {
             *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(view.clone());
         }
 
-        fn activity(&self, delta: &ActivityDelta) {
+        fn activity(&self, entry: &ActivityEntry) {
             self.activities
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(delta.clone());
+                .push(entry.clone());
         }
     }
 
@@ -396,6 +426,7 @@ mod tests {
                 elevated: false,
                 simulated: false,
                 agent_version: "0.0.0".to_string(),
+                account: None,
             },
         }
     }
@@ -405,7 +436,7 @@ mod tests {
     /// is dropped: `step` never touches it, only the async `pump` does.
     fn dialing_session() -> ConsentSession {
         let (tx, _rx) = unbounded_channel::<Intent>();
-        ConsentSession::live_dialing(tx)
+        ConsentSession::live_dialing(tx, None)
     }
 
     #[test]
@@ -528,12 +559,19 @@ mod tests {
         assert!(!session.agent.control_granted());
     }
 
+    fn only_item(entries: &[ActivityEntry]) -> ActivityItem {
+        match entries {
+            [ActivityEntry::Item { item }] => item.clone(),
+            other => panic!("expected one item, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn command_started_taps_a_started_card_without_touching_the_lifecycle_fold() {
+    fn command_started_taps_a_running_item_without_touching_the_lifecycle_fold() {
         // The activity mirror is additive: a `CommandStarted` produces exactly one
-        // `started` card, yet the shared `apply_session_event` fold ignores it, so
+        // running item, yet the shared `apply_session_event` fold ignores it, so
         // the security-relevant phase is neither advanced nor fabricated (ADR-0011,
-        // REQ-S-002). The attribution chip comes straight off the wire `origin`.
+        // REQ-S-002). The source comes straight off the wire `origin`.
         let mut session = dialing_session();
         let before = format!("{:?}", session.agent.phase());
         let sink = RecordingSink::default();
@@ -564,120 +602,322 @@ mod tests {
         );
         assert!(!session.agent.control_granted());
 
-        // Exactly one `started` card, carrying the command, shell, and origin.
-        let deltas = sink.activities();
-        assert_eq!(deltas.len(), 1);
-        let delta = &deltas[0];
-        assert_eq!(delta.job, 7);
-        assert_eq!(delta.kind, ActivityKind::Started);
-        assert_eq!(delta.command.as_deref(), Some("Get-Process"));
-        assert_eq!(delta.shell.as_deref(), Some("PowerShell"));
-        assert_eq!(delta.origin, Some(Origin::Mcp));
-        // The AI's stated purpose rides the card beside the real command
-        // (REQ-F-026, ST-M009-007).
-        assert_eq!(delta.purpose.as_deref(), Some("Listing running programs"));
-        // A start carries none of the terminal fields yet.
-        assert!(delta.exit_code.is_none());
-        assert!(delta.outcome.is_none());
-        assert!(delta.ok.is_none());
+        let item = only_item(&sink.activities());
+        assert_eq!(item.id, "job-7");
+        assert_eq!(item.source, ActivitySource::Ai);
+        assert_eq!(item.kind, ActivityKind::Command);
+        assert_eq!(item.operation, "run a command in PowerShell: Get-Process");
+        assert_eq!(item.purpose.as_deref(), Some("Listing running programs"));
+        assert_eq!(item.state, ActivityState::Running);
+        // The client label never exists on the customer side (ST-M009-011).
+        assert_eq!(item.client_label, None);
         // The view is still re-emitted exactly once per fold (unchanged behaviour).
         assert_eq!(sink.count(), 1);
+        // `get_activity` reads the same feed.
+        assert_eq!(session.activity.entries(), sink.activities());
     }
 
     #[test]
-    fn exec_finished_taps_a_finished_card_with_the_honest_outcome() {
-        // A finish closes the card with the real exit code and outcome; the `ok`
-        // flag reflects only a clean `Completed`, so a failure is never dressed up
-        // as success (REQ-N-008).
+    fn exec_finished_updates_the_item_in_place_with_the_honest_outcome() {
         let mut session = dialing_session();
         let sink = RecordingSink::default();
         let ctx = EventContext {
             session: Some(SessionId::new()),
         };
-
-        assert!(!step(
-            &mut session,
-            &SessionEvent::ExecFinished {
-                job: JobId(7),
-                exit_code: Some(0),
-                outcome: JobOutcome::Completed,
-            },
-            ctx,
-            None,
-            &sink,
-        ));
-        assert!(!step(
-            &mut session,
-            &SessionEvent::ExecFinished {
-                job: JobId(8),
-                exit_code: Some(1),
-                outcome: JobOutcome::Failed,
-            },
-            ctx,
-            None,
-            &sink,
-        ));
-
-        let deltas = sink.activities();
-        assert_eq!(deltas.len(), 2);
-
-        assert_eq!(deltas[0].kind, ActivityKind::Finished);
-        assert_eq!(deltas[0].exit_code, Some(0));
-        assert_eq!(deltas[0].outcome.as_deref(), Some("completed"));
-        assert_eq!(deltas[0].ok, Some(true));
-        // A finish carries none of the start-only fields.
-        assert!(deltas[0].command.is_none());
-        assert!(deltas[0].shell.is_none());
-        assert!(deltas[0].origin.is_none());
-
-        assert_eq!(deltas[1].exit_code, Some(1));
-        assert_eq!(deltas[1].outcome.as_deref(), Some("failed"));
-        assert_eq!(deltas[1].ok, Some(false));
+        for (job, exit_code, outcome) in [
+            (7, Some(0), JobOutcome::Completed),
+            (8, Some(1), JobOutcome::Failed),
+            (9, None, JobOutcome::Unknown),
+        ] {
+            step(
+                &mut session,
+                &SessionEvent::CommandStarted {
+                    job: JobId(job),
+                    shell: Shell::Cmd,
+                    command: "dir".to_string(),
+                    origin: Origin::Console,
+                    purpose: None,
+                },
+                ctx,
+                None,
+                &sink,
+            );
+            step(
+                &mut session,
+                &SessionEvent::ExecFinished {
+                    job: JobId(job),
+                    exit_code,
+                    outcome,
+                },
+                ctx,
+                None,
+                &sink,
+            );
+        }
+        let entries = session.activity.entries();
+        assert_eq!(entries.len(), 3, "each job's item updated in place");
+        let states: Vec<ActivityState> = entries
+            .into_iter()
+            .map(|entry| match entry {
+                ActivityEntry::Item { item } => item.state,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                ActivityState::Done { exit_code: Some(0) },
+                ActivityState::Failed {
+                    exit_code: Some(1),
+                    message: None
+                },
+                // An unknown outcome is never a success (REQ-N-008).
+                ActivityState::failed(cretlink_session::activity::UNKNOWN_RESULT),
+            ]
+        );
     }
 
     #[test]
-    fn unknown_outcome_is_mirrored_honestly_never_a_false_success() {
-        // A connection lost mid-job yields `Unknown` with no exit code; the mirror
-        // surfaces it as-is and never marks it ok (REQ-N-008).
-        let delta = activity_delta(&SessionEvent::ExecFinished {
-            job: JobId(3),
-            exit_code: None,
-            outcome: JobOutcome::Unknown,
-        })
-        .expect("ExecFinished always produces a finished card");
-        assert_eq!(delta.kind, ActivityKind::Finished);
-        assert_eq!(delta.outcome.as_deref(), Some("unknown"));
-        assert_eq!(delta.ok, Some(false));
-        assert!(delta.exit_code.is_none());
+    fn a_shed_marker_is_shown_as_a_gap() {
+        let mut session = dialing_session();
+        let sink = RecordingSink::default();
+        step(
+            &mut session,
+            &SessionEvent::ActivityShed { count: 12 },
+            EventContext::default(),
+            None,
+            &sink,
+        );
+        assert!(matches!(
+            sink.activities().as_slice(),
+            [ActivityEntry::Gap { count: 12, .. }]
+        ));
     }
 
     #[test]
-    fn lifecycle_desktop_and_console_only_events_produce_no_card() {
-        // Only the two events the customer side actually emits become cards.
-        // Lifecycle transitions carry no job, and the per-line output signals are
-        // console-side only (see `crates/session/src/runtime.rs`), so tapping them
-        // here would fabricate activity the customer never received.
-        assert!(activity_delta(&SessionEvent::Connected).is_none());
-        assert!(activity_delta(&SessionEvent::AwaitingApprovalCompare).is_none());
-        assert!(activity_delta(&SessionEvent::AwaitingConsent).is_none());
-        assert!(activity_delta(&SessionEvent::Active).is_none());
-        assert!(
-            activity_delta(&SessionEvent::ExecOutput {
+    fn lifecycle_and_console_only_events_produce_no_item() {
+        // Lifecycle transitions carry no action, and the per-line output
+        // signals are console-side only, so tapping them here would fabricate
+        // activity the customer never received.
+        let mut session = dialing_session();
+        let sink = RecordingSink::default();
+        for event in [
+            SessionEvent::Connected,
+            SessionEvent::AwaitingApprovalCompare,
+            SessionEvent::ExecOutput {
                 job: JobId(1),
                 stream: OutputStream::Stdout,
                 bytes: vec![b'x'],
-            })
-            .is_none(),
-            "per-line output is console-side only, never mirrored here",
-        );
-        assert!(
-            activity_delta(&SessionEvent::ExecOutputDropped {
+            },
+            SessionEvent::ExecOutputDropped {
                 job: JobId(1),
                 bytes: 10,
-            })
-            .is_none(),
-            "drop markers are console-side only, never mirrored here",
+            },
+        ] {
+            step(&mut session, &event, EventContext::default(), None, &sink);
+        }
+        assert!(sink.activities().is_empty());
+    }
+
+    #[test]
+    fn the_view_shows_the_technician_name_as_the_technician_computer_says() {
+        let mut session = dialing_session();
+        assert!(session.view().technician.is_none());
+        session.set_technician_name(Some("Sam".to_string()));
+        let technician = session.view().technician.expect("a name");
+        assert_eq!(technician.display_name, "Sam");
+        assert!(technician.provenance.contains("technician's computer"));
+    }
+
+    #[test]
+    fn desktop_activity_shows_on_the_screen_tile_without_touching_the_lifecycle() {
+        use cretlink_protocol::DesktopAccess;
+
+        let mut session = dialing_session();
+        let before = format!("{:?}", session.agent.phase());
+        let sink = RecordingSink::default();
+        assert!(!step(
+            &mut session,
+            &SessionEvent::DesktopActivity {
+                access: DesktopAccess::Control,
+            },
+            EventContext::default(),
+            None,
+            &sink,
+        ));
+        assert_eq!(before, format!("{:?}", session.agent.phase()));
+        let view = sink.last().expect("a view was emitted");
+        assert!(view.screen.controlled_at_ms.is_some());
+        assert!(view.screen.observed_at_ms.is_none());
+    }
+
+    #[test]
+    fn the_band_knows_when_control_began() {
+        let mut session = dialing_session();
+        let sink = RecordingSink::default();
+        let ctx = EventContext {
+            session: Some(SessionId::new()),
+        };
+        for event in [
+            SessionEvent::Connected,
+            SessionEvent::AwaitingApprovalCompare,
+            SessionEvent::AwaitingConsent,
+        ] {
+            step(&mut session, &event, ctx, None, &sink);
+        }
+        assert_eq!(session.view().control_since_ms, None);
+        step(&mut session, &consent_event(), ctx, None, &sink);
+        assert!(session.view().control_since_ms.is_some());
+        assert!(session.view().session_active);
+    }
+
+    /// A wire scripted by the test: the events it delivers, and what the pump
+    /// sent on it.
+    struct ScriptedWire {
+        events: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+        revoked: Arc<Mutex<Vec<RevokeReason>>>,
+        granted: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedWire {
+        fn new(
+            events: Vec<SessionEvent>,
+        ) -> (Self, Arc<Mutex<Vec<RevokeReason>>>, Arc<AtomicUsize>) {
+            let (tx, rx) = unbounded_channel();
+            for event in events {
+                tx.send(event).unwrap();
+            }
+            // The sender goes, so the stream ends after the scripted events,
+            // as when the session task has finished.
+            drop(tx);
+            let revoked = Arc::new(Mutex::new(Vec::new()));
+            let granted = Arc::new(AtomicUsize::new(0));
+            let wire = Self {
+                events: rx,
+                revoked: Arc::clone(&revoked),
+                granted: Arc::clone(&granted),
+            };
+            (wire, revoked, granted)
+        }
+    }
+
+    impl Wire for ScriptedWire {
+        fn next_event(&mut self) -> impl Future<Output = Option<SessionEvent>> + Send {
+            self.events.recv()
+        }
+        fn session(&self) -> Option<SessionId> {
+            None
+        }
+        fn approval_code(&self) -> Option<String> {
+            None
+        }
+        fn technician_display_name(&self) -> Option<String> {
+            None
+        }
+        fn grant_consent(&self) {
+            self.granted.fetch_add(1, Ordering::Relaxed);
+        }
+        fn deny_consent(&self, _reason: String) {}
+        fn revoke(&self, reason: RevokeReason) {
+            self.revoked.lock().unwrap().push(reason);
+        }
+        fn ended_by(&self) -> Option<EndedBy> {
+            None
+        }
+        fn cleanup_report(&self) -> Option<CleanupReport> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_queued_behind_a_wire_event_still_revokes_on_the_wire() {
+        // REQ-F-018: the customer presses Stop while a wire event is already
+        // waiting. Whichever the pump sees first, the revoke must reach the
+        // wire before the window waits for the teardown. Repeated, because an
+        // unbiased select would take the event first about half the time.
+        for _ in 0..32 {
+            let (tx, rx) = intent_channel();
+            let session = ConsentSession::live_dialing(tx, None);
+            let generation = session.generation;
+            let shared = Arc::new(Mutex::new(session));
+            let (wire, revoked, _) = ScriptedWire::new(vec![SessionEvent::Connected]);
+            // What the Stop button does: queue the revoke, stop the model.
+            super::super::stop_now(&mut lock(&shared)).unwrap();
+            let sink: Arc<dyn ViewSink> = Arc::new(RecordingSink::default());
+            pump(wire, Arc::clone(&shared), generation, sink, rx).await;
+            assert_eq!(
+                *revoked.lock().unwrap(),
+                vec![RevokeReason::CustomerRequested]
+            );
+            assert!(matches!(
+                lock(&shared).agent.phase(),
+                AgentPhase::Stopped { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn draining_sends_a_queued_stop_but_no_grant_behind_it() {
+        let (wire, revoked, granted) = ScriptedWire::new(Vec::new());
+        let (tx, mut rx) = intent_channel();
+        tx.send(Intent::Grant).unwrap();
+        tx.send(Intent::Stop(RevokeReason::CustomerRequested))
+            .unwrap();
+        drain_intents(&wire, &mut rx);
+        assert_eq!(
+            *revoked.lock().unwrap(),
+            vec![RevokeReason::CustomerRequested]
         );
+        assert_eq!(granted.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn an_earlier_dial_never_writes_into_the_next_session() {
+        // The first dial ended (Stop) and the customer dialed again: the old
+        // pump and its teardown still run, and must leave the new state alone.
+        let (old_tx, old_rx) = intent_channel();
+        let old = ConsentSession::live_dialing(old_tx, None);
+        let old_generation = old.generation;
+        let shared = Arc::new(Mutex::new(old));
+        super::super::stop_now(&mut lock(&shared)).unwrap();
+        let (new_tx, _new_rx) = intent_channel();
+        let next = ConsentSession::live_dialing(new_tx, None);
+        let next_generation = next.generation;
+        assert_ne!(old_generation, next_generation);
+        lock(&shared).replace_with(next);
+
+        let (wire, revoked, _) = ScriptedWire::new(vec![
+            SessionEvent::CommandStarted {
+                job: JobId(3),
+                shell: Shell::Cmd,
+                command: "dir".to_string(),
+                origin: Origin::Mcp,
+                purpose: None,
+            },
+            SessionEvent::ActivityShed { count: 4 },
+        ]);
+        let recorder = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn ViewSink> = recorder.clone();
+        pump(wire, Arc::clone(&shared), old_generation, sink, old_rx).await;
+
+        // The old session's Stop still went out on its own wire.
+        assert_eq!(
+            *revoked.lock().unwrap(),
+            vec![RevokeReason::CustomerRequested]
+        );
+        let session = lock(&shared);
+        assert_eq!(session.generation, next_generation);
+        assert!(session.activity.entries().is_empty());
+        assert!(
+            !is_terminal(&session),
+            "the new dial is not failed or stopped"
+        );
+        assert!(session.report.report().is_none());
+        drop(session);
+        assert_eq!(recorder.count(), 0, "nothing rendered for a stale dial");
+        assert!(recorder.activities().is_empty());
+        assert!(lock_current(&shared, old_generation).is_none());
+        assert!(lock_current(&shared, next_generation).is_some());
     }
 
     #[test]

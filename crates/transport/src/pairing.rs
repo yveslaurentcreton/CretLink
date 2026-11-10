@@ -28,9 +28,9 @@
 
 use core::fmt;
 use cretlink_protocol::{
-    B64Bytes, Message, PairingMessage, ProtocolError, ProtocolVersion, SAC_COMMITMENT_LEN,
-    SAC_NONCE_LEN, SessionApprovalCode, derive_session_approval_code, limits, pairing_prologue,
-    sac_commitment,
+    B64Bytes, DisplayName, Message, PairingMessage, ProtocolError, ProtocolVersion,
+    SAC_COMMITMENT_LEN, SAC_NONCE_LEN, SessionApprovalCode, derive_session_approval_code, limits,
+    pairing_prologue, sac_commitment,
 };
 use rand::TryRngCore;
 use rand::rngs::OsRng;
@@ -81,6 +81,11 @@ pub struct Paired<T> {
     /// is not the approval code and carries no standing authority; it is
     /// zeroized on drop and kept out of `Debug` so it cannot leak into logs.
     pub handshake_hash: Zeroizing<[u8; 32]>,
+    /// The display name the responder (the console) sent in its
+    /// [`PairingMessage::Nonce`], as the technician's computer reports it
+    /// (ST-M009-011). Only the initiator (the agent) receives one; it is an
+    /// unverified label, never an identity, and not part of the approval code.
+    pub peer_display_name: Option<DisplayName>,
 }
 
 impl<T> fmt::Debug for Paired<T> {
@@ -93,6 +98,7 @@ impl<T> fmt::Debug for Paired<T> {
             .field("approval_code", &"<redacted>")
             .field("peer_static", &self.peer_static)
             .field("handshake_hash", &"<redacted>")
+            .field("peer_display_name", &self.peer_display_name)
             .field("channel", &self.channel)
             .finish()
     }
@@ -121,9 +127,29 @@ impl Pairing {
         version: ProtocolVersion,
         capabilities: &[String],
     ) -> Result<Paired<T>, PairingError> {
+        Self::perform_with_display_name(io, role, version, capabilities, None).await
+    }
+
+    /// [`Pairing::perform`], with the responder's optional display name
+    /// (ST-M009-011, protocol minor 10).
+    ///
+    /// A [`Role::Responder`] (the console) sends `display_name` in its
+    /// [`PairingMessage::Nonce`]; a [`Role::Initiator`] ignores it and instead
+    /// reports the name it received in [`Paired::peer_display_name`]. The name
+    /// is a label only: it is not hashed into the approval code and grants no
+    /// authority, so the comparison of the Session Approval Code still alone
+    /// establishes trust (REQ-S-006).
+    pub async fn perform_with_display_name<T: AsyncRead + AsyncWrite + Unpin>(
+        io: T,
+        role: Role,
+        version: ProtocolVersion,
+        capabilities: &[String],
+        display_name: Option<DisplayName>,
+    ) -> Result<Paired<T>, PairingError> {
         let (mut channel, handshake_hash, peer_static) =
             establish_channel(io, role, version, capabilities).await?;
-        let approval_code = run_commit_reveal(&mut channel, role, &handshake_hash).await?;
+        let (approval_code, peer_display_name) =
+            run_commit_reveal(&mut channel, role, &handshake_hash, display_name).await?;
 
         // Retain `h` for the caller instead of dropping it: a consented session
         // derives the reboot-resume continuity key from this same transcript
@@ -133,6 +159,7 @@ impl Pairing {
             approval_code,
             peer_static,
             handshake_hash,
+            peer_display_name,
         })
     }
 }
@@ -284,7 +311,8 @@ async fn run_commit_reveal<T: AsyncRead + AsyncWrite + Unpin>(
     channel: &mut SecureChannel<T>,
     role: Role,
     handshake_hash: &[u8; 32],
-) -> Result<SessionApprovalCode, PairingError> {
+    display_name: Option<DisplayName>,
+) -> Result<(SessionApprovalCode, Option<DisplayName>), PairingError> {
     match role {
         Role::Initiator => {
             let na = SecretNonce::random()?;
@@ -298,7 +326,8 @@ async fn run_commit_reveal<T: AsyncRead + AsyncWrite + Unpin>(
             .await?;
 
             // Wrap the peer's nonce so it is scrubbed on drop like our own `na`.
-            let nc = Zeroizing::new(expect_nonce(recv_pairing(channel).await?)?);
+            let (nc, peer_display_name) = expect_nonce(recv_pairing(channel).await?)?;
+            let nc = Zeroizing::new(nc);
 
             send_pairing(
                 channel,
@@ -308,7 +337,10 @@ async fn run_commit_reveal<T: AsyncRead + AsyncWrite + Unpin>(
             )
             .await?;
 
-            Ok(derive_session_approval_code(handshake_hash, &na.0, &nc))
+            Ok((
+                derive_session_approval_code(handshake_hash, &na.0, &nc),
+                peer_display_name,
+            ))
         }
         Role::Responder => {
             // The first pairing message received MUST be the commit; anything
@@ -320,6 +352,7 @@ async fn run_commit_reveal<T: AsyncRead + AsyncWrite + Unpin>(
                 channel,
                 PairingMessage::Nonce {
                     nc: B64Bytes::from(nc.0.to_vec()),
+                    display_name,
                 },
             )
             .await?;
@@ -334,7 +367,10 @@ async fn run_commit_reveal<T: AsyncRead + AsyncWrite + Unpin>(
                 return Err(PairingError::CommitmentMismatch);
             }
 
-            Ok(derive_session_approval_code(handshake_hash, &na, &nc.0))
+            Ok((
+                derive_session_approval_code(handshake_hash, &na, &nc.0),
+                None,
+            ))
         }
     }
 }
@@ -372,10 +408,15 @@ fn expect_commit(pairing: PairingMessage) -> Result<[u8; SAC_COMMITMENT_LEN], Pa
     }
 }
 
-/// Extracts the responder's 32-byte nonce from an expected [`PairingMessage::Nonce`].
-fn expect_nonce(pairing: PairingMessage) -> Result<[u8; SAC_NONCE_LEN], PairingError> {
+/// Extracts the responder's 32-byte nonce, and the display name it optionally
+/// carries, from an expected [`PairingMessage::Nonce`].
+fn expect_nonce(
+    pairing: PairingMessage,
+) -> Result<([u8; SAC_NONCE_LEN], Option<DisplayName>), PairingError> {
     match pairing {
-        PairingMessage::Nonce { nc } => fixed_bytes(&nc).ok_or(PairingError::CommitmentMismatch),
+        PairingMessage::Nonce { nc, display_name } => fixed_bytes(&nc)
+            .map(|nc| (nc, display_name))
+            .ok_or(PairingError::CommitmentMismatch),
         _ => Err(PairingError::CommitmentMismatch),
     }
 }
@@ -491,6 +532,7 @@ mod tests {
     fn expect_helpers_reject_wrong_variant() {
         let nonce = PairingMessage::Nonce {
             nc: B64Bytes::from(vec![0u8; 32]),
+            display_name: None,
         };
         assert!(matches!(
             expect_commit(nonce),
@@ -559,7 +601,7 @@ mod tests {
             .await?;
             Ok::<(), PairingError>(())
         };
-        let honest = run_commit_reveal(&mut ch_b, Role::Responder, &h_b);
+        let honest = run_commit_reveal(&mut ch_b, Role::Responder, &h_b, None);
         let (cheat_res, honest_res) = tokio::join!(cheat, honest);
 
         cheat_res.expect("cheating initiator still sends valid frames");
@@ -580,12 +622,49 @@ mod tests {
                 &mut ch_a,
                 PairingMessage::Nonce {
                     nc: B64Bytes::from(vec![0u8; SAC_NONCE_LEN]),
+                    display_name: None,
                 },
             )
             .await
         };
-        let honest = run_commit_reveal(&mut ch_b, Role::Responder, &h_b);
+        let honest = run_commit_reveal(&mut ch_b, Role::Responder, &h_b, None);
         let (_bad, honest_res) = tokio::join!(bad, honest);
         assert!(matches!(honest_res, Err(PairingError::CommitmentMismatch)));
+    }
+
+    // The responder's display name reaches the initiator beside an identical
+    // approval code; the name is not part of the code, and a responder that
+    // sends none leaves the initiator with `None` (ST-M009-011).
+    #[tokio::test]
+    async fn the_responder_display_name_reaches_the_initiator() {
+        for sent in [Some(DisplayName::new("Sam").expect("valid")), None] {
+            let (a, b) = duplex(4096);
+            let caps = vec!["exec".to_string()];
+            let (initiator, responder) = tokio::join!(
+                Pairing::perform_with_display_name(
+                    a,
+                    Role::Initiator,
+                    PROTOCOL_V1,
+                    &caps,
+                    Some(DisplayName::new("ignored on the initiator").expect("valid")),
+                ),
+                Pairing::perform_with_display_name(
+                    b,
+                    Role::Responder,
+                    PROTOCOL_V1,
+                    &caps,
+                    sent.clone(),
+                ),
+            );
+            let initiator = initiator.expect("initiator pairs");
+            let responder = responder.expect("responder pairs");
+            assert_eq!(initiator.peer_display_name, sent);
+            // The initiator never sends a name, whatever it was given.
+            assert_eq!(responder.peer_display_name, None);
+            assert_eq!(
+                initiator.approval_code.to_string(),
+                responder.approval_code.to_string()
+            );
+        }
     }
 }

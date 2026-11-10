@@ -1,10 +1,10 @@
 //! Windows FFI for [`super`]: attach to the parent's console, relaunch
 //! elevated through UAC, and show a message box (ST-M009-001, ST-M009-005,
-//! ADR-0018).
+//! ST-M009-006, ADR-0018).
 //!
-//! This is the only `unsafe` code in `cretlink-cli`, localized to this adapter
-//! like the console-mode exception in `cretlink-shell`'s `tty::win`. It holds no
-//! session authority and carries no protocol logic.
+//! This, `install::win` and `shell::tty::win` are the only `unsafe` code in
+//! `cretlink-cli`, each localized to its adapter. It holds no session authority
+//! and carries no protocol logic.
 
 #![allow(
     unsafe_code,
@@ -25,7 +25,10 @@ use windows::Win32::System::Console::{
     STD_OUTPUT_HANDLE, SetStdHandle,
 };
 use windows::Win32::UI::Shell::{SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW};
-use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW, SW_SHOWNORMAL};
+use windows::Win32::UI::WindowsAndMessaging::{
+    IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO,
+    MESSAGEBOX_STYLE, MessageBoxW, SW_SHOWNORMAL,
+};
 use windows::core::{HSTRING, PCWSTR, w};
 
 use super::{ConsoleAttach, Elevation};
@@ -101,15 +104,31 @@ pub(super) fn relaunch_elevated(exe: &Path, parameters: &str) -> io::Result<Elev
 }
 
 pub(super) fn alert(title: &str, message: &str) {
+    let _ = message_box(title, message, MB_OK | MB_ICONERROR);
+}
+
+pub(super) fn inform(title: &str, message: &str) {
+    let _ = message_box(title, message, MB_OK | MB_ICONINFORMATION);
+}
+
+pub(super) fn confirm(title: &str, message: &str) -> bool {
+    message_box(title, message, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES
+}
+
+fn message_box(
+    title: &str,
+    message: &str,
+    style: MESSAGEBOX_STYLE,
+) -> windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_RESULT {
     let title = HSTRING::from(title);
     let message = HSTRING::from(message);
     // SAFETY: both HSTRINGs outlive the modal call; no owner window is passed.
-    let _ = unsafe {
+    unsafe {
         MessageBoxW(
             None,
             PCWSTR(message.as_ptr()),
             PCWSTR(title.as_ptr()),
-            MB_OK | MB_ICONERROR,
+            style,
         )
-    };
+    }
 }

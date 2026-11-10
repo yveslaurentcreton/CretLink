@@ -1,0 +1,285 @@
+//! Windows FFI for [`super`] (ST-M009-006): the Start-menu shortcut, the
+//! per-user uninstall entry, the process list, and removing the installed
+//! folder after this process exits.
+//!
+//! Like `process::win`, this adapter is a localized `unsafe` exception: it
+//! holds no session authority and no protocol logic, only the calls Windows
+//! offers no safe API for.
+//!
+//! - The shortcut is a `.lnk` file, written by the shell's own `ShellLink` COM
+//!   object (`IShellLinkW` + `IPersistFile`): the documented way, rather than
+//!   a hand-made binary file. It runs on a thread of its own so its COM
+//!   apartment never meets the window's.
+//! - The uninstall entry is a key under `HKEY_CURRENT_USER`, so no
+//!   administrator rights are needed.
+//! - The process list (`CreateToolhelp32Snapshot` and
+//!   `QueryFullProcessImageNameW`) tells whether the installed copy runs.
+
+#![allow(
+    unsafe_code,
+    reason = "Localized Windows FFI (CoInitializeEx, CoCreateInstance, IShellLinkW, \
+              IPersistFile, RegCreateKeyExW, RegSetValueExW, RegOpenKeyExW, \
+              RegDeleteTreeW, CreateToolhelp32Snapshot, Process32FirstW/NextW, \
+              OpenProcess, QueryFullProcessImageNameW); every pointer handed to \
+              Windows borrows a value that outlives the call, and every handle is \
+              closed by an owner."
+)]
+
+use std::ffi::OsString;
+use std::io;
+use std::os::windows::ffi::OsStringExt;
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, HANDLE, WIN32_ERROR};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    CoUninitialize, IPersistFile,
+};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+    REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegSetValueExW,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
+use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+use windows::core::{HSTRING, Interface, PCWSTR, PWSTR};
+
+use super::{Shortcut, UNINSTALL_KEY, UninstallEntry};
+
+/// `CREATE_NO_WINDOW`: the removal helper opens no console window.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn check(status: WIN32_ERROR) -> io::Result<()> {
+    status.ok().map_err(io::Error::from)
+}
+
+/// Closes a registry key when dropped.
+struct Key(HKEY);
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        // SAFETY: the key was opened by this module and is closed once.
+        let _ = unsafe { RegCloseKey(self.0) };
+    }
+}
+
+/// Closes a kernel handle when dropped.
+struct Handle(HANDLE);
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // SAFETY: the handle was opened by this module and is closed once.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn set_value(key: &Key, name: &str, kind: REG_VALUE_TYPE, data: &[u8]) -> io::Result<()> {
+    let name = HSTRING::from(name);
+    // SAFETY: `name` and `data` outlive the call; the key is open for writing.
+    check(unsafe { RegSetValueExW(key.0, &name, None, kind, Some(data)) })
+}
+
+fn set_string(key: &Key, name: &str, value: &str) -> io::Result<()> {
+    // REG_SZ data is the UTF-16 string with its terminating NUL, in bytes.
+    let data: Vec<u8> = value
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    set_value(key, name, REG_SZ, &data)
+}
+
+pub(super) fn write_uninstall_entry(entry: &UninstallEntry) -> io::Result<()> {
+    let path = HSTRING::from(UNINSTALL_KEY);
+    let mut key = HKEY::default();
+    // SAFETY: `path` outlives the call and `key` receives the opened key, which
+    // `Key` closes.
+    check(unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            &path,
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut key,
+            None,
+        )
+    })?;
+    let key = Key(key);
+    for (name, value) in [
+        ("DisplayName", &entry.display_name),
+        ("DisplayVersion", &entry.display_version),
+        ("Publisher", &entry.publisher),
+        ("InstallLocation", &entry.install_location),
+        ("UninstallString", &entry.uninstall_string),
+        ("DisplayIcon", &entry.display_icon),
+    ] {
+        set_string(&key, name, value)?;
+    }
+    // Uninstall is the only action the entry offers.
+    for name in ["NoModify", "NoRepair"] {
+        set_value(&key, name, REG_DWORD, &1u32.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+pub(super) fn has_uninstall_entry() -> bool {
+    let path = HSTRING::from(UNINSTALL_KEY);
+    let mut key = HKEY::default();
+    // SAFETY: as in `write_uninstall_entry`; read access only.
+    let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, &path, None, KEY_READ, &mut key) };
+    if status.is_ok() {
+        drop(Key(key));
+        true
+    } else {
+        false
+    }
+}
+
+pub(super) fn remove_uninstall_entry() -> io::Result<bool> {
+    let path = HSTRING::from(UNINSTALL_KEY);
+    // SAFETY: `path` outlives the call.
+    let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &path) };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(false);
+    }
+    check(status).map(|()| true)
+}
+
+pub(super) fn create_shortcut(shortcut: &Shortcut) -> io::Result<()> {
+    if let Some(parent) = shortcut.path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let shortcut = shortcut.clone();
+    std::thread::spawn(move || write_shortcut(&shortcut))
+        .join()
+        .map_err(|_| io::Error::other("the shortcut could not be written"))?
+}
+
+/// Writes the `.lnk` on the calling thread, which must be a fresh one.
+fn write_shortcut(shortcut: &Shortcut) -> io::Result<()> {
+    // SAFETY: a fresh thread, initialised once and uninitialised below.
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+        .ok()
+        .map_err(io::Error::from)?;
+    let result = (|| -> windows::core::Result<()> {
+        let target = HSTRING::from(shortcut.target.as_os_str());
+        let arguments = HSTRING::from(shortcut.arguments.as_str());
+        let description = HSTRING::from(shortcut.description.as_str());
+        let path = HSTRING::from(shortcut.path.as_os_str());
+        // SAFETY: COM is initialised on this thread; every HSTRING outlives
+        // the call it is passed to; the interfaces are released on drop.
+        unsafe {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            link.SetPath(&target)?;
+            link.SetArguments(&arguments)?;
+            link.SetDescription(&description)?;
+            let file: IPersistFile = link.cast()?;
+            file.Save(&path, true)
+        }
+    })();
+    // SAFETY: balances the successful CoInitializeEx above, after every
+    // interface of this thread has been released.
+    unsafe { CoUninitialize() };
+    result.map_err(io::Error::from)
+}
+
+/// The full image path of a process, when this user may query it.
+fn image_path(pid: u32) -> Option<PathBuf> {
+    // SAFETY: OpenProcess takes plain values; the handle is closed by `Handle`.
+    let handle =
+        Handle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?);
+    let mut buffer = vec![0u16; 32_768];
+    let mut len = u32::try_from(buffer.len()).ok()?;
+    // SAFETY: `buffer` holds `len` UTF-16 units and outlives the call, which
+    // writes the path's length back into `len`.
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle.0,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .ok()?;
+    buffer.truncate(usize::try_from(len).ok()?);
+    Some(PathBuf::from(OsString::from_wide(&buffer)))
+}
+
+pub(super) fn running_elsewhere(exe: &Path) -> io::Result<bool> {
+    let me = std::process::id();
+    let Some(wanted) = exe
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+    else {
+        return Ok(false);
+    };
+    // SAFETY: plain values in; the snapshot handle is closed by `Handle`.
+    let snapshot = Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }?);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>())
+            .map_err(|_| io::Error::other("PROCESSENTRY32W size overflows u32"))?,
+        ..Default::default()
+    };
+    // SAFETY: `entry` is a correctly sized PROCESSENTRY32W that outlives each
+    // call; the snapshot is open.
+    let mut next = unsafe { Process32FirstW(snapshot.0, &mut entry) };
+    while next.is_ok() {
+        let pid = entry.th32ProcessID;
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase();
+        // Only a process with the same file name is worth asking for its path;
+        // one this user may not query is not this user's copy.
+        if pid != me
+            && name == wanted
+            && image_path(pid).is_some_and(|path| super::same_path(&path, exe))
+        {
+            return Ok(true);
+        }
+        // SAFETY: as above.
+        next = unsafe { Process32NextW(snapshot.0, &mut entry) };
+    }
+    Ok(false)
+}
+
+/// Starts the removal helper, detached and without a window: it waits for
+/// this process to exit, then removes `files` and `dir` if it is empty.
+///
+/// A running Windows program cannot delete its own file, and `cmd.exe` cannot
+/// wait for a process id, so the helper is the in-box Windows PowerShell
+/// (`Wait-Process`), started by its absolute path under `%SystemRoot%`. The
+/// script uses cmdlets only, so it also runs under Constrained Language mode,
+/// and the execution policy does not apply to `-Command`.
+pub(super) fn remove_after_exit(files: &[PathBuf], dir: &Path) -> io::Result<()> {
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let powershell = system_root
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let script = super::removal_script(std::process::id(), files, dir);
+    Command::new(powershell)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        // Not inside the folder it removes.
+        .current_dir(&system_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(drop)
+}

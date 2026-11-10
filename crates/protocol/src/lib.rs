@@ -52,7 +52,9 @@
 //! consumers render or strip them. The simulator emits plain text. Output
 //! bytes are untrusted input from the remote target.
 
+mod account;
 mod b64;
+mod display_name;
 mod error;
 mod ids;
 pub mod limits;
@@ -62,7 +64,9 @@ mod purpose;
 mod reboot_resume;
 mod version;
 
+pub use account::{AccountName, AccountNameError};
 pub use b64::B64Bytes;
+pub use display_name::{DisplayName, DisplayNameError};
 pub use error::ProtocolError;
 pub use ids::{JobId, RequestId, SessionId};
 pub use message::{

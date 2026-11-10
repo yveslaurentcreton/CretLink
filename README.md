@@ -10,17 +10,29 @@ AI API key.
 
 ## Intended workflow
 
-1. Start CretLink Console on the technician computer.
-2. Launch CretLink Support from removable media on the customer computer.
-3. Approve UAC, compare the session code, and grant full control for the
+CretLink is one application, `cretlink` (`cretlink.exe` on Windows), with two
+roles: **Give help** for the technician and, on Windows, **Get help** for the
+customer.
+
+1. On the technician computer, unpack the release archive, start `cretlink`
+   and choose **Give help** (run once or install, see below).
+2. Connect your AI clients once with `cretlink mcp install`, or from the AI
+   assistants screen.
+3. On the customer's Windows computer, start the same `cretlink.exe`, for
+   example from removable media, and choose **Get help**. A copy renamed to
+   `CretLink-Support.exe` opens Get help straight away.
+4. Approve UAC, compare the session code, and grant full control for the
    attended session.
-4. Use Codex, Claude, or another MCP client through the local CretLink bridge.
-5. Let the AI inspect the target, run arbitrary PowerShell or Command Prompt
+5. Use Codex, Claude, or another MCP client; it reaches the session through
+   the local bridge, `cretlink mcp`.
+6. Let the AI inspect the target, run arbitrary PowerShell or Command Prompt
    work, control jobs, and transfer files.
-6. Stop the session from either endpoint and remove temporary access.
+7. Stop the session from either endpoint and remove temporary access.
 
 The primary path is a direct authenticated and encrypted LAN connection.
-On Windows, offline recovery of leftover CretLink resources is implemented, as
+On Windows, offline recovery of leftover CretLink resources is implemented
+(`cretlink recover [--remove]`; Get help also removes what an earlier session
+left before it connects, and says so when it cannot), as
 are the building blocks of attended reboot-resume: a customer-armed,
 single-use, expiring continuity ticket that never restores control without
 fresh consent. Wiring reboot-resume into an actual reboot (automatic restart of
@@ -29,17 +41,52 @@ relay, which forwards only end-to-end encrypted traffic, is in progress.
 Interactive desktop control follows once the command, file, consent,
 revocation, and cleanup foundations are reliable.
 
+## Run once or install
+
+The technician side is one program, `cretlink`, that runs from wherever it was
+unpacked. Its start screen offers, under **Give help**:
+
+- **Run once without installing.** The copy writes nothing but its audit trail
+  (in the per-user data folder). AI clients you connect from it point at this
+  copy and break when it is moved or deleted; the AI assistants screen says so.
+- **Install for me.** Copies `cretlink` (and `cretlink-cli`) to a fixed
+  per-user location — `%LOCALAPPDATA%\Programs\CretLink\` on Windows,
+  `~/Applications/CretLink.app` on macOS, `~/.local/bin/` on Linux — adds a
+  Start-menu shortcut (Windows) or a desktop entry (Linux), connects the AI
+  clients you select, and starts the installed copy. It needs no administrator
+  rights and adds no service and nothing that starts by itself. Installing a
+  newer download again updates the copy in place, so the AI clients keep
+  working.
+
+`cretlink uninstall` (or **Uninstall** in Settings, or the Windows *Installed
+apps* entry) shows what it will remove and asks first, then removes the
+installed files, the shortcut or desktop entry, the uninstall entry and the AI
+client registrations the install made, but only while they still point at the
+installed copy. The audit trail stays. On macOS and Linux an installed copy
+opens Give help directly; a copy that is not installed shows the start screen
+so it can still be installed. A `CretLink-Support*` copy, for customers, never
+installs or uninstalls; the one command it accepts is `recover [--remove]`.
+
 ## Platforms
 
-- **Technician side** (console, MCP bridge, and the experimental
-  `cretlink-shell` terminal client): Windows and macOS.
-- **Customer side** (support agent): Windows. Non-Windows builds of the support
-  agent are for development and testing only; they offer file operations and
-  piped commands but no interactive terminal, desktop control, reboot-resume,
-  or privilege reporting.
+- **Technician side** (Give help, the MCP bridge `cretlink mcp`, and the
+  experimental terminal client `cretlink-cli shell`): Windows and macOS.
+- **Customer side** (Get help): Windows. The customer role exists only in the
+  Windows build of `cretlink`.
 - **Linux** builds exist for operating the relay server and for development.
 
-Release binaries are built for Windows x86_64, macOS aarch64, and Linux x86_64.
+Each release has one archive per operating system, for Windows x86_64, macOS
+aarch64, and Linux x86_64. It holds the application `cretlink` and its console
+build `cretlink-cli`, which runs the same subcommands without a window (on
+Windows, use it for `shell`). The relay server is attached separately.
+`cretlink-console` and `cretlink-support-agent`, the headless technician and
+customer programs in the source tree, are development and test tools and are
+not released; non-Windows builds of the support agent offer file operations
+and piped commands but no interactive terminal, desktop control,
+reboot-resume, or privilege reporting.
+The Linux binaries run on glibc 2.35 or newer (Ubuntu 22.04 LTS, Debian 12 and
+later); the application `cretlink` also needs the WebKitGTK 4.1 webview
+(`libwebkit2gtk-4.1-0` on Debian and Ubuntu).
 
 ## Current status
 

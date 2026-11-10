@@ -87,8 +87,9 @@ impl Client {
         }
     }
 
-    /// The client's command-line program.
-    fn program(self) -> &'static str {
+    /// The client's command-line program, which is also its `--client` name.
+    #[must_use]
+    pub fn program(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
@@ -200,7 +201,9 @@ pub struct Registration {
 }
 
 impl Registration {
-    fn display(&self) -> String {
+    /// The command line, as typed in a terminal.
+    #[must_use]
+    pub fn display(&self) -> String {
         let mut parts = vec![self.command.clone()];
         parts.extend(self.args.iter().cloned());
         display_command(&parts)
@@ -278,7 +281,7 @@ impl Context {
         })
     }
 
-    fn exe_string(&self) -> String {
+    pub(crate) fn exe_string(&self) -> String {
         self.exe.to_string_lossy().into_owned()
     }
 
@@ -346,6 +349,233 @@ impl Runner for SystemRunner {
     }
 }
 
+/// The CretLink registration in one client, judged against the program it
+/// should start ([`Context::exe`]) (ST-M009-006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationState {
+    /// No `cretlink` entry.
+    Absent,
+    /// A `cretlink` entry that starts this program with `mcp`.
+    ThisExecutable(Registration),
+    /// A `cretlink` entry that starts another command.
+    OtherCommand(Registration),
+    /// A `cretlink` entry, or a configuration file, that could not be read.
+    Unreadable(String),
+}
+
+/// One command of a plan: a client's command line and its arguments, exactly
+/// as it is run (REQ-F-025).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedCommand {
+    /// The client's program as a technician types it (`claude`, `codex`,
+    /// `gemini`); it is run from where [`ClientStatus::program`] found it.
+    pub program: &'static str,
+    /// Its arguments.
+    pub args: Vec<String>,
+}
+
+impl PlannedCommand {
+    /// The command as typed in a terminal, quoting the arguments a shell would
+    /// split.
+    #[must_use]
+    pub fn display(&self) -> String {
+        let mut parts = vec![self.program.to_owned()];
+        parts.extend(self.args.iter().cloned());
+        display_command(&parts)
+    }
+}
+
+/// One client as the setup interface sees it: whether its command line is
+/// present, its registration with the configuration path, and the exact
+/// commands install and uninstall would run (ST-M009-006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientStatus {
+    /// The client.
+    pub client: Client,
+    /// Where the client's command line was found on `PATH`, if it was.
+    pub program: Option<PathBuf>,
+    /// The per-user configuration file its registrations are read from.
+    pub config_path: Option<PathBuf>,
+    /// The current registration.
+    pub registration: RegistrationState,
+    /// What install runs. Empty when the client is not present or already
+    /// starts this program.
+    pub install_plan: Vec<PlannedCommand>,
+    /// What uninstall runs. Empty when the client is not present or has no
+    /// `cretlink` entry.
+    pub uninstall_plan: Vec<PlannedCommand>,
+}
+
+impl ClientStatus {
+    /// Whether the client's command line is on `PATH`.
+    #[must_use]
+    pub fn present(&self) -> bool {
+        self.program.is_some()
+    }
+
+    /// The plan for `action`; status changes nothing.
+    #[must_use]
+    pub fn plan(&self, action: Action) -> &[PlannedCommand] {
+        match action {
+            Action::Install => &self.install_plan,
+            Action::Uninstall => &self.uninstall_plan,
+            Action::Status => &[],
+        }
+    }
+}
+
+/// Reads one client's state and plans install and uninstall against
+/// [`Context::exe`]. Only reads: nothing is run or written.
+#[must_use]
+pub fn inspect(context: &Context, client: Client) -> ClientStatus {
+    let program = context.find_program(client.program());
+    let registration = match client.read_registration(context) {
+        Registered::Absent => RegistrationState::Absent,
+        Registered::Present(registration) if context.is_this_program(&registration) => {
+            RegistrationState::ThisExecutable(registration)
+        }
+        Registered::Present(registration) => RegistrationState::OtherCommand(registration),
+        Registered::Unreadable(reason) => RegistrationState::Unreadable(reason),
+    };
+    let command = |args: Vec<String>| PlannedCommand {
+        program: client.program(),
+        args,
+    };
+    let mut install_plan = Vec::new();
+    let mut uninstall_plan = Vec::new();
+    if program.is_some() {
+        match &registration {
+            RegistrationState::ThisExecutable(_) => {}
+            RegistrationState::Absent => {}
+            RegistrationState::OtherCommand(_) | RegistrationState::Unreadable(_) => {
+                if client.add_needs_remove_first() {
+                    install_plan.push(command(client.remove_args()));
+                }
+            }
+        }
+        if !matches!(registration, RegistrationState::ThisExecutable(_)) {
+            install_plan.push(command(client.add_args(&context.exe_string())));
+        }
+        if registration != RegistrationState::Absent {
+            uninstall_plan.push(command(client.remove_args()));
+        }
+    }
+    ClientStatus {
+        client,
+        program,
+        config_path: client.config_path(context),
+        registration,
+        install_plan,
+        uninstall_plan,
+    }
+}
+
+/// [`inspect`] for each of `clients`, or for every supported client when
+/// `clients` is empty.
+#[must_use]
+pub fn inspect_clients(context: &Context, clients: &[Client]) -> Vec<ClientStatus> {
+    let clients: &[Client] = if clients.is_empty() {
+        &Client::ALL
+    } else {
+        clients
+    };
+    clients
+        .iter()
+        .map(|&client| inspect(context, client))
+        .collect()
+}
+
+/// Why a plan did not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyError {
+    /// The client's command line is not on `PATH`, so nothing could run.
+    NotPresent(Client),
+    /// A command ran and failed; `output` is what it wrote.
+    Failed {
+        /// The command, as displayed.
+        command: String,
+        /// Its stdout and stderr.
+        output: String,
+    },
+    /// A command could not be started.
+    CouldNotRun {
+        /// The command, as displayed.
+        command: String,
+        /// Why it could not start.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPresent(client) => write!(
+                f,
+                "{} is not installed: '{}' was not found on PATH",
+                client.label(),
+                client.program()
+            ),
+            Self::Failed { command, output } => {
+                let output = output.trim();
+                if output.is_empty() {
+                    write!(f, "'{command}' failed")
+                } else {
+                    write!(f, "'{command}' failed: {output}")
+                }
+            }
+            Self::CouldNotRun { command, reason } => {
+                write!(f, "'{command}' could not be started: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApplyError {}
+
+/// Runs the plan of `status` for `action` through `runner`, stopping at the
+/// first failure. An empty plan succeeds without running anything, except
+/// that a change is asked of a client that is not present.
+///
+/// # Errors
+///
+/// Returns which command failed and why.
+pub fn apply(runner: &dyn Runner, status: &ClientStatus, action: Action) -> Result<(), ApplyError> {
+    let wants_change = match action {
+        Action::Install => !matches!(status.registration, RegistrationState::ThisExecutable(_)),
+        Action::Uninstall => status.registration != RegistrationState::Absent,
+        Action::Status => false,
+    };
+    let Some(program) = &status.program else {
+        return if wants_change {
+            Err(ApplyError::NotPresent(status.client))
+        } else {
+            Ok(())
+        };
+    };
+    for command in status.plan(action) {
+        run_one(runner, program, command)?;
+    }
+    Ok(())
+}
+
+fn run_one(
+    runner: &dyn Runner,
+    program: &Path,
+    command: &PlannedCommand,
+) -> Result<(), ApplyError> {
+    match runner.run(program, &command.args) {
+        Ok(result) if result.success => Ok(()),
+        Ok(result) => Err(ApplyError::Failed {
+            command: command.display(),
+            output: result.output,
+        }),
+        Err(err) => Err(ApplyError::CouldNotRun {
+            command: command.display(),
+            reason: format!("could not run {}: {err}", program.display()),
+        }),
+    }
+}
+
 /// Runs a setup command and writes its report to `out`.
 ///
 /// Returns `Ok(true)` when every requested client ended in the wanted state, or
@@ -362,11 +592,6 @@ pub fn execute(
     out: &mut dyn Write,
 ) -> io::Result<bool> {
     let explicit = !options.clients.is_empty();
-    let clients: &[Client] = if explicit {
-        &options.clients
-    } else {
-        &Client::ALL
-    };
     let exe = context.exe_string();
     if action != Action::Status {
         writeln!(out, "CretLink program: {exe}")?;
@@ -375,106 +600,84 @@ pub fn execute(
         }
     }
     let mut ok = true;
-    for &client in clients {
-        let program = context.find_program(client.program());
-        let registered = client.read_registration(context);
+    for status in inspect_clients(context, &options.clients) {
         ok &= match action {
             Action::Status => {
-                report_status(context, client, program.as_deref(), &registered, out)?;
+                report_status(&status, out)?;
                 true
             }
-            Action::Install => install(
-                context,
-                runner,
-                client,
-                program.as_deref(),
-                &registered,
-                options.dry_run,
-                explicit,
-                out,
-            )?,
-            Action::Uninstall => uninstall(
-                context,
-                runner,
-                client,
-                program.as_deref(),
-                &registered,
-                options.dry_run,
-                explicit,
-                out,
-            )?,
+            Action::Install => install(context, runner, &status, options.dry_run, explicit, out)?,
+            Action::Uninstall => uninstall(runner, &status, options.dry_run, explicit, out)?,
         };
     }
     Ok(ok)
 }
 
-fn report_status(
-    context: &Context,
-    client: Client,
-    program: Option<&Path>,
-    registered: &Registered,
-    out: &mut dyn Write,
-) -> io::Result<()> {
-    let presence = match program {
+fn report_status(status: &ClientStatus, out: &mut dyn Write) -> io::Result<()> {
+    let client = status.client;
+    let presence = match &status.program {
         Some(path) => format!("found at {}", path.display()),
         None => format!("'{}' not found on PATH", client.program()),
     };
     writeln!(out, "{}: {presence}", client.label())?;
-    let state = match registered {
-        Registered::Absent => "CretLink is not registered".to_owned(),
-        Registered::Present(registration) if context.is_this_program(registration) => {
+    let state = match &status.registration {
+        RegistrationState::Absent => "CretLink is not registered".to_owned(),
+        RegistrationState::ThisExecutable(registration) => {
             format!(
                 "CretLink is registered with this program: {}",
                 registration.display()
             )
         }
-        Registered::Present(registration) => format!(
+        RegistrationState::OtherCommand(registration) => format!(
             "CretLink is registered with another program: {} (running 'mcp install' again updates it)",
             registration.display()
         ),
-        Registered::Unreadable(reason) => {
+        RegistrationState::Unreadable(reason) => {
             format!("the registration could not be read: {reason}")
         }
     };
     writeln!(out, "  {state}")?;
-    if let Some(path) = client.config_path(context) {
+    if let Some(path) = &status.config_path {
         writeln!(out, "  configuration: {}", path.display())?;
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+fn config_location(status: &ClientStatus) -> String {
+    status.config_path.as_ref().map_or_else(
+        || "its configuration".to_owned(),
+        |path| path.display().to_string(),
+    )
+}
+
 fn install(
     context: &Context,
     runner: &dyn Runner,
-    client: Client,
-    program: Option<&Path>,
-    registered: &Registered,
+    status: &ClientStatus,
     dry_run: bool,
     explicit: bool,
     out: &mut dyn Write,
 ) -> io::Result<bool> {
-    let exe = context.exe_string();
-    let Some(program) = program else {
+    let client = status.client;
+    let Some(program) = &status.program else {
         writeln!(
             out,
             "{}: '{}' not found on PATH; skipped.",
             client.label(),
             client.program()
         )?;
-        let location = client.config_path(context).map_or_else(
-            || "its configuration".to_owned(),
-            |path| path.display().to_string(),
-        );
-        writeln!(out, "  To register by hand, add to {location}:")?;
-        for line in client.manual_snippet(&exe).lines() {
+        writeln!(
+            out,
+            "  To register by hand, add to {}:",
+            config_location(status)
+        )?;
+        for line in client.manual_snippet(&context.exe_string()).lines() {
             writeln!(out, "    {line}")?;
         }
         return Ok(!explicit);
     };
-    let mut steps = Vec::new();
-    match registered {
-        Registered::Present(registration) if context.is_this_program(registration) => {
+    match &status.registration {
+        RegistrationState::ThisExecutable(_) => {
             writeln!(
                 out,
                 "{}: already registered with this program; nothing to do.",
@@ -482,28 +685,22 @@ fn install(
             )?;
             return Ok(true);
         }
-        Registered::Present(registration) => {
+        RegistrationState::OtherCommand(registration) => {
             writeln!(
                 out,
                 "{}: replacing the registration that starts {}.",
                 client.label(),
                 registration.display()
             )?;
-            if client.add_needs_remove_first() {
-                steps.push(client.remove_args());
-            }
         }
-        Registered::Unreadable(reason) => {
+        RegistrationState::Unreadable(reason) => {
             writeln!(
                 out,
                 "{}: the current registration could not be read ({reason}); registering again.",
                 client.label()
             )?;
-            if client.add_needs_remove_first() {
-                steps.push(client.remove_args());
-            }
         }
-        Registered::Absent => {
+        RegistrationState::Absent => {
             writeln!(
                 out,
                 "{}: registering the '{SERVER_NAME}' MCP server.",
@@ -511,22 +708,18 @@ fn install(
             )?;
         }
     }
-    steps.push(client.add_args(&exe));
-    run_steps(runner, client, program, &steps, dry_run, out)
+    run_steps(runner, program, &status.install_plan, dry_run, out)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn uninstall(
-    context: &Context,
     runner: &dyn Runner,
-    client: Client,
-    program: Option<&Path>,
-    registered: &Registered,
+    status: &ClientStatus,
     dry_run: bool,
     explicit: bool,
     out: &mut dyn Write,
 ) -> io::Result<bool> {
-    if *registered == Registered::Absent {
+    let client = status.client;
+    if status.registration == RegistrationState::Absent {
         writeln!(
             out,
             "{}: CretLink is not registered; nothing to do.",
@@ -534,16 +727,13 @@ fn uninstall(
         )?;
         return Ok(true);
     }
-    let Some(program) = program else {
-        let location = client.config_path(context).map_or_else(
-            || "its configuration".to_owned(),
-            |path| path.display().to_string(),
-        );
+    let Some(program) = &status.program else {
         writeln!(
             out,
-            "{}: '{}' not found on PATH; remove the '{SERVER_NAME}' entry from {location} by hand.",
+            "{}: '{}' not found on PATH; remove the '{SERVER_NAME}' entry from {} by hand.",
             client.label(),
-            client.program()
+            client.program(),
+            config_location(status)
         )?;
         return Ok(!explicit);
     };
@@ -552,42 +742,36 @@ fn uninstall(
         "{}: removing the '{SERVER_NAME}' MCP server.",
         client.label()
     )?;
-    run_steps(
-        runner,
-        client,
-        program,
-        &[client.remove_args()],
-        dry_run,
-        out,
-    )
+    run_steps(runner, program, &status.uninstall_plan, dry_run, out)
 }
 
 fn run_steps(
     runner: &dyn Runner,
-    client: Client,
     program: &Path,
-    steps: &[Vec<String>],
+    steps: &[PlannedCommand],
     dry_run: bool,
     out: &mut dyn Write,
 ) -> io::Result<bool> {
-    for args in steps {
-        let mut shown = vec![client.program().to_owned()];
-        shown.extend(args.iter().cloned());
-        writeln!(out, "  $ {}", display_command(&shown))?;
+    for step in steps {
+        writeln!(out, "  $ {}", step.display())?;
         if dry_run {
             continue;
         }
-        match runner.run(program, args) {
-            Ok(result) if result.success => {}
-            Ok(result) => {
+        match run_one(runner, program, step) {
+            Ok(()) => {}
+            Err(ApplyError::Failed { output, .. }) => {
                 writeln!(out, "  failed:")?;
-                for line in result.output.lines().filter(|line| !line.trim().is_empty()) {
+                for line in output.lines().filter(|line| !line.trim().is_empty()) {
                     writeln!(out, "    {line}")?;
                 }
                 return Ok(false);
             }
-            Err(err) => {
-                writeln!(out, "  could not run {}: {err}", program.display())?;
+            Err(err @ (ApplyError::CouldNotRun { .. } | ApplyError::NotPresent(_))) => {
+                let reason = match err {
+                    ApplyError::CouldNotRun { reason, .. } => reason,
+                    other => other.to_string(),
+                };
+                writeln!(out, "  {reason}")?;
                 return Ok(false);
             }
         }
@@ -1210,6 +1394,124 @@ mod tests {
         assert!(report.contains("registered with another program: /elsewhere/cretlink mcp"));
         assert!(report.contains("Gemini CLI: 'gemini' not found on PATH"));
         assert!(report.contains("CretLink is not registered"));
+    }
+
+    fn shown(plan: &[PlannedCommand]) -> Vec<String> {
+        plan.iter().map(PlannedCommand::display).collect()
+    }
+
+    #[test]
+    fn inspect_reports_presence_registration_and_plans() {
+        let fixture = Fixture::new("inspect", &["claude", "codex"]);
+        let exe = fixture.exe();
+        fixture.write(
+            ".claude.json",
+            &format!(
+                r#"{{"mcpServers": {{"cretlink": {{"command": {}, "args": ["mcp"]}}}}}}"#,
+                json_string(&exe)
+            ),
+        );
+        fixture.write(
+            ".codex/config.toml",
+            "[mcp_servers.cretlink]\ncommand = \"/old/cretlink\"\nargs = [\"mcp\"]\n",
+        );
+        let statuses = inspect_clients(&fixture.context, &[]);
+        let clients: Vec<Client> = statuses.iter().map(|status| status.client).collect();
+        assert_eq!(clients, Client::ALL);
+
+        let claude = &statuses[0];
+        assert!(claude.present());
+        assert_eq!(
+            claude.registration,
+            RegistrationState::ThisExecutable(Registration {
+                command: exe.clone(),
+                args: strings(&["mcp"]),
+            })
+        );
+        assert_eq!(claude.config_path, Some(fixture.dir.join(".claude.json")));
+        assert!(claude.install_plan.is_empty());
+        assert_eq!(
+            shown(&claude.uninstall_plan),
+            strings(&["claude mcp remove --scope user cretlink"])
+        );
+
+        let codex = &statuses[1];
+        assert_eq!(
+            codex.registration,
+            RegistrationState::OtherCommand(Registration {
+                command: "/old/cretlink".to_owned(),
+                args: strings(&["mcp"]),
+            })
+        );
+        assert_eq!(
+            shown(&codex.install_plan),
+            vec![display_command(&strings(&[
+                "codex", "mcp", "add", "cretlink", "--", &exe, "mcp"
+            ]))]
+        );
+        assert_eq!(
+            shown(&codex.uninstall_plan),
+            strings(&["codex mcp remove cretlink"])
+        );
+
+        let gemini = &statuses[2];
+        assert!(!gemini.present());
+        assert_eq!(gemini.registration, RegistrationState::Absent);
+        assert!(gemini.install_plan.is_empty() && gemini.uninstall_plan.is_empty());
+        assert_eq!(
+            gemini.config_path,
+            Some(fixture.dir.join(".gemini").join("settings.json"))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_registration_is_planned_as_replaced() {
+        let fixture = Fixture::new("inspect-unreadable", &["claude"]);
+        fixture.write(".claude.json", "{ not json");
+        let status = inspect(&fixture.context, Client::Claude);
+        assert!(matches!(
+            status.registration,
+            RegistrationState::Unreadable(_)
+        ));
+        assert_eq!(status.install_plan.len(), 2);
+        assert_eq!(
+            status.install_plan[0].display(),
+            "claude mcp remove --scope user cretlink"
+        );
+        assert_eq!(status.uninstall_plan.len(), 1);
+    }
+
+    #[test]
+    fn apply_runs_exactly_the_plan_and_reports_failures() {
+        let fixture = Fixture::new("apply", &["claude"]);
+        let status = inspect(&fixture.context, Client::Claude);
+        let runner = Recorder::new(true);
+        assert_eq!(apply(&runner, &status, Action::Install), Ok(()));
+        let planned: Vec<Vec<String>> = status
+            .install_plan
+            .iter()
+            .map(|command| command.args.clone())
+            .collect();
+        assert_eq!(runner.calls(), planned);
+        // Nothing is registered, so uninstall has nothing to run.
+        assert_eq!(apply(&runner, &status, Action::Uninstall), Ok(()));
+        assert_eq!(runner.calls().len(), 1);
+
+        let failing = Recorder::new(false);
+        match apply(&failing, &status, Action::Install) {
+            Err(ApplyError::Failed { command, output }) => {
+                assert!(command.starts_with("claude mcp add"), "{command}");
+                assert!(output.contains("something went wrong"));
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+
+        let gemini = inspect(&fixture.context, Client::Gemini);
+        assert_eq!(
+            apply(&runner, &gemini, Action::Install),
+            Err(ApplyError::NotPresent(Client::Gemini))
+        );
+        assert_eq!(apply(&runner, &gemini, Action::Uninstall), Ok(()));
     }
 
     #[test]

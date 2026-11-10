@@ -1,7 +1,7 @@
 //! The versioned, length-prefixed bridge-console IPC contract (ADR-0004,
 //! REQ-N-012).
 //!
-//! The MCP bridge (`apps/mcp-bridge`) holds no session authority; it translates
+//! The MCP bridge (`cretlink-cli mcp`) holds no session authority; it translates
 //! MCP tool calls into these [`IpcRequest`]s and forwards them to the console
 //! over same-user local IPC ([`super::transport`]). The console — the sole
 //! routing authority — answers with an [`IpcResponse`] carrying the routed
@@ -81,11 +81,116 @@ use crate::target::{
 /// still runs, attributed to the AI, and is audited without a purpose). A
 /// console on minor `9` accepts both forms, so an older bridge keeps working
 /// and its calls show no purpose (REQ-N-012).
+///
+/// Minor `10` adds the additive, optional [`ClientName`] on
+/// [`IpcRequest::WithPurpose`]: the AI client's `clientInfo.name` from the MCP
+/// `initialize` request, which the console records in the call's audit records
+/// and maps to the client label of its activity feed (ST-M009-011). The label
+/// stays on the technician computer: the console never puts it on the session
+/// protocol, so it never reaches the customer computer. Because the wrapper
+/// rejects unknown fields, the bridge sends `client` only after a `Hello` on the
+/// same connection reports a console minor of at least [`IPC_CLIENT_MINOR`]; an
+/// older console receives the wrapper without it and its feed shows "AI
+/// assistant" (REQ-N-012).
+///
+/// Minor `11` adds the optional `account` of every routed [`TargetIdentity`]
+/// (ST-M009-008). [`TargetIdentity`] rejects unknown fields, so a bridge or
+/// terminal client on an older minor would fail every answer that carries it:
+/// the console sends `account` only on a connection whose `Hello` reported a
+/// client minor of at least [`IPC_ACCOUNT_MINOR`], and strips it otherwise —
+/// also on a connection that sent no `Hello` ([`IpcResponse::for_peer`],
+/// [`identity_for_peer`]).
 pub const IPC_PROTOCOL: ProtocolVersion = PROTOCOL_V1;
+
+/// The first IPC contract minor whose clients decode the `account` of a
+/// [`TargetIdentity`] (ST-M009-008).
+pub const IPC_ACCOUNT_MINOR: u16 = 11;
+
+/// Removes from `target` what a client on `peer_minor` cannot decode: the
+/// `account` below [`IPC_ACCOUNT_MINOR`], or when the client's minor is not
+/// known (no `Hello` on the connection). Applied by the console to everything
+/// it writes (REQ-N-012).
+pub fn identity_for_peer(target: &mut TargetIdentity, peer_minor: Option<u16>) {
+    if peer_minor.is_none_or(|minor| minor < IPC_ACCOUNT_MINOR) {
+        target.account = None;
+    }
+}
 
 /// The first IPC contract minor whose console understands
 /// [`IpcRequest::WithPurpose`] (ST-M009-007).
 pub const IPC_PURPOSE_MINOR: u16 = 9;
+
+/// The first IPC contract minor whose console understands the
+/// [`ClientName`] on [`IpcRequest::WithPurpose`] (ST-M009-011).
+pub const IPC_CLIENT_MINOR: u16 = 10;
+
+/// The longest [`ClientName`], in characters.
+pub const MAX_CLIENT_NAME_CHARS: usize = 64;
+
+/// The AI client's self-reported name (`clientInfo.name` from the MCP
+/// `initialize` request), bounded to one line of at most
+/// [`MAX_CLIENT_NAME_CHARS`] characters (ST-M009-011).
+///
+/// It is a label the client chose, used only to name the client in the
+/// technician's activity feed and audit records; it grants no authority and is
+/// never sent to the customer computer. It is validated on decode, so a
+/// multi-line, empty, or over-long name fails the frame closed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ClientName(String);
+
+impl ClientName {
+    /// Validates `raw` strictly: trimmed, 1 to [`MAX_CLIENT_NAME_CHARS`]
+    /// characters, no control characters.
+    ///
+    /// # Errors
+    ///
+    /// A plain description of why the name was refused.
+    pub fn new(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("the client name is empty".to_string());
+        }
+        if trimmed.chars().any(char::is_control) {
+            return Err("the client name must be one line of plain text".to_string());
+        }
+        if trimmed.chars().count() > MAX_CLIENT_NAME_CHARS {
+            return Err(format!(
+                "the client name is longer than {MAX_CLIENT_NAME_CHARS} characters"
+            ));
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+
+    /// Builds a name from what an MCP client reported, dropping control
+    /// characters and cutting an over-long name; `None` when nothing is left.
+    #[must_use]
+    pub fn from_client_info(raw: &str) -> Option<Self> {
+        let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+        let cut: String = cleaned.trim().chars().take(MAX_CLIENT_NAME_CHARS).collect();
+        Self::new(&cut).ok()
+    }
+
+    /// The name text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ClientName {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(&value)
+    }
+}
+
+impl From<ClientName> for String {
+    fn from(value: ClientName) -> Self {
+        value.0
+    }
+}
 
 /// Maximum size of one IPC frame, checked from the length prefix before any
 /// allocation. Sized to hold a full [`ExecReport`] whose captured output is at
@@ -115,6 +220,11 @@ pub enum IpcRequest {
     WithPurpose {
         /// The validated, single-line stated purpose.
         purpose: Purpose,
+        /// The AI client's `clientInfo.name` (IPC minor `10`, ST-M009-011),
+        /// sent only to a console that reported at least [`IPC_CLIENT_MINOR`];
+        /// omitted when unknown, so the minor-9 wire form is unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client: Option<ClientName>,
         /// The routed tool request the purpose belongs to.
         call: Box<IpcRequest>,
     },
@@ -332,6 +442,46 @@ pub enum IpcRequest {
         /// The terminal job.
         term: JobId,
     },
+}
+
+impl IpcResponse {
+    /// The routed target identity this answer carries, if any.
+    fn target_mut(&mut self) -> Option<&mut TargetIdentity> {
+        match self {
+            Self::Hello { target, .. } => target.as_mut(),
+            Self::SystemInfo { target, .. }
+            | Self::Exec { target, .. }
+            | Self::WriteStdin { target, .. }
+            | Self::Cancel { target, .. }
+            | Self::ListJobs { target, .. }
+            | Self::FsStat { target, .. }
+            | Self::FsList { target, .. }
+            | Self::MakeDir { target, .. }
+            | Self::Move { target, .. }
+            | Self::Delete { target, .. }
+            | Self::RemoveDir { target, .. }
+            | Self::Upload { target, .. }
+            | Self::Download { target, .. }
+            | Self::ListStaged { target, .. }
+            | Self::Cleanup { target, .. }
+            | Self::DesktopFrame { target, .. }
+            | Self::DesktopAck { target, .. }
+            | Self::ClipboardContents { target, .. }
+            | Self::TermOpened { target, .. }
+            | Self::TermAttached { target, .. } => Some(target),
+            Self::Error { .. } => None,
+        }
+    }
+
+    /// This answer in the form a client on `peer_minor` decodes
+    /// ([`identity_for_peer`]); `None` when the connection sent no `Hello`.
+    #[must_use]
+    pub fn for_peer(mut self, peer_minor: Option<u16>) -> Self {
+        if let Some(target) = self.target_mut() {
+            identity_for_peer(target, peer_minor);
+        }
+        self
+    }
 }
 
 impl IpcRequest {
@@ -921,6 +1071,7 @@ mod tests {
                 elevated: false,
                 simulated: true,
                 agent_version: "test".to_string(),
+                account: None,
             },
             call_id: 7,
             report: ExecReport {
@@ -979,6 +1130,7 @@ mod tests {
             elevated: false,
             simulated: true,
             agent_version: "test".to_string(),
+            account: None,
         }
     }
 
@@ -1143,6 +1295,7 @@ mod tests {
         let purpose = Purpose::new("Checking free disk space").unwrap();
         let request = IpcRequest::WithPurpose {
             purpose: purpose.clone(),
+            client: None,
             call: Box::new(IpcRequest::ListJobs {}),
         };
         let (mut a, mut b) = tokio::io::duplex(4096);
@@ -1204,11 +1357,84 @@ mod tests {
         assert!(
             !IpcRequest::WithPurpose {
                 purpose: Purpose::new("x").unwrap(),
+                client: None,
                 call: Box::new(IpcRequest::ListJobs {}),
             }
             .is_tool_call()
         );
         const { assert!(IPC_PROTOCOL.minor >= IPC_PURPOSE_MINOR) };
+        const { assert!(IPC_PROTOCOL.minor >= IPC_CLIENT_MINOR) };
+    }
+
+    /// The account in a routed identity reaches only a client on IPC minor 11
+    /// or later; an older or unannounced client gets the minor-10 form
+    /// (ST-M009-008, REQ-N-012).
+    #[test]
+    fn the_account_is_stripped_for_an_older_client() {
+        let mut target = sample_target();
+        target.account = Some(cretlink_protocol::AccountName::new(r"ACME\ann").unwrap());
+        let answer = IpcResponse::Hello {
+            protocol: IPC_PROTOCOL,
+            session: Some(SessionId::new()),
+            target: Some(target.clone()),
+        };
+        let account = |response: &IpcResponse| match response {
+            IpcResponse::Hello { target, .. } => target.as_ref().and_then(|t| t.account.clone()),
+            _ => None,
+        };
+        assert!(account(&answer.clone().for_peer(Some(IPC_ACCOUNT_MINOR))).is_some());
+        assert!(account(&answer.clone().for_peer(Some(IPC_ACCOUNT_MINOR - 1))).is_none());
+        assert!(account(&answer.for_peer(None)).is_none());
+        let routed = IpcResponse::ListJobs {
+            session: SessionId::new(),
+            target,
+            call_id: 1,
+            jobs: Vec::new(),
+        }
+        .for_peer(Some(10));
+        let json = serde_json::to_value(&routed).unwrap();
+        assert!(json["target"].get("account").is_none(), "{json}");
+        const { assert!(IPC_PROTOCOL.minor >= IPC_ACCOUNT_MINOR) };
+    }
+
+    /// The client name rides beside the purpose at IPC minor 10, is omitted
+    /// when unknown (the minor-9 wire form), and is validated on decode
+    /// (ST-M009-011, REQ-N-012).
+    #[tokio::test]
+    async fn client_name_round_trips_and_is_validated() {
+        let request = IpcRequest::WithPurpose {
+            purpose: Purpose::new("Checking free disk space").unwrap(),
+            client: Some(ClientName::new("claude-code").unwrap()),
+            call: Box::new(IpcRequest::ListJobs {}),
+        };
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        write_message(&mut a, &request).await.unwrap();
+        let decoded: IpcRequest = read_message(&mut b).await.unwrap();
+        assert_eq!(decoded, request);
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["client"],
+            serde_json::json!("claude-code")
+        );
+        for bad in [
+            serde_json::json!(""),
+            serde_json::json!("two\nlines"),
+            serde_json::json!("c".repeat(MAX_CLIENT_NAME_CHARS + 1)),
+        ] {
+            let json = serde_json::json!({
+                "request": "with_purpose",
+                "purpose": "Checking free disk space",
+                "client": bad,
+                "call": { "request": "list_jobs" },
+            });
+            assert!(serde_json::from_value::<IpcRequest>(json).is_err());
+        }
+        assert_eq!(
+            ClientName::from_client_info("  gemini-cli-mcp-client\r\n")
+                .unwrap()
+                .as_str(),
+            "gemini-cli-mcp-client"
+        );
+        assert!(ClientName::from_client_info("\u{0007}").is_none());
     }
 
     /// Reboot-resume can be armed **only** by the attended local gesture on the

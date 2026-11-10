@@ -43,24 +43,30 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::time::Duration;
 
-use cretlink_protocol::{ErrorCode, SessionApprovalCode, TargetIdentity};
+use cretlink_protocol::{DisplayName, ErrorCode, SessionApprovalCode, TargetIdentity};
 use cretlink_shared::{Actor, Outcome};
 use cretlink_transport::{PairingError, SecureChannelError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod action;
+pub mod activity;
 mod dial;
 mod host;
 mod joiner;
 mod reboot;
 mod redeem;
+pub mod report;
 mod runtime;
 mod transfer;
 
 pub use action::{
     ActionOutcome, Attribution, MAX_ACTION_DESCRIPTION_CHARS, describe_cancel, describe_operation,
     is_transfer_step,
+};
+pub use activity::{
+    ActivityEntry, ActivityFeed, ActivityItem, ActivityKind, ActivitySource, ActivityState,
+    CustomerActivity,
 };
 pub use dial::{Dial, DirectDial, RelayDial, WssRelayDial};
 // The wss trust material a retrying endpoint builds once and clones per attempt
@@ -75,6 +81,10 @@ pub use reboot::{
 pub use redeem::{
     AnswerOutcome, RedemptionClock, RedemptionOutcome, RedemptionRefusal, agent_answer_challenge,
     console_redeem,
+};
+pub use report::{
+    CleanupNote, CleanupResult, CleanupState, CustomerCounts, CustomerReport, CustomerReportInput,
+    EndedBy,
 };
 pub use transfer::{CancelToken, DownloadRequest, TransferProgress, TransferReport, UploadRequest};
 
@@ -216,6 +226,13 @@ pub(crate) const CONSENT_TIMEOUT: Duration = Duration::from_secs(120);
 /// silent peer cannot stall teardown.
 pub(crate) const TEARDOWN_DRAIN: Duration = Duration::from_secs(2);
 
+/// How long the console keeps draining after its own `Revoke` for the agent's
+/// teardown report (protocol minor 11, ST-M009-012). The agent stops its jobs
+/// and sweeps its staging area first, so this is longer than
+/// [`TEARDOWN_DRAIN`]; the drain ends as soon as the report arrives or the
+/// agent closes.
+pub(crate) const CLEANUP_REPORT_WAIT: Duration = Duration::from_secs(5);
+
 /// The honest full-control disclosure the customer sees before consenting
 /// (REQ-S-003, REQ-S-016).
 ///
@@ -353,18 +370,50 @@ pub enum SessionEvent {
     /// transfer's commit is. Delivered under the same lifecycle reserve as
     /// streamed output, so a burst of actions can never crowd out a stop or
     /// revoke event.
+    ///
+    /// A file leaving the customer computer is reported twice under one `id`:
+    /// when sending starts (`outcome` [`ActionOutcome::InProgress`]) and again
+    /// when it completes or fails, with the byte count. A received file is
+    /// reported at its commit with its byte count (ST-M009-011).
     RequestHandled {
+        /// Stable for the life of one activity item: a later `RequestHandled`
+        /// with the same id (a finished file transfer) replaces the earlier one.
+        /// Minted per session by the agent, starting at 1.
+        id: u64,
         /// Which local actor drove the request (from the wire `origin`).
         origin: Origin,
         /// The caller's stated purpose (from the wire `purpose`): an unverified
         /// claim, shown beside `operation`, never instead of it. `None` for
         /// technician-driven requests.
         purpose: Option<Purpose>,
+        /// What the request does, derived by the agent from the request itself
+        /// ([`ActivityKind::of`]), ST-M009-011.
+        kind: ActivityKind,
         /// The real operation in plain words ([`describe_operation`]), bounded
         /// and free of typed, clipboard, stdin, or file content.
         operation: String,
+        /// The remote path the request acts on, when there is one (the source
+        /// of a move), bounded like the operation text.
+        path: Option<String>,
+        /// The byte count, when known: the bytes sent so far or in total for a
+        /// file leaving the computer, the committed length of a received file.
+        bytes: Option<u64>,
         /// How the agent answered the request.
         outcome: ActionOutcome,
+        /// How long the agent took, in milliseconds: from the request (the
+        /// first read of a file transfer) to its answer (the last read).
+        /// `None` while a transfer is still in progress.
+        duration_ms: Option<u64>,
+    },
+    /// Activity events ([`Self::RequestHandled`], [`Self::CommandStarted`],
+    /// [`Self::ExecFinished`]) were shed on the agent side to keep the bounded
+    /// event channel's lifecycle reserve free (REQ-N-006). Emitted, at the
+    /// place in the stream where they were dropped, as soon as there is room
+    /// again, so the customer surface shows that `count` items were not shown
+    /// instead of a silent gap (ST-M009-011, REQ-N-008).
+    ActivityShed {
+        /// How many activity events were dropped since the last marker.
+        count: u64,
     },
     /// A chunk of a running job's output (ST-M003-002). Emitted on the console
     /// side as it streams in. Bytes are raw, untrusted remote output.
@@ -573,6 +622,36 @@ pub enum SessionError {
 pub trait SessionAudit: Send + Sync + core::fmt::Debug {
     /// Records one session lifecycle event.
     fn record(&self, actor: Actor, action: &'static str, outcome: Outcome);
+
+    /// Records the honest identity the customer's consent bound, right after
+    /// `consent_granted`, so a later reader knows which computer the session
+    /// controlled (ST-M009-012, REQ-F-016). Defaulted to a no-op for sinks that
+    /// keep only the lifecycle.
+    fn record_target(&self, _identity: &TargetIdentity) {}
+
+    /// Records how the session ended and the peer's teardown report, after the
+    /// terminal lifecycle record and before the log is sealed (ST-M009-012).
+    /// Defaulted to a no-op for sinks that keep only the lifecycle.
+    fn record_end(&self, _end: &SessionEnd) {}
+}
+
+/// How a session ended, as the runtime reports it to [`SessionAudit::record_end`]
+/// (ST-M009-012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEnd {
+    /// Who ended it, from this side's point of view.
+    pub ended_by: EndedBy,
+    /// The terminal lifecycle action (`revoked`, `disconnected`, `error`,
+    /// `consent_denied`, `compare_mismatch`).
+    pub action: &'static str,
+    /// Whether full control was granted before the end. Without it nothing ran
+    /// on the customer computer, so there was nothing to clean up there.
+    pub control_granted: bool,
+    /// On the console side, the teardown report the agent sent
+    /// ([`cretlink_protocol::ControlMessage::CleanupReported`]); `None` when
+    /// none arrived (a lost connection, an older peer), which is never
+    /// success.
+    pub peer_cleanup: Option<CleanupReport>,
 }
 
 /// An audit sink that discards every event — the default when a caller wires no
@@ -594,6 +673,13 @@ pub struct ConsoleHints {
     /// A human label for the technician console, for example
     /// `"This computer (technician)"`.
     pub label: String,
+    /// The technician's display name as the operating-system account reports
+    /// it (ST-M009-011). The console sends it to the agent in the pairing
+    /// handshake ([`cretlink_protocol::PairingMessage::Nonce`], protocol minor
+    /// 10) so the customer side can show who the technician's computer says is
+    /// helping. A label only: it grants no authority. `None` sends no name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<DisplayName>,
 }
 
 /// Cross-handle shared state a session task publishes and its handle reads.
@@ -613,6 +699,19 @@ pub(crate) struct Shared {
     /// never a security decision.
     armed_not_after: AtomicI64,
     cleanup: OnceLock<CleanupReport>,
+    /// On the console side, the teardown report the agent sent before the
+    /// channel closed (protocol minor 11, ST-M009-012).
+    peer_cleanup: OnceLock<CleanupReport>,
+    /// Who ended the session, from this side's point of view, set once at
+    /// teardown (ST-M009-012).
+    ended_by: OnceLock<EndedBy>,
+    /// The console's display name received in the pairing handshake, on the
+    /// agent side only (ST-M009-011). An unverified label the customer surface
+    /// shows as what the technician's computer says.
+    peer_display_name: OnceLock<DisplayName>,
+    /// The display name this console sends in the pairing handshake, on the
+    /// console side only (from [`ConsoleHints::display_name`], ST-M009-011).
+    own_display_name: Option<DisplayName>,
 }
 
 impl fmt::Debug for Shared {
@@ -633,6 +732,9 @@ impl fmt::Debug for Shared {
             .field("heartbeats", &self.heartbeats())
             .field("armed_not_after", &self.armed_not_after())
             .field("cleanup", &self.cleanup.get())
+            .field("peer_cleanup", &self.peer_cleanup.get())
+            .field("ended_by", &self.ended_by.get())
+            .field("peer_display_name", &self.peer_display_name.get())
             .finish()
     }
 }
@@ -647,7 +749,33 @@ impl Shared {
             heartbeats: AtomicU64::new(0),
             armed_not_after: AtomicI64::new(0),
             cleanup: OnceLock::new(),
+            peer_cleanup: OnceLock::new(),
+            ended_by: OnceLock::new(),
+            peer_display_name: OnceLock::new(),
+            own_display_name: None,
         }
+    }
+
+    /// Shared state for a console-side session that sends `display_name` in
+    /// the pairing handshake (ST-M009-011).
+    fn for_console(display_name: Option<DisplayName>) -> Self {
+        Self {
+            own_display_name: display_name,
+            ..Self::new()
+        }
+    }
+
+    fn own_display_name(&self) -> Option<DisplayName> {
+        self.own_display_name.clone()
+    }
+
+    fn set_peer_display_name(&self, name: DisplayName) {
+        // Set at most once, at pairing completion; a redundant set is ignored.
+        let _ = self.peer_display_name.set(name);
+    }
+
+    fn peer_display_name(&self) -> Option<DisplayName> {
+        self.peer_display_name.get().cloned()
     }
 
     fn set_session(&self, session: SessionId) {
@@ -729,5 +857,22 @@ impl Shared {
 
     fn cleanup(&self) -> Option<CleanupReport> {
         self.cleanup.get().cloned()
+    }
+
+    fn set_peer_cleanup(&self, report: CleanupReport) {
+        // The first report counts; a repeated one is ignored (write-once).
+        let _ = self.peer_cleanup.set(report);
+    }
+
+    fn peer_cleanup(&self) -> Option<CleanupReport> {
+        self.peer_cleanup.get().cloned()
+    }
+
+    fn set_ended_by(&self, ended_by: EndedBy) {
+        let _ = self.ended_by.set(ended_by);
+    }
+
+    fn ended_by(&self) -> Option<EndedBy> {
+        self.ended_by.get().copied()
     }
 }

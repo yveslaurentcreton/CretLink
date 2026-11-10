@@ -28,7 +28,7 @@ including the maintainer-run half ([`manual-tests.md`](manual-tests.md)) of
 the privileged adversarial suite (ST-M003-007), whose automated half is green
 and cited by test name below. Resilience and release hardening (M006) is in
 progress: the reboot-resume ticket, proof and fail-closed checks (ADR-0014),
-the residual-access inventory and `cretlink-support-agent recover`, and
+the residual-access inventory and `cretlink recover`, and
 kill-on-close process-tree containment are implemented; wiring reboot-resume
 into an actual reboot (the auto-start entry and the post-reboot reconnect) is
 not, so hardware scenario MT-8 cannot pass yet. Official releases are
@@ -358,6 +358,33 @@ authenticated pairing bound to a human-compared SAC (REQ-S-006, REQ-F-005), and
 a single clearly worded full-control consent (REQ-F-006). A malicious
 announcement can at worst start a pairing attempt that fails code comparison;
 it cannot mint authority.
+
+*A borrowed technician name (ST-M009-011).* The console advertises its
+technician's display name (the account's full name, else the user name) and
+sends it again, as an optional field of its pairing `Nonce` (protocol minor 10),
+so the customer window can say who the technician's computer claims to be. Any
+LAN peer can advertise, and any console can send, whatever name it likes.
+Mitigation: the name is validated to one bounded line without control or
+text-direction characters, it is not part of the Session Approval Code
+derivation and grants nothing, and the customer surface labels it as what the
+technician's computer says, never as a verified identity. Trust still comes
+only from comparing the code with the person on the phone (REQ-S-006). Residual
+risk: a customer who reads only the name, not the code, can be misled; the
+consent flow keeps the code comparison mandatory for that reason.
+
+*The customer's account in the target identity (ST-M009-008).* Since protocol
+minor 11 the agent's `TargetIdentity` (hostname, Windows version, architecture,
+elevation, agent version) also carries, as an optional `account`, the account
+its process runs as (`DOMAIN\user` from `GetUserNameExW(NameSamCompatible)`,
+the machine name as the domain for a local account, or the bare user name
+when only that can be read). It is the customer's own account name,
+shown to the technician in the live identity line, and, like the hostname, part
+of the target identity in AI-facing results, so it reaches the technician's AI
+client; it is not a credential and grants nothing. It is validated on decode
+to one bounded line without control or text-direction characters, omitted when
+the account could not be read, and not part of the reboot-resume target
+binding, whose pre-image is frozen (ADR-0014). Like every identity field it is
+what the agent reports, not a verified claim.
 
 *Denial of service.* An attacker suppresses or floods discovery, exhausts the
 listener with connection attempts or oversized messages, or disrupts an active
@@ -710,10 +737,95 @@ outward or fetching hostile payloads.
   the AI's own unverified reason, next to the real command, path, or action,
   its source, and its result — never instead of them**. Like `origin`, it grants
   no authority and is never interpreted: it is display and audit text. A
-  technician's own actions carry no purpose and are labelled by their source. The append-oriented audit trail records
+  technician's own actions carry no purpose and are labelled by their source.
+- *One activity item on both surfaces (ST-M009-011).* The technician's console
+  and the customer window build the same activity item for every action: its
+  source, the AI's stated purpose, a plain description, its kind, the real
+  operation, path and byte count, the honest state, the start time and the
+  duration. The console builds it from its own capture-time audit records of
+  every actor (the AI, the technician terminal, manual console actions),
+  including read-only AI calls; the customer side builds it from what its agent
+  actually did. A file leaving the customer computer is reported when sending
+  starts and again when it ends, with its byte count (REQ-S-016). Every
+  request the agent refuses — one bound to another session, or a refused
+  transfer chunk (once per path until that path's next reported request) —
+  is a failed item on the customer side too, with the reason in plain words
+  and no file content. A request the technician's computer refuses before
+  sending it (a path that fails the wire rules, such as a UNC or traversal
+  path) never reaches the customer computer, so only the technician side
+  shows it. Events shed
+  under pressure on either side are counted and shown as "N items were not
+  shown" where they were dropped, never as a silent gap (REQ-N-008); the
+  durable audit log is never lossy. An item still running when the session ends
+  is shown as ended with the session, never as done.
+- *The AI client's name stays on the technician computer (ST-M009-011).* The
+  bridge passes the MCP client's self-reported `clientInfo.name` to the console
+  over local IPC (IPC minor 10), bounded to one line; the console records it in
+  its audit records and labels the activity "Claude Code", "Codex CLI",
+  "Gemini CLI" or "AI assistant". It is the client's own claim and grants
+  nothing, and the console never puts it on the session protocol, so the
+  customer computer only ever sees "AI assistant".
+- *Audit trail.* The append-oriented audit trail records
   session identity, actor or source, action, arguments, and results
   (REQ-S-017), so injected or malicious actions are observable during the
   session and reconstructable afterwards.
+- *End records and the session history (ST-M009-012).* At consent the console
+  records the identity the consent bound (`target_identity`); at the end,
+  before the file is sealed, it records who ended the session
+  (`session_ended`: technician, customer, lost connection or failure) and the
+  cleanup report the agent sent with every note (`cleanup_report`). The agent
+  sends that report over the encrypted channel at the end of an active
+  session (`CleanupReported`, protocol minor 11), before it closes after the
+  technician's stop and before its own `Revoke` when the customer stops. The
+  report is a claim of the customer computer, like every agent result: it is
+  bounded (at most 32 notes of 512 bytes, one line each, validated on
+  decode), recorded as the agent's, and grants nothing. Without one — a lost
+  connection, an interrupted session — the record says so and the cleanup is
+  shown as unknown, never as success (REQ-N-015, REQ-F-019); a session that
+  never reached full control needed none. The history reads these records
+  back and verifies each file's chain and seal first: a broken file is
+  summarized only from its verified prefix and shown as damaged, an unsealed
+  one as unfinished, and neither is skipped. The records hold no session
+  secret (REQ-S-017). `open_audit` opens only the audit folder or a file the
+  history listed inside it, with the platform opener and no shell.
+- *The customer keeps no record unless asked (ST-M009-012, REQ-F-027).* The
+  customer window builds its end report in memory from what it showed and
+  the agent's own teardown report, and writes nothing. Only **Save a copy**
+  writes a file — after a save dialog, into a folder of the customer's
+  choosing (`Documents\CretLink\` by default, created only then) — as one
+  HTML file with inline CSS, no script and no external resource, in which
+  every string from the session (operations, paths, purposes, notes, the
+  technician's name) is escaped, so a hostile string cannot run or reach the
+  network when the file is opened (REQ-S-016). The report holds what the
+  customer saw and no session secret: no approval code, no key, no
+  connection code. **Open** opens only a file this process saved, with the
+  platform opener started by its absolute path (`%SystemRoot%\explorer.exe`,
+  `/usr/bin/open`): Windows looks for a bare program name in the running
+  program's own folder first, often `Downloads` for the customer, where a
+  planted `explorer.exe` would otherwise run with the session's
+  administrator rights. On Linux (technician only) `xdg-open` is found on the
+  user's own `PATH`. The technician's host name is read without starting a
+  program by name either (`COMPUTERNAME`, the kernel's host name, or
+  `/bin/hostname` on macOS).
+- *The technician interface (ST-M009-008).* The technician window renders
+  every string that comes from the customer computer or an AI (operations,
+  paths, hostnames, notes, stated purposes, codes) as text nodes only: its DOM
+  builder has no markup path and refuses inline event-handler attributes, and
+  a rendering test checks that markup in an activity item stays text
+  (REQ-S-016, REQ-S-018). A stated purpose is labelled as such, above the real
+  operation. Items shed under load are shown as "N items were not shown" where
+  they were dropped, never silently. The end report takes the cleanup result
+  from the sealed audit file and says "Cleanup unknown", never "Cleaned up",
+  when no cleanup report arrived or the file cannot be read; a broken or
+  unsealed audit file is shown as such (REQ-N-015). The Live tab **Audit**
+  shows this session's audit records from its own audit file, only the ones
+  the hash chain verified, each as one bounded line built from what the
+  record already holds — records carry no secret by construction
+  (REQ-S-017), redactions read `[REDACTED]` and bytes only as a digest — and
+  never a payload or a chain field; a file name that is not a plain name in
+  the audit folder is not read. Connecting an AI client
+  shows the exact commands before anything changes, and a run-once copy warns
+  that its registration breaks when the copy moves (REQ-F-025).
 - *Immediate interruption and ephemeral authority.* Customer and technician
   each hold an always-available stop control; stop rejects new tool calls,
   terminates or honestly reports running work, and invalidates session secrets
@@ -757,14 +869,16 @@ outward or fetching hostile payloads.
   state a reassuring purpose for a harmful action. The mitigation is that the
   real operation is always shown beside the purpose and the purpose is
   labelled as the AI's claim, so the customer and technician can see the
-  mismatch and stop the session. Two gaps remain: the customer GUI shows the
-  purpose on command cards only, while other AI actions (file, desktop,
-  clipboard, transfer) reach the agent's session events and the headless
-  agent's text output with their purpose but are not yet rendered in the GUI
-  (ST-M009-008/009); and the console's live activity echo shows the purpose
-  only on the start lines it already renders, while the audit log holds it for
-  every call. A console older than IPC minor 9 receives calls without the
-  purpose, so they are shown and audited without one.
+  mismatch and stop the session. One gap remains: both application backends
+  now emit the same activity item, with purpose, for every action
+  (ST-M009-011), but the new interfaces that render it are separate stories
+  (ST-M009-008, ST-M009-009); until they land, the windows render less than
+  the backends emit. A console older than IPC minor 9 receives calls without
+  the purpose, so they are shown and audited without one. In the other
+  direction, the console sends the customer's `account` in a routed target
+  identity only to a client whose `Hello` reported IPC minor 11 or later, so an
+  older bridge, which refuses unknown identity fields, never fails closed on
+  every answer (REQ-N-012).
 - Exfiltration by command is not blockable. An AI with consented administrator
   control can move customer data using ordinary commands, including directly
   off the customer computer when that machine has internet access. CretLink
@@ -816,13 +930,16 @@ is never counted as AI in-flight control and is attributed separately.
 **Status.** The wire and same-user IPC surface are implemented: the terminal
 attach/stream/detach message set, the console terminal registry and
 multi-consumer fan-out, fail-closed routing, and the adversarial suite. M008 is
-a draft milestone, and its front ends are experimental. The standalone
-`cretlink-shell` command-line client (ST-M008-002) is a same-user IPC consumer
+a draft milestone, and its front ends are experimental. The command-line
+client `cretlink-cli shell` (ST-M008-002) is a same-user IPC consumer
 beside the MCP bridge: it holds no session authority and adds no new listener,
 endpoint, protocol variant, or trust anchor (REQ-N-012, REQ-S-023). The console
 GUI's terminal panel (ST-M008-001) attaches to the hosted session in-process
 rather than over IPC, fails closed outside a consented session, and writes the
-untrusted VT stream to an xterm.js terminal. Verified by the console IPC tests
+untrusted VT stream to an xterm.js terminal. Its opening and closing are
+recorded in the session's audit log as the `terminal` actor, like an IPC
+terminal client's, and appear in the technician's activity feed
+(ST-M009-011, REQ-S-023). Verified by the console IPC tests
 (`apps/console/tests/terminal_ipc_e2e.rs`), the terminal registry unit tests
 (`apps/console/src/service.rs`), a `cfg(windows)` real-ConPTY-over-IPC
 end-to-end, and the ST-M008-003 adversarial consolidation suite for the operator
@@ -902,7 +1019,7 @@ could otherwise stall the shared stream.
   puts a connection into duplex mode.
 
 **Operator-surface validation (ST-M008-003).** The operator terminal surface —
-the standalone `cretlink-shell` client and the console panel, both non-AI
+the `cretlink-cli shell` client and the console panel, both non-AI
 technician front ends — is exercised by an adversarial consolidation
 suite so its safety properties are pinned, not assumed:
 
@@ -933,7 +1050,7 @@ suite so its safety properties are pinned, not assumed:
   authority by construction.
 - Operator-facing rendering of the VT stream relies on the terminal emulator in
   each front end (xterm.js in the console panel, the host terminal for
-  `cretlink-shell`); the contract passes raw VT bytes through as untrusted data,
+  `cretlink-cli shell`); the contract passes raw VT bytes through as untrusted data,
   and escape-sequence handling is only as robust as that emulator.
 
 ### Command execution
@@ -1304,6 +1421,16 @@ its hard-disconnect sibling `disconnect_mid_upload_is_honest_never_success`
 proves the same honest outcome when the transport is *severed* mid-upload rather
 than gracefully revoked — the console surfaces a terminal `Revoked { Error }`,
 the upload never reads complete, and no committed final file is published;
+an error on the technician's own file (a download's missing destination folder,
+an upload's missing source, denied access, a full disk) ends that transfer as
+failed in the stage `local`, with the local path and the reason, and is never
+reported as a lost session, so the reported reason is the true one and the
+technician can act on it (REQ-N-008, REQ-N-015, ST-M003-005) —
+`download_into_a_missing_local_folder_is_failed_and_the_session_stays_usable`
+and `upload_of_a_missing_local_file_is_failed_and_the_session_stays_usable`
+prove it with a command that still runs afterwards, and on Linux
+`download_onto_a_full_disk_is_failed_and_the_session_stays_usable` proves that
+a write the disk refused fails the download instead of publishing a short file;
 partial-write atomicity or recovery behaviour is documented per operation
 (ST-M003-004).
 
@@ -1560,10 +1687,31 @@ fresh handshake proves peer continuity but never restores control — attended
 full-control consent still runs (ST-M006-002). It is the **single reviewed
 exception** to ADR-0003's "no key material persists across sessions", bounded
 to authority-reducing continuity proof only. The owned-resource inventory and
-`cretlink-support-agent recover [--remove]` (ST-M006-003) report and remove
-CretLink residue offline — staged trees and sealed tickets — and assert every
-other ownable kind empty. The agent does not itself register the per-user OS
-auto-start entry or bind redemption into a live post-reboot dial; the
+`cretlink recover [--remove]` (ST-M006-003, ST-M009-010; also `cretlink-cli
+recover` and a `CretLink-Support*` copy's `recover`, the only subcommand such a
+copy accepts) report and remove CretLink residue offline — staged trees and
+sealed tickets — and assert every other ownable kind empty. The verb opens no
+connection and grants no control; removing exits with an error whenever
+something was kept or could not be read. The Get help role runs the startup
+sweep that reclaims staging trees a crashed run left behind before it
+connects, once the window is past the UAC step, and when the sweep keeps
+files it tells the customer so in plain words, with the recovery command as
+it runs in an administrator Windows PowerShell: the full path of
+`cretlink-cli.exe` next to the program, or of the program itself piped to
+`Out-Host`, because PowerShell does not wait for a GUI-subsystem program
+otherwise and would show its report after the prompt has returned. The path
+is a single-quoted PowerShell literal, so nothing in it is interpreted.
+The sweep never removes a live session's staging: every customer-side
+process holds a shared lock on `.in-use.lock` in the staging base for as long
+as it runs, and the sweep runs only when it gets that lock exclusively —
+otherwise it is skipped, nothing is claimed, and a later start retries. The
+operating system releases the lock with the process, so a crash cannot strand
+it. `recover --remove` is an explicit customer action and does not take the
+lock. The same verb and sweep remain in the `cretlink-support-agent`
+development tool.
+The agent does not itself
+register the per-user OS auto-start entry or bind redemption into a live
+post-reboot dial; the
 end-to-end reboot path is hardware scenario MT-8 in
 [`manual-tests.md`](manual-tests.md), not yet recorded. On Windows, every
 job's process tree is held in a kill-on-close Job Object (ST-M006-007), so even
@@ -1666,7 +1814,7 @@ while cleanup is incomplete.
   outcomes (REQ-N-008). Lifecycle states, including crash recovery and
   cleanup, must be explicit and idempotent where practical (REQ-N-004), so an
   interrupted cleanup can be re-run rather than abandoned. The recovery command
-  `cretlink-support-agent recover` (ST-M006-003) inspects and, with
+  `cretlink recover` (ST-M006-003, ST-M009-010) inspects and, with
   `--remove`, removes known CretLink residuals without hiding evidence,
   reporting anything it keeps with a reason and manual remediation, consistent
   with the no-stealth rule (REQ-S-002).
@@ -1869,8 +2017,9 @@ metadata rather than content.
 
 ### One application, two roles (M009)
 
-**Status.** Implemented in `apps/app` (ST-M009-005, ADR-0018); the UAC prompt
-and a Windows run of both roles against each other are manual checks.
+**Status.** Implemented in `apps/app` (ST-M009-005, ST-M009-009, ADR-0018);
+the UAC prompt, the compact bar and a Windows run of both roles against each
+other are manual checks (`docs/manual-tests.md`, MT-12).
 
 **What changed.** The technician console, the customer's support window and the
 command-line subcommands are one program, `cretlink`. The customer runs the
@@ -1879,7 +2028,8 @@ computer, unused.
 
 **Entry points.** The start screen (Windows), the file name (a copy named
 `CretLink-Support*` opens Get help), the `--role technician | customer`
-argument the start screen uses to start a role, and the subcommands.
+argument the application uses to start a role (with `--from-start` for Get
+help from the start screen, ST-M009-009), and the subcommands.
 
 **Threats and mitigations.**
 
@@ -1890,20 +2040,29 @@ argument the start screen uses to start a role, and the subcommands.
   process, so a customer process has no way to reach them, and the reverse. A
   `CretLink-Support*` copy refuses subcommands and `--role technician`, so a
   file handed to a customer cannot serve MCP or open the console
-  (REQ-F-024).
+  (REQ-F-024). Its one accepted subcommand is the offline `recover
+  [--remove]` (ST-M009-010), which opens no connection and grants nothing.
 - *Silent or repeated elevation.* Get help elevates only through the visible
-  UAC prompt (`ShellExecuteExW`, `runas`); declining starts nothing and says
-  so (REQ-F-002). The relaunched process gets exactly `--role customer` and
-  never relaunches again, so there is no prompt loop; it reports its real
-  elevation state (REQ-S-011). Elevation grants no control: pairing, the
-  Session Approval Code and the informed consent still gate everything
-  (REQ-S-001, REQ-S-003).
+  UAC prompt (`ShellExecuteExW`, `runas`), and only after the unelevated
+  window has explained it and the customer pressed **Continue** (`#c-admin`,
+  ST-M009-009); declining starts nothing, and the window says honestly that
+  administrator tasks will not work (REQ-F-002). The relaunched process gets
+  exactly `--role customer` and never explains or relaunches again, so there
+  is no prompt loop; it reports its real elevation state (REQ-S-011).
+  **Continue without admin rights** goes on in the same unelevated process,
+  and the identity says "Admin rights: No". The backend refuses a dial before
+  the step is passed. Elevation grants no control: pairing, the Session
+  Approval Code and the informed consent still gate everything (REQ-S-001,
+  REQ-S-003).
 - *Something else starts `cretlink --role customer`.* That is the same as the
-  customer double-clicking it: a UAC prompt, a visible window, no session
-  without the customer's actions. It adds no hidden path (REQ-S-002).
+  customer double-clicking it: a visible window (elevated only through a UAC
+  prompt somebody answered), no session without the customer's actions. It
+  adds no hidden path (REQ-S-002). `--from-start` only changes where **Back**
+  goes.
 - *Persistence through the application.* Get help installs nothing and adds no
-  auto-start entry (REQ-F-001, REQ-F-019); only the technician role may be
-  installed, per user, in a later story (ST-M009-006).
+  auto-start entry (REQ-F-001, REQ-F-019). Only the technician role installs,
+  per user (ST-M009-006, below); the customer role never offers it, and a
+  `CretLink-Support*` copy refuses `install` and `uninstall`.
 - *Missing WebView2 runtime.* The program says so in a native message box and
   starts nothing, rather than failing in a half-open state.
 
@@ -1912,6 +2071,117 @@ runs; a flaw that reached arbitrary code execution inside the customer process
 could use it, but such a flaw would already control an elevated process. The
 customer depends on the WebView2 runtime the technician console already needed
 (ADR-0018).
+
+#### The customer window (ST-M009-009)
+
+**What it adds.** The customer interface of the mock: a state band in words on
+every screen, the untrusted list of nearby consoles, the compare and consent
+screens, the live activity with **Stop now**, a second always-on-top window
+(the compact bar), the close question and the end report.
+
+**Threats and mitigations.**
+
+- *Hiding the session from the customer.* While a session exists, the main
+  window or the compact bar is always visible: **Make small** hides the main
+  window only after the bar is shown, minimising the main window shows the
+  bar, the bar refuses to close during a session, and when the session ends
+  the main window comes back with the end report (REQ-S-002). The bar is
+  always on top and in the taskbar. Its state is in words, never colour alone
+  (REQ-N-013).
+- *Closing the window without revoking.* A close of the main window during a
+  session — its close button, `Alt+F4`, or an exit request — is held in the
+  backend (`CloseRequested`, `ExitRequested`) and the window asks "Stop the
+  session and close?". **Stop and close** revokes the session, waits (bounded)
+  for the cleanup report, then exits; outside a session the window closes at
+  once. A close right after **Stop**, while the session task still tears
+  down, takes the same bounded wait. A process that is killed still drops the
+  encrypted channel, which the technician side sees as a lost connection
+  (REQ-S-004, REQ-S-009).
+- *A Stop that never reaches the wire.* The window goes safe at once, so the
+  session pump must not mistake its own stopped model for the end of the
+  session: it prefers queued intents over wire events and sends any Stop or
+  decline still queued before it waits for the teardown (REQ-F-018). A
+  finished dial that is still tearing down writes only its own state, never
+  the next dial's (each dial has a generation).
+- *A false "stopped" state.* Stop and `Escape` exist only while a session
+  exists; on the resting window the backend refuses a stop rather than
+  showing a session that never existed.
+- *A forged entry in the nearby list.* Each entry shows the name and host name
+  the console advertises — the technician's computer advertises its host name
+  as the DNS-SD instance name — but nothing is preselected, nothing connects
+  on its own, and an entry grants nothing: trust still comes only from the
+  Session Approval Code (ADR-0007, REQ-S-006). The list is capped and every
+  field is written as text.
+- *Injected text in the activity.* Purposes, operations, paths and names from
+  the technician's side are written only as text nodes, never parsed as
+  markup (REQ-S-018). The stated purpose is shown beside the real operation,
+  never instead of it (REQ-F-026); a file leaving the computer is said in
+  words.
+- *The second window as a new command surface.* The compact bar loads the same
+  frontend and uses the customer role's commands only; it gets the same core
+  capability as the main window and nothing more.
+
+**Residual risks.** A customer who reads only the advertised name, not the
+code, can still be misled by a forged console (as before). The Screen tile is
+only as current as the agent's `DesktopActivity` signals, and desktop control
+is not offered by this window yet (M005). A forced kill of the customer process
+(Task Manager) cannot ask first; the session then ends as a lost connection.
+
+#### Run once or install the technician role (ST-M009-006)
+
+**What it adds.** *Install for me* copies `cretlink` and `cretlink-cli` to a
+location fixed per operating system (`%LOCALAPPDATA%\Programs\CretLink\`,
+`~/Applications/CretLink.app`, `~/.local/bin/`), adds a Start-menu shortcut
+and an uninstall entry under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\CretLink`
+(Windows) or a desktop entry (Linux), registers the selected AI clients with
+the installed path, and records all of it in `install.json`. A *run-once* copy
+writes nothing of its own but the audit trail.
+
+**Threats and mitigations.**
+
+- *Hidden persistence.* The install is per user and needs no administrator
+  rights. It creates no service, no scheduled task, no Run key and no login
+  item: nothing starts CretLink except the user (the shortcut, the desktop
+  entry or the bundle) or an AI client the technician connected. The only
+  registry entry is the uninstall entry, which is visible in *Installed apps*
+  (REQ-F-024, REQ-F-019).
+- *An install that cannot be removed completely.* Uninstall (`cretlink
+  uninstall`, Settings, or the uninstall entry) shows what it will remove and
+  asks first (CLI: unless `--yes`). It removes the files, the shortcut or
+  desktop entry, the uninstall entry and the recorded registrations, and
+  reports anything it could not remove instead of claiming success. The audit
+  trail stays on purpose, and the uninstall says so.
+- *A tampered `install.json` turns uninstall into a deletion primitive.*
+  Uninstall deletes only the fixed paths of the layout, never a path read from
+  the record, and reads at most 64 KiB of it. The record decides only which
+  AI-client registrations to remove, and each is removed only while it still
+  starts the installed program, through the client's own command line.
+- *A registration the technician changed by hand.* It no longer points at the
+  installed program, so uninstall leaves it alone and says so.
+- *Replacing a running copy.* Install and uninstall stop when the installed
+  program runs in another process (including as `cretlink mcp` under an AI
+  client) and say what to close; nothing is half-replaced.
+- *Removing the running program on Windows.* A program cannot delete its own
+  file there, so an uninstall started from the installed copy leaves the folder
+  to a detached, window-less Windows PowerShell started by its absolute path
+  under `%SystemRoot%`. It waits for the uninstalling process to exit
+  (`Wait-Process`, without a time limit, so it never removes under a running
+  program), removes only the program files and the
+  record, and the folder only when it is then empty. `cmd.exe` cannot wait for
+  a process id, which is why PowerShell is used; the script is cmdlets only and
+  passes paths as single-quoted literals.
+- *A customer copy installs itself.* The customer role never shows the
+  install choice, and the install and uninstall functions refuse a
+  `CretLink-Support*` program as well as the launch rules (REQ-F-024).
+
+**Residual risks.** The install is not code-signed yet (ST-M006-005); on
+macOS the generated bundle is unsigned and Gatekeeper may ask. The webview
+keeps its own profile in a per-user data folder (Tauri's `dev.cretlink.app`)
+for run-once and installed copies alike; uninstall does not remove it. An AI
+client registration points at the installed path, so anyone who can replace
+that per-user file can run code as the user when the client starts it — the
+same as any per-user program, and the folder is the user's own.
 
 ### Supply chain and distribution
 
@@ -1950,10 +2220,10 @@ marked with its honest implementation status.
 - CI jobs: pull-request jobs that execute contributed code, and release jobs
   that hold publishing credentials.
 - Release artifacts: one archive per operating system (Windows x86_64, macOS
-  aarch64, Linux x86_64) holding the application `cretlink`, `cretlink-cli`,
-  `cretlink-console`, `cretlink-mcp`, `cretlink-shell` and, on Windows,
-  `cretlink-support-agent`;
-  the loose `cretlink-relay-server`; `SHA256SUMS.txt` over the archives,
+  aarch64, Linux x86_64) holding exactly two programs: the application
+  `cretlink` (`cretlink.exe`, both roles, and the program the customer runs)
+  and its console build `cretlink-cli` (ST-M009-010, ADR-0018); the loose
+  `cretlink-relay-server`; `SHA256SUMS.txt` over the archives,
   per-target checksums, the dependency inventory, SBOMs, and the generated
   release notes. The version stamped into the binaries is computed before the
   build, and semantic-release refuses to publish under any other version
@@ -1968,8 +2238,10 @@ typosquatted crate name added by mistake); an attacker with repository or
 workflow access (a compromised maintainer account, or a malicious pull request
 that attempts to alter CI behaviour or reach release credentials); an artifact
 tamperer or impersonator (someone who modifies binaries after build, or
-distributes altered or lookalike "CretLink Support" binaries outside the
-official release channel); and a careless insider (accidental commit of
+distributes altered or lookalike `cretlink.exe` or `CretLink-Support*.exe`
+files, or programs under the retired names `cretlink-support-agent`,
+`cretlink-console`, `cretlink-mcp` or `cretlink-shell`, outside the official
+release channel); and a careless insider (accidental commit of
 tokens, signing material, or test fixtures containing real credentials).
 
 **Abuse cases.**
@@ -1987,7 +2259,7 @@ tokens, signing material, or test fixtures containing real credentials).
   build and download, or a third party mirrors modified binaries that
   technicians mistake for official releases.
 - *Unsigned-binary impersonation.* Until code signing exists, a lookalike
-  binary can imitate the CretLink Support consent screens while omitting the
+  binary can imitate CretLink's Get help consent screens while omitting the
   safety properties behind them. Customers cannot cryptographically
   distinguish it, and repeated Windows SmartScreen warnings on the genuine
   unsigned artifact risk training users to click through warnings generally.
@@ -2003,11 +2275,17 @@ tokens, signing material, or test fixtures containing real credentials).
 known RustSec advisories, violations of the MIT-compatible licence policy,
 banned or yanked crates, and wildcard or unknown-source dependencies fail the
 build, duplicate crate versions are surfaced as warnings, and dependency
-review plus secret scanning run on every pull request and on the release
-branch (REQ-N-010, REQ-N-016, REQ-N-017; M001 exit criteria, ST-M001-004) —
-*configured and enforced on `main` (ST-M001-004, Done): `ci.yml` runs
-`cargo-deny` licence, advisory, ban, and source checks plus gitleaks secret
-scanning, with all actions SHA-pinned*. The committed Cargo lockfile pins the
+review plus secret scanning run on pull requests (REQ-N-010, REQ-N-016,
+REQ-N-017; M001 exit criteria, ST-M001-004) — *configured and enforced on
+`main` (ST-M001-004, Done; ST-M006-017): `ci.yml` runs `cargo-deny` licence,
+advisory, ban, and source checks on every pull request that changes more than
+documentation, and `hygiene.yml` runs gitleaks secret scanning and the
+private-data check (ST-M006-016) on every pull request, with all actions
+SHA-pinned. While the repository is private, neither runs again on the release
+branch: a pull request is merged only when it is up to date with `main`, so
+the merged tree is the tested one, and a direct push to `main`, which the
+[release policy](releasing.md) forbids, would go unchecked until branch
+protection exists*. The committed Cargo lockfile pins the
 exact dependency graph, so a release builds from reviewed, recorded versions
 rather than whatever resolves on the day — *in place: the Cargo workspace,
 `Cargo.lock`, and `deny.toml` are committed (ST-M001-002, Done)*.
@@ -2021,6 +2299,9 @@ non-privileged simulated agent, and release secrets and signing keys never
 enter untrusted pull-request jobs (REQ-N-011, REQ-N-017; [release policy](releasing.md))
 — *configured on `main` (ST-M001-004, Done): pull-request jobs carry no write
 tokens, and the release workflow runs only on `main` behind a fork guard*.
+Besides its read-only token, the only secret a pull-request job reads is the
+maintainer's list of private terms for the private-data check (ST-M006-016),
+which is no credential and which a pull request from a fork does not receive.
 Only protected release automation may publish from the release branch;
 versions, tags, and changelogs come from semantic-release rather than manual
 steps that an attacker could imitate (REQ-N-018, REQ-N-019, ST-M001-005) —

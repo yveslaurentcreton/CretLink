@@ -1,5 +1,5 @@
-//! The stdio MCP server entry point shared by `cretlink-cli mcp` and the
-//! `cretlink-mcp` binary (ADR-0004, ST-M004-001, ST-M009-002).
+//! The stdio MCP server entry point behind `cretlink-cli mcp` and
+//! `cretlink mcp` (ADR-0004, ST-M004-001, ST-M009-002).
 //!
 //! The bridge holds **no** session authority. It serves the generic
 //! remote-computer tools of [`McpBridge`] over the stdio MCP transport, backed

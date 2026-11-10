@@ -96,7 +96,7 @@ impl Purpose {
 /// (C0, DEL, C1, which includes CR and LF), the line and paragraph separators,
 /// and the bidirectional formatting characters that could visually reorder the
 /// line a customer reads (a spoofing vector on the attended surface).
-fn is_disallowed(c: char) -> bool {
+pub(crate) fn is_disallowed(c: char) -> bool {
     c.is_control()
         || matches!(
             c,

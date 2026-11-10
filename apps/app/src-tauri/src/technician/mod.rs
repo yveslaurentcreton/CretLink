@@ -25,8 +25,9 @@ use std::time::Duration;
 
 use cretlink_console::{
     AUDIT_CHANNEL_CAPACITY, AuditServiceConfig, ChannelAudit, ConsoleSessionService, ConsoleState,
-    SessionPhase, StopReason, TechnicianHost, TermAttachment, TermEvent, prune_audit_dir,
-    report_prune, spawn_audit_service,
+    SessionPhase, StopReason, TechnicianActivity, TechnicianHost, TermAttachment, TermEvent,
+    prune_audit_dir, report_prune, spawn_audit_service, technician_display_name, terminal_closed,
+    terminal_open_started, terminal_opened,
 };
 // The simulated seed targets are developer-only: the shipped console listens and
 // never picks a target, so these compile only under `dev-simulate`.
@@ -43,15 +44,23 @@ use cretlink_protocol::{JobId, JobOutcome, PROTOCOL_V1, RevokeReason, Shell};
 // simulated identity; they leave the shipped build entirely (ST-M002-009).
 #[cfg(feature = "dev-simulate")]
 use cretlink_protocol::{SessionId, TargetIdentity};
-use cretlink_session::{ConsoleHints, SessionHost};
+use cretlink_session::{ActivityEntry, ConsoleHints, SessionHost};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
-use tokio::sync::oneshot;
 
+// The local MCP bridge for the rail (ST-M009-008).
+mod bridge;
+// The session history and the audit files (ST-M009-012).
+mod history;
+// This computer's operating system by name (ST-M009-008).
+mod host_os;
 mod session_driver;
+// This copy, its AI clients, and run once or install (ST-M009-006); the start
+// screen registers part of it too.
+pub(crate) mod setup;
 use session_driver::{
-    ActivityLine, Intent, IntentSender, ServiceSlot, StateSink, intent_channel, lock, lock_service,
-    pump,
+    ActivitySlot, Intent, IntentSender, ServiceSlot, StateSink, intent_channel, lock,
+    lock_activity, lock_service, pump,
 };
 
 /// The console's single source of truth, shared across command invocations and
@@ -73,6 +82,20 @@ pub struct AppState {
     /// (ST-M008-001). `None` outside an active session, so a terminal command
     /// then fails closed exactly like the service's own `NoConsentedSession`.
     service: ServiceSlot,
+    /// The current session's activity feed (ST-M009-011), read by
+    /// [`get_activity`]. Kept after the session ends and replaced only when the
+    /// next session starts.
+    activity: ActivitySlot,
+    /// The live session's audit sink while a session runs, so the in-process
+    /// terminal commands record their actions as the `terminal` actor
+    /// (REQ-S-023, ST-M009-011). Cleared before the log is sealed.
+    audit: Arc<Mutex<Option<ChannelAudit>>>,
+    /// The session log the audit drain is writing, left out of the history
+    /// until it is sealed (ST-M009-012).
+    audit_log: history::OpenLog,
+    /// The local MCP bridge as the rail shows it: its endpoint and the AI
+    /// clients that called during this session (ST-M009-008).
+    bridge: bridge::BridgeSlot,
 }
 
 impl AppState {
@@ -92,6 +115,10 @@ impl AppState {
             inner: Arc::new(Mutex::new(ConsoleState::new(technician_host()))),
             live: Arc::new(Mutex::new(None)),
             service: Arc::new(Mutex::new(None)),
+            activity: Arc::new(Mutex::new(TechnicianActivity::new())),
+            audit: Arc::new(Mutex::new(None)),
+            audit_log: history::OpenLog::default(),
+            bridge: bridge::BridgeSlot::default(),
         }
     }
 
@@ -105,6 +132,10 @@ impl AppState {
             inner: Arc::new(Mutex::new(seed_state())),
             live: Arc::new(Mutex::new(None)),
             service: Arc::new(Mutex::new(None)),
+            activity: Arc::new(Mutex::new(TechnicianActivity::new())),
+            audit: Arc::new(Mutex::new(None)),
+            audit_log: history::OpenLog::default(),
+            bridge: bridge::BridgeSlot::default(),
         }
     }
 
@@ -128,6 +159,26 @@ impl AppState {
         let live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         live.as_ref().is_some_and(|tx| tx.send(intent).is_ok())
     }
+
+    /// The current session's activity feed, oldest first (ST-M009-011).
+    fn activity_entries(&self) -> Vec<ActivityEntry> {
+        lock_activity(&self.activity).entries()
+    }
+
+    /// Records one technician-terminal audit entry on the live session's log
+    /// (REQ-S-023, ST-M009-011); the pump's live echo then folds it into the
+    /// activity feed. Without a live audit sink (no session) there is nothing
+    /// to record.
+    fn record_terminal(&self, entry: cretlink_console::AuditEntry) {
+        let audit = self
+            .audit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(audit) = audit {
+            audit.record_entry(entry);
+        }
+    }
 }
 
 /// The initial console for both [`run`] and [`Default`]: the live-idle console in
@@ -141,6 +192,16 @@ fn default_app_state() -> AppState {
 #[cfg(not(feature = "dev-simulate"))]
 fn default_app_state() -> AppState {
     AppState::live_idle()
+}
+
+/// Takes a session's audit sink back from the terminal commands when dropped,
+/// so the last sender can go and the drain can seal the log (ST-M003-006).
+struct AuditLent(Arc<Mutex<Option<ChannelAudit>>>);
+
+impl Drop for AuditLent {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
 }
 
 /// Bounded window to let the audit drain seal the session log after the pump
@@ -165,11 +226,17 @@ impl StateSink for TauriSink {
         let _ = self.app.emit("console-state", state);
     }
 
-    fn emit_activity(&self, line: &ActivityLine) {
-        // Live activity rides a separate event so a burst of job output never
-        // forces a whole-`console-state` re-render (REQ-N-006); a dropped
-        // frontend is likewise not a backend error.
-        let _ = self.app.emit("console-activity", line);
+    fn emit_activity(&self, entry: &ActivityEntry) {
+        // Live activity rides a separate event (the frontend's `ActivityEvent`,
+        // ST-M009-011) so a burst of actions never forces a whole
+        // `console-state` re-render (REQ-N-006); a dropped frontend is likewise
+        // not a backend error.
+        let _ = self.app.emit("console-activity", entry);
+    }
+
+    fn emit_bridge(&self, status: &bridge::BridgeStatus) {
+        // The rail's bridge status (ST-M009-008), on its own event.
+        let _ = self.app.emit(bridge::BRIDGE_EVENT, status);
     }
 }
 
@@ -202,6 +269,15 @@ impl CommandError {
 #[tauri::command]
 fn get_state(state: State<'_, AppState>) -> ConsoleState {
     state.guard().clone()
+}
+
+/// Returns the current session's activity feed, oldest first (ST-M009-011):
+/// every item and gap the `"console-activity"` event has carried, so a frontend
+/// that (re)loads mid-session or after it ended shows the same feed. Kept until
+/// the next session starts.
+#[tauri::command]
+fn get_activity(state: State<'_, AppState>) -> Vec<ActivityEntry> {
+    state.activity_entries()
 }
 
 /// The technician confirms the Session Approval Codes match on both screens,
@@ -366,6 +442,15 @@ fn start_live_session(
     // (ST-M008-001). Any stale service from a prior session was cleared on that
     // session's fail-closed teardown.
     let service_slot = state.service.clone();
+    // A new session starts a new feed; the previous one was kept until now
+    // (ST-M009-011).
+    *lock_activity(&state.activity) = TechnicianActivity::new();
+    let activity = state.activity.clone();
+    // A new session starts with no bridge endpoint and no AI clients.
+    bridge::lock_bridge(&state.bridge).reset();
+    let bridge_slot = state.bridge.clone();
+    let audit_slot = state.audit.clone();
+    let audit_log = state.audit_log.clone();
 
     tauri::async_runtime::spawn(async move {
         let sink: Arc<dyn StateSink> = Arc::new(TauriSink { app });
@@ -382,7 +467,12 @@ fn start_live_session(
             None,
         ));
         let (audit, audit_rx) = ChannelAudit::bounded(AUDIT_CHANNEL_CAPACITY);
-        let (start_tx, start_rx) = oneshot::channel();
+        // Lend the terminal commands this session's audit sink; the guard
+        // takes it back on every exit path so the log can still be sealed.
+        *audit_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(audit.clone());
+        let audit_lent = AuditLent(audit_slot);
+        // The history leaves this log out until it is sealed (ST-M009-012).
+        let (start_tx, start_rx) = audit_log.track();
         let audit_task = spawn_audit_service(audit_config.clone(), audit_rx, start_rx);
 
         // 1. Bind the listener on a private interface, recording lifecycle
@@ -393,6 +483,9 @@ fn start_live_session(
             bind_addr,
             ConsoleHints {
                 label: "This computer (technician)".to_string(),
+                // The account's full name, else its user name, sent in the
+                // pairing handshake as what this computer says (ST-M009-011).
+                display_name: technician_display_name(),
             },
             PROTOCOL_V1,
             Vec::new(),
@@ -423,13 +516,19 @@ fn start_live_session(
 
         // 2. Best-effort mDNS advertising. Discovery is convenience only and
         //    grants no authority; the manual code below always works.
-        let _advertiser = Advertiser::advertise(
-            "cretlink-console",
-            local_addr.port(),
-            PROTOCOL_V1,
-            "CretLink Console",
-        )
-        .ok();
+        //    The advertised name is the technician's display name (ST-M009-011),
+        //    an untrusted hint on the customer side; without one, the product
+        //    name.
+        let advertised_name = technician_display_name().map_or_else(
+            || "CretLink Console".to_string(),
+            |name| name.as_str().to_string(),
+        );
+        //    The instance name is this computer's host name, so the customer's
+        //    list shows the name and host name the waiting screen tells them
+        //    to pick (ST-M009-009); equally untrusted on their side.
+        let instance = advertised_instance(&lock(&shared).technician.hostname);
+        let _advertiser =
+            Advertiser::advertise(&instance, local_addr.port(), PROTOCOL_V1, &advertised_name).ok();
 
         // 3. Enter the listening phase carrying the connection code the customer
         //    types in and the private listen address to read out. No target is
@@ -466,13 +565,17 @@ fn start_live_session(
             audit_config,
             start_tx,
             service_slot,
+            activity,
+            bridge_slot,
         )
         .await;
 
-        // Seal the durable log: drop the last sender so the drain observes
+        // Seal the durable log: release the terminal commands' sender, then
+        // drop the last one so the drain observes
         // channel close, then wait a bounded moment for the seal record to land.
         // A timeout is recorded honestly — the log verifies as unsealed rather
         // than the exit blocking forever (REQ-N cleanup honesty).
+        drop(audit_lent);
         drop(audit);
         if tokio::time::timeout(AUDIT_SEAL_TIMEOUT, audit_task)
             .await
@@ -482,6 +585,7 @@ fn start_live_session(
                 "note: the audit log could not be sealed before exit; it will verify as unsealed"
             );
         }
+        audit_log.closed();
     });
 
     Ok(state.guard().clone())
@@ -645,12 +749,29 @@ async fn open_terminal(
         Some("cmd") => Shell::Cmd,
         _ => Shell::PowerShell,
     };
+    let (cols, rows) = (cols.max(1), rows.max(1));
     // The service stamps `Origin::Terminal`, keeping the technician terminal
-    // distinct from Claude's MCP bridge in the audit log (ST-M003-009).
-    let term = service
-        .open_terminal(shell, cols.max(1), rows.max(1), None, BTreeMap::new())
-        .await
-        .map_err(terminal_error)?;
+    // distinct from the AI's MCP bridge (ST-M003-009); the open is recorded as
+    // the `terminal` actor before and after it reaches the target (REQ-S-023,
+    // ST-M009-011).
+    let session = service.session();
+    state.record_terminal(terminal_open_started(session, cols, rows));
+    let started = std::time::Instant::now();
+    let opened = service
+        .open_terminal(shell, cols, rows, None, BTreeMap::new())
+        .await;
+    let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match &opened {
+        Ok(term) => state.record_terminal(terminal_opened(session, cols, rows, Ok(*term), elapsed)),
+        Err(error) => state.record_terminal(terminal_opened(
+            session,
+            cols,
+            rows,
+            Err(&error.to_string()),
+            elapsed,
+        )),
+    }
+    let term = opened.map_err(terminal_error)?;
     // Attach one local consumer for this panel; attaching grants no new authority
     // (ST-M003-009). The bounded event channel is drained by the spawned task.
     let attachment = service.term_attach(term).map_err(terminal_error)?;
@@ -697,10 +818,18 @@ async fn term_resize(
 #[tauri::command]
 async fn term_close(state: State<'_, AppState>, term: u64) -> Result<(), CommandError> {
     let service = state.service().ok_or_else(no_session)?;
-    service
-        .term_close(JobId(term))
-        .await
-        .map_err(terminal_error)
+    let started = std::time::Instant::now();
+    let closed = service.term_close(JobId(term)).await;
+    let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // Recorded as the `terminal` actor with its honest outcome (REQ-S-023).
+    let reason = closed.as_ref().err().map(ToString::to_string);
+    state.record_terminal(terminal_closed(
+        service.session(),
+        JobId(term),
+        reason.as_deref().map_or(Ok(()), Err),
+        elapsed,
+    ));
+    closed.map_err(terminal_error)
 }
 
 /// Picks a private, non-loopback interface address to bind the listener to,
@@ -734,6 +863,8 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
     let builder = builder.invoke_handler(tauri::generate_handler![
         crate::start::get_role,
         get_state,
+        get_activity,
+        bridge::get_bridge_status,
         confirm_code,
         report_code_mismatch,
         simulate_consent,
@@ -743,12 +874,23 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         open_terminal,
         term_input,
         term_resize,
-        term_close
+        term_close,
+        history::list_sessions,
+        history::open_audit,
+        history::get_session_audit,
+        setup::get_app_info,
+        setup::ai_clients,
+        setup::ai_client_install,
+        setup::ai_client_uninstall,
+        setup::uninstall_plan,
+        setup::uninstall_app
     ]);
     #[cfg(not(feature = "dev-simulate"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         crate::start::get_role,
         get_state,
+        get_activity,
+        bridge::get_bridge_status,
         confirm_code,
         report_code_mismatch,
         stop_session,
@@ -756,7 +898,16 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         open_terminal,
         term_input,
         term_resize,
-        term_close
+        term_close,
+        history::list_sessions,
+        history::open_audit,
+        history::get_session_audit,
+        setup::get_app_info,
+        setup::ai_clients,
+        setup::ai_client_install,
+        setup::ai_client_uninstall,
+        setup::uninstall_plan,
+        setup::uninstall_app
     ]);
     builder
 }
@@ -773,19 +924,62 @@ fn simulated_identity() -> TargetIdentity {
         elevated: true,
         simulated: true,
         agent_version: "sim-0".to_string(),
+        account: None,
     }
 }
 
 /// Detects the technician host name without a runtime dependency, falling back
 /// to a neutral label when detection fails.
+///
+/// No program is looked up by name: Windows would search the running
+/// program's own folder first. Windows reads `COMPUTERNAME`, Linux the
+/// kernel's host name, and macOS runs `/bin/hostname` by its absolute path.
 fn detect_hostname() -> String {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
+    os_hostname()
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "this-computer".to_string())
+}
+
+#[cfg(windows)]
+fn os_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
+#[cfg(target_os = "linux")]
+fn os_hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname").ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn os_hostname() -> Option<String> {
+    std::process::Command::new("/bin/hostname")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+}
+
+#[cfg(not(any(windows, unix)))]
+fn os_hostname() -> Option<String> {
+    None
+}
+
+/// The DNS-SD instance name this console advertises: its host name when that
+/// is one plain DNS label, else the product's neutral name (ST-M009-009).
+fn advertised_instance(hostname: &str) -> String {
+    let label = hostname.split('.').next().unwrap_or_default();
+    let plain = !label.is_empty()
+        && label.len() <= 63
+        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !label.starts_with('-')
+        && !label.ends_with('-');
+    if plain {
+        label.to_owned()
+    } else {
+        "cretlink-console".to_owned()
+    }
 }
 
 /// Builds this technician host descriptor from live host inspection. Always
@@ -794,7 +988,11 @@ fn technician_host() -> TechnicianHost {
     TechnicianHost {
         label: "This computer (technician)".to_string(),
         hostname: detect_hostname(),
-        os: format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH),
+        // The product name and release, such as "Windows 11 Pro 25H2"
+        // (ST-M009-008).
+        os: host_os::name(),
+        // The account's full name, else its user name (ST-M009-011).
+        display_name: technician_display_name().map(|name| name.as_str().to_string()),
     }
 }
 
@@ -846,6 +1044,31 @@ mod tests {
     }
 
     #[test]
+    fn get_activity_reads_the_shared_feed_the_pump_folds_into() {
+        // A fresh console has an empty feed; what the pump folds into the shared
+        // slot is exactly what `get_activity` returns (ST-M009-011).
+        let state = AppState::live_idle();
+        assert!(state.activity_entries().is_empty());
+        let mut entry = cretlink_console::AuditEntry::event(
+            cretlink_shared::Actor::Mcp,
+            None,
+            "mcp_remote_list_jobs_start",
+            cretlink_shared::Outcome::Ok,
+        );
+        entry
+            .args
+            .insert("call_id", cretlink_shared::AuditValue::Int(1));
+        let emitted = lock_activity(&state.activity).apply(&entry, 0);
+        assert_eq!(
+            state.activity_entries(),
+            emitted.into_iter().collect::<Vec<_>>()
+        );
+        // No session runs, so no terminal record can be written.
+        state.record_terminal(entry);
+        assert_eq!(state.activity_entries().len(), 1);
+    }
+
+    #[test]
     fn a_fresh_console_hosts_no_service_so_terminals_fail_closed() {
         // No session is under full control at boot, so the terminal service slot
         // is empty and every terminal command refuses before touching the wire
@@ -879,5 +1102,35 @@ mod tests {
         assert_eq!(frame.exit_code, Some(0));
         assert_eq!(frame.outcome.as_deref(), Some("Completed"));
         assert!(frame.data.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_name_comes_from_the_kernel_without_running_a_program() {
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+        let kernel = kernel.trim();
+        if !kernel.is_empty() {
+            assert_eq!(detect_hostname(), kernel);
+        }
+    }
+
+    #[test]
+    fn this_computer_is_described_by_its_host_name_and_operating_system_name() {
+        // The foot of the navigation shows both (ST-M009-008): the operating
+        // system is the name `host_os` reads, for the console state and for
+        // this copy's details alike.
+        let host = technician_host();
+        assert!(!host.hostname.is_empty());
+        assert_eq!(host.os, host_os::name());
+        assert_eq!(setup::app_info().os, host.os);
+    }
+
+    #[test]
+    fn the_advertised_instance_is_the_host_name_when_plain() {
+        assert_eq!(advertised_instance("TECH-LAPTOP"), "TECH-LAPTOP");
+        assert_eq!(advertised_instance("host-01.example.org"), "host-01");
+        for odd in ["", "this computer", "-x", "naïve", &"a".repeat(64)] {
+            assert_eq!(advertised_instance(odd), "cretlink-console", "{odd:?}");
+        }
     }
 }

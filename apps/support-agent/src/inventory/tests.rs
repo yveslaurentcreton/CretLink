@@ -87,6 +87,7 @@ fn target_identity() -> TargetIdentity {
         elevated: true,
         simulated: false,
         agent_version: "0.0.0".to_string(),
+        account: None,
     }
 }
 

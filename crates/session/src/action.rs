@@ -52,6 +52,10 @@ impl From<Origin> for Attribution {
 /// (REQ-N-008: never a fabricated success).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionOutcome {
+    /// The agent answered and the transfer the request began is still going:
+    /// a file has started to leave the computer and a later report with the
+    /// same id says how it ended (ST-M009-011).
+    InProgress,
     /// The agent performed the operation and answered with a result.
     Succeeded,
     /// The agent refused or failed the operation with this error category.
@@ -82,9 +86,7 @@ pub const MAX_ACTION_DESCRIPTION_CHARS: usize = 512;
 pub fn describe_operation(op: &Operation) -> String {
     let text = match op {
         Operation::SystemInfo {} => "read system information".to_owned(),
-        Operation::Exec { shell, command, .. } => {
-            format!("run a command in {}: {command}", shell_name(*shell))
-        }
+        Operation::Exec { shell, command, .. } => return describe_exec(*shell, command),
         Operation::WriteStdin { job, data } => {
             format!("send {} bytes of input to job {job}", data.len())
         }
@@ -174,6 +176,12 @@ pub fn describe_operation(op: &Operation) -> String {
         ),
     };
     clamp(text)
+}
+
+/// Describes a started command the way [`describe_operation`] describes its
+/// `Exec` request, bounded by [`MAX_ACTION_DESCRIPTION_CHARS`].
+pub(crate) fn describe_exec(shell: Shell, command: &str) -> String {
+    clamp(format!("run a command in {}: {command}", shell_name(shell)))
 }
 
 /// Describes a job cancellation for the customer surface.

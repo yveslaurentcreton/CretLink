@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CretLink screens (dev gallery)</title>
+    <style>
+      .gallery-term { margin: 0; color: #cbd5e1; font: 12.5px/1.6 var(--mono); white-space: pre; }
+    </style>
+  </head>
+  <body>
+    <!-- Development only (ST-M009-008, ST-M009-009): renders each snapshot fixture with the
+         real views and styles, without Tauri. Not part of the production
+         build, which builds only ../index.html. Serve with `npx vite` and
+         open /dev/gallery.html, /dev/gallery.html?f=<technician fixture> or
+         /dev/gallery.html?c=<customer fixture>. -->
+    <div id="app"></div>
+    <script type="module" src="./gallery.ts"></script>
+  </body>
+</html>

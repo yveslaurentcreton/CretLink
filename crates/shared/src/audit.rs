@@ -62,7 +62,7 @@ mod retention;
 mod value;
 mod writer;
 
-pub use clock::{Clock, FixedClock, SystemClock, format_rfc3339_millis};
+pub use clock::{Clock, FixedClock, SystemClock, format_rfc3339_millis, parse_rfc3339_millis};
 pub use record::{AUDIT_SCHEMA_VERSION, Actor, AuditRecord, Outcome, ZERO_PREV};
 pub use retention::{
     AuditFileMeta, DEFAULT_SESSION_SOFT_CAP_BYTES, RetentionPolicy, files_to_prune,

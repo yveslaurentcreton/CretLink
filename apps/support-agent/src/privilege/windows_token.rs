@@ -17,6 +17,7 @@
 use core::ffi::c_void;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Security::Authentication::Identity::{GetUserNameExW, NameSamCompatible};
 use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_ELEVATION,
     TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenElevation, TokenIntegrityLevel,
@@ -42,12 +43,21 @@ impl Drop for TokenHandle {
 
 /// Queries the current process token and reports the effective identity.
 pub(super) fn current_identity() -> EffectiveIdentity {
-    let username = current_username().unwrap_or_else(|| "unknown".to_string());
+    // `DOMAIN\user` (the machine name for a local account), so the technician
+    // sees the customer's qualified account (ST-M009-008); the bare user name
+    // when the qualified one cannot be read.
+    let (domain, username) = match sam_compatible_name() {
+        Some((domain, user)) => (Some(domain), user),
+        None => (
+            None,
+            current_username().unwrap_or_else(|| super::UNKNOWN_USERNAME.to_string()),
+        ),
+    };
 
     let Some(token) = open_current_process_token() else {
         return EffectiveIdentity {
             username,
-            domain: None,
+            domain,
             elevated: false,
             integrity: IntegrityLevel::Unknown,
             is_windows: true,
@@ -69,9 +79,9 @@ pub(super) fn current_identity() -> EffectiveIdentity {
 
     EffectiveIdentity {
         username,
-        // The domain is not resolved by `GetUserNameW` (that would need
-        // `GetUserNameExW`, `DOMAIN\user`). `None` is honest here.
-        domain: None,
+        // From `GetUserNameExW(NameSamCompatible)`; `None` when only the bare
+        // user name could be read, never guessed.
+        domain,
         elevated: elevated.unwrap_or(false),
         integrity,
         is_windows: true,
@@ -165,6 +175,39 @@ fn query_integrity_level(token: &TokenHandle) -> IntegrityLevel {
     };
 
     integrity_from_rid(rid)
+}
+
+/// The longest SAM-compatible name accepted, in UTF-16 units (a domain of 15
+/// and a user name of 256 fit with room to spare).
+const MAX_SAM_UNITS: u32 = 1024;
+
+/// Reads the current user's SAM-compatible name, `DOMAIN\user`, split into
+/// its domain and user name; `None` on failure or an unexpected form.
+fn sam_compatible_name() -> Option<(String, String)> {
+    let mut len: u32 = 0;
+    // SAFETY: a null buffer with a zero size only asks for the required size,
+    // written to `len`; nothing else is read or written. The expected
+    // size-probe failure is ignored.
+    let _ = unsafe { GetUserNameExW(NameSamCompatible, None, &mut len) };
+    if len == 0 || len > MAX_SAM_UNITS {
+        return None;
+    }
+    let mut buffer = vec![0u16; len as usize];
+    // SAFETY: `buffer` holds `len` UTF-16 units and `len` says so; the call
+    // writes at most that many (with the terminator) and sets `len` to the
+    // units written without it.
+    let ok = unsafe {
+        GetUserNameExW(
+            NameSamCompatible,
+            Some(PWSTR(buffer.as_mut_ptr())),
+            &mut len,
+        )
+    };
+    if !ok || len as usize > buffer.len() {
+        return None;
+    }
+    buffer.truncate(len as usize);
+    super::split_sam_compatible(&String::from_utf16(&buffer).ok()?)
 }
 
 /// Reads the account name of the current user, or `None` on failure.

@@ -81,6 +81,7 @@ fn simulated_identity() -> TargetIdentity {
         elevated: false,
         simulated: true,
         agent_version: "mock-1".to_string(),
+        account: None,
     }
 }
 
@@ -469,6 +470,11 @@ async fn lists_all_five_generic_tools() {
             "missing tool {expected}"
         );
     }
+    // The list the technician's rail counts (ST-M009-008) is exactly what a
+    // client is offered.
+    let mut listed = names.clone();
+    listed.sort();
+    assert_eq!(cretlink_mcp::McpBridge::tool_names(), listed);
 
     client.cancel().await.ok();
 }
@@ -511,6 +517,34 @@ async fn tool_schemas_advertise_the_protocol_limits() {
         json!(cretlink_mcp::MAX_STDIN_BASE64_CHARS),
         "data_base64 bound missing from the schema: {schema}"
     );
+
+    client.cancel().await.ok();
+}
+
+/// The AI is told that a command's processes end with the command, on every
+/// way it can end, so it waits for work that must finish inside the command
+/// instead of starting it and returning (ST-M004-002, REQ-S-014).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_exec_says_that_its_processes_end_with_the_command() {
+    let (client, _session) = connect().await;
+    let tools = client.list_all_tools().await.expect("list tools");
+
+    let exec = tools
+        .iter()
+        .find(|tool| tool.name == "remote_exec")
+        .expect("remote_exec listed");
+    let description = exec.description.as_deref().unwrap_or_default();
+    for statement in [
+        "Every process the command starts ends with the command",
+        "also on cancel, timeout and stop",
+        "does not survive it",
+        "Wait for such work inside the command",
+    ] {
+        assert!(
+            description.contains(statement),
+            "the remote_exec description must say {statement:?}: {description:?}"
+        );
+    }
 
     client.cancel().await.ok();
 }

@@ -1,6 +1,6 @@
 [package]
 name = "cretlink-cli"
-description = "The `cretlink-cli` command: MCP bridge, AI-client registration, technician terminal and version (ST-M009-002, ST-M009-003, ADR-0018)"
+description = "The `cretlink-cli` command: MCP bridge, AI-client registration, technician terminal, residual recovery and version (ST-M009-002, ST-M009-003, ST-M009-010, ADR-0018)"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
@@ -21,46 +21,74 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-# `serve_stdio` is the MCP bridge shared with `cretlink-mcp` (ADR-0004).
+# `serve_stdio` is the stdio MCP bridge (ADR-0004); the same-user IPC surface
+# (`ipc::connect`, the versioned wire ops and the `TermFrame` duplex) carries
+# the technician terminal client in `shell` (ST-M008-002). The terminal client
+# adds no new IPC surface, listener or protocol variant (REQ-S-023, REQ-N-012).
 cretlink-mcp.workspace = true
+cretlink-protocol.workspace = true
 cretlink-shared.workspace = true
-# The technician terminal client shared with `cretlink-shell` (ST-M008-002).
-# Apps are deliberately not in [workspace.dependencies]; a path dependency is
-# permitted by cargo.
-cretlink-shell = { path = "../shell-cli", version = "0.0.0" }
-# Reads the AI clients' JSON configuration (Claude Code, Gemini CLI) read-only.
+# Reads the AI clients' JSON configuration (Claude Code, Gemini CLI) read-only,
+# and the install record `install.json` (ST-M009-006).
+serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true }
+# `net` adds the same-user local IPC carrier used by `ipc::connect`.
+tokio = { workspace = true, features = ["net"] }
+# `recover [--remove]` (ST-M009-010): the customer-side residual recovery of
+# ST-M006-003 stays in the product after `cretlink-support-agent` left the
+# archives. The support agent's library owns the inventory, the ticket store
+# and the report text, so the verb is reused rather than duplicated. The
+# library is the portable customer core: it builds and tests on every host of
+# the workspace matrix, its Windows-only parts are `cfg`-gated, and its
+# `build.rs` elevation manifest applies only to its own development binary,
+# never to a dependent (the application already depends on it the same way).
+cretlink-support-agent = { path = "../support-agent", version = "0.0.0" }
 
 # Attaching a GUI-subsystem process to its parent's console, and the elevated
-# relaunch through UAC (ST-M009-001). Same `windows` 0.62 line already in the
-# lockfile (shell-cli, support-agent, exec); the calls are the only `unsafe` in
-# this crate and live in `process::win`.
+# relaunch through UAC (ST-M009-001); the Start-menu shortcut (COM ShellLink),
+# the HKCU uninstall entry and the process list of the per-user install
+# (ST-M009-006); the raw console mode of the terminal client (ST-M008-002).
+# Same `windows` 0.62 line already in the lockfile (support-agent, exec); the
+# calls are the only `unsafe` in this crate and live in `process::win`,
+# `install::win` and `shell::tty::win`.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Storage_FileSystem",
+  "Win32_System_Com",
   "Win32_System_Console",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Registry",
+  "Win32_System_Threading",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
 
 [features]
-# Build `cretlink` for the Windows GUI subsystem, as the one application will be
-# (ADR-0018): no console window on a double-click. The ST-M009-001 spike builds
-# and tests the binary this way on Windows CI. No effect elsewhere.
+# Build `cretlink-cli` for the Windows GUI subsystem, as the application
+# `cretlink` is (ADR-0018): no console window on a double-click. Windows CI
+# builds and tests the binary this way, the MCP conformance harness included
+# (ST-M009-001). No effect elsewhere.
 gui-subsystem = []
 
 [dev-dependencies]
-# The ST-M004-005 conformance harness of `apps/mcp-bridge`, included as a module,
-# runs against `cretlink mcp`; these are its dependencies.
-cretlink-protocol.workspace = true
+# The ST-M004-005 conformance harness (`tests/conformance`) spawns the built
+# `cretlink-cli mcp` and speaks raw JSON-RPC (no rmcp client types) to model an
+# independently implemented client such as Codex CLI, then drives the full
+# console path for the positive full-chain test. The terminal client's tests
+# drive the real console IPC server with the fail-closed `ClosedRoute`
+# (REQ-S-009, REQ-S-023). The console is an application crate, not a workspace
+# library dependency, so it is referenced by path (test-only).
 cretlink-session.workspace = true
 cretlink-console = { path = "../console", version = "0.0.0" }
 base64.workspace = true
+# `process` spawns the binary; `net` backs the console's loopback TCP + IPC.
 tokio = { workspace = true, features = ["process", "net"] }
+# Compiles every advertised tool input schema as a real JSON Schema, proving an
+# independent client can consume them. Exact-pinned (cargo-deny denies
+# wildcards); MIT-licensed; default features off to drop the HTTP/TLS `$ref`
+# resolvers the self-contained schemas never need.
 jsonschema = { version = "=0.49.9", default-features = false }
 
 [lints]

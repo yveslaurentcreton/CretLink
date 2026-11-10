@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{Conpty, spawn};
+use super::{Conpty, command_line, spawn};
 use crate::{JobSpec, Shell, TermSize};
 
 /// Polls `f` every 50ms until it is true or `budget` elapses.
@@ -99,4 +99,26 @@ fn exit_waiter_reports_the_real_exit_code() {
     control.shutdown();
     drop(stdin_tx);
     let _ = drainer.join();
+}
+
+/// The command line each shell form is started with. A Command Prompt command
+/// is appended raw behind `/S /C`, so `cmd.exe` receives it exactly as written:
+/// no quote is escaped and no backslash is doubled (ST-M003-001). A PowerShell
+/// command keeps the C runtime quoting that `powershell.exe` reads, and the
+/// forms without a command stay the shells' own prompts (ST-M003-009).
+#[test]
+fn command_lines_keep_cmd_raw_and_powershell_quoted() {
+    assert_eq!(
+        command_line(Shell::Cmd, r#"dir "C:\Program Files\""#),
+        r#"cmd.exe /S /C "dir "C:\Program Files\"""#
+    );
+    assert_eq!(
+        command_line(Shell::PowerShell, r#"Write-Output "a b""#),
+        r#"powershell.exe -NoProfile -Command "Write-Output \"a b\"""#
+    );
+    assert_eq!(command_line(Shell::Cmd, ""), "cmd.exe");
+    assert_eq!(
+        command_line(Shell::PowerShell, ""),
+        "powershell.exe -NoProfile -NoLogo"
+    );
 }

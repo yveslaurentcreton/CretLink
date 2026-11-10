@@ -1,8 +1,9 @@
 {
   "identifier": "default",
-  "description": "Core capability for the CretLink window. Each role's own commands are app-defined and registered only in that role's process (ST-M009-005); this grants only the core window/event/webview defaults.",
+  "description": "Core capability for the CretLink windows: the main window, and the customer's compact bar (`mini`, ST-M009-009), which loads the same frontend and listens to the same events. Each role's own commands are app-defined and registered only in that role's process (ST-M009-005); this grants only the core window/event/webview defaults.",
   "windows": [
-    "main"
+    "main",
+    "mini"
   ],
   "permissions": [
     "core:default"

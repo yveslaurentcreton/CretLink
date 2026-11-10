@@ -6,18 +6,17 @@ Every CretLink GitHub release attaches:
   `cretlink-<version>-macos-aarch64.tar.gz` and
   `cretlink-<version>-linux-x86_64.tar.gz`. Each holds one folder with the
   application `cretlink` (Give help, and on Windows Get help, the program the
-  customer runs), its console build `cretlink-cli`, `cretlink-console`,
-  `cretlink-mcp` and `cretlink-shell`, in the Windows archive also the headless
-  `cretlink-support-agent.exe`, plus `README.txt`, `LICENSE` and the target's
-  `CHECKSUMS-<target>.txt`;
+  customer runs) and its console build `cretlink-cli`, plus `README.txt`,
+  `LICENSE` and the target's `CHECKSUMS-<target>.txt`;
 - `SHA256SUMS.txt` — SHA-256 over the archives;
 - `cretlink-relay-server-<target>[.exe]` — the relay server, operator-hosted
   infrastructure on neither endpoint, so not in the archives;
 - `CHECKSUMS-<target>.txt` — SHA-256 over every program built for that target;
 - `dependency-inventory-<target>.txt` — the resolved, pinned dependency graph the
   programs were built from;
-- `sbom-<binary>-<target>.cdx.json` — one CycloneDX SBOM per shipped program,
-  carrying the release version.
+- `sbom-<binary>-<target>.cdx.json` — one CycloneDX SBOM per shipped program
+  (`cretlink`, `cretlink-cli` and the relay server), carrying the release
+  version.
 
 Every program reports its release version: `cretlink version` or
 `cretlink-cli version`.
@@ -89,9 +88,12 @@ the baseline.
 
 ### Is a binary signed, and by whom?
 
+Check both programs of the archive, `cretlink.exe` (the one the customer runs)
+and `cretlink-cli.exe`, from the unpacked folder:
+
 ```powershell
-Get-AuthenticodeSignature .\cretlink-support-agent.exe |
-    Format-List Status, StatusMessage, SignerCertificate
+Get-AuthenticodeSignature .\cretlink.exe, .\cretlink-cli.exe |
+    Format-List Path, Status, StatusMessage, SignerCertificate
 ```
 
 - `Status : Valid` with a trusted, timestamped signer means the binary is an
@@ -102,8 +104,11 @@ Get-AuthenticodeSignature .\cretlink-support-agent.exe |
 Or with the Windows SDK `signtool`:
 
 ```powershell
-signtool verify /pa /v .\cretlink-support-agent.exe
+signtool verify /pa /v .\cretlink.exe .\cretlink-cli.exe
 ```
+
+A customer who received only `cretlink.exe` (or a copy renamed to
+`CretLink-Support.exe`) checks that one file the same way.
 
 ### Expected signer identity
 

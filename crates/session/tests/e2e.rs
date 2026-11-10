@@ -25,11 +25,11 @@ use cretlink_protocol::{
 use cretlink_session::ConsoleHints;
 use cretlink_session::{
     ArmOutcome, CAP_DESKTOP_V1, CAP_REBOOT_RESUME_V1, CAP_TERM_V1, CancelToken,
-    DesktopCaptureRequest, DisclosureSummary, DownloadRequest, ExecRequest, HostHandle,
+    DesktopCaptureRequest, DisclosureSummary, DownloadRequest, EndedBy, ExecRequest, HostHandle,
     ImageFormat, JobId, JobOutcome, JoinHandle, NoAudit, OutputStream, PointerAction,
     PointerButton, RebootResumeArmError, RebootResumeArmer, RebootResumeTicketId, RevokeReason,
-    SessionAudit, SessionError, SessionEvent, SessionHost, SessionId, SessionJoiner, Shell,
-    TransferProgress, UploadRequest,
+    SessionAudit, SessionEnd, SessionError, SessionEvent, SessionHost, SessionId, SessionJoiner,
+    Shell, TransferProgress, TransferReport, UploadRequest,
 };
 use cretlink_shared::{Actor, Outcome};
 use tokio::time::timeout;
@@ -102,6 +102,7 @@ fn loopback() -> SocketAddr {
 fn console_hints() -> ConsoleHints {
     ConsoleHints {
         label: "This computer (technician)".to_string(),
+        display_name: cretlink_protocol::DisplayName::new("Test Technician").ok(),
     }
 }
 
@@ -114,6 +115,7 @@ fn agent_identity() -> TargetIdentity {
         elevated: true,
         simulated: false,
         agent_version: "0.0.0".to_string(),
+        account: None,
     }
 }
 
@@ -514,6 +516,146 @@ async fn cleanup_report_is_produced_after_stop() {
     drain_until_end!(joiner);
     let joiner_report = joiner.cleanup_report().expect("agent cleanup report");
     assert!(joiner_report.ok);
+}
+
+// --- end records and the agent's cleanup report (ST-M009-012) ---
+
+/// A console-side audit sink keeping the consent-bound identity and the end
+/// record the runtime reports.
+#[derive(Debug, Default)]
+struct EndAudit {
+    targets: std::sync::Mutex<Vec<TargetIdentity>>,
+    ends: std::sync::Mutex<Vec<SessionEnd>>,
+}
+
+impl SessionAudit for EndAudit {
+    fn record(&self, _actor: Actor, _action: &'static str, _outcome: Outcome) {}
+
+    fn record_target(&self, identity: &TargetIdentity) {
+        self.targets.lock().unwrap().push(identity.clone());
+    }
+
+    fn record_end(&self, end: &SessionEnd) {
+        self.ends.lock().unwrap().push(end.clone());
+    }
+}
+
+/// Like [`connected_pair`], with the console's lifecycle recorded into `audit`.
+async fn connected_pair_end_audited(audit: Arc<EndAudit>) -> (HostHandle, JoinHandle) {
+    let host =
+        SessionHost::host_with_audit(loopback(), console_hints(), PROTOCOL_V1, caps(), audit)
+            .await
+            .expect("bind console");
+    let addr = host
+        .local_addr()
+        .expect("a LAN-bound console reports its local listener address");
+    let joiner = SessionJoiner::join(addr, agent_identity(), PROTOCOL_V1, caps())
+        .await
+        .expect("dial agent");
+    (host, joiner)
+}
+
+#[tokio::test]
+async fn technician_stop_records_the_agents_cleanup_report() {
+    let audit = Arc::new(EndAudit::default());
+    let (mut host, mut joiner) = connected_pair_end_audited(Arc::clone(&audit)).await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    host.revoke(RevokeReason::TechnicianRequested)
+        .expect("revoke");
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+
+    // The agent sent its own teardown report before it closed; the console
+    // kept it, and it is the agent's report, not the console's.
+    let agent_report = joiner.cleanup_report().expect("agent report");
+    let received = host
+        .peer_cleanup_report()
+        .expect("the agent's report reached the console");
+    assert_eq!(received, agent_report);
+    assert!(received.ok);
+    assert!(
+        received
+            .notes
+            .iter()
+            .any(|note| note.contains("revoked by the peer"))
+    );
+
+    assert_eq!(host.ended_by(), Some(EndedBy::Technician));
+    assert_eq!(joiner.ended_by(), Some(EndedBy::Technician));
+    assert_eq!(*audit.targets.lock().unwrap(), vec![agent_identity()]);
+    let ends = audit.ends.lock().unwrap().clone();
+    assert_eq!(ends.len(), 1, "exactly one end record");
+    assert_eq!(ends[0].ended_by, EndedBy::Technician);
+    assert_eq!(ends[0].action, "revoked");
+    assert!(ends[0].control_granted);
+    assert_eq!(ends[0].peer_cleanup.as_ref(), Some(&agent_report));
+}
+
+#[tokio::test]
+async fn customer_stop_records_the_agents_cleanup_report() {
+    let audit = Arc::new(EndAudit::default());
+    let (mut host, mut joiner) = connected_pair_end_audited(Arc::clone(&audit)).await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    joiner
+        .revoke(RevokeReason::CustomerRequested)
+        .expect("revoke");
+    drain_until_end!(joiner);
+    drain_until_end!(host);
+
+    let agent_report = joiner.cleanup_report().expect("agent report");
+    assert_eq!(host.peer_cleanup_report(), Some(agent_report.clone()));
+    assert_eq!(host.ended_by(), Some(EndedBy::Customer));
+    assert_eq!(joiner.ended_by(), Some(EndedBy::Customer));
+    let ends = audit.ends.lock().unwrap().clone();
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0].ended_by, EndedBy::Customer);
+    assert_eq!(ends[0].peer_cleanup, Some(agent_report));
+}
+
+#[tokio::test]
+async fn a_lost_connection_records_no_cleanup_report() {
+    let audit = Arc::new(EndAudit::default());
+    let (mut host, mut joiner) = connected_pair_end_audited(Arc::clone(&audit)).await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    // A hard disconnect: the agent task is aborted and sends nothing.
+    drop(joiner);
+    drain_until_end!(host);
+
+    assert_eq!(
+        host.peer_cleanup_report(),
+        None,
+        "never a fabricated report"
+    );
+    assert_eq!(host.ended_by(), Some(EndedBy::ConnectionLost));
+    let ends = audit.ends.lock().unwrap().clone();
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0].ended_by, EndedBy::ConnectionLost);
+    assert!(ends[0].control_granted);
+    assert_eq!(ends[0].peer_cleanup, None);
+}
+
+#[tokio::test]
+async fn a_declined_consent_is_ended_by_the_customer_without_control() {
+    let audit = Arc::new(EndAudit::default());
+    let (mut host, mut joiner) = connected_pair_end_audited(Arc::clone(&audit)).await;
+    drive_to_awaiting_consent(&mut host, &mut joiner).await;
+
+    joiner.deny_consent("not now").expect("deny");
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+
+    assert_eq!(host.ended_by(), Some(EndedBy::Customer));
+    assert!(
+        audit.targets.lock().unwrap().is_empty(),
+        "no identity was bound"
+    );
+    let ends = audit.ends.lock().unwrap().clone();
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0].action, "consent_denied");
+    assert!(!ends[0].control_granted);
 }
 
 // --- REQ-S-010: never open an internet-reachable listener ---
@@ -2327,6 +2469,386 @@ fn download_temp_exists(dest: &Path) -> bool {
     download_temp_path_for(dest).exists()
 }
 
+// --- an error on the technician's own file (ST-M003-005) --------------------
+//
+// A transfer reads or writes one file on the technician computer. An error
+// there is that transfer's failure: it is reported in the stage `local` with
+// the local path and the reason, it is never reported as a lost session, and
+// the session stays usable. The connection's own errors are covered by
+// `disconnect_mid_upload_is_honest_never_success` and still end the session.
+
+/// Asserts `report` is a failed transfer caused by the technician's own file at
+/// `local`, and returns its category and message for the checks that depend on
+/// the cause.
+fn assert_failed_locally(report: &TransferReport, local: &Path) -> (ErrorCode, String) {
+    assert_eq!(report.outcome, JobOutcome::Failed, "{report:?}");
+    assert!(
+        report.digest.is_empty() && report.canonical_path.is_none(),
+        "a failed transfer verifies and publishes nothing: {report:?}"
+    );
+    let error = report
+        .error
+        .as_ref()
+        .expect("a failed transfer carries the reason");
+    assert_eq!(error.stage, "local", "{error:?}");
+    assert!(
+        error.message.contains(&local.display().to_string()),
+        "the message names the local path {}: {}",
+        local.display(),
+        error.message
+    );
+    assert!(
+        error.message.contains("on the technician computer"),
+        "the message says which computer the file is on: {}",
+        error.message
+    );
+    (error.code, error.message.clone())
+}
+
+/// Runs a short command to its end: the session still carries work.
+async fn assert_the_session_still_runs_a_command(host: &mut HostHandle) {
+    assert!(host.control_active(), "the session must still be active");
+    let job = host
+        .run_command(ExecRequest::new(Shell::Cmd, "echo still-usable"))
+        .await
+        .expect("the session still accepts a command")
+        .job;
+    let result = collect_exec(host, job).await;
+    assert_eq!(result.outcome, JobOutcome::Completed);
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("still-usable"),
+        "stdout was {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+/// Commits `data` to target staging under `name` through a real upload, from a
+/// file in `dir`.
+async fn stage_artifact(host: &HostHandle, dir: &Path, name: &str, data: &[u8]) {
+    let source = dir.join(format!("{name}.source"));
+    std::fs::write(&source, data).expect("write the source");
+    let report = host
+        .upload_file(
+            UploadRequest {
+                source,
+                dest: RemotePath::Staging {
+                    name: name.to_string(),
+                },
+                source_label: "e2e-local-file-error".to_string(),
+                cleanup: CleanupPolicy::OnSessionEnd,
+                overwrite: false,
+            },
+            &CancelToken::new(),
+            |_p| {},
+        )
+        .await
+        .expect("stage the artifact via upload");
+    assert_eq!(report.outcome, JobOutcome::Completed);
+}
+
+/// A download into a folder that does not exist on the technician computer is
+/// a failed transfer that names the path and the reason, not a lost session:
+/// the next command and the next transfer on the same session work.
+#[tokio::test]
+async fn download_into_a_missing_local_folder_is_failed_and_the_session_stays_usable() {
+    let (mut host, mut joiner) = connected_pair().await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    let dir = temp_dir_for("download-missing-local-folder");
+    let data = pattern(4096);
+    let name = "download-missing-local-folder.bin";
+    let staged = || RemotePath::Staging {
+        name: name.to_string(),
+    };
+    stage_artifact(&host, &dir, name, &data).await;
+
+    // The destination's folder was never created.
+    let folder = dir.join("no-such-folder");
+    let dest = folder.join("download.bin");
+    let report = host
+        .download_file(
+            DownloadRequest {
+                source: staged(),
+                dest: dest.clone(),
+            },
+            &CancelToken::new(),
+            |_p| {},
+        )
+        .await
+        .expect("an error on the technician's own file is a report, not a lost session");
+    let (code, message) = assert_failed_locally(&report, &dest);
+    assert_eq!(code, ErrorCode::PathNotFound, "{message}");
+    assert!(
+        message.contains("the folder does not exist"),
+        "the message gives the reason: {message}"
+    );
+    assert_eq!(report.sent, 0, "nothing was written");
+    assert!(
+        !folder.exists(),
+        "a failed download creates neither the folder nor a file in it"
+    );
+
+    // The session is intact: a command runs, and the same download into a
+    // folder that exists completes.
+    assert_the_session_still_runs_a_command(&mut host).await;
+    let dest = dir.join("download.bin");
+    let report = host
+        .download_file(
+            DownloadRequest {
+                source: staged(),
+                dest: dest.clone(),
+            },
+            &CancelToken::new(),
+            |_p| {},
+        )
+        .await
+        .expect("download runs");
+    assert_eq!(report.outcome, JobOutcome::Completed);
+    assert_eq!(std::fs::read(&dest).expect("read downloaded file"), data);
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An upload of a file that does not exist on the technician computer is a
+/// failed transfer that names the path and the reason, not a lost session:
+/// nothing reaches the target, and the next command and the next transfer on
+/// the same session work.
+#[tokio::test]
+async fn upload_of_a_missing_local_file_is_failed_and_the_session_stays_usable() {
+    let (mut host, mut joiner) = connected_pair().await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    let dir = temp_dir_for("upload-missing-local-file");
+    let source = dir.join("no-such-file.bin");
+    let name = "upload-missing-local-file.bin";
+    let request = || UploadRequest {
+        source: source.clone(),
+        dest: RemotePath::Staging {
+            name: name.to_string(),
+        },
+        source_label: "e2e-local-file-error".to_string(),
+        cleanup: CleanupPolicy::OnSessionEnd,
+        overwrite: false,
+    };
+
+    let report = host
+        .upload_file(request(), &CancelToken::new(), |_p| {})
+        .await
+        .expect("an error on the technician's own file is a report, not a lost session");
+    let (code, message) = assert_failed_locally(&report, &source);
+    assert_eq!(code, ErrorCode::PathNotFound, "{message}");
+    assert!(
+        message.contains("the file does not exist"),
+        "the message gives the reason: {message}"
+    );
+    assert_eq!(report.sent, 0, "nothing was sent");
+
+    // Nothing reached the target: neither a final entry nor a pending part.
+    match host
+        .file_op(Operation::FsStat {
+            path: RemotePath::Staging {
+                name: name.to_string(),
+            },
+        })
+        .await
+        .expect("FsStat after the failed upload")
+    {
+        OpResult::PathStat { entry, partial_len } => {
+            assert!(entry.is_none(), "no artifact was committed");
+            assert!(partial_len.is_none(), "no part was staged");
+        }
+        other => panic!("expected PathStat, got {other:?}"),
+    }
+
+    // The session is intact: a command runs, and the same upload completes
+    // once the file exists.
+    assert_the_session_still_runs_a_command(&mut host).await;
+    let data = pattern(4096);
+    std::fs::write(&source, &data).expect("write the source");
+    let report = host
+        .upload_file(request(), &CancelToken::new(), |_p| {})
+        .await
+        .expect("upload runs");
+    assert_eq!(report.outcome, JobOutcome::Completed);
+    assert_eq!(report.digest, sha256(&data));
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An upload whose source is a folder cannot be read: a failed transfer on the
+/// technician's own file, with the operating system's reason, not a lost
+/// session. (The category is the operating system's too, so it is not pinned:
+/// reading a folder is refused on some systems and opening it on others.)
+#[tokio::test]
+async fn upload_of_a_local_folder_is_failed_and_the_session_stays_usable() {
+    let (mut host, mut joiner) = connected_pair().await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    let dir = temp_dir_for("upload-local-folder");
+    let source = dir.join("a-folder");
+    std::fs::create_dir(&source).expect("create the folder");
+    let name = "upload-local-folder.bin";
+
+    let report = host
+        .upload_file(
+            UploadRequest {
+                source: source.clone(),
+                dest: RemotePath::Staging {
+                    name: name.to_string(),
+                },
+                source_label: "e2e-local-file-error".to_string(),
+                cleanup: CleanupPolicy::OnSessionEnd,
+                overwrite: false,
+            },
+            &CancelToken::new(),
+            |_p| {},
+        )
+        .await
+        .expect("an error on the technician's own file is a report, not a lost session");
+    assert_failed_locally(&report, &source);
+    assert_eq!(report.sent, 0, "nothing was sent");
+
+    // Nothing reached the target: neither a final entry nor a pending part.
+    match host
+        .file_op(Operation::FsStat {
+            path: RemotePath::Staging {
+                name: name.to_string(),
+            },
+        })
+        .await
+        .expect("FsStat after the failed upload")
+    {
+        OpResult::PathStat { entry, partial_len } => {
+            assert!(entry.is_none(), "no artifact was committed");
+            assert!(partial_len.is_none(), "no part was staged");
+        }
+        other => panic!("expected PathStat, got {other:?}"),
+    }
+
+    assert_the_session_still_runs_a_command(&mut host).await;
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A download whose destination cannot be replaced fails at its very end, when
+/// every byte has arrived and been verified: still a failed transfer on the
+/// technician's own file, not a lost session. Here the destination is a folder
+/// that is not empty, which no system replaces with a file; the folder is left
+/// as it was and the download's temp is removed.
+#[tokio::test]
+async fn download_onto_a_local_folder_is_failed_and_the_session_stays_usable() {
+    let (mut host, mut joiner) = connected_pair().await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    let dir = temp_dir_for("download-local-folder");
+    let data = pattern(4096);
+    let name = "download-local-folder.bin";
+    stage_artifact(&host, &dir, name, &data).await;
+
+    let dest = dir.join("a-folder");
+    std::fs::create_dir(&dest).expect("create the folder");
+    let kept = dest.join("kept.txt");
+    std::fs::write(&kept, b"kept").expect("fill the folder");
+
+    let report = host
+        .download_file(
+            DownloadRequest {
+                source: RemotePath::Staging {
+                    name: name.to_string(),
+                },
+                dest: dest.clone(),
+            },
+            &CancelToken::new(),
+            |_p| {},
+        )
+        .await
+        .expect("an error on the technician's own file is a report, not a lost session");
+    assert_failed_locally(&report, &dest);
+    assert_eq!(
+        report.sent,
+        data.len() as u64,
+        "every byte had arrived before the destination refused the file"
+    );
+    assert_eq!(
+        std::fs::read(&kept).expect("the folder keeps its content"),
+        b"kept"
+    );
+    assert!(
+        !download_temp_exists(&dest),
+        "a failed download removes its temp"
+    );
+
+    assert_the_session_still_runs_a_command(&mut host).await;
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A download whose bytes cannot be written because the disk is full is a
+/// failed transfer in the storage category: never a completed one with a short
+/// file, and never a lost session. The engine writes in the background, so the
+/// error of a write shows on the next write (the larger file) or only on the
+/// final flush (the file of one chunk); both are covered.
+///
+/// Linux only: the test points the engine's sibling temp at `/dev/full`, the
+/// device whose every write fails with "no space left", so no disk has to be
+/// filled.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn download_onto_a_full_disk_is_failed_and_the_session_stays_usable() {
+    let (mut host, mut joiner) = connected_pair().await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    let dir = temp_dir_for("download-full-disk");
+    for (name, data) in [
+        ("download-full-disk-one-chunk.bin", pattern(4096)),
+        ("download-full-disk-windowed.bin", windowed_payload()),
+    ] {
+        stage_artifact(&host, &dir, name, &data).await;
+        let dest = dir.join(name);
+        let temp = download_temp_path_for(&dest);
+        std::os::unix::fs::symlink("/dev/full", &temp).expect("point the temp at a full device");
+
+        let report = host
+            .download_file(
+                DownloadRequest {
+                    source: RemotePath::Staging {
+                        name: name.to_string(),
+                    },
+                    dest: dest.clone(),
+                },
+                &CancelToken::new(),
+                |_p| {},
+            )
+            .await
+            .expect("an error on the technician's own file is a report, not a lost session");
+        let (code, message) = assert_failed_locally(&report, &dest);
+        assert_eq!(code, ErrorCode::StorageExhausted, "{message}");
+        assert!(
+            message.contains("the disk is full"),
+            "the message gives the reason: {message}"
+        );
+        assert!(!dest.exists(), "a failed download publishes no file");
+        assert!(
+            std::fs::symlink_metadata(&temp).is_err(),
+            "a failed download removes its temp"
+        );
+    }
+
+    assert_the_session_still_runs_a_command(&mut host).await;
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- revocation races against transfers and each other (ST-M003-007) -------
 //
 // The exec-side revoke-race is covered by
@@ -2926,13 +3448,41 @@ async fn next_handled(joiner: &mut JoinHandle) -> SessionEvent {
     }
 }
 
+/// The parts of a `RequestHandled` a test asserts: everything but the minted
+/// id and the measured duration.
+fn handled_parts(
+    event: SessionEvent,
+) -> (
+    cretlink_session::Origin,
+    Option<cretlink_session::Purpose>,
+    cretlink_session::ActivityKind,
+    String,
+    Option<String>,
+    Option<u64>,
+    cretlink_session::ActionOutcome,
+) {
+    match event {
+        SessionEvent::RequestHandled {
+            origin,
+            purpose,
+            kind,
+            operation,
+            path,
+            bytes,
+            outcome,
+            ..
+        } => (origin, purpose, kind, operation, path, bytes, outcome),
+        other => panic!("expected RequestHandled, got {other:?}"),
+    }
+}
+
 /// The agent reports every handled request with who drove it, the caller's
 /// stated purpose (AI only), the real operation, and the honest result; a
 /// started command carries its purpose on `CommandStarted` instead, and a
 /// technician request carries no purpose.
 #[tokio::test]
 async fn agent_reports_each_action_with_source_purpose_operation_and_result() {
-    use cretlink_session::{ActionOutcome, Attribution, Origin, Purpose};
+    use cretlink_session::{ActionOutcome, ActivityKind, Attribution, Origin, Purpose};
 
     let (mut host, mut joiner) = connected_pair().await;
     drive_to_active(&mut host, &mut joiner).await;
@@ -2942,26 +3492,44 @@ async fn agent_reports_each_action_with_source_purpose_operation_and_result() {
     host.system_info_as(ai("Checking which computer this is"))
         .await
         .expect("system info");
-    assert_eq!(
-        next_handled(&mut joiner).await,
+    let first = next_handled(&mut joiner).await;
+    let first_id = match &first {
         SessionEvent::RequestHandled {
-            origin: Origin::Mcp,
-            purpose: Some(Purpose::new("Checking which computer this is").unwrap()),
-            operation: "read system information".to_string(),
-            outcome: ActionOutcome::Succeeded,
+            id, duration_ms, ..
+        } => {
+            assert!(duration_ms.is_some(), "a handled request has a duration");
+            *id
         }
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        handled_parts(first),
+        (
+            Origin::Mcp,
+            Some(Purpose::new("Checking which computer this is").unwrap()),
+            ActivityKind::SystemInformation,
+            "read system information".to_string(),
+            None,
+            None,
+            ActionOutcome::Succeeded,
+        )
     );
 
-    // A technician request: labelled by its source, no purpose.
+    // A technician request: labelled by its source, no purpose, a fresh id.
     host.list_jobs().await.expect("list jobs");
+    let second = next_handled(&mut joiner).await;
+    assert!(matches!(second, SessionEvent::RequestHandled { id, .. } if id > first_id));
     assert_eq!(
-        next_handled(&mut joiner).await,
-        SessionEvent::RequestHandled {
-            origin: Origin::Console,
-            purpose: None,
-            operation: "list running jobs".to_string(),
-            outcome: ActionOutcome::Succeeded,
-        }
+        handled_parts(second),
+        (
+            Origin::Console,
+            None,
+            ActivityKind::JobControl,
+            "list running jobs".to_string(),
+            None,
+            None,
+            ActionOutcome::Succeeded,
+        )
     );
 
     // An AI cancellation the agent refuses: the purpose rides the wire
@@ -2971,15 +3539,18 @@ async fn agent_reports_each_action_with_source_purpose_operation_and_result() {
         .await;
     assert!(refused.is_err(), "{refused:?}");
     assert_eq!(
-        next_handled(&mut joiner).await,
-        SessionEvent::RequestHandled {
-            origin: Origin::Mcp,
-            purpose: Some(Purpose::new("Stopping the stuck installer").unwrap()),
-            operation: "stop job 999".to_string(),
-            outcome: ActionOutcome::Failed {
+        handled_parts(next_handled(&mut joiner).await),
+        (
+            Origin::Mcp,
+            Some(Purpose::new("Stopping the stuck installer").unwrap()),
+            ActivityKind::JobControl,
+            "stop job 999".to_string(),
+            None,
+            None,
+            ActionOutcome::Failed {
                 code: ErrorCode::UnknownJob
             },
-        }
+        )
     );
 
     // A started command carries its purpose on `CommandStarted`, beside the
@@ -3024,4 +3595,289 @@ async fn agent_reports_each_action_with_source_purpose_operation_and_result() {
     }
 
     host.stop().expect("stop");
+}
+
+// --- One activity item for both surfaces (ST-M009-011) ---
+
+/// The console's display name rides the pairing handshake (protocol minor 10):
+/// the agent knows what the technician's computer says once connected.
+#[tokio::test]
+async fn the_agent_learns_the_technician_display_name_from_the_handshake() {
+    let (mut host, mut joiner) = connected_pair().await;
+    assert_eq!(next_event!(joiner), SessionEvent::Connected);
+    assert_eq!(
+        joiner
+            .technician_display_name()
+            .as_ref()
+            .map(cretlink_protocol::DisplayName::as_str),
+        Some("Test Technician")
+    );
+    host.stop().expect("stop");
+    drain_until_end!(host);
+}
+
+/// A file reaching the customer computer is reported at its commit with its
+/// byte count; a file leaving it is reported when sending starts and again,
+/// under the same id, when it completes, with the byte count — and the
+/// customer-side fold turns that into one "file sent" item updated in place.
+#[tokio::test]
+async fn files_sent_and_received_are_reported_with_their_byte_count() {
+    use cretlink_session::{ActionOutcome, ActivityKind, ActivityState, CustomerActivity};
+
+    let (mut host, mut joiner) = connected_pair().await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    let dir = temp_dir_for("activity-bytes");
+    let data = windowed_payload();
+    let source = dir.join("source.bin");
+    std::fs::write(&source, &data).expect("write source");
+    let staged = || RemotePath::Staging {
+        name: "activity.bin".to_string(),
+    };
+    let cancel = CancelToken::new();
+    let report = host
+        .upload_file(
+            UploadRequest {
+                source: source.clone(),
+                dest: staged(),
+                source_label: "e2e-activity".to_string(),
+                cleanup: CleanupPolicy::Keep,
+                overwrite: false,
+            },
+            &cancel,
+            |_| {},
+        )
+        .await
+        .expect("upload runs");
+    assert_eq!(report.outcome, JobOutcome::Completed);
+    let report = host
+        .download_file(
+            DownloadRequest {
+                source: staged(),
+                dest: dir.join("downloaded.bin"),
+            },
+            &cancel,
+            |_| {},
+        )
+        .await
+        .expect("download runs");
+    assert_eq!(report.outcome, JobOutcome::Completed);
+    // One more request after the transfer, so the stream has a known end.
+    host.list_jobs().await.expect("list jobs");
+
+    let total = data.len() as u64;
+    let mut fold = CustomerActivity::new();
+    let mut received = None;
+    let mut sent = Vec::new();
+    loop {
+        let event = next_handled(&mut joiner).await;
+        fold.apply(&event, 0);
+        let SessionEvent::RequestHandled {
+            id,
+            kind,
+            bytes,
+            outcome,
+            operation,
+            ..
+        } = event
+        else {
+            unreachable!()
+        };
+        match kind {
+            ActivityKind::FileReceived => received = Some((bytes, outcome)),
+            ActivityKind::FileSent => sent.push((id, bytes, outcome)),
+            ActivityKind::JobControl if operation == "list running jobs" => break,
+            _ => {}
+        }
+    }
+    assert_eq!(received, Some((Some(total), ActionOutcome::Succeeded)));
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    let (start_id, start_bytes, start_outcome) = sent[0];
+    let (end_id, end_bytes, end_outcome) = sent[1];
+    assert_eq!(start_id, end_id, "start and end share one item id");
+    assert_eq!(
+        (start_bytes, start_outcome),
+        (Some(total), ActionOutcome::InProgress)
+    );
+    assert_eq!(
+        (end_bytes, end_outcome),
+        (Some(total), ActionOutcome::Succeeded)
+    );
+
+    let file_sent: Vec<_> = fold
+        .entries()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            cretlink_session::ActivityEntry::Item { item }
+                if item.kind == ActivityKind::FileSent =>
+            {
+                Some(item)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(file_sent.len(), 1, "updated in place: {file_sent:?}");
+    assert_eq!(file_sent[0].bytes, Some(total));
+    assert_eq!(file_sent[0].state, ActivityState::Done { exit_code: None });
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+}
+
+/// Every request the agent refuses reaches the customer feed as a failed item
+/// with the reason in plain words and no file content (ST-M009-011, REQ-F-017):
+/// a request bound to another session, and a refused transfer step — once per
+/// path until that path's next reported request, so the chunks of one refused
+/// transfer do not flood the feed.
+#[tokio::test]
+async fn requests_the_agent_refuses_reach_the_customer_feed() {
+    use cretlink_session::{ActionOutcome, ActivityKind, ActivityState, CustomerActivity};
+
+    let (mut host, mut joiner) = connected_pair().await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let mut fold = CustomerActivity::new();
+
+    // A download read bound to another session: refused, never run.
+    let source = RemotePath::Staging {
+        name: "refused.bin".to_string(),
+    };
+    host.file_op_with_session(
+        SessionId::new(),
+        Operation::FsRead {
+            path: source.clone(),
+            offset: 0,
+            len: 16,
+        },
+    )
+    .await
+    .expect_err("a wrong-session read is refused");
+    let event = next_handled(&mut joiner).await;
+    fold.apply(&event, 0);
+    let (_, _, kind, _, path, bytes, outcome) = handled_parts(event);
+    assert_eq!(kind, ActivityKind::FileSent);
+    assert_eq!(
+        path.as_deref(),
+        Some("refused.bin (CretLink staging folder)")
+    );
+    assert_eq!(bytes, None);
+    assert_eq!(
+        outcome,
+        ActionOutcome::Failed {
+            code: ErrorCode::UnknownSession
+        }
+    );
+
+    // A refused chunk write (an offset the part does not have), twice: one item.
+    let dest = RemotePath::Staging {
+        name: "refused-upload.bin".to_string(),
+    };
+    let write = |offset| Operation::FsWrite {
+        dest: dest.clone(),
+        offset,
+        data: B64Bytes::new(vec![0xAB; 8]),
+    };
+    for _ in 0..2 {
+        host.file_op(write(64))
+            .await
+            .expect_err("a write at a wrong offset is refused");
+    }
+    // A reported request on the same path, then another refused write: a new
+    // item, so a later refused transfer is not hidden by an earlier one.
+    host.file_op(Operation::FsStat { path: dest.clone() })
+        .await
+        .expect("stat");
+    host.file_op(write(128)).await.expect_err("refused again");
+    host.list_jobs().await.expect("list jobs");
+
+    let mut refused_writes = 0;
+    loop {
+        let event = next_handled(&mut joiner).await;
+        fold.apply(&event, 0);
+        let (_, _, kind, operation, _, bytes, outcome) = handled_parts(event);
+        if operation.starts_with("write ") {
+            refused_writes += 1;
+            assert_eq!(kind, ActivityKind::FileOperation);
+            assert_eq!(bytes, None, "no byte count for a refused chunk");
+            assert_eq!(
+                outcome,
+                ActionOutcome::Failed {
+                    code: ErrorCode::WriteConflict
+                }
+            );
+        } else if operation == "list running jobs" {
+            break;
+        }
+    }
+    assert_eq!(refused_writes, 2, "one per refused transfer, not per chunk");
+
+    // The customer's fold shows them failed, with the reason in words.
+    let failed: Vec<_> = fold
+        .entries()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            cretlink_session::ActivityEntry::Item { item } => match item.state {
+                ActivityState::Failed { message, .. } => Some(message),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failed.len(), 3, "{failed:?}");
+    assert_eq!(
+        failed[0].as_deref(),
+        Some("the request was not for this session")
+    );
+    assert_eq!(
+        failed[1].as_deref(),
+        Some("the file changed during the transfer")
+    );
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+}
+
+/// When the agent's event channel is under pressure, activity events are shed
+/// to keep the lifecycle reserve free — and counted: the next activity event is
+/// preceded by one `ActivityShed` marker, so handled plus shed events add up to
+/// every request (ST-M009-011, REQ-N-008).
+#[tokio::test]
+async fn shed_activity_events_are_counted_and_reported_where_they_were_dropped() {
+    let (mut host, mut joiner) = connected_pair().await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    // Far more requests than the agent's bounded channel holds, without reading
+    // the agent's events, so most of them are shed.
+    const BURST: u64 = 200;
+    for _ in 0..BURST {
+        host.list_jobs().await.expect("list jobs");
+    }
+    let mut handled = 0u64;
+    let mut shed = 0u64;
+    // Drain what was buffered, then one more request delivers the marker.
+    while let Ok(Some(event)) = timeout(Duration::from_millis(300), joiner.next_event()).await {
+        match event {
+            SessionEvent::RequestHandled { .. } => handled += 1,
+            SessionEvent::ActivityShed { count } => shed += count,
+            _ => {}
+        }
+    }
+    assert!(handled < BURST, "the burst must overflow the channel");
+    host.list_jobs().await.expect("list jobs");
+    match next_event!(joiner) {
+        SessionEvent::ActivityShed { count } => shed += count,
+        other => panic!("expected the shed marker first, got {other:?}"),
+    }
+    assert!(matches!(
+        next_event!(joiner),
+        SessionEvent::RequestHandled { .. }
+    ));
+    handled += 1;
+    assert_eq!(
+        handled + shed,
+        BURST + 1,
+        "every request is either shown or counted"
+    );
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
 }

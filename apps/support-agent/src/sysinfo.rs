@@ -15,7 +15,9 @@
 //! - Version: `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion` —
 //!   `ProductName`, `DisplayVersion` (falling back to the older `ReleaseId`),
 //!   `CurrentBuildNumber`, and `UBR`, composed into for example
-//!   `"Windows 11 Pro 24H2 (build 26100.1234)"`.
+//!   `"Windows 11 Pro 24H2 (build 26100.1234)"`. [`os_name`] is the same
+//!   without the build, `"Windows 11 Pro 24H2"`: the name a person reads,
+//!   which the technician's window shows for its own computer (ST-M009-008).
 //! - Architecture: `HKLM\SYSTEM\CurrentControlSet\Control\Session
 //!   Manager\Environment` → `PROCESSOR_ARCHITECTURE`. This is the machine's
 //!   native architecture (`HKLM\SYSTEM` is never WOW64-redirected and the
@@ -34,6 +36,22 @@ pub fn os_version() -> String {
     #[cfg(windows)]
     {
         windows_registry::os_version()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::consts::OS.to_string()
+    }
+}
+
+/// The operating system's product name and release without the build, for
+/// example `Windows 11 Pro 24H2`, read live from the same registry facts as
+/// [`os_version`] (ST-M009-008). Off Windows this is the deterministic host OS
+/// tag, as for [`os_version`].
+#[must_use]
+pub fn os_name() -> String {
+    #[cfg(windows)]
+    {
+        windows_registry::os_name()
     }
     #[cfg(not(windows))]
     {
@@ -73,14 +91,40 @@ pub fn reboot_pending() -> bool {
     }
 }
 
-/// Composes the version string from the registry facts, tolerating any subset
-/// being unavailable. Pure so it is unit-tested on every CI platform.
+/// Composes the product name and release, for example `Windows 11 Pro 24H2`,
+/// from the registry facts, tolerating any subset being unavailable. Pure so
+/// it is unit-tested on every CI platform.
 ///
 /// The registry famously keeps `ProductName` at "Windows 10 ..." on Windows
 /// 11, so a product name is corrected from the build number (Windows 11 starts
 /// at build 22000) — reporting what the machine actually runs (REQ-N-008).
-// Only the Windows reader calls this outside of tests; the cfg keeps the
-// non-Windows lib build free of dead code while the tests still run everywhere.
+// Only the Windows reader calls this and `compose_os_version` outside of
+// tests; the cfg keeps the non-Windows lib build free of dead code while the
+// tests still run everywhere.
+#[cfg(any(windows, test))]
+fn compose_os_name(
+    product: Option<String>,
+    display: Option<String>,
+    build: Option<&str>,
+) -> String {
+    let mut name = product.unwrap_or_else(|| "Windows".to_string());
+    if let Some(build) = build
+        && let Ok(number) = build.parse::<u64>()
+        && number >= 22_000
+        && let Some(rest) = name.strip_prefix("Windows 10")
+    {
+        name = format!("Windows 11{rest}");
+    }
+    if let Some(display) = display {
+        name.push(' ');
+        name.push_str(&display);
+    }
+    name
+}
+
+/// Composes the version string: the name of [`compose_os_name`] followed by
+/// the build, or by the plain statement that no build number could be read.
+/// Pure so it is unit-tested on every CI platform.
 #[cfg(any(windows, test))]
 fn compose_os_version(
     product: Option<String>,
@@ -88,19 +132,7 @@ fn compose_os_version(
     build: Option<String>,
     ubr: Option<u32>,
 ) -> String {
-    let mut name = product.unwrap_or_else(|| "Windows".to_string());
-    if let Some(build) = &build
-        && let Ok(number) = build.parse::<u64>()
-        && number >= 22_000
-        && let Some(rest) = name.strip_prefix("Windows 10")
-    {
-        name = format!("Windows 11{rest}");
-    }
-    let mut out = name;
-    if let Some(display) = display {
-        out.push(' ');
-        out.push_str(&display);
-    }
+    let mut out = compose_os_name(product, display, build.as_deref());
     match (build, ubr) {
         (Some(build), Some(ubr)) => {
             out.push_str(&format!(" (build {build}.{ubr})"));
@@ -135,7 +167,7 @@ mod windows_registry {
     use winreg::RegKey;
     use winreg::enums::HKEY_LOCAL_MACHINE;
 
-    use super::{compose_os_version, normalize_arch};
+    use super::{compose_os_name, compose_os_version, normalize_arch};
 
     /// The version facts live here.
     const CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
@@ -151,11 +183,26 @@ mod windows_registry {
     /// Holds `PendingFileRenameOperations` when file renames await a reboot.
     const SESSION_MANAGER: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager";
 
-    pub(super) fn os_version() -> String {
+    /// The version facts of [`CURRENT_VERSION`], each `None` when it could not
+    /// be read.
+    struct VersionFacts {
+        product: Option<String>,
+        display: Option<String>,
+        build: Option<String>,
+        ubr: Option<u32>,
+    }
+
+    /// One read of the version facts, shared by the long and the short form.
+    fn version_facts() -> VersionFacts {
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
         let Ok(key) = hklm.open_subkey(CURRENT_VERSION) else {
-            // The key itself was unreadable: still never the bare "Windows".
-            return compose_os_version(None, None, None, None);
+            // The key itself was unreadable: nothing is known.
+            return VersionFacts {
+                product: None,
+                display: None,
+                build: None,
+                ubr: None,
+            };
         };
         let product: Option<String> = key.get_value("ProductName").ok();
         // `DisplayVersion` (for example "24H2") arrived with Windows 10 20H2;
@@ -166,7 +213,24 @@ mod windows_registry {
             .or_else(|| key.get_value("ReleaseId").ok());
         let build: Option<String> = key.get_value("CurrentBuildNumber").ok();
         let ubr: Option<u32> = key.get_value("UBR").ok();
-        compose_os_version(product, display, build, ubr)
+        VersionFacts {
+            product,
+            display,
+            build,
+            ubr,
+        }
+    }
+
+    pub(super) fn os_version() -> String {
+        // With the key unreadable this is still never the bare "Windows".
+        let facts = version_facts();
+        compose_os_version(facts.product, facts.display, facts.build, facts.ubr)
+    }
+
+    pub(super) fn os_name() -> String {
+        // With the key unreadable this is "Windows": the one thing known.
+        let facts = version_facts();
+        compose_os_name(facts.product, facts.display, facts.build.as_deref())
     }
 
     pub(super) fn machine_arch() -> String {
@@ -248,6 +312,82 @@ mod tests {
         );
     }
 
+    // --- The name without the build (ST-M009-008) ---
+
+    #[test]
+    fn the_name_is_the_product_and_release_without_the_build() {
+        let name = compose_os_name(
+            Some("Windows 11 Pro".to_string()),
+            Some("25H2".to_string()),
+            Some("26200"),
+        );
+        assert_eq!(name, "Windows 11 Pro 25H2");
+        // The long form is this name followed by the build.
+        let version = compose_os_version(
+            Some("Windows 11 Pro".to_string()),
+            Some("25H2".to_string()),
+            Some("26200".to_string()),
+            Some(1234),
+        );
+        assert_eq!(version, format!("{name} (build 26200.1234)"));
+    }
+
+    #[test]
+    fn the_name_corrects_the_windows_10_product_name_on_11_builds() {
+        // The registry keeps "Windows 10 ..." on Windows 11.
+        assert_eq!(
+            compose_os_name(
+                Some("Windows 10 Pro".to_string()),
+                Some("25H2".to_string()),
+                Some("26200"),
+            ),
+            "Windows 11 Pro 25H2"
+        );
+        // A genuine Windows 10 build keeps its name, and so does a server
+        // edition, whatever its build.
+        assert_eq!(
+            compose_os_name(
+                Some("Windows 10 Home".to_string()),
+                Some("22H2".to_string()),
+                Some("19045"),
+            ),
+            "Windows 10 Home 22H2"
+        );
+        assert_eq!(
+            compose_os_name(
+                Some("Windows Server 2025 Standard".to_string()),
+                Some("24H2".to_string()),
+                Some("26100"),
+            ),
+            "Windows Server 2025 Standard 24H2"
+        );
+        // Without a readable build number nothing is corrected: the name is
+        // what the registry says.
+        assert_eq!(
+            compose_os_name(
+                Some("Windows 10 Pro".to_string()),
+                Some("25H2".to_string()),
+                None,
+            ),
+            "Windows 10 Pro 25H2"
+        );
+    }
+
+    #[test]
+    fn the_name_degrades_to_what_is_known() {
+        // No release: the product alone. No product: "Windows" and the
+        // release. Nothing readable: "Windows", never an invented edition.
+        assert_eq!(
+            compose_os_name(Some("Windows 11 Pro".to_string()), None, Some("26200")),
+            "Windows 11 Pro"
+        );
+        assert_eq!(
+            compose_os_name(None, Some("25H2".to_string()), Some("26200")),
+            "Windows 25H2"
+        );
+        assert_eq!(compose_os_name(None, None, None), "Windows");
+    }
+
     #[test]
     fn arch_tokens_map_to_the_wire_vocabulary() {
         assert_eq!(normalize_arch("AMD64"), "x86_64");
@@ -273,6 +413,21 @@ mod tests {
         assert!(
             version.chars().any(|c| c.is_ascii_digit()),
             "expected digits in {version:?}"
+        );
+    }
+
+    /// The live name is the long form without its build: never empty, and
+    /// the long form starts with it.
+    #[cfg(windows)]
+    #[test]
+    fn live_os_name_is_the_version_without_the_build() {
+        let name = os_name();
+        assert!(!name.trim().is_empty());
+        assert!(!name.contains("(build"), "no build in {name:?}");
+        let version = os_version();
+        assert!(
+            version.starts_with(&name),
+            "expected {version:?} to start with {name:?}"
         );
     }
 
@@ -303,6 +458,7 @@ mod tests {
     #[test]
     fn non_windows_values_are_deterministic_host_tags() {
         assert_eq!(os_version(), std::env::consts::OS);
+        assert_eq!(os_name(), std::env::consts::OS);
         assert_eq!(machine_arch(), std::env::consts::ARCH);
         assert!(!reboot_pending());
     }

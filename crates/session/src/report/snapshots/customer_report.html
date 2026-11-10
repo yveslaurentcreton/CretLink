@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<title>CretLink session report · ACME-PC-07</title>
+<style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#1d232b;background:#fff;margin:0;padding:24px;line-height:1.45}main{max-width:860px;margin:0 auto}h1{font-size:1.4em;margin:0 0 4px}h2{font-size:1.1em;margin:24px 0 8px}.band{display:inline-block;border:1px solid #6b7480;border-radius:4px;padding:2px 8px;font-weight:600;font-size:.85em}.muted{color:#56606b}dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px;margin:0}dt{color:#56606b}dd{margin:0}ul.notes{padding-left:20px}.problem{font-weight:600}table{border-collapse:collapse;width:100%;font-size:.9em}th,td{text-align:left;vertical-align:top;border-bottom:1px solid #d6dae0;padding:6px 8px}th{color:#56606b;font-weight:600}code{font-family:ui-monospace,Consolas,monospace;font-size:.95em;word-break:break-all}footer{margin-top:32px;font-size:.85em;color:#56606b}</style>
+</head>
+<body>
+<main>
+<p><span class="band">○ No access</span> The session has ended</p>
+<h1>You stopped the session</h1>
+<p class="muted">CretLink session report for ACME-PC-07. The technician can no longer reach this computer. A new session needs a new code and your permission again.</p>
+<h2>When</h2>
+<dl>
+<dt>Started</dt><dd>2025-10-22 14:00 UTC</dd>
+<dt>Ended</dt><dd>2025-10-22 14:12 UTC</dd>
+<dt>Duration</dt><dd>12 min 34 s</dd>
+<dt>Technician</dt><dd>Sam &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;&amp;&quot; <span class="muted">(as the technician's computer reports it)</span></dd>
+</dl>
+<h2>What happened</h2>
+<dl>
+<dt>Commands</dt><dd>2 · 1 failed</dd>
+<dt>Files sent</dt><dd>1 (left this computer)</dd>
+<dt>Files received</dt><dd>0</dd>
+<dt>Screenshots</dt><dd>1</dd>
+</dl>
+<h2>Cleanup: 1 item left behind</h2>
+<ul class="notes">
+<li><span class="problem">Problem:</span> staged artifact not removed: C:\Temp\&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;&amp;&quot;.bin (in use)</li>
+<li>session revoked by the peer; secure channel and session keys dropped</li>
+</ul>
+<h2>Activity</h2>
+<table>
+<thead><tr><th>Time</th><th>Who</th><th>What</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>14:01:00</td><td>AI assistant</td><td>Ran a command<br><span class="muted">Stated purpose:</span> Check the &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;&amp;&quot; driver<br><code>run a command: echo &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;&amp;&quot;</code></td><td>failed (exit code 1)</td></tr>
+<tr><td>14:01:00</td><td>AI assistant</td><td>Ran a command<br><code>run a command: ipconfig</code></td><td>done (exit code 0)</td></tr>
+<tr><td>14:01:00</td><td>AI assistant</td><td>Copied a file from the customer computer<br><code>copy the file C:\log.txt from the customer computer</code></td><td>done</td></tr>
+<tr><td>14:01:00</td><td>AI assistant</td><td>Copied a file to the customer computer<br><code>copy a file to the customer computer at C:\x.msi</code></td><td>failed: the result is not known</td></tr>
+<tr><td>14:01:00</td><td>AI assistant</td><td>Took a picture of the screen<br><code>take a screenshot of display 0</code></td><td>done</td></tr>
+<tr><td>14:02:00</td><td colspan="3" class="muted">2 actions not shown here</td></tr>
+</tbody>
+</table>
+<footer>Saved by CretLink at your request. This copy holds what the CretLink window showed you during the session and no session secret. Times are in UTC.</footer>
+</main>
+</body>
+</html>

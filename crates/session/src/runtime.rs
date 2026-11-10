@@ -36,7 +36,7 @@
 //! against a remote target that floods output, without blocking the socket read
 //! (which would stall the half-duplex channel).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -59,10 +59,12 @@ use tokio::sync::oneshot;
 use tokio::time::{MissedTickBehavior, timeout};
 
 use crate::reboot::ArmCommand;
+use crate::report::{RESIDUAL_NOTE_PREFIX, TEARDOWN_FAILED_NOTE_PREFIX, fit_for_wire};
 use crate::{
-    ACCEPT_TIMEOUT, ActionOutcome, Attribution, CONSENT_TIMEOUT, CleanupReport, DisclosureSummary,
-    HEARTBEAT_INTERVAL, PAIR_TIMEOUT, RebootProbe, RebootResumeArmError, RebootResumeArmer,
-    RebootResumeTicketId, SessionAudit, SessionError, SessionEvent, Shared, TEARDOWN_DRAIN,
+    ACCEPT_TIMEOUT, ActionOutcome, ActivityKind, Attribution, CLEANUP_REPORT_WAIT, CONSENT_TIMEOUT,
+    CleanupReport, DisclosureSummary, EndedBy, HEARTBEAT_INTERVAL, PAIR_TIMEOUT, RebootProbe,
+    RebootResumeArmError, RebootResumeArmer, RebootResumeTicketId, SessionAudit, SessionEnd,
+    SessionError, SessionEvent, Shared, TEARDOWN_DRAIN,
 };
 
 /// What the agent's active loop answers a `SystemInfo` request from: the
@@ -167,6 +169,7 @@ enum Incoming {
 
 /// How a session ended; maps to a terminal [`SessionEvent`], a cleanup note, and
 /// an audit outcome in [`describe_ending`].
+#[derive(Debug, Clone, Copy)]
 enum Ending {
     /// This side revoked/stopped with the given reason.
     LocalRevoke(RevokeReason),
@@ -215,17 +218,275 @@ fn emit(tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
     let _ = tx.try_send(event);
 }
 
-/// Emits one per-request activity event ([`SessionEvent::RequestHandled`]) on
-/// the agent side only while the bounded channel keeps [`LIFECYCLE_RESERVE`]
-/// slots free, so a burst of remote actions (for example rapid pointer moves)
-/// can never crowd out a stop, revoke, or failure event (REQ-S-004, REQ-N-006).
-/// Under that pressure the activity line is shed (the console's audit still
-/// records every routed AI call); the shed line is never replaced by a
-/// fabricated one.
-fn emit_activity(tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
-    if tx.capacity() > LIFECYCLE_RESERVE {
-        let _ = tx.try_send(event);
+/// The agent's per-session bookkeeping of customer-visible activity
+/// (ST-M009-011): the ids of handled requests, the activity events shed under
+/// pressure, and the files that are leaving the computer.
+///
+/// Activity events ([`SessionEvent::RequestHandled`]) are delivered only while
+/// the bounded channel keeps [`LIFECYCLE_RESERVE`] slots free, so a burst of
+/// remote actions (for example rapid pointer moves) can never crowd out a stop,
+/// revoke, or failure event (REQ-S-004, REQ-N-006). A shed event is never
+/// replaced by a fabricated one: it is **counted**, and the count is delivered
+/// as one [`SessionEvent::ActivityShed`] at the place in the stream where the
+/// events were dropped, as soon as there is room again, so the customer surface
+/// shows a gap instead of silently missing items (REQ-N-008). The console's
+/// audit still records every routed call in full.
+#[derive(Debug, Default)]
+struct ActivityTap {
+    /// The last minted item id (ids start at 1).
+    last_id: u64,
+    /// Activity events dropped since the last delivered marker.
+    shed: u64,
+    /// Files leaving the computer, keyed by the remote path text.
+    sending: HashMap<String, Sending>,
+    /// Paths whose refused transfer step has been reported since that path's
+    /// last reported request, so the in-flight chunks of one refused transfer
+    /// yield one item rather than one each.
+    refused_steps: HashSet<String>,
+}
+
+/// One file that has started to leave the customer computer.
+#[derive(Debug)]
+struct Sending {
+    id: u64,
+    attribution: Attribution,
+    operation: String,
+    path: Option<String>,
+    started: Instant,
+    sent: u64,
+}
+
+impl ActivityTap {
+    fn mint(&mut self) -> u64 {
+        self.last_id += 1;
+        self.last_id
     }
+
+    /// Whether a refused transfer step on `path` is the first since that
+    /// path's last reported request.
+    fn first_refusal(&mut self, path: Option<&str>) -> bool {
+        self.refused_steps
+            .insert(path.unwrap_or_default().to_owned())
+    }
+
+    /// A request on `path` other than a transfer step was reported: a later
+    /// refused step on it starts a new item.
+    fn settle(&mut self, path: Option<&str>) {
+        self.refused_steps.remove(path.unwrap_or_default());
+    }
+
+    /// Reports a request the agent refused before serving it (here: one bound
+    /// to another session), so the customer sees every refusal, not only the
+    /// requests that ran (ST-M009-011, REQ-F-017).
+    fn refused(
+        &mut self,
+        tx: &mpsc::Sender<SessionEvent>,
+        attribution: Attribution,
+        op: &Operation,
+        code: ErrorCode,
+    ) {
+        self.handled(
+            tx,
+            attribution,
+            ActivityKind::of(op),
+            crate::describe_operation(op),
+            crate::activity::path_of(op),
+            None,
+            ActionOutcome::Failed { code },
+            Instant::now(),
+        );
+    }
+
+    /// Delivers the pending shed count as one marker when there is room.
+    fn flush(&mut self, tx: &mpsc::Sender<SessionEvent>) {
+        if self.shed > 0
+            && tx.capacity() > LIFECYCLE_RESERVE
+            && tx
+                .try_send(SessionEvent::ActivityShed { count: self.shed })
+                .is_ok()
+        {
+            self.shed = 0;
+        }
+    }
+
+    /// Delivers a pending shed count before the session's terminal event, so
+    /// a gap at the end of a session is shown rather than lost with the
+    /// session (REQ-N-008). It may use the lifecycle reserve — nothing else is
+    /// sent after it — but leaves one slot for the terminal event itself.
+    fn flush_final(&mut self, tx: &mpsc::Sender<SessionEvent>) {
+        if self.shed > 0
+            && tx.capacity() > 1
+            && tx
+                .try_send(SessionEvent::ActivityShed { count: self.shed })
+                .is_ok()
+        {
+            self.shed = 0;
+        }
+    }
+
+    /// Emits one activity event while the lifecycle reserve stays free, else
+    /// counts it as shed.
+    fn emit(&mut self, tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
+        self.flush(tx);
+        if tx.capacity() <= LIFECYCLE_RESERVE || tx.try_send(event).is_err() {
+            self.shed += 1;
+        }
+    }
+
+    /// Emits a job event ([`SessionEvent::CommandStarted`],
+    /// [`SessionEvent::ExecFinished`]), which may use the reserve; one that
+    /// still cannot be placed is counted as shed rather than lost silently.
+    fn emit_job(&mut self, tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
+        self.flush(tx);
+        if tx.try_send(event).is_err() {
+            self.shed += 1;
+        }
+    }
+
+    /// Reports one handled request other than a file read.
+    #[allow(clippy::too_many_arguments)]
+    fn handled(
+        &mut self,
+        tx: &mpsc::Sender<SessionEvent>,
+        attribution: Attribution,
+        kind: ActivityKind,
+        operation: String,
+        path: Option<String>,
+        bytes: Option<u64>,
+        outcome: ActionOutcome,
+        started: Instant,
+    ) {
+        let id = self.mint();
+        self.emit(
+            tx,
+            SessionEvent::RequestHandled {
+                id,
+                origin: attribution.origin,
+                purpose: attribution.purpose,
+                kind,
+                operation,
+                path,
+                bytes,
+                outcome,
+                duration_ms: Some(elapsed_ms(started)),
+            },
+        );
+    }
+
+    /// Reports one file read: the first read of a file reports that it starts
+    /// to leave the computer (with its size), the read that reaches the end of
+    /// the file or fails reports how sending ended (with the bytes sent). The
+    /// reads in between are internal transfer steps and are not reported.
+    #[allow(clippy::too_many_arguments)]
+    fn read(
+        &mut self,
+        tx: &mpsc::Sender<SessionEvent>,
+        attribution: Attribution,
+        operation: String,
+        path: Option<String>,
+        offset: u64,
+        outcome: ActionOutcome,
+        data: Option<ReadData>,
+        started: Instant,
+    ) {
+        let key = path.clone().unwrap_or_default();
+        // A new read from the start while an earlier one is still open means
+        // the earlier transfer was abandoned: its end is not known.
+        if offset == 0
+            && let Some(old) = self.sending.remove(&key)
+        {
+            self.end_sending(tx, old, ActionOutcome::Unknown);
+        }
+        match (outcome, data) {
+            (ActionOutcome::Succeeded, Some(data)) => {
+                if !self.sending.contains_key(&key) {
+                    let id = self.mint();
+                    self.emit(
+                        tx,
+                        SessionEvent::RequestHandled {
+                            id,
+                            origin: attribution.origin,
+                            purpose: attribution.purpose.clone(),
+                            kind: ActivityKind::FileSent,
+                            operation: operation.clone(),
+                            path: path.clone(),
+                            bytes: Some(data.file_len.saturating_sub(offset)),
+                            outcome: ActionOutcome::InProgress,
+                            duration_ms: None,
+                        },
+                    );
+                    self.sending.insert(
+                        key.clone(),
+                        Sending {
+                            id,
+                            attribution,
+                            operation,
+                            path,
+                            started,
+                            sent: 0,
+                        },
+                    );
+                }
+                if let Some(open) = self.sending.get_mut(&key) {
+                    open.sent = open.sent.saturating_add(data.len);
+                }
+                if data.eof
+                    && let Some(open) = self.sending.remove(&key)
+                {
+                    self.end_sending(tx, open, ActionOutcome::Succeeded);
+                }
+            }
+            (outcome, _) => match self.sending.remove(&key) {
+                Some(open) => self.end_sending(tx, open, outcome),
+                // Nothing left the computer: report the refused read once.
+                None => self.handled(
+                    tx,
+                    attribution,
+                    ActivityKind::FileSent,
+                    operation,
+                    path,
+                    None,
+                    outcome,
+                    started,
+                ),
+            },
+        }
+    }
+
+    fn end_sending(
+        &mut self,
+        tx: &mpsc::Sender<SessionEvent>,
+        open: Sending,
+        outcome: ActionOutcome,
+    ) {
+        self.emit(
+            tx,
+            SessionEvent::RequestHandled {
+                id: open.id,
+                origin: open.attribution.origin,
+                purpose: open.attribution.purpose,
+                kind: ActivityKind::FileSent,
+                operation: open.operation,
+                path: open.path,
+                bytes: Some(open.sent),
+                outcome,
+                duration_ms: Some(elapsed_ms(open.started)),
+            },
+        );
+    }
+}
+
+/// What one successful file read answered: the bytes read, whether the read
+/// reached the end of the file, and the file's length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadData {
+    len: u64,
+    eof: bool,
+    file_len: u64,
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Delivers one streamed output chunk to the console under the bounded event
@@ -337,6 +598,9 @@ struct ReplyTap<'a, C> {
     inner: &'a mut C,
     request: RequestId,
     outcome: Option<ActionOutcome>,
+    /// What a successful file read answered, so a file leaving the computer is
+    /// reported with its byte count (ST-M009-011).
+    read: Option<ReadData>,
 }
 
 impl<'a, C: FrameSink> ReplyTap<'a, C> {
@@ -345,6 +609,7 @@ impl<'a, C: FrameSink> ReplyTap<'a, C> {
             inner,
             request,
             outcome: None,
+            read: None,
         }
     }
 
@@ -357,8 +622,20 @@ impl<'a, C: FrameSink> ReplyTap<'a, C> {
 impl<C: FrameSink> FrameSink for ReplyTap<'_, C> {
     async fn send_frame(&mut self, message: &Message) -> Result<(), ()> {
         match message {
-            Message::Response { id, .. } if *id == self.request => {
+            Message::Response { id, result, .. } if *id == self.request => {
                 self.outcome = Some(ActionOutcome::Succeeded);
+                if let OpResult::FileData {
+                    data,
+                    eof,
+                    file_len,
+                } = result
+                {
+                    self.read = Some(ReadData {
+                        len: data.len() as u64,
+                        eof: *eof,
+                        file_len: *file_len,
+                    });
+                }
             }
             Message::Error {
                 id: Some(id), code, ..
@@ -501,15 +778,42 @@ fn finish_inner<T: AsyncRead + AsyncWrite + Unpin>(
     ending: Ending,
     fs: FsCleanup,
 ) {
-    // Explicit drop: releasing the `SecureChannel` invalidates the Noise
-    // session keys and closes the stream. The session is single-use.
-    drop(channel);
-    shared.set_control_active(false);
+    let report = teardown_report(ending, fs);
+    finish_with_report(channel, shared, tx, audit, actor, ending, report);
+}
 
-    let (event, note, action, outcome) = describe_ending(ending);
+/// This side's honest teardown report: the ending's note plus any staging
+/// residuals.
+fn teardown_report(ending: Ending, fs: FsCleanup) -> CleanupReport {
+    let (_, note, _, _) = describe_ending(ending);
     let mut report = CleanupReport::clean(note);
     report.ok &= fs.ok;
     report.notes.extend(fs.notes);
+    report
+}
+
+/// Drops the channel, publishes the report and who ended the session, emits the
+/// terminal event, and audits the outcome followed by the end record
+/// (ST-M009-012). Synchronous from the emit on, so the end record is written
+/// even when the caller drops the handle the moment it sees the terminal event.
+fn finish_with_report<T: AsyncRead + AsyncWrite + Unpin>(
+    channel: SecureChannel<T>,
+    shared: &Shared,
+    tx: &mpsc::Sender<SessionEvent>,
+    audit: &dyn SessionAudit,
+    actor: Actor,
+    ending: Ending,
+    report: CleanupReport,
+) {
+    // Explicit drop: releasing the `SecureChannel` invalidates the Noise
+    // session keys and closes the stream. The session is single-use.
+    drop(channel);
+    let control_granted = shared.control_active();
+    shared.set_control_active(false);
+    let ended_by = ended_by(ending);
+    shared.set_ended_by(ended_by);
+
+    let (event, _, action, outcome) = describe_ending(ending);
     let cleanup_outcome = if report.ok {
         Outcome::Ok
     } else {
@@ -519,6 +823,26 @@ fn finish_inner<T: AsyncRead + AsyncWrite + Unpin>(
     emit(tx, event);
     audit.record(actor, action, outcome);
     audit.record(Actor::System, "cleanup", cleanup_outcome);
+    audit.record_end(&SessionEnd {
+        ended_by,
+        action,
+        control_granted,
+        peer_cleanup: shared.peer_cleanup(),
+    });
+}
+
+/// Who ended the session, from this side's point of view (ST-M009-012). A
+/// revocation names its requester; a declined consent is the customer's
+/// decision and a code mismatch the technician's; a lost peer is a lost
+/// connection; a fault, a timeout or a protocol violation is a failure.
+fn ended_by(ending: Ending) -> EndedBy {
+    match ending {
+        Ending::LocalRevoke(reason) | Ending::PeerRevoke(reason) => EndedBy::of_revoke(reason),
+        Ending::ActiveDisconnect | Ending::EarlyDisconnect(_) => EndedBy::ConnectionLost,
+        Ending::ConsentDenied => EndedBy::Customer,
+        Ending::CompareMismatch => EndedBy::Technician,
+        Ending::ChannelFault(_) | Ending::Timeout(_) | Ending::Protocol(_) => EndedBy::Failure,
+    }
 }
 
 /// The agent-side terminal path. Before finishing, the agent autonomously
@@ -526,18 +850,56 @@ fn finish_inner<T: AsyncRead + AsyncWrite + Unpin>(
 /// artifacts never outlive the session — this runs on every exit reason
 /// (disconnect, revoke, protocol fault), so it holds even when the console is
 /// already gone (ST-M003-005, REQ-N-008, REQ-F-019). The honest sweep outcome
-/// is folded into the teardown report.
+/// is folded into the teardown report, which the agent then sends to the
+/// console while the channel is still up (protocol minor 11, ST-M009-012) so
+/// the technician's audit records what was left behind.
+#[allow(clippy::too_many_arguments)]
 async fn agent_active_finish<T: AsyncRead + AsyncWrite + Unpin>(
-    channel: SecureChannel<T>,
+    mut channel: SecureChannel<T>,
+    session: SessionId,
     file_store: &FileStore,
     shared: &Shared,
     tx: &mpsc::Sender<SessionEvent>,
+    activity: &mut ActivityTap,
     audit: &dyn SessionAudit,
     actor: Actor,
     ending: Ending,
 ) {
     let fs = sweep_staging_on_exit(file_store, audit).await;
-    finish_inner(channel, shared, tx, audit, actor, ending, fs);
+    let report = teardown_report(ending, fs);
+    // A lost or faulted channel cannot carry the report; the console then
+    // records the cleanup as unknown, never as success.
+    if !matches!(ending, Ending::ActiveDisconnect | Ending::ChannelFault(_)) {
+        send_cleanup_report(&mut channel, session, &report).await;
+    }
+    // Activity shed since the last marker is shown before the end.
+    activity.flush_final(tx);
+    finish_with_report(channel, shared, tx, audit, actor, ending, report);
+}
+
+/// Sends the agent's teardown report to the console, fitted to the wire bounds
+/// and bounded in time; a failure only means the console will not have it.
+async fn send_cleanup_report<T: AsyncRead + AsyncWrite + Unpin>(
+    channel: &mut SecureChannel<T>,
+    session: SessionId,
+    report: &CleanupReport,
+) {
+    if channel.is_poisoned() {
+        return;
+    }
+    let fitted = fit_for_wire(report);
+    let _ = timeout(
+        TEARDOWN_DRAIN,
+        send_control(
+            channel,
+            session,
+            ControlMessage::CleanupReported {
+                ok: fitted.ok,
+                notes: fitted.notes,
+            },
+        ),
+    )
+    .await;
 }
 
 /// Runs the session-end staging sweep and reports an honest, secret-free
@@ -554,12 +916,7 @@ async fn sweep_staging_on_exit(file_store: &FileStore, audit: &dyn SessionAudit)
             audit.record(Actor::System, "fs_cleanup", Outcome::Failed);
             let notes = failed
                 .into_iter()
-                .map(|f| {
-                    format!(
-                        "staged artifact not removed: {} ({})",
-                        f.canonical_path, f.reason
-                    )
-                })
+                .map(|f| format!("{RESIDUAL_NOTE_PREFIX}{} ({})", f.canonical_path, f.reason))
                 .collect();
             FsCleanup { ok: false, notes }
         }
@@ -569,14 +926,16 @@ async fn sweep_staging_on_exit(file_store: &FileStore, audit: &dyn SessionAudit)
             audit.record(Actor::System, "fs_cleanup", Outcome::Unknown);
             FsCleanup {
                 ok: false,
-                notes: vec!["staging cleanup returned an unexpected result".to_string()],
+                notes: vec![format!(
+                    "{TEARDOWN_FAILED_NOTE_PREFIX}the staging cleanup returned an unexpected result"
+                )],
             }
         }
         Err(error) => {
             audit.record(Actor::System, "fs_cleanup", Outcome::Failed);
             FsCleanup {
                 ok: false,
-                notes: vec![format!("staging cleanup failed: {}", error.message)],
+                notes: vec![format!("{TEARDOWN_FAILED_NOTE_PREFIX}{}", error.message)],
             }
         }
     }
@@ -599,6 +958,11 @@ struct EarlyFailure {
 /// open and drains until the peer reads it and closes, so the peer reports the
 /// honest revoke reason rather than a bare disconnect (a reset would otherwise
 /// wipe the Revoke from the peer's receive buffer). Bounded by [`TEARDOWN_DRAIN`].
+///
+/// On the console side the drain also keeps the agent's teardown report, which
+/// the agent sends before it closes (protocol minor 11, ST-M009-012); the
+/// console waits up to [`CLEANUP_REPORT_WAIT`] for it, ending as soon as it
+/// arrives or the agent closes.
 async fn finish_local_revoke<T: AsyncRead + AsyncWrite + Unpin>(
     mut channel: SecureChannel<T>,
     session: SessionId,
@@ -609,7 +973,15 @@ async fn finish_local_revoke<T: AsyncRead + AsyncWrite + Unpin>(
     actor: Actor,
 ) {
     let _ = send_control(&mut channel, session, ControlMessage::Revoke { reason }).await;
-    let _ = timeout(TEARDOWN_DRAIN, drain_until_closed(&mut channel)).await;
+    if actor == Actor::Console {
+        let _ = timeout(
+            CLEANUP_REPORT_WAIT,
+            drain_keeping_cleanup_report(&mut channel, session, shared),
+        )
+        .await;
+    } else {
+        let _ = timeout(TEARDOWN_DRAIN, drain_until_closed(&mut channel)).await;
+    }
     finish(
         channel,
         shared,
@@ -651,6 +1023,27 @@ async fn drain_until_closed<T: AsyncRead + AsyncWrite + Unpin>(channel: &mut Sec
     while channel.recv().await.is_ok() {}
 }
 
+/// Like [`drain_until_closed`], but keeps the agent's teardown report for this
+/// session and stops at it: it is the last frame the agent sends before it
+/// closes (console side, ST-M009-012).
+async fn drain_keeping_cleanup_report<T: AsyncRead + AsyncWrite + Unpin>(
+    channel: &mut SecureChannel<T>,
+    session: SessionId,
+    shared: &Shared,
+) {
+    while let Ok(message) = channel.recv().await {
+        if let Message::Control {
+            session: stamped,
+            control: ControlMessage::CleanupReported { ok, notes },
+        } = message
+            && stamped == session
+        {
+            shared.set_peer_cleanup(CleanupReport { ok, notes });
+            return;
+        }
+    }
+}
+
 /// Fails the session before any channel exists (a pairing/accept failure), still
 /// producing an honest cleanup report and terminal event.
 fn fail_before_channel(
@@ -661,6 +1054,7 @@ fn fail_before_channel(
     failure: EarlyFailure,
 ) {
     shared.set_control_active(false);
+    shared.set_ended_by(EndedBy::Failure);
     shared.set_cleanup(CleanupReport::clean(
         "no secure session was established; nothing to tear down",
     ));
@@ -673,6 +1067,12 @@ fn fail_before_channel(
     );
     audit.record(actor, failure.action, failure.outcome);
     audit.record(Actor::System, "cleanup", Outcome::Ok);
+    audit.record_end(&SessionEnd {
+        ended_by: EndedBy::Failure,
+        action: failure.action,
+        control_granted: false,
+        peer_cleanup: None,
+    });
 }
 
 /// Maps an [`Ending`] to its terminal event, cleanup note, audit action, and
@@ -964,7 +1364,7 @@ pub(crate) async fn host_task_over_stream<S>(
         }
         res = timeout(
             PAIR_TIMEOUT,
-            Pairing::perform(stream, Role::Responder, version, &prologue_caps),
+            Pairing::perform_with_display_name(stream, Role::Responder, version, &prologue_caps, shared.own_display_name()),
         ) => res,
     };
     let mut channel = match pairing_result {
@@ -1210,9 +1610,12 @@ pub(crate) async fn host_task_over_stream<S>(
     {
         Step::Control(s, ControlMessage::ConsentGranted { target }) if s == session => {
             shared.set_control_active(true);
+            audit.record(Actor::Agent, "consent_granted", Outcome::Ok);
+            // The honest identity this session controls, for the end report
+            // (ST-M009-012, REQ-F-016).
+            audit.record_target(&target);
             emit(&tx, SessionEvent::ConsentGranted { identity: target });
             emit(&tx, SessionEvent::Active);
-            audit.record(Actor::Agent, "consent_granted", Outcome::Ok);
             host_active(
                 channel,
                 session,
@@ -1455,6 +1858,15 @@ async fn host_active<T: AsyncRead + AsyncWrite + Unpin>(
                     finish_running_unknown(&running, tx);
                     return finish(channel, shared, tx, audit, Actor::Agent, Ending::PeerRevoke(reason));
                 }
+                // The agent's teardown report, sent just before its own
+                // `Revoke` when the customer stops (protocol minor 11,
+                // ST-M009-012): kept for the end record. A report stamped with
+                // another session is not this target's and is ignored.
+                Frame::Message(Message::Control { session: stamped, control: ControlMessage::CleanupReported { ok, notes } }) => {
+                    if stamped == session {
+                        shared.set_peer_cleanup(CleanupReport { ok, notes });
+                    }
+                }
                 // The agent reflected a freshly armed reboot-resume ticket
                 // (ADR-0014, ST-M006-001): surface it for **display only**. It
                 // carries no key material and never grants control — attended
@@ -1584,6 +1996,11 @@ pub(crate) async fn join_task<S>(
     let (mut channel, handshake_hash) = match pairing_result {
         Ok(Ok(paired)) => {
             shared.set_approval_code(paired.approval_code);
+            // The console's display name, as the technician's computer reports
+            // it: a label for the customer surface, never authority (ST-M009-011).
+            if let Some(name) = paired.peer_display_name {
+                shared.set_peer_display_name(name);
+            }
             (paired.channel, paired.handshake_hash)
         }
         Ok(Err(_)) => {
@@ -1805,6 +2222,8 @@ async fn join_active<T: AsyncRead + AsyncWrite + Unpin>(
     // burst afterwards.
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut seq: u64 = 0;
+    // The customer-visible activity of this session (ST-M009-011).
+    let mut activity = ActivityTap::default();
 
     // Discard any arming gestures that arrived before the session became active.
     // Reboot-resume may be armed only from *within* an already-consented,
@@ -1818,7 +2237,7 @@ async fn join_active<T: AsyncRead + AsyncWrite + Unpin>(
             biased;
             cmd = revoke_rx.recv() => {
                 let reason = cmd.unwrap_or(RevokeReason::CustomerRequested);
-                return teardown_agent_revoke(channel, session, &broker, &mut broker_rx, &file_store, reason, shared, tx, audit).await;
+                return teardown_agent_revoke(channel, session, &broker, &mut broker_rx, &file_store, reason, shared, tx, &mut activity, audit).await;
             }
             cmd = arm_rx.recv() => {
                 // A local reboot-resume arming gesture. `None` means the handle was
@@ -1828,41 +2247,41 @@ async fn join_active<T: AsyncRead + AsyncWrite + Unpin>(
                     && handle_arm_command(&mut channel, session, handshake_hash, armer, &sysinfo.identity, shared, cmd, tx, audit).await.is_err()
                 {
                     broker.cancel_all();
-                    return agent_active_finish(channel, &file_store, shared, tx, audit, Actor::Agent, Ending::ActiveDisconnect).await;
+                    return agent_active_finish(channel, session, &file_store, shared, tx, &mut activity, audit, Actor::Agent, Ending::ActiveDisconnect).await;
                 }
             }
             maybe_event = broker_rx.recv() => {
                 if let Some(event) = maybe_event
-                    && forward_broker_event(&mut channel, session, event, tx, audit).await.is_err()
+                    && forward_broker_event(&mut channel, session, event, tx, &mut activity, audit).await.is_err()
                 {
                     broker.cancel_all();
-                    return agent_active_finish(channel, &file_store, shared, tx, audit, Actor::Agent, Ending::ActiveDisconnect).await;
+                    return agent_active_finish(channel, session, &file_store, shared, tx, &mut activity, audit, Actor::Agent, Ending::ActiveDisconnect).await;
                 }
             }
             frame = recv_frame(&mut channel) => {
                 let step = match frame {
                     Frame::Message(message) => {
-                        handle_agent_frame(&mut channel, session, &broker, &file_store, &desktop, &mut capture_governor, &mut input_governor, sysinfo, terminal_enabled, desktop_enabled, shared, message, tx, audit).await
+                        handle_agent_frame(&mut channel, session, &broker, &file_store, &desktop, &mut capture_governor, &mut input_governor, sysinfo, terminal_enabled, desktop_enabled, shared, message, tx, &mut activity, audit).await
                     }
                     Frame::Disconnected => AgentStep::Disconnected,
                     Frame::ChannelFault => {
                         broker.cancel_all();
-                        return agent_active_finish(channel, &file_store, shared, tx, audit, Actor::Agent, Ending::ChannelFault("active")).await;
+                        return agent_active_finish(channel, session, &file_store, shared, tx, &mut activity, audit, Actor::Agent, Ending::ChannelFault("active")).await;
                     }
                 };
                 match step {
                     AgentStep::Continue => {}
                     AgentStep::PeerRevoke(reason) => {
                         broker.cancel_all();
-                        return agent_active_finish(channel, &file_store, shared, tx, audit, Actor::Console, Ending::PeerRevoke(reason)).await;
+                        return agent_active_finish(channel, session, &file_store, shared, tx, &mut activity, audit, Actor::Console, Ending::PeerRevoke(reason)).await;
                     }
                     AgentStep::Protocol => {
                         broker.cancel_all();
-                        return agent_active_finish(channel, &file_store, shared, tx, audit, Actor::Agent, Ending::Protocol("active")).await;
+                        return agent_active_finish(channel, session, &file_store, shared, tx, &mut activity, audit, Actor::Agent, Ending::Protocol("active")).await;
                     }
                     AgentStep::Disconnected => {
                         broker.cancel_all();
-                        return agent_active_finish(channel, &file_store, shared, tx, audit, Actor::Agent, Ending::ActiveDisconnect).await;
+                        return agent_active_finish(channel, session, &file_store, shared, tx, &mut activity, audit, Actor::Agent, Ending::ActiveDisconnect).await;
                     }
                 }
             }
@@ -1870,7 +2289,7 @@ async fn join_active<T: AsyncRead + AsyncWrite + Unpin>(
                 seq += 1;
                 if send_control(&mut channel, session, ControlMessage::Heartbeat { seq }).await.is_err() {
                     broker.cancel_all();
-                    return agent_active_finish(channel, &file_store, shared, tx, audit, Actor::Agent, Ending::ActiveDisconnect).await;
+                    return agent_active_finish(channel, session, &file_store, shared, tx, &mut activity, audit, Actor::Agent, Ending::ActiveDisconnect).await;
                 }
             }
         }
@@ -1978,6 +2397,7 @@ async fn forward_broker_event<T: AsyncRead + AsyncWrite + Unpin>(
     session: SessionId,
     event: BrokerEvent,
     tx: &mpsc::Sender<SessionEvent>,
+    activity: &mut ActivityTap,
     audit: &dyn SessionAudit,
 ) -> Result<(), ()> {
     match event {
@@ -2015,7 +2435,7 @@ async fn forward_broker_event<T: AsyncRead + AsyncWrite + Unpin>(
                 },
             )
             .await;
-            emit(
+            activity.emit_job(
                 tx,
                 SessionEvent::ExecFinished {
                     job,
@@ -2079,6 +2499,7 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
     shared: &Shared,
     message: Message,
     tx: &mpsc::Sender<SessionEvent>,
+    activity: &mut ActivityTap,
     audit: &dyn SessionAudit,
 ) -> AgentStep {
     match message {
@@ -2091,7 +2512,8 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
         } => {
             if session != negotiated {
                 // Bound to THIS session only: reject and never execute
-                // (REQ-S-012, REQ-S-014).
+                // (REQ-S-012, REQ-S-014). The customer still sees the refused
+                // request (ST-M009-011).
                 let _ = send_error(
                     channel,
                     Some(id),
@@ -2101,13 +2523,30 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                     ErrorStage::Execution,
                 )
                 .await;
+                activity.refused(
+                    tx,
+                    Attribution::new(origin, purpose),
+                    &op,
+                    ErrorCode::UnknownSession,
+                );
                 return AgentStep::Continue;
             }
             // Describe the real operation before it moves into the handler, so
             // the customer sees what was done beside the caller's stated
-            // purpose and the honest result (REQ-F-026, ST-M009-007).
-            let operation = (!crate::is_transfer_step(&op)).then(|| crate::describe_operation(&op));
+            // purpose and the honest result (REQ-F-026, ST-M009-007), with the
+            // structured kind, path and byte count (ST-M009-011).
+            let operation = crate::describe_operation(&op);
+            let is_step = crate::is_transfer_step(&op);
+            let kind = ActivityKind::of(&op);
+            let path = crate::activity::path_of(&op);
+            let bytes = crate::activity::bytes_of(&op);
+            let read_offset = match &op {
+                Operation::FsRead { offset, .. } => Some(*offset),
+                _ => None,
+            };
             let is_exec = matches!(op, Operation::Exec { .. });
+            let started = Instant::now();
+            let attribution = Attribution::new(origin, purpose);
             let mut tap = ReplyTap::new(channel, id);
             let step = handle_agent_request(
                 &mut tap,
@@ -2121,26 +2560,61 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                 terminal_enabled,
                 desktop_enabled,
                 id,
-                Attribution::new(origin, purpose.clone()),
+                attribution.clone(),
                 op,
                 tx,
+                activity,
                 audit,
             )
             .await;
             let outcome = tap.outcome();
-            // A command that started is reported by `CommandStarted` and later
-            // `ExecFinished`; every other handled request is reported here.
-            if let Some(operation) = operation
-                && !(is_exec && outcome == ActionOutcome::Succeeded)
-            {
-                emit_activity(
+            let read = tap.read;
+            if let Some(offset) = read_offset {
+                // A file read: reported when the file starts to leave the
+                // computer and again when sending ends (ST-M009-011).
+                activity.read(
                     tx,
-                    SessionEvent::RequestHandled {
-                        origin,
-                        purpose,
+                    attribution,
+                    operation,
+                    path,
+                    offset,
+                    outcome,
+                    read,
+                    started,
+                );
+            } else if is_step {
+                // An internal transfer step is reported only when the agent
+                // refused or failed it: once per path until that path's next
+                // reported request, so a refused transfer is never silent on
+                // the customer side and its in-flight chunks do not flood the
+                // feed (ST-M009-011, REQ-F-017). No byte count: nothing of the
+                // file is described.
+                if outcome != ActionOutcome::Succeeded && activity.first_refusal(path.as_deref()) {
+                    activity.handled(
+                        tx,
+                        attribution,
+                        kind,
                         operation,
+                        path,
+                        None,
                         outcome,
-                    },
+                        started,
+                    );
+                }
+            } else if !(is_exec && outcome == ActionOutcome::Succeeded) {
+                // A command that started is reported by `CommandStarted` and
+                // later `ExecFinished`; every other handled request that is not
+                // an internal transfer step is reported here.
+                activity.settle(path.as_deref());
+                activity.handled(
+                    tx,
+                    attribution,
+                    kind,
+                    operation,
+                    path,
+                    bytes,
+                    outcome,
+                    started,
                 );
             }
             step
@@ -2162,8 +2636,21 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                     ErrorStage::Execution,
                 )
                 .await;
+                activity.handled(
+                    tx,
+                    Attribution::new(origin, purpose),
+                    ActivityKind::JobControl,
+                    crate::describe_cancel(job),
+                    None,
+                    None,
+                    ActionOutcome::Failed {
+                        code: ErrorCode::UnknownSession,
+                    },
+                    Instant::now(),
+                );
                 return AgentStep::Continue;
             }
+            let started = Instant::now();
             let mut tap = ReplyTap::new(channel, id);
             let step = match broker.cancel(cretlink_exec::JobId(job.0)) {
                 Ok(()) => reply_ack(&mut tap, negotiated, id).await,
@@ -2180,14 +2667,16 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                     AgentStep::Continue
                 }
             };
-            emit_activity(
+            let outcome = tap.outcome();
+            activity.handled(
                 tx,
-                SessionEvent::RequestHandled {
-                    origin,
-                    purpose,
-                    operation: crate::describe_cancel(job),
-                    outcome: tap.outcome(),
-                },
+                Attribution::new(origin, purpose),
+                ActivityKind::JobControl,
+                crate::describe_cancel(job),
+                None,
+                None,
+                outcome,
+                started,
             );
             step
         }
@@ -2226,6 +2715,7 @@ async fn handle_agent_request<C: FrameSink>(
     attribution: Attribution,
     op: Operation,
     tx: &mpsc::Sender<SessionEvent>,
+    activity: &mut ActivityTap,
     audit: &dyn SessionAudit,
 ) -> AgentStep {
     match op {
@@ -2268,7 +2758,7 @@ async fn handle_agent_request<C: FrameSink>(
                     }
                     // Visible activity: the customer sees exactly what is run
                     // (REQ-F-017, REQ-S-002), and the start is audited.
-                    emit(
+                    activity.emit_job(
                         tx,
                         SessionEvent::CommandStarted {
                             job,
@@ -3009,6 +3499,7 @@ async fn teardown_agent_revoke<T: AsyncRead + AsyncWrite + Unpin>(
     reason: RevokeReason,
     shared: &Shared,
     tx: &mpsc::Sender<SessionEvent>,
+    activity: &mut ActivityTap,
     audit: &dyn SessionAudit,
 ) {
     let mut remaining = broker.job_ids().len();
@@ -3026,7 +3517,7 @@ async fn teardown_agent_revoke<T: AsyncRead + AsyncWrite + Unpin>(
             maybe_event = broker_rx.recv() => match maybe_event {
                 Some(event) => {
                     let is_done = matches!(event, BrokerEvent::Done(_));
-                    if forward_broker_event(&mut channel, session, event, tx, audit).await.is_err() {
+                    if forward_broker_event(&mut channel, session, event, tx, activity, audit).await.is_err() {
                         break;
                     }
                     if is_done {
@@ -3038,18 +3529,17 @@ async fn teardown_agent_revoke<T: AsyncRead + AsyncWrite + Unpin>(
         }
     }
 
+    // Sweep and report before the `Revoke`, so the console still reads the
+    // report on its way out (protocol minor 11, ST-M009-012).
+    let ending = Ending::LocalRevoke(reason);
+    let fs = sweep_staging_on_exit(file_store, audit).await;
+    let report = teardown_report(ending, fs);
+    send_cleanup_report(&mut channel, session, &report).await;
     let _ = send_control(&mut channel, session, ControlMessage::Revoke { reason }).await;
     let _ = timeout(TEARDOWN_DRAIN, drain_until_closed(&mut channel)).await;
-    agent_active_finish(
-        channel,
-        file_store,
-        shared,
-        tx,
-        audit,
-        Actor::Agent,
-        Ending::LocalRevoke(reason),
-    )
-    .await;
+    // Activity shed since the last marker is shown before the end.
+    activity.flush_final(tx);
+    finish_with_report(channel, shared, tx, audit, Actor::Agent, ending, report);
 }
 
 #[cfg(test)]
@@ -3117,6 +3607,45 @@ mod tests {
             dropped.is_empty(),
             "delivered markers clear the accumulator"
         );
+    }
+
+    // Activity shed at the very end of a session is shown as a gap before the
+    // terminal event rather than lost with the session (ST-M009-011,
+    // REQ-N-008), and never takes the terminal event's slot.
+    #[tokio::test]
+    async fn a_pending_shed_count_is_delivered_before_the_end() {
+        let cap = SESSION_EVENT_CHANNEL_CAPACITY;
+        let (tx, mut rx) = mpsc::channel::<SessionEvent>(cap);
+        // Fill the channel down to the lifecycle reserve.
+        while tx.capacity() > LIFECYCLE_RESERVE {
+            tx.try_send(SessionEvent::Active).unwrap();
+        }
+        let mut tap = ActivityTap::default();
+        for _ in 0..3 {
+            tap.emit(&tx, SessionEvent::ActivityShed { count: 99 });
+        }
+        assert_eq!(tap.shed, 3, "activity is shed into the reserve");
+        tap.flush(&tx);
+        assert_eq!(tap.shed, 3, "the ordinary flush keeps the reserve free");
+        // The end: the count goes out, using the reserve.
+        tap.flush_final(&tx);
+        assert_eq!(tap.shed, 0);
+        let mut delivered = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let SessionEvent::ActivityShed { count } = event {
+                delivered.push(count);
+            }
+        }
+        assert_eq!(delivered, vec![3]);
+
+        // With one slot left, it stays for the terminal event.
+        while tx.capacity() > 1 {
+            tx.try_send(SessionEvent::Active).unwrap();
+        }
+        tap.shed = 2;
+        tap.flush_final(&tx);
+        assert_eq!(tap.shed, 2);
+        assert_eq!(tx.capacity(), 1);
     }
 
     // Under no pressure, output is delivered verbatim and in order, and no drop

@@ -1250,7 +1250,9 @@ impl ConsoleSessionService {
     ///
     /// # Errors
     ///
-    /// A mapped [`TargetError`]; fail-closed when inactive or revoked.
+    /// A mapped [`TargetError`]; fail-closed when inactive or revoked. An error
+    /// on the local file is not an error of the call: it is a `Failed` report
+    /// in the stage `local`, and the session stays usable (ST-M003-005).
     pub async fn upload(
         &self,
         purpose: Option<Purpose>,
@@ -1288,7 +1290,9 @@ impl ConsoleSessionService {
     ///
     /// # Errors
     ///
-    /// A mapped [`TargetError`]; fail-closed when inactive or revoked.
+    /// A mapped [`TargetError`]; fail-closed when inactive or revoked. An error
+    /// on the local destination is not an error of the call: it is a `Failed`
+    /// report in the stage `local`, and the session stays usable (ST-M003-005).
     pub async fn download(
         &self,
         purpose: Option<Purpose>,
@@ -1937,8 +1941,11 @@ fn append_capped(
 
 /// Projects the transfer engine's honest [`TransferReport`] onto the MCP-facing
 /// [`UploadReport`], carrying the canonical committed path but never content
-/// (REQ-N-007, REQ-S-018). The agent error (whose type is internal to the
-/// session crate) is mapped field-by-field into the decoupled [`TransferFailure`].
+/// (REQ-N-007, REQ-S-018). The error that ended a failed transfer (whose type is
+/// internal to the session crate) is mapped field-by-field into the decoupled
+/// [`TransferFailure`], so its category, message and stage — `local` for an
+/// error on the technician's own file — reach the caller unchanged
+/// (ST-M003-005).
 fn upload_report_from(report: TransferReport) -> UploadReport {
     UploadReport {
         outcome: report.outcome,
@@ -1998,6 +2005,9 @@ fn session_to_target(err: HostSessionError) -> TargetError {
         | HostSessionError::RevokedLocally
         | HostSessionError::RevokedByPeer
         | HostSessionError::ConsentDenied => TargetError::NoConsentedSession,
+        // `Io` is the connection's (binding, dialing). An error on the
+        // technician's own file never arrives here: the transfer engine reports
+        // it as a failed transfer in the stage `local` (ST-M003-005).
         HostSessionError::Disconnected
         | HostSessionError::Io(_)
         | HostSessionError::Channel(_)
@@ -2214,5 +2224,26 @@ mod terminal_registry_tests {
             reg.contains(JobId(1)),
             "the terminal outlives zero-or-more consumers"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_error_mapping_tests {
+    use super::*;
+
+    /// An error of the connection is still a lost session, whose remote outcome
+    /// is not known (REQ-N-008). Only an error on the technician's own file is
+    /// a failed transfer instead, and the transfer engine reports that one in
+    /// its own report: it never arrives here as an error (ST-M003-005).
+    #[test]
+    fn a_connection_error_is_still_a_lost_session() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        for error in [
+            HostSessionError::Io(reset),
+            HostSessionError::Disconnected,
+            HostSessionError::Timeout,
+        ] {
+            assert_eq!(session_to_target(error), TargetError::Disconnected);
+        }
     }
 }

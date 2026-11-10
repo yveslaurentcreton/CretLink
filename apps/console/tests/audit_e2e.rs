@@ -66,6 +66,7 @@ fn simulated_identity() -> TargetIdentity {
         elevated: false,
         simulated: true,
         agent_version: "audit-e2e-agent".to_string(),
+        account: None,
     }
 }
 
@@ -103,6 +104,7 @@ async fn active_session_with_audit(
 ) -> (HostHandle, JoinHandle, SessionId, TargetIdentity) {
     let hints = ConsoleHints {
         label: "This computer (technician)".to_string(),
+        display_name: None,
     };
     let mut host = SessionHost::host_with_audit(
         loopback(),

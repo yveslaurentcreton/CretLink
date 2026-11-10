@@ -1,314 +1,221 @@
-/* CretLink shared visual design language (ST-M002-011).
- *
- * One token + component system, a shared design language kept in sync by hand
- * between the two detached Tauri workspaces (ADR-0011 keeps console-gui and
- * agent-gui as separate Vite packages that cannot share a source import); each
- * copy carries only the components its own window renders. Light is the bare
- * :root; dark is redefined at the token level for all three theme states — the
- * un-stamped prefers-color-scheme default and the explicit data-theme choices —
- * so the window never renders one theme's text on the other theme's ground.
- *
- * Per-side identity: --brand resolves to the technician accent here (the agent
- * window's copy switches it to the customer-agent teal). Status colour is
- * always paired with a text label (the state pill), never colour alone
- * (REQ-N-014). */
+/* The technician window (ST-M009-008, mock `#t-home` … `#t-ai`). The tokens
+ * and building blocks come from `base.css`; this file lays out the window:
+ * the navigation, the pages, and the live-session workbench. The window has
+ * no bar of its own under the operating system's title bar. */
 
-:root {
-  --bg: #eaeef4;
-  --surface: #ffffff;
-  --surface-2: #f4f6fb;
-  --inset: #eef1f7;
-  --border: #d9e0ea;
-  --border-strong: #c4cdda;
-  --ink: #141925;
-  --ink-soft: #33405a;
-  --muted: #5a6478;
-  --faint: #8a93a6;
-
-  --accent: #2f5fe0;      /* technician identity + primary action */
-  --accent-ink: #ffffff;
-  --accent-soft: #e7edfd;
-  --agent: #0e8f83;       /* customer-agent identity (distinct calm teal) */
-
-  --pending: #b7791f;     /* connecting / comparing / awaiting */
-  --live: #d1453b;        /* full control — real risk */
-  --good: #1f9d63;        /* affirmative: matches / granted */
-  --idle: #64748b;        /* safe / no access / ended */
-
-  --shadow: 0 1px 2px rgba(20,25,37,.04), 0 12px 30px -12px rgba(20,25,37,.18);
-  --shadow-sm: 0 1px 2px rgba(20,25,37,.06), 0 4px 10px -6px rgba(20,25,37,.14);
-  --radius: 14px;
-  --radius-sm: 9px;
-
-  --mono: ui-monospace, "Cascadia Code", "SF Mono", "Segoe UI Mono", "Roboto Mono", monospace;
-  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-
-  --brand: var(--accent);
-  color-scheme: light;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #0d1017;
-    --surface: #161b24;
-    --surface-2: #1b212c;
-    --inset: #10151d;
-    --border: #29313f;
-    --border-strong: #384456;
-    --ink: #e8ecf4;
-    --ink-soft: #c4ccdb;
-    --muted: #98a2b6;
-    --faint: #6a748a;
-    --accent: #7093ff;
-    --accent-ink: #0a0e16;
-    --accent-soft: #1a2440;
-    --agent: #35b6a8;
-    --pending: #e0a53a;
-    --live: #f26a5f;
-    --good: #37c483;
-    --idle: #8391a6;
-    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 16px 34px -14px rgba(0,0,0,.6);
-    --shadow-sm: 0 1px 2px rgba(0,0,0,.3), 0 6px 14px -8px rgba(0,0,0,.5);
-    color-scheme: dark;
-  }
-}
-:root[data-theme="dark"] {
-  --bg: #0d1017;
-  --surface: #161b24;
-  --surface-2: #1b212c;
-  --inset: #10151d;
-  --border: #29313f;
-  --border-strong: #384456;
-  --ink: #e8ecf4;
-  --ink-soft: #c4ccdb;
-  --muted: #98a2b6;
-  --faint: #6a748a;
-  --accent: #7093ff;
-  --accent-ink: #0a0e16;
-  --accent-soft: #1a2440;
-  --agent: #35b6a8;
-  --pending: #e0a53a;
-  --live: #f26a5f;
-  --good: #37c483;
-  --idle: #8391a6;
-  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 16px 34px -14px rgba(0,0,0,.6);
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.3), 0 6px 14px -8px rgba(0,0,0,.5);
-  color-scheme: dark;
-}
-
-* { box-sizing: border-box; }
-html, body { height: 100%; }
+html,
 body {
+  height: 100%;
   margin: 0;
-  background: var(--bg);
-  color: var(--ink);
-  font-family: var(--sans);
-  line-height: 1.5;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
+}
+body {
+  background: var(--paper);
+}
+#app {
+  height: 100%;
 }
 
-/* ---------- App shell ---------- */
-#app { min-height: 100%; display: flex; flex-direction: column; }
-.wrap {
-  width: 100%; max-width: 600px; margin: 0 auto; flex: 1;
-  padding: 20px 22px 26px; display: flex; flex-direction: column; gap: 16px;
+.tapp {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  font-size: 14px;
 }
 
-/* Top identity strip: brand + this-machine label + live state pill */
-.app-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.brand-dot {
-  width: 11px; height: 11px; border-radius: 50%; flex: 0 0 auto;
-  background: var(--brand); box-shadow: 0 0 0 4px color-mix(in srgb, var(--brand) 18%, transparent);
+/* The assertive alert is a banner at the top of every screen. */
+.tapp > .alert {
+  margin: 0; flex: none; border-width: 0 0 1px; border-radius: 0; padding: 12px 18px;
 }
-.app-name { font-weight: 700; font-size: .96rem; letter-spacing: -.01em; min-width: 0; }
-.app-name small { display: block; font-weight: 500; color: var(--faint); font-size: .72rem; letter-spacing: .02em; }
+.tapp > .alert .alert-body { flex: 1; }
+.tapp > .alert .next { margin-top: 4px; font-weight: 600; }
 
-/* state pill — status is shape + text, never colour alone */
-.pill {
-  display: inline-flex; align-items: center; gap: 7px; font-size: .74rem; font-weight: 700;
-  padding: 5px 11px; border-radius: 999px; letter-spacing: .02em; white-space: nowrap;
-  border: 1px solid transparent;
+/* ---------- Shell: navigation + page ---------- */
+.tshell { flex: 1; display: grid; grid-template-columns: 214px minmax(0, 1fr); min-height: 0; }
+.side {
+  background: var(--bg); border-right: 1px solid var(--line); padding: 14px 10px;
+  display: flex; flex-direction: column; gap: 2px; min-height: 0;
 }
-.pill .pd { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: 0 0 auto; }
-.pill.idle    { color: var(--idle);    background: color-mix(in srgb, var(--idle) 12%, transparent);    border-color: color-mix(in srgb, var(--idle) 26%, transparent); }
-.pill.pending { color: var(--pending); background: color-mix(in srgb, var(--pending) 13%, transparent); border-color: color-mix(in srgb, var(--pending) 30%, transparent); }
-.pill.live    { color: var(--live);    background: color-mix(in srgb, var(--live) 13%, transparent);    border-color: color-mix(in srgb, var(--live) 32%, transparent); }
-.pill.pending .pd, .pill.live .pd { animation: pulse 1.4s ease-in-out infinite; }
-
-/* ---------- Cards + section headings ---------- */
-.card {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); box-shadow: var(--shadow-sm);
-  padding: 16px 17px; display: flex; flex-direction: column; gap: 12px;
+.side button {
+  display: flex; gap: 10px; align-items: center; padding: 8px 12px; border-radius: 8px;
+  color: var(--ink-2); font-size: 14px; border: 0; background: none; text-align: left;
 }
-.f-eyebrow { text-transform: uppercase; letter-spacing: .12em; font-size: .68rem; font-weight: 700; color: var(--faint); margin: 0; }
-.f-title { font-size: 1.1rem; font-weight: 700; margin: 2px 0 0; letter-spacing: -.01em; text-wrap: balance; }
-.f-help { color: var(--muted); font-size: .9rem; margin: 0; }
-.muted { color: var(--muted); font-size: .9rem; margin: 0; }
-.empty { color: var(--faint); font-size: .88rem; margin: 0; }
-
-/* ---------- Status + control-level lines ---------- */
-.status { color: var(--ink-soft); font-size: .92rem; margin: 0; }
-.control-level {
-  display: inline-flex; align-items: center; gap: 8px; font-weight: 700;
-  font-size: .82rem; letter-spacing: .02em; margin: 0;
-  padding: 6px 12px; border-radius: 999px; border: 1px solid transparent; align-self: flex-start;
+.side button:hover { background: var(--line-2); }
+.side button.on { background: #fff; color: var(--tech-deep); font-weight: 600; box-shadow: var(--shadow); }
+/* This computer and this copy. A long host name wraps inside the column; the
+ * second part of each line (the operating system's name, installed or runs
+ * once) moves to the next line in one piece when it does not fit beside the
+ * first. */
+.side .foot {
+  margin-top: auto; font-size: 12px; color: var(--muted); padding: 10px 12px; line-height: 1.6;
+  border-top: 1px solid var(--line); overflow-wrap: anywhere;
 }
-.control-level.level-none { color: var(--idle); background: color-mix(in srgb, var(--idle) 12%, transparent); border-color: color-mix(in srgb, var(--idle) 26%, transparent); }
-.control-level.level-connected { color: var(--pending); background: color-mix(in srgb, var(--pending) 13%, transparent); border-color: color-mix(in srgb, var(--pending) 30%, transparent); }
-.control-level.level-full { color: var(--live); background: color-mix(in srgb, var(--live) 13%, transparent); border-color: color-mix(in srgb, var(--live) 32%, transparent); }
-
-/* ---------- Error (assertive alert) ---------- */
-.error {
-  border: 1px solid color-mix(in srgb, var(--live) 40%, var(--border));
-  background: color-mix(in srgb, var(--live) 9%, transparent);
-  color: var(--live); font-weight: 600; font-size: .9rem;
-  border-radius: var(--radius-sm); padding: 11px 13px; margin: 0;
+.side .foot .keep { display: inline-block; }
+.tmain {
+  padding: 28px 32px; overflow: auto; display: flex; flex-direction: column; gap: 18px; min-height: 0;
 }
+.tmain:focus { outline: none; }
+.screen { display: flex; flex-direction: column; gap: 18px; }
+.grid2 { display: grid; grid-template-columns: 1.35fr 1fr; gap: 18px; align-items: start; }
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.card-head h4 { margin: 0; }
+.list-card { padding: 8px 20px; }
+.unavailable { margin: 0; }
 
-/* ---------- Code + address chips ---------- */
-.code-chip {
-  font-family: var(--mono); font-size: 1.55rem; font-weight: 600; letter-spacing: .16em;
-  background: var(--inset); border: 1px dashed var(--border-strong); color: var(--ink);
-  border-radius: var(--radius-sm); padding: 14px 16px; text-align: center;
+/* ---------- Home ---------- */
+.hero { display: flex; align-items: center; gap: 20px; padding: 24px 26px; }
+.hero .iconbox.big { width: 52px; height: 52px; }
+.hero-text { flex: 1; }
+.hero-text h2 { font-size: 20px; }
+.hero-text p { margin: 0; }
+
+.session-row {
+  display: flex; gap: 12px; align-items: center; width: 100%; padding: 0; border: 0; background: none;
+  text-align: left; font-size: 14px; border-radius: 8px;
 }
-.sac-chip {
-  font-family: var(--mono); font-size: 1.8rem; font-weight: 700; letter-spacing: .22em;
-  background: color-mix(in srgb, var(--pending) 10%, var(--inset));
-  border: 1px solid color-mix(in srgb, var(--pending) 40%, transparent);
-  color: var(--ink); border-radius: var(--radius-sm); padding: 14px 8px; text-align: center;
+.session-row:hover .session-text b { text-decoration: underline; }
+.session-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.session-text .muted { font-size: 12px; }
+.session-pills { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.list.sessions .it { padding: 9px 0; }
+
+/* ---------- Waiting, compare, consent ---------- */
+.card.center { padding: 32px; text-align: center; display: flex; flex-direction: column; align-items: center; }
+.card.center h2 { margin-top: 14px; font-size: 20px; }
+.card.center .label { margin-top: 20px; }
+.conn-addr { margin: 10px 0 0; }
+.center-col { align-items: center; justify-content: center; text-align: center; flex: 1; }
+.center-col h2 { margin-top: 4px; }
+.compare .reports { margin: 16px 0 4px; }
+.compare .row { justify-content: center; }
+
+/* ---------- Live session ---------- */
+.live-screen { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.live-screen:focus { outline: none; }
+.band.full.slim .band-note { margin-left: auto; font-weight: 500; opacity: 0.9; }
+.sessbar {
+  display: flex; align-items: center; gap: 14px; padding: 12px 18px; border-bottom: 1px solid var(--line);
+  background: #fff; flex: none;
 }
-.addr-row { display: flex; align-items: center; gap: 10px; }
-.addr {
-  font-family: var(--mono); font-size: .9rem; color: var(--ink-soft);
-  background: var(--inset); border: 1px solid var(--border); border-radius: 7px;
-  padding: 6px 10px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+.sessbar .iconbox { width: 38px; height: 38px; }
+.sessbar .host { font-weight: 700; font-size: 16px; letter-spacing: -0.01em; margin: 0; }
+.sessbar .meta { font-size: 12px; color: var(--muted); margin-top: 1px; }
+.sess-id { min-width: 0; }
+.t-live { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-height: 0; }
+.workpane { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.tabs { display: flex; gap: 4px; padding: 0 14px; border-bottom: 1px solid var(--line); background: #fff; flex: none; }
+.tabs [role="tab"] {
+  display: flex; gap: 7px; align-items: center; padding: 10px 12px; font-size: 13px; color: var(--muted);
+  border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; background: none;
 }
-.mini { font: inherit; font-size: .78rem; font-weight: 600; color: var(--muted);
-  background: transparent; border: 1px solid var(--border-strong); border-radius: 7px; padding: 6px 10px; cursor: pointer; }
-.mini:hover { color: var(--ink); border-color: var(--brand); }
+.tabs [role="tab"].on { color: var(--ink); border-color: var(--tech); font-weight: 600; }
+.tabs .ic { width: 15px; height: 15px; }
+.tabpanel { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
+.tabpanel[hidden] { display: none; }
+.pane-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+.pane-body .row p { margin: 0; }
 
-/* ---------- Waiting line ---------- */
-.waiting { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: .9rem; }
-.waiting .spin {
-  width: 15px; height: 15px; border-radius: 50%; flex: 0 0 auto;
-  border: 2px solid color-mix(in srgb, var(--brand) 30%, var(--border));
-  border-top-color: var(--brand); animation: spin .8s linear infinite;
+/* Terminal: dark, titled the way the customer sees it */
+.panel-terminal { overflow: hidden; }
+.shell { flex: 1; display: flex; flex-direction: column; min-height: 0; background: #0b1120; }
+.sh-bar {
+  display: flex; align-items: center; gap: 10px; padding: 8px 18px; flex: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06); font: 12px var(--mono); color: #64748b;
 }
-
-/* ---------- Approval code (SAC) block ---------- */
-.approval { display: flex; flex-direction: column; gap: 8px; }
-.approval-label { font-size: .74rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); margin: 0; }
-.approval-hint { color: var(--muted); font-size: .86rem; margin: 0; }
-
-/* ---------- Identity table ---------- */
-.identity { display: flex; flex-direction: column; gap: 8px; }
-.idtable { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: .86rem; margin: 0; }
-.idtable dt { color: var(--faint); }
-.idtable dd { margin: 0; font-family: var(--mono); font-size: .82rem; color: var(--ink-soft); word-break: break-word; }
-.region-tag { text-transform: uppercase; letter-spacing: .12em; font-size: .68rem; font-weight: 700; color: var(--faint); margin: 0; }
-
-/* ---------- Live banner (full control, both endpoints) ---------- */
-.live-banner {
-  border-radius: var(--radius-sm); padding: 12px 14px; display: flex; align-items: center; gap: 10px;
-  background: color-mix(in srgb, var(--live) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--live) 34%, transparent); color: var(--live); font-weight: 650; font-size: .92rem;
-}
-.live-banner .pd { width: 9px; height: 9px; border-radius: 50%; background: currentColor; flex: 0 0 auto; animation: pulse 1.4s ease-in-out infinite; }
-
-/* ---------- Session tabs (console view switcher) ---------- */
-.stabs { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.stab-group { display: inline-flex; gap: 3px; background: var(--surface-2);
-  padding: 3px; border-radius: 10px; border: 1px solid var(--border); }
-.stab { font: 600 .78rem/1 var(--sans); color: var(--muted); background: transparent;
-  border: none; padding: 7px 14px; border-radius: 7px; cursor: pointer;
-  transition: background .12s ease, color .12s ease; }
-.stab:hover { color: var(--ink); }
-.stab.active { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-sm); }
-.stab[aria-disabled="true"] { opacity: .4; cursor: not-allowed; }
-.stab-live { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
-  font: 700 .62rem/1 var(--mono); letter-spacing: .07em; color: var(--live); }
-.stab-live .pd { width: 8px; height: 8px; border-radius: 50%; background: currentColor;
-  animation: pulse 1.4s ease-in-out infinite; }
-/* The body of the active tab: a vertical stack of the panel's blocks. */
-.stab-panel { display: flex; flex-direction: column; gap: 12px; }
-/* The Activity timeline scrolls within its own container so a long session
- * never grows the card past the viewport. */
-.activity-feed { display: flex; flex-direction: column; gap: 8px; max-height: 340px; overflow: auto; }
-
-/* ---------- Job feed (streamed output, mirrored on both sides) ---------- */
-.feed-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin: 4px 0 2px; }
-.fh-title { font-weight: 700; font-size: .8rem; letter-spacing: .02em; }
-.fh-sub { font-size: .72rem; color: var(--faint); font-family: var(--mono); }
-.job { border: 1px solid var(--border); border-radius: 9px; overflow: hidden; margin: 0; background: var(--surface-2); }
-.job-head { display: flex; align-items: center; gap: 8px; padding: 6px 9px; background: var(--inset); border-bottom: 1px solid var(--border); }
-.job-head .spacer { flex: 1; }
-.job-purpose { padding: 5px 9px; font-size: .74rem; color: var(--ink-soft); }
-.cmd-inline { font: 600 .72rem/1.35 var(--mono); color: var(--ink-soft);
-  min-width: 0; flex: 0 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.job-status { font: 600 .68rem/1 var(--mono); padding: 3px 7px; border-radius: 999px; white-space: nowrap; }
-.job-status.run { color: var(--pending); background: color-mix(in srgb, var(--pending) 15%, transparent); }
-.job-status.ok  { color: var(--good); background: color-mix(in srgb, var(--good) 16%, transparent); }
-.job-status.bad { color: var(--live); background: color-mix(in srgb, var(--live) 16%, transparent); }
-
-/* Source chip — who started this job */
-.job-src { font: 700 .6rem/1 var(--mono); letter-spacing: .06em; text-transform: uppercase;
-  padding: 3px 6px; border-radius: 5px; white-space: nowrap; }
-.src-mcp { color: #fff; background: var(--accent); }
-.src-terminal { color: var(--muted); background: color-mix(in srgb, var(--muted) 16%, transparent); border: 1px solid var(--border); }
-
-.term-legend { font-size: .68rem; color: var(--faint); font-family: var(--mono); margin: 2px 0 0; }
-
-/* ---------- Interactive terminal host (console terminal view) ---------- */
-.shell { border: 1px solid var(--border-strong); border-radius: 11px; overflow: hidden;
-  background: #0b1220; box-shadow: 0 10px 26px -12px rgba(0,0,0,.5); }
-.sh-bar { display: flex; align-items: center; gap: 9px; padding: 8px 12px;
-  background: #0e1524; border-bottom: 1px solid rgba(255,255,255,.06); }
-.sh-dots { display: inline-flex; gap: 6px; }
-.sh-dots i { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
-.sh-dots .r { background: #ff5f57; } .sh-dots .y { background: #febc2e; } .sh-dots .g { background: #28c840; }
-.sh-title { font: 600 .74rem/1 var(--mono); color: #aeb8c8; }
-.sh-title b { color: #eef2f8; font-weight: 700; }
-.sh-badge { margin-left: auto; display: inline-flex; align-items: center; gap: 5px;
-  font: 700 .58rem/1 var(--mono); letter-spacing: .05em; color: #7fe0b0;
-  background: rgba(40,200,120,.13); padding: 4px 8px; border-radius: 6px; }
-/* The badge's own state dot; `currentColor` tracks the honest status colour. */
-.sh-badge .pd { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: 0 0 auto; }
-/* Honest status colours: connecting (warn) and closed/revoked/unavailable (bad),
-   distinct from the default live green so a dead shell never looks attached. */
-.sh-badge.warn { color: #ffd479; background: rgba(255,180,60,.13); }
-.sh-badge.bad { color: #ff9b9b; background: rgba(255,80,80,.14); }
-.sh-body { font-family: var(--mono); font-size: .78rem; line-height: 1.55; color: #d6deec;
-  padding: 12px 14px; min-height: 120px; max-height: 320px; overflow: auto; background: #0b1220; }
-/* xterm host: an explicit height so FitAddon computes a stable row count; the
-   terminal scrolls internally, so the body keeps a small inset without its own
-   scrollbar (288 + 24 padding < the body's 320 max-height). */
-.sh-xterm { width: 100%; height: 288px; }
+.sh-title { color: #94a3b8; }
+.sh-title b { color: #e2e8f0; }
+.sh-body { flex: 1; min-height: 0; padding: 10px 14px; }
+.sh-xterm { width: 100%; height: 100%; }
 .sh-xterm .xterm { height: 100%; }
+.sh-legend { flex: none; margin: 0; padding: 6px 18px; font: 11.5px var(--mono); color: #64748b; }
+.sh-badge {
+  display: inline-flex; align-items: center; gap: 5px; font: 700 10.5px/1 var(--mono); letter-spacing: 0.03em;
+  color: #86efac; background: rgba(40, 200, 120, 0.13); padding: 4px 8px; border-radius: 6px;
+}
+.sh-badge .pd { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.sh-badge.warn { color: #fde68a; background: rgba(255, 180, 60, 0.13); }
+.sh-badge.bad { color: #fca5a5; background: rgba(255, 80, 80, 0.14); }
 
-/* ---------- Action buttons ---------- */
-.f-actions { display: flex; gap: 10px; flex-wrap: wrap; }
-.fbtn { font: inherit; font-weight: 650; cursor: pointer; border-radius: 9px; padding: 11px 16px;
-  border: 1px solid var(--border-strong); background: var(--surface-2); color: var(--ink); }
-.fbtn:hover { border-color: var(--brand); }
-.fbtn:disabled, .fbtn[aria-disabled="true"] { opacity: .4; cursor: not-allowed; }
-.fbtn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
-.fbtn.brand { background: var(--brand); border-color: var(--brand); color: #fff; }
-.fbtn.good    { background: var(--good); border-color: var(--good); color: #fff; }
-.fbtn.danger  { background: transparent; border-color: color-mix(in srgb, var(--live) 55%, var(--border)); color: var(--live); }
-.fbtn.danger.solid { background: var(--live); border-color: var(--live); color: #fff; }
-.fbtn.ghost   { background: transparent; }
+/* Files and audit */
+.list.files .it { align-items: flex-start; }
+.list.files .k {
+  width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center; flex: none;
+  background: #fff; border: 1px solid var(--line); color: var(--ink-2);
+}
+.list.files .k.out { background: var(--warn-soft); border-color: var(--warn-line); color: var(--warn); }
+.file-text { min-width: 0; }
+.file-text b { font-size: 13px; overflow-wrap: anywhere; }
+.file-text .m { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 4px; font-size: 11.5px; color: var(--muted); }
+.audit-wrap { overflow: auto; border: 1px solid var(--line); border-radius: var(--r-md); }
+table.audit { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+table.audit th { text-align: left; font-weight: 700; color: var(--muted); background: var(--bg); padding: 7px 10px; font-size: 11.5px; }
+table.audit td { padding: 7px 10px; border-top: 1px solid var(--line-2); vertical-align: top; }
+table.audit td.op { overflow-wrap: anywhere; color: var(--ink-2); }
+table.audit tr.gap td { color: var(--warn); font-weight: 600; }
 
-/* ---------- Stop bar ---------- */
-.stop-bar { display: flex; flex-direction: column; gap: 6px; margin-top: auto; }
-.stop-hint { font-size: .74rem; color: var(--faint); margin: 0; }
+.statusbar {
+  flex: none; border-top: 1px solid var(--line); padding: 7px 18px; font-size: 12px; color: var(--muted);
+  display: flex; gap: 20px; background: var(--bg); flex-wrap: wrap;
+}
+.statusbar span { display: flex; gap: 6px; align-items: center; }
 
-/* ---------- Focus + motion ---------- */
-:focus-visible { outline: 2.5px solid var(--brand); outline-offset: 2px; }
-@keyframes spin { to { transform: rotate(360deg); } }
-@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
-@media (prefers-reduced-motion: reduce) {
-  * { animation: none !important; transition: none !important; }
+/* Rail: AI clients and the activity feed */
+.rail { border-left: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; background: var(--bg); }
+.rail section { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.rail .rail-h {
+  margin: 0 0 8px; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 700;
+}
+.rail .rail-ai .list .it { padding: 4px 0; font-size: 14px; }
+.rail .rail-ai p { margin: 0; font-size: 12.5px; }
+.rail .rail-ai .rail-tools { margin-top: 6px; }
+.rail .rail-ai .rail-alert { margin: 6px 0 8px; font-size: 12.5px; }
+.rail .rail-feed-head { padding: 12px 16px 4px; border: 0; display: flex; justify-content: space-between; align-items: baseline; }
+.rail .rail-feed-head .rail-h { margin: 0; }
+.feed { flex: 1; overflow: auto; padding: 4px 16px 10px; margin: 0; list-style: none; min-height: 0; }
+.feed:focus-visible { outline-offset: -2px; }
+.feed-empty { padding: 4px 16px; margin: 0; font-size: 12.5px; }
+
+/* ---------- End report ---------- */
+.report-body { display: flex; flex-direction: column; gap: 18px; }
+.report-body h2 { margin: 0; }
+.report-body .row .muted { font-size: 13px; }
+.note.bad { border-color: var(--bad-line); background: var(--bad-soft); color: var(--bad-deep); }
+.end > .row, .report > .row { flex: none; }
+
+/* ---------- AI assistants ---------- */
+.list.clients .it { align-items: flex-start; }
+.list.clients .dot { margin-top: 6px; }
+.client-text { flex: 1; min-width: 0; }
+.client-text .muted { font-size: 12px; overflow-wrap: anywhere; }
+.client-text code { font-size: 11.5px; }
+.confirm {
+  margin-top: 10px; border: 1px solid var(--tech-line); background: var(--tech-soft); border-radius: var(--r-md);
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;
+}
+.confirm p { margin: 0; }
+.confirm-head { font-weight: 600; font-size: 13px; }
+.screen.ai p { margin: 0; }
+.note.run-once { align-items: center; }
+
+/* ---------- Settings ---------- */
+.with-action { display: inline-flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.settings .kv { grid-template-columns: 140px 1fr; }
+.plan { margin: 0 0 12px; padding-left: 18px; font-size: 13px; display: grid; gap: 4px; }
+.settings .card { display: flex; flex-direction: column; gap: 10px; }
+.settings .card p { margin: 0; }
+.settings .card .btn { align-self: flex-start; }
+
+/* ---------- Narrow windows ---------- */
+@media (max-width: 1000px) {
+  .t-live { grid-template-columns: minmax(0, 1fr) 290px; }
+  .grid2 { grid-template-columns: 1fr; }
+}
+@media (max-width: 760px) {
+  .tshell { grid-template-columns: 64px minmax(0, 1fr); }
+  .side button { font-size: 0; justify-content: center; padding: 10px; }
+  .side button .ic { width: 20px; height: 20px; }
+  .side .foot { display: none; }
+  .t-live { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) minmax(0, 40%); }
+  .rail { border-left: 0; border-top: 1px solid var(--line); }
+  .tmain { padding: 20px; }
 }

@@ -13,13 +13,15 @@ intended behaviour in the issue or pull request first.
 apps/
   app/              The CretLink application `cretlink`: Give help and Get help
                     (Tauri v2, detached package)
-  cli/              The console build `cretlink-cli` of the subcommands (MCP
-                    bridge, AI-client registration, terminal, version)
-  console/          CretLink Console core and CLI (session state, audit, MCP host)
-  mcp-bridge/       Builds the `cretlink-mcp` stdio MCP bridge binary
+  cli/              The subcommands of `cretlink` and their console build
+                    `cretlink-cli`: the stdio MCP bridge (`mcp`), AI-client
+                    registration, the experimental terminal client (`shell`),
+                    version and uninstall; the MCP conformance harness
+  console/          Technician role library (session state, audit, MCP host)
+                    and the `cretlink-console` development tool
   relay-server/     Operator-hosted relay server (`cretlink-relay-server`)
-  shell-cli/        Experimental technician terminal client (`cretlink-shell`)
-  support-agent/    CretLink Support agent (customer side, Windows)
+  support-agent/    Customer role library (Windows) and the headless
+                    `cretlink-support-agent` development tool
 crates/
   discovery/        LAN mDNS discovery and the manual connection-code fallback
   exec/             Execution broker, interactive terminal, files, desktop backend
@@ -33,7 +35,8 @@ crates/
   wss/              TLS/WebSocket transport envelope for the relay
 docs/               Threat model, release policy, artifact verification, relay
                     operation, MCP clients, manual tests, release sign-off
-scripts/            Release artifact generation and Windows signing helpers
+scripts/            Release artifact generation, Windows signing helpers and
+                    the private-data check
 ```
 
 ## Prerequisites
@@ -57,7 +60,15 @@ cargo fmt --all --check                                # verify formatting
 cargo clippy --workspace --all-targets -- -D warnings  # lint
 cargo test --workspace                                 # run all tests
 cargo build --workspace                                # build everything
+node scripts/check-private-data.mjs                    # no private data (see "Sample data")
 ```
+
+Only `cretlink` (from `apps/app`), `cretlink-cli` and the relay server are
+released. `cretlink-console` and `cretlink-support-agent` are headless
+development and test tools: they drive the same libraries as the application,
+and the console's relay options (`--relay`, `--ticket`, `--token`,
+`--relay-tls`, `--relay-ca`) stay available to developers until the relay
+comes to the application (M007).
 
 All routine tests run without administrator rights against the simulated
 target (`crates/simulator`). Privileged Windows tests are opt-in and never run
@@ -97,9 +108,16 @@ Follow [`docs/releasing.md`](docs/releasing.md):
 - semantic-release owns versions, tags, and changelogs; never edit them by
   hand. The only manual tags are the `v0.0.0` bootstrap seed and the
   `v0.21.1` snapshot seed (see `docs/releasing.md`).
-- CI must be green before squash-merging. Branch protection with required
-  checks is enabled once the repository becomes public; on the current
-  private free-plan repository this rule is procedural.
+- CI must be green before squash-merging, and the pull request must be up to
+  date with `main`, so that the tree CI tested is the tree that is merged.
+  Branch protection with required checks is enabled once the repository
+  becomes public; on the current private free-plan repository these rules are
+  procedural.
+- While the repository is private, CI minutes are limited: CI runs on pull
+  requests and not again on `main`, a newer push cancels the run in progress,
+  and a pull request that changes only documentation runs the secret scan and
+  the private-data check without the build and test matrix. CI on `main`
+  returns when the repository is public.
 
 ## Dependency and license policy
 
@@ -119,7 +137,51 @@ run in CI via `cargo deny`:
 
 Retain third-party license notices. Never commit credentials, tokens, signing
 keys, or customer data (REQ-N-017); `.gitignore` excludes common local state,
-and CI runs a secret scan.
+and every pull request runs a secret scan and the private-data check described
+below.
+
+## Sample data
+
+The repository and everything published with it hold no private data
+(REQ-N-022): no name of a real computer, user account, network, domain, person
+or customer, no real IP or hardware address, no path from a real machine, and
+nothing copied from a real support session. This holds for code, tests,
+fixtures, snapshots, documentation, screenshots, commit messages and pull
+request texts. The author's name as copyright holder and publisher is the only
+exception. Evidence of a hardware run names the kind of computer and its
+operating-system version ("a Windows 11 Pro laptop"), never its name.
+
+Use these sample values:
+
+| For | Sample values |
+|---|---|
+| Computers | `TECH-LAPTOP` (the technician's), `CUSTOMER-PC`, `ACME-PC-07`, `FRONTDESK-2`, `MOM-LAPTOP` |
+| People | `Sam` (the technician) and `Ann` |
+| Accounts | `sam`, `ann`, `jdoe`, `tech`, `customer`, as in `C:\Users\ann` and `/home/ann` |
+| Addresses | `127.0.0.1`, `10.0.0.42`, `192.168.1.20`, and `192.0.2.1` for a peer on the internet |
+| Domains | names under `example.org`, such as `host-01.example.org` and `ann@example.org` |
+
+[`scripts/private-data-samples.json`](scripts/private-data-samples.json) lists
+every allowed account, address and e-mail domain with its reason.
+`scripts/check-private-data.mjs` checks the tracked files and the commit
+messages of every pull request against that list: it fails on any other IPv4
+address, user-profile path or e-mail address, and on a computer name as
+Windows generates it (`DESKTOP-` or `LAPTOP-` and seven or eight characters).
+Run it before pushing; it reads the tracked files, so `git add` new files
+first:
+
+```sh
+node scripts/check-private-data.mjs --commits origin/main..HEAD
+```
+
+A maintainer adds `--terms <file>` with a private list of real names, one per
+line; on a pull request the list comes from the `PRIVATE_TERMS` secret. The
+check reports the place and the number of a term, never the term itself.
+
+Replace a reported value by a sample value. A new sample value goes into
+`scripts/private-data-samples.json`, with its reason, and into the table above
+in the same change. The tests of the check run with
+`node --test "scripts/*.test.mjs"`.
 
 ## Security
 

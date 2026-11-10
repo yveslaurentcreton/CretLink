@@ -1,0 +1,77 @@
+{
+  "_comment": "The sample values that scripts/check-private-data.mjs allows (ST-M006-016). Every list is a list of groups, and every group says why its values are here. Add a new sample value here and to \"Sample data\" in CONTRIBUTING.md in the same change. Never add a real name, address or path: replace it by a sample value.",
+  "ipv4": [
+    {
+      "_comment": "The unspecified address and the broadcast address. Every 127.x.x.x address is allowed without being listed.",
+      "values": ["0.0.0.0", "255.255.255.255"]
+    },
+    {
+      "_comment": "Network constants: the private (RFC 1918), link-local and loopback ranges that code and documentation name.",
+      "values": ["10.0.0.0", "172.16.0.0", "192.168.0.0", "169.254.0.0", "127.0.0.0"]
+    },
+    {
+      "_comment": "Fixture addresses in the private ranges, for computers on the same network.",
+      "values": [
+        "10.0.0.1",
+        "10.0.0.5",
+        "10.0.0.9",
+        "10.0.0.42",
+        "10.0.0.57",
+        "192.168.1.10",
+        "192.168.1.20"
+      ]
+    },
+    {
+      "_comment": "Fixture addresses in the documentation ranges (RFC 5737), for peers on the internet.",
+      "values": ["192.0.2.1", "198.51.100.9", "203.0.113.7"]
+    },
+    {
+      "_comment": "Not an address: the assembly version in apps/support-agent/cretlink-support.manifest.",
+      "values": ["1.0.0.0"]
+    }
+  ],
+  "accounts": [
+    {
+      "_comment": "Sample accounts: Ann, Sam, a technician, a customer and J. Doe. An account with a space in its name, such as Ann Lee, counts by its first word.",
+      "values": ["ann", "sam", "tech", "customer", "jdoe"]
+    },
+    {
+      "_comment": "The accounts of the GitHub-hosted runners, which build paths and logs show.",
+      "values": ["runner", "runneradmin"]
+    },
+    {
+      "_comment": "Placeholders for an account in documentation, and the parent folder in tests that reject path traversal.",
+      "values": ["..", "<name>", "%USERNAME%", "$USER", "USERNAME"]
+    },
+    {
+      "_comment": "One-letter accounts in tests of path handling.",
+      "values": ["a", "c"]
+    }
+  ],
+  "computerNames": [
+    {
+      "_comment": "Names of the form Windows generates: DESKTOP- or LAPTOP- and seven or eight characters. None so far: the sample computers have names such as TECH-LAPTOP, which the rule does not match.",
+      "values": []
+    }
+  ],
+  "emailDomains": [
+    {
+      "_comment": "The no-reply addresses of GitHub, which commits use.",
+      "values": ["users.noreply.github.com"]
+    },
+    {
+      "_comment": "Domains reserved for examples (RFC 2606).",
+      "values": ["example.org", "example.com", "example.net"]
+    }
+  ],
+  "emailExceptions": [
+    {
+      "_comment": "Not an address: the file name of an icon at double resolution.",
+      "values": ["128x128@2x.png"]
+    },
+    {
+      "_comment": "Not a person: the no-reply address in the Co-Authored-By trailer of commits written with an AI assistant, which published commits carry.",
+      "values": ["noreply@anthropic.com"]
+    }
+  ]
+}

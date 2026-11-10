@@ -146,7 +146,10 @@ itself needs no elevation.
 Both the console and the support agent dial the relay outbound and must present
 the **same** single-use rendezvous ticket. Give each side a relay address, that
 ticket, and — if the relay requires one — the shared admission token, through
-their CLI flags or environment:
+their CLI flags or environment. Today these options exist only in the headless
+development tools `cretlink-console` and `cretlink-support-agent`, built from
+the source tree (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)); the released
+application `cretlink` does not use a relay yet (M007, ST-M009-010):
 
 | Variable | Flag | Used by | Meaning |
 | --- | --- | --- | --- |

@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::account::AccountName;
 use crate::b64::B64Bytes;
+use crate::display_name::DisplayName;
 use crate::error::ProtocolError;
 use crate::ids::{JobId, RequestId, SessionId};
 use crate::limits;
@@ -78,6 +80,13 @@ pub struct TargetIdentity {
     pub simulated: bool,
     /// Version of the agent software on the target.
     pub agent_version: String,
+    /// The account the agent's process runs as, `DOMAIN\user`: the customer's
+    /// own account name, shown to the technician in the live identity line
+    /// (ST-M009-008, REQ-F-016). Additive in minor 11; omitted when unknown and
+    /// validated on decode ([`AccountName`]). It is not part of the
+    /// reboot-resume [`crate::TargetBinding`], whose pre-image is frozen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountName>,
 }
 
 /// Which shell executes an `Exec` command.
@@ -994,6 +1003,15 @@ pub enum PairingMessage {
     Nonce {
         /// The responder's 32-byte nonce.
         nc: B64Bytes,
+        /// The console's display name, as the technician's computer reports it
+        /// (ST-M009-011): an unverified label the customer side shows as what
+        /// the technician's computer says, never an identity and never
+        /// authority. It is not part of the Session Approval Code derivation.
+        /// Additive since minor `10`: omitted when `None`, so a nonce without a
+        /// name keeps its earlier wire form, and validated on decode through
+        /// [`DisplayName::new`] (REQ-N-012).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<DisplayName>,
     },
     /// Initiator -> responder: the initiator's revealed nonce `na`; the
     /// responder verifies `SHA-256(na)` equals the earlier commitment before
@@ -1157,6 +1175,24 @@ pub enum ControlMessage {
         ticket_id: B64Bytes,
         /// The continuity proof tag (32 bytes, base64).
         proof: B64Bytes,
+    },
+    /// Agent -> console: the honest account of the agent's session teardown,
+    /// sent once when an active session ends and the channel is still up —
+    /// before the agent's own `Revoke` when the customer stops, or before the
+    /// agent closes after the technician's `Revoke` (ST-M009-012, REQ-F-019).
+    /// The console records it in the session's audit file with every note.
+    /// `ok` is `false` when something was left behind or teardown failed; the
+    /// notes say what. It carries no secret (REQ-S-017): only teardown wording,
+    /// canonical paths of staged artifacts and their failure reasons. A
+    /// disconnect leaves the console without one, which it records as unknown,
+    /// never as success. Added in protocol minor 11.
+    CleanupReported {
+        /// Whether every session-scoped resource was torn down.
+        ok: bool,
+        /// One line each, at most [`limits::MAX_CLEANUP_NOTES`] notes of at
+        /// most [`limits::MAX_CLEANUP_NOTE_BYTES`] bytes, without control
+        /// characters.
+        notes: Vec<String>,
     },
 }
 
@@ -1419,6 +1455,30 @@ fn validate_control(control: &ControlMessage) -> Result<(), ProtocolError> {
                 crate::REBOOT_RESUME_PROOF_LEN as u64,
             )
         }
+        // Bounded so the report always fits one record, and one line per note
+        // so a peer cannot forge extra lines in a log or a report (ST-M009-012).
+        ControlMessage::CleanupReported { notes, .. } => {
+            check_limit(
+                "cleanup report note count",
+                notes.len() as u64,
+                limits::MAX_CLEANUP_NOTES as u64,
+            )?;
+            for note in notes {
+                check_limit(
+                    "cleanup report note length",
+                    note.len() as u64,
+                    limits::MAX_CLEANUP_NOTE_BYTES as u64,
+                )?;
+                if !is_single_line(note) {
+                    return Err(ProtocolError::Malformed(
+                        <serde_json::Error as serde::de::Error>::custom(
+                            "a cleanup report note must be one line without control characters",
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        }
         // The bound target identity is fixed-shape; its coarse size is caught by
         // the frame cap, consistent with how `HelloAck` treats it.
         ControlMessage::ConsentGranted { .. }
@@ -1441,7 +1501,8 @@ fn validate_pairing(pairing: &PairingMessage) -> Result<(), ProtocolError> {
             commitment.len() as u64,
             SAC_COMMITMENT_LEN as u64,
         ),
-        PairingMessage::Nonce { nc } => check_limit(
+        // A display name is bounded by construction (`DisplayName::new`).
+        PairingMessage::Nonce { nc, .. } => check_limit(
             "pairing nonce length",
             nc.len() as u64,
             SAC_NONCE_LEN as u64,
@@ -1771,6 +1832,14 @@ fn validate_event(event: &EventKind) -> Result<(), ProtocolError> {
         | EventKind::Disconnected { .. }
         | EventKind::DesktopActivity { .. } => Ok(()),
     }
+}
+
+/// Whether `text` is one line of plain text: no control character and no
+/// line or paragraph separator.
+fn is_single_line(text: &str) -> bool {
+    !text
+        .chars()
+        .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
 }
 
 const fn check_limit(field: &'static str, len: u64, max: u64) -> Result<(), ProtocolError> {

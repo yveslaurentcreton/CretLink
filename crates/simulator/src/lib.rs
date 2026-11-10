@@ -180,6 +180,7 @@ impl Simulator {
             elevated: false,
             simulated: true,
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            account: None,
         }
     }
 

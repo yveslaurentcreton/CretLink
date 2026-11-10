@@ -1,6 +1,6 @@
 [package]
 name = "cretlink-console"
-description = "CretLink Console: technician-side session management, audit, and MCP bridge host"
+description = "The technician role of CretLink (Give help): session management, audit and MCP bridge host, plus the `cretlink-console` development tool"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
@@ -18,9 +18,20 @@ cretlink-shared.workspace = true
 cretlink-transport.workspace = true
 async-trait = "0.1"
 serde = { workspace = true }
+# The session history reads the audit files back (ST-M009-012).
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
 uuid = { workspace = true }
+
+# The technician's full name on Windows (ST-M009-011): the same `windows`
+# version the support agent already uses, with the two API families the
+# display-name lookup needs.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_NetworkManagement_NetManagement",
+  "Win32_Security_Authentication_Identity",
+] }
 
 [dev-dependencies]
 cretlink-simulator.workspace = true

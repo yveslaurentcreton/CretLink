@@ -1,134 +1,208 @@
-/* The start screen (ST-M009-005, mock `#start`). Self-contained: the role
- * windows load their own design system only after a role is chosen. The two
- * choices carry the role colours of the mock — teal for the customer, indigo
- * for the technician — always next to a text label (REQ-N-014). */
+/* The start screen (`#start`) and the install screen (`#t-install`),
+ * ST-M009-005 and ST-M009-006. Built on the shared design tokens and building
+ * blocks of `base.css` (the root is `cl-ui tech`); only the layout of these two
+ * screens lives here. The two choices carry the role colours of the mock —
+ * teal for the customer, indigo for the technician — always next to a text
+ * label (REQ-N-014). */
 
-:root {
-  --bg: #f5f6fa;
-  --surface: #ffffff;
-  --border: #e3e6ee;
-  --ink: #141925;
-  --muted: #5a6478;
-  --technician: #4f46e5;
-  --customer: #0d9488;
-  --warn-bg: #fff7e6;
-  --warn-ink: #7a4a00;
-  --focus: #2563eb;
-  color-scheme: light dark;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #11141b;
-    --surface: #1a1f2a;
-    --border: #2c3443;
-    --ink: #eef1f7;
-    --muted: #a3acbf;
-    --technician: #818cf8;
-    --customer: #2dd4bf;
-    --warn-bg: #3a2a08;
-    --warn-ink: #ffd88a;
-  }
-}
-
-body.app-start {
+body:has(.start-root) {
   margin: 0;
-  background: var(--bg);
-  color: var(--ink);
-  font: 15px/1.5 "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: var(--paper);
 }
 
-.start {
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 32px 28px;
-}
-
-.start h1 {
-  margin: 0 0 4px;
-  font-size: 24px;
-  letter-spacing: -0.01em;
-}
-
-.start .muted {
-  margin: 0 0 20px;
-  color: var(--muted);
-}
-
-.notice {
-  margin: 0 0 18px;
-  padding: 12px 14px;
-  border-radius: 10px;
-  background: var(--warn-bg);
-  color: var(--warn-ink);
-}
-
-.choices {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 16px;
-}
-
-.card {
+.start-root {
+  min-height: 100vh;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+}
+
+.start-root .start {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 30px 34px;
+}
+
+.start-root .start:focus {
+  outline: none;
+}
+
+.start-root h1 {
+  margin: 0 0 6px;
+  font-size: 22px;
+  letter-spacing: -0.015em;
+}
+
+.start-root .where {
+  margin: 0 0 14px;
+  overflow-wrap: anywhere;
+}
+
+.start-root .alert {
+  margin-bottom: var(--sp-4);
+}
+
+/* ---------- Start ---------- */
+.start-root .choice {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--sp-4);
+  margin-top: var(--sp-2);
+  flex: 1;
+}
+
+.start-root .choice .card {
   padding: 22px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: var(--surface);
-  border-top-width: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
 }
 
-.card.get {
-  border-top-color: var(--customer);
-}
-
-.card.give {
-  border-top-color: var(--technician);
-}
-
-.card h2 {
-  margin: 0;
+.start-root .choice h2 {
   font-size: 19px;
+  margin: 4px 0 0;
 }
 
-.card p {
+.start-root .choice .card p {
+  font-size: 14px;
   margin: 0;
+}
+
+.start-root .choice .card.get {
+  border: 1.5px solid var(--cust-line);
+  background: linear-gradient(180deg, var(--cust-soft), #fff 55%);
+}
+
+.start-root .choice .card.give {
+  border: 1.5px solid var(--tech-line);
+  background: linear-gradient(180deg, var(--tech-soft), #fff 55%);
+}
+
+.start-root .iconbox.c {
+  background: var(--cust-soft);
+  color: var(--cust-deep);
+}
+
+.start-root .btn.primary.c {
+  background: var(--cust);
+  border-color: var(--cust);
+}
+
+.start-root .btn.primary.c:hover {
+  background: var(--cust-deep);
+}
+
+.start-root .card.get :focus-visible {
+  outline-color: var(--cust);
+}
+
+.start-root .facts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
   color: var(--muted);
 }
 
-.facts {
-  margin: 6px 0 14px;
-  padding-left: 18px;
-  color: var(--ink);
+.start-root .facts span {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
 }
 
-.btn {
-  margin-top: auto;
-  padding: 11px 16px;
-  border: 0;
-  border-radius: 10px;
-  font: inherit;
-  font-weight: 600;
-  color: #ffffff;
+.start-root .facts .ic {
+  width: 15px;
+  height: 15px;
+}
+
+.start-root .installed {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+  color: var(--muted);
+}
+
+/* ---------- Install ---------- */
+.start-root .location {
+  margin: 6px 0 var(--sp-3);
+  padding: 12px 16px;
+}
+
+.start-root .location .ic {
+  color: var(--muted);
+}
+
+.start-root .location .mono {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.start-root .check {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: flex-start;
+  padding: 9px 0;
+  font-size: 14px;
   cursor: pointer;
 }
 
-.btn.customer {
-  background: var(--customer);
+.start-root .check input {
+  width: 18px;
+  height: 18px;
+  margin: 1px 0 0;
+  flex: none;
+  accent-color: var(--tech);
 }
 
-.btn.technician {
-  background: var(--technician);
+.start-root .check.off {
+  cursor: default;
+  color: var(--muted);
 }
 
-.btn:disabled {
-  opacity: 0.6;
-  cursor: progress;
+.start-root .check small {
+  display: block;
+  color: var(--muted);
+  font-size: 12.5px;
+  margin-top: 1px;
+  overflow-wrap: anywhere;
 }
 
-.btn:focus-visible {
-  outline: 3px solid var(--focus);
-  outline-offset: 2px;
+.start-root .check code {
+  font-size: 12px;
+}
+
+.start-root .clients {
+  border: 0;
+  margin: 14px 0 0;
+  padding: 0;
+}
+
+.start-root .clients legend {
+  padding: 0;
+}
+
+.start-root .outcome {
+  margin-top: var(--sp-3);
+}
+
+.start-root .outcome ul {
+  margin: 6px 0;
+  padding-left: 18px;
+}
+
+.start-root .install > p[aria-busy] {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+}
+
+.start-root .install .row.end {
+  margin-top: var(--sp-5);
+}
+
+.start-root .check b {
+  font-weight: 600;
 }

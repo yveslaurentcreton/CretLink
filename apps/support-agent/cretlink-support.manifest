@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <!--
-  CretLink Support application manifest (ST-M002-001, REQ-F-002).
+  Manifest of the cretlink-support-agent development binary (ST-M002-001,
+  REQ-F-002).
 
   Requests administrator elevation so the attended support agent can host the
   elevated execution broker after visible consent. `uiAccess="false"` keeps the

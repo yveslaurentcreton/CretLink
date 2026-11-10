@@ -1,20 +1,29 @@
 //! What a `cretlink` process does, decided before any window opens
 //! (ST-M009-005, ADR-0018).
 //!
-//! The decision is a pure function of the arguments, the program's file name
-//! and the operating system, so it is tested exhaustively. Its rules:
+//! The decision is a pure function of the arguments, the program's file name,
+//! the operating system and whether this copy is the installed one, so it is
+//! tested exhaustively. Its rules:
 //!
 //! - A copy whose file name starts with `CretLink-Support` (any case) is for
-//!   getting help only: it opens the customer role, and refuses subcommands and
-//!   the technician role, so a file handed to a customer cannot be used the
-//!   other way.
+//!   getting help only: it opens the customer role, and refuses subcommands
+//!   (`install` and `uninstall` included, ST-M009-006) and the technician role,
+//!   so a file handed to a customer cannot be used the other way. The one
+//!   subcommand it accepts is the customer's own clean-up, `recover
+//!   [--remove]` (ST-M009-010, ST-M006-003).
 //! - `--role technician` and `--role customer` open that role directly; the
 //!   application passes them to itself when it starts the chosen role in a new
-//!   process. The customer role exists only on Windows.
+//!   process. The customer role exists only on Windows. Get help on the start
+//!   screen starts `--role customer --from-start`, unelevated, so the customer
+//!   first sees what the UAC prompt is for (`#c-admin`, ST-M009-009); its
+//!   **Continue** starts `--role customer` elevated, and that process never
+//!   explains or relaunches again ([`customer_admin_step`]).
 //! - Any other arguments are subcommands (`mcp`, `mcp install`, `version`, …),
 //!   handled by the shared command line without a window.
-//! - Without arguments, Windows shows the start screen (Get help or Give help);
-//!   macOS and Linux open the technician role.
+//! - Without arguments, Windows shows the start screen (Get help or Give help).
+//!   On macOS and Linux the installed copy opens the technician role directly
+//!   (ST-M009-005); a run-once copy shows the start screen with Give help only,
+//!   so it can still be installed (ST-M009-006).
 
 /// The two roles; one per process, for its whole life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +45,21 @@ impl Role {
     }
 }
 
+/// How a role's process was started (ST-M009-009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    /// Without arguments: a `CretLink-Support*` copy, or the installed copy on
+    /// macOS and Linux.
+    Direct,
+    /// From Get help on the start screen (`--role customer --from-start`):
+    /// **Back** returns to the start screen.
+    FromStart,
+    /// Started by the application itself with `--role`: the elevated customer
+    /// after the UAC prompt, or Give help from the start screen. It never
+    /// relaunches again.
+    Relaunched,
+}
+
 /// What this process does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
@@ -43,16 +67,67 @@ pub enum Launch {
     Subcommand(Vec<String>),
     /// Show the start screen.
     Start,
-    /// Open a role's window. `relaunched` is set when the application started
-    /// this process itself with `--role`, so it never relaunches again.
+    /// Open a role's window.
     Role {
         /// The role.
         role: Role,
-        /// Whether the process was started with an explicit `--role`.
-        relaunched: bool,
+        /// How the process was started.
+        entry: Entry,
     },
     /// Refuse, with a message for the user.
     Refuse(String),
+}
+
+/// The argument the start screen adds after `--role customer`.
+pub const FROM_START: &str = "--from-start";
+
+/// What the customer role shows first (ST-M009-009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminStep {
+    /// Explain the UAC prompt (`#c-admin`) before anything else.
+    Explain,
+    /// Go straight to choosing the technician (`#c-find`).
+    NotNeeded,
+}
+
+/// Whether a customer process first explains the UAC prompt: only when it is
+/// not elevated and was not itself started by the application with `--role`
+/// — the elevated child, or a process whose relaunch was already attempted,
+/// never asks again (REQ-F-002, REQ-S-011).
+#[must_use]
+pub fn customer_admin_step(entry: Entry, elevated: bool) -> AdminStep {
+    if elevated || entry == Entry::Relaunched {
+        AdminStep::NotNeeded
+    } else {
+        AdminStep::Explain
+    }
+}
+
+/// Whether this customer process may start itself again elevated: never a
+/// process the application already started with `--role`, so a relaunch never
+/// relaunches again.
+#[must_use]
+pub fn may_relaunch(entry: Entry) -> bool {
+    entry != Entry::Relaunched
+}
+
+/// Where **Back** on `#c-admin` goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackTo {
+    /// Start the start screen again, then close.
+    StartScreen,
+    /// Close this copy (a `CretLink-Support*` copy has no start screen).
+    Close,
+}
+
+/// Back returns to the start screen only when the start screen opened this
+/// process; a `CretLink-Support*` copy closes.
+#[must_use]
+pub fn back_target(entry: Entry) -> BackTo {
+    match entry {
+        Entry::FromStart => BackTo::StartScreen,
+        Entry::Direct | Entry::Relaunched => BackTo::Close,
+    }
 }
 
 /// The file-name prefix of a copy meant for the customer.
@@ -66,9 +141,15 @@ pub fn is_customer_copy(file_stem: &str) -> bool {
 
 /// Decides what this process does. `args` excludes the program name;
 /// `customer_available` is whether the customer role exists here (Windows, or
-/// a `dev-simulate` build).
+/// a `dev-simulate` build); `installed` is whether this copy runs from the
+/// install location (ST-M009-006).
 #[must_use]
-pub fn resolve(args: &[String], file_stem: &str, customer_available: bool) -> Launch {
+pub fn resolve(
+    args: &[String],
+    file_stem: &str,
+    customer_available: bool,
+    installed: bool,
+) -> Launch {
     let customer_copy = is_customer_copy(file_stem);
     let no_customer = || {
         Launch::Refuse(
@@ -87,8 +168,11 @@ pub fn resolve(args: &[String], file_stem: &str, customer_available: bool) -> La
             }
             None => return Launch::Refuse("--role expects 'technician' or 'customer'".to_owned()),
         };
-        if args.len() > 2 {
-            return Launch::Refuse(format!("unexpected argument '{}'", args[2]));
+        let from_start =
+            role == Role::Customer && args.get(2).map(String::as_str) == Some(FROM_START);
+        let expected = if from_start { 3 } else { 2 };
+        if let Some(extra) = args.get(expected) {
+            return Launch::Refuse(format!("unexpected argument '{extra}'"));
         }
         if role == Role::Customer && !customer_available {
             return no_customer();
@@ -96,14 +180,19 @@ pub fn resolve(args: &[String], file_stem: &str, customer_available: bool) -> La
         if role == Role::Technician && customer_copy {
             return Launch::Refuse(customer_copy_message());
         }
-        return Launch::Role {
-            role,
-            relaunched: true,
+        // A customer copy has no start screen to return to.
+        let entry = if from_start && !customer_copy {
+            Entry::FromStart
+        } else if from_start {
+            Entry::Direct
+        } else {
+            Entry::Relaunched
         };
+        return Launch::Role { role, entry };
     }
 
     if !args.is_empty() {
-        if customer_copy {
+        if customer_copy && !is_recover(args) {
             return Launch::Refuse(customer_copy_message());
         }
         return Launch::Subcommand(args.to_vec());
@@ -115,22 +204,47 @@ pub fn resolve(args: &[String], file_stem: &str, customer_available: bool) -> La
         }
         return Launch::Role {
             role: Role::Customer,
-            relaunched: false,
+            entry: Entry::Direct,
         };
     }
-    if customer_available {
+    if customer_available || !installed {
         Launch::Start
     } else {
         Launch::Role {
             role: Role::Technician,
-            relaunched: false,
+            entry: Entry::Direct,
         }
     }
 }
 
+/// Whether the arguments are exactly `recover` or `recover --remove`: the only
+/// subcommand a customer copy runs (ST-M009-010).
+fn is_recover(args: &[String]) -> bool {
+    match args {
+        [verb] => verb == "recover",
+        [verb, option] => verb == "recover" && option == "--remove",
+        _ => false,
+    }
+}
+
+/// The program name the shared command line prints in its texts, such as the
+/// recovery command it suggests: the file name of a customer copy, quoted when
+/// it holds a space (`"CretLink-Support (1)"`), else `cretlink`.
+#[must_use]
+pub fn program_name(file_stem: &str) -> String {
+    if !is_customer_copy(file_stem) {
+        "cretlink".to_owned()
+    } else if file_stem.contains(char::is_whitespace) {
+        format!("\"{file_stem}\"")
+    } else {
+        file_stem.to_owned()
+    }
+}
+
 fn customer_copy_message() -> String {
-    "This copy of CretLink is for getting help. Start it without arguments; to give help, use \
-     cretlink."
+    "This copy of CretLink is for getting help. Start it without arguments; to list what \
+     CretLink left on this computer, add 'recover' (and 'recover --remove' to remove it); to \
+     give help, use cretlink."
         .to_owned()
 }
 
@@ -142,21 +256,32 @@ mod tests {
         list.iter().map(|arg| (*arg).to_owned()).collect()
     }
 
-    fn role(role: Role, relaunched: bool) -> Launch {
-        Launch::Role { role, relaunched }
+    fn role(role: Role, entry: Entry) -> Launch {
+        Launch::Role { role, entry }
     }
 
     #[test]
     fn windows_without_arguments_shows_the_start_screen() {
-        assert_eq!(resolve(&[], "cretlink", true), Launch::Start);
+        assert_eq!(resolve(&[], "cretlink", true, false), Launch::Start);
     }
 
     #[test]
-    fn macos_and_linux_open_the_technician_role() {
+    fn an_installed_copy_on_macos_and_linux_opens_the_technician_role() {
         assert_eq!(
-            resolve(&[], "cretlink", false),
-            role(Role::Technician, false)
+            resolve(&[], "cretlink", false, true),
+            role(Role::Technician, Entry::Direct)
         );
+    }
+
+    #[test]
+    fn a_run_once_copy_on_macos_and_linux_can_still_install() {
+        // The start screen then offers Give help only: install or run once.
+        assert_eq!(resolve(&[], "cretlink", false, false), Launch::Start);
+    }
+
+    #[test]
+    fn the_installed_copy_on_windows_still_offers_both_roles() {
+        assert_eq!(resolve(&[], "cretlink", true, true), Launch::Start);
     }
 
     #[test]
@@ -167,13 +292,13 @@ mod tests {
             "CretLink-Support (1)",
         ] {
             assert_eq!(
-                resolve(&[], name, true),
-                role(Role::Customer, false),
+                resolve(&[], name, true, false),
+                role(Role::Customer, Entry::Direct),
                 "{name}"
             );
         }
         assert!(matches!(
-            resolve(&[], "CretLink-Support", false),
+            resolve(&[], "CretLink-Support", false, false),
             Launch::Refuse(_)
         ));
     }
@@ -182,35 +307,92 @@ mod tests {
     fn a_customer_copy_refuses_subcommands_and_the_technician_role() {
         let copy = "CretLink-Support";
         assert!(matches!(
-            resolve(&args(&["mcp"]), copy, true),
+            resolve(&args(&["mcp"]), copy, true, false),
             Launch::Refuse(_)
         ));
+        // It never installs or uninstalls (ST-M009-006), installed or not.
+        for command in [
+            args(&["install"]),
+            args(&["uninstall"]),
+            args(&["uninstall", "--yes"]),
+            args(&["mcp", "install"]),
+        ] {
+            for installed in [false, true] {
+                assert!(
+                    matches!(resolve(&command, copy, true, installed), Launch::Refuse(_)),
+                    "{command:?}"
+                );
+            }
+        }
         assert!(matches!(
-            resolve(&args(&["--role", "technician"]), copy, true),
+            resolve(&args(&["--role", "technician"]), copy, true, false),
             Launch::Refuse(_)
         ));
         assert_eq!(
-            resolve(&args(&["--role", "customer"]), copy, true),
-            role(Role::Customer, true)
+            resolve(&args(&["--role", "customer"]), copy, true, false),
+            role(Role::Customer, Entry::Relaunched)
+        );
+    }
+
+    #[test]
+    fn a_customer_copy_accepts_recover() {
+        for name in ["CretLink-Support", "cretlink-support (1)"] {
+            for command in [args(&["recover"]), args(&["recover", "--remove"])] {
+                for installed in [false, true] {
+                    assert_eq!(
+                        resolve(&command, name, true, installed),
+                        Launch::Subcommand(command.clone()),
+                        "{name} {command:?}"
+                    );
+                }
+            }
+            // Only that verb, spelled exactly.
+            for command in [
+                args(&["recover", "--force"]),
+                args(&["recover", "--remove", "--remove"]),
+                args(&["--remove"]),
+                args(&["version"]),
+                args(&["shell"]),
+            ] {
+                assert!(
+                    matches!(resolve(&command, name, true, false), Launch::Refuse(_)),
+                    "{name} {command:?}"
+                );
+            }
+        }
+        // The ordinary program runs it like any subcommand.
+        assert_eq!(
+            resolve(&args(&["recover", "--remove"]), "cretlink", true, true),
+            Launch::Subcommand(args(&["recover", "--remove"]))
+        );
+    }
+
+    #[test]
+    fn the_program_name_is_the_customer_copy_typed() {
+        assert_eq!(program_name("cretlink"), "cretlink");
+        assert_eq!(program_name("CretLink-Support"), "CretLink-Support");
+        assert_eq!(
+            program_name("CretLink-Support (1)"),
+            "\"CretLink-Support (1)\""
         );
     }
 
     #[test]
     fn explicit_roles_mark_the_relaunch() {
         assert_eq!(
-            resolve(&args(&["--role", "technician"]), "cretlink", true),
-            role(Role::Technician, true)
+            resolve(&args(&["--role", "technician"]), "cretlink", true, false),
+            role(Role::Technician, Entry::Relaunched)
         );
         assert_eq!(
-            resolve(&args(&["--role", "customer"]), "cretlink", true),
-            role(Role::Customer, true)
+            resolve(&args(&["--role", "customer"]), "cretlink", true, false),
+            role(Role::Customer, Entry::Relaunched)
         );
     }
 
     #[test]
     fn the_customer_role_needs_windows() {
         assert!(matches!(
-            resolve(&args(&["--role", "customer"]), "cretlink", false),
+            resolve(&args(&["--role", "customer"]), "cretlink", false, false),
             Launch::Refuse(_)
         ));
     }
@@ -221,9 +403,12 @@ mod tests {
             args(&["--role"]),
             args(&["--role", "admin"]),
             args(&["--role", "technician", "mcp"]),
+            args(&["--role", "technician", "--from-start"]),
+            args(&["--role", "customer", "--from-start", "mcp"]),
+            args(&["--role", "customer", "mcp"]),
         ] {
             assert!(
-                matches!(resolve(&bad, "cretlink", true), Launch::Refuse(_)),
+                matches!(resolve(&bad, "cretlink", true, false), Launch::Refuse(_)),
                 "{bad:?}"
             );
         }
@@ -232,12 +417,80 @@ mod tests {
     #[test]
     fn other_arguments_are_subcommands() {
         assert_eq!(
-            resolve(&args(&["mcp", "install"]), "cretlink", true),
+            resolve(&args(&["mcp", "install"]), "cretlink", true, false),
             Launch::Subcommand(args(&["mcp", "install"]))
         );
         assert_eq!(
-            resolve(&args(&["version"]), "cretlink", false),
+            resolve(&args(&["version"]), "cretlink", false, true),
             Launch::Subcommand(args(&["version"]))
         );
+        // The Windows uninstall entry runs `"<path>" uninstall`.
+        assert_eq!(
+            resolve(&args(&["uninstall"]), "cretlink", true, true),
+            Launch::Subcommand(args(&["uninstall"]))
+        );
+    }
+
+    #[test]
+    fn get_help_from_the_start_screen_is_marked() {
+        assert_eq!(
+            resolve(
+                &args(&["--role", "customer", "--from-start"]),
+                "cretlink",
+                true,
+                false
+            ),
+            role(Role::Customer, Entry::FromStart)
+        );
+        // A customer copy has no start screen to go back to.
+        assert_eq!(
+            resolve(
+                &args(&["--role", "customer", "--from-start"]),
+                "CretLink-Support",
+                true,
+                false
+            ),
+            role(Role::Customer, Entry::Direct)
+        );
+        assert!(matches!(
+            resolve(
+                &args(&["--role", "customer", "--from-start"]),
+                "cretlink",
+                false,
+                false
+            ),
+            Launch::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn an_unelevated_customer_first_explains_the_uac_prompt() {
+        // Get help from the start screen, and a `CretLink-Support*` copy.
+        for entry in [Entry::FromStart, Entry::Direct] {
+            assert_eq!(customer_admin_step(entry, false), AdminStep::Explain);
+            assert!(may_relaunch(entry));
+        }
+        // Already elevated (started as administrator): nothing to explain.
+        for entry in [Entry::FromStart, Entry::Direct, Entry::Relaunched] {
+            assert_eq!(customer_admin_step(entry, true), AdminStep::NotNeeded);
+        }
+    }
+
+    #[test]
+    fn a_relaunched_customer_never_explains_or_relaunches_again() {
+        // The elevated child, and any process started with `--role`, opens
+        // with its real identity — elevated or not (REQ-S-011).
+        assert_eq!(
+            customer_admin_step(Entry::Relaunched, false),
+            AdminStep::NotNeeded
+        );
+        assert!(!may_relaunch(Entry::Relaunched));
+    }
+
+    #[test]
+    fn back_returns_to_the_start_screen_only_from_the_start_screen() {
+        assert_eq!(back_target(Entry::FromStart), BackTo::StartScreen);
+        assert_eq!(back_target(Entry::Direct), BackTo::Close);
+        assert_eq!(back_target(Entry::Relaunched), BackTo::Close);
     }
 }

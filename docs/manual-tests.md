@@ -11,10 +11,13 @@ Each scenario lists steps and an expected outcome. When a maintainer runs a
 scenario on hardware, they record the date, host, and actual outcome in the
 **Run log** at the bottom.
 
-The reference agent is `cretlink-support-agent` on the customer computer; the
-technician side is the console plus the local MCP bridge. Treat every path,
-process, and file named here as belonging to the **remote target**, never the
-technician machine.
+The customer side is the application `cretlink.exe` in its **Get help** role on
+the customer computer; the technician side is `cretlink` in its **Give help**
+role plus the local MCP bridge, `cretlink mcp`, which the MCP client starts.
+Where a scenario needs something only the headless development tools offer
+(`cretlink-support-agent` for reboot-resume arming), it says so; those tools are built from the source tree and are not in the release
+archives. Treat every path, process, and file named here as belonging to the
+**remote target**, never the technician machine.
 
 ## Running-job policy on stop
 
@@ -99,9 +102,10 @@ a real UAC prompt**, which CI deliberately never grants.
 ## Windows manual scenarios
 
 Prerequisites: two Windows machines (or one customer VM and one technician
-host) on the same LAN; the technician runs the console and the MCP bridge; the
-customer runs `cretlink-support-agent`. Complete pairing and grant full-control
-consent before each scenario unless the scenario says otherwise.
+host) on the same LAN; the technician runs `cretlink` (Give help) and an MCP
+client that starts `cretlink mcp`; the customer runs `cretlink.exe` and chooses
+**Get help**. Complete pairing and grant full-control consent before each
+scenario unless the scenario says otherwise.
 
 ### MT-1 — UAC decline and accept
 
@@ -164,7 +168,8 @@ ST-M006-007).**
 1. Start a long-running elevated job as in MT-2 and note the child PID and its
    tree.
 2. **Hard-kill** the agent process so destructors are skipped:
-   `taskkill /f /im cretlink-support-agent.exe`, or End Task in Task Manager
+   `taskkill /f /im cretlink.exe` on the customer machine, or End Task in Task
+   Manager
    (both call `TerminateProcess`).
    - Expected (console): an honest terminal outcome as in MT-3a — `Revoked`
      with reason `Error`, and the in-flight job reported `Unknown`, never
@@ -192,7 +197,7 @@ ST-M006-007).**
 1. Complete a session that stages an artifact (`remote_upload` with
    `on_session_end`) and runs one or more jobs; then end the session normally.
 2. On the customer machine, verify **nothing CretLink placed survives**:
-   - no `cretlink-support-agent` process running (`tasklist`);
+   - no `cretlink.exe` process running (`tasklist`);
    - no CretLink service and no auto-start entry (`sc query`, `Get-Service`,
      the `Run`/`RunOnce` registry keys, and the Startup folder);
    - the session's staging tree under
@@ -232,22 +237,22 @@ ST-M006-007).**
    leave a running job or a standing access path; a later reconnect is a **new**
    pairing that requires fresh consent (REQ-S-007, REQ-S-009).
 
-### MT-7 — `cretlink-shell` host-terminal profile smoke (ST-M008-002)
+### MT-7 — `cretlink-cli shell` host-terminal profile smoke (ST-M008-002)
 
-This exercises the standalone `cretlink-shell` command-line client as a real
+This exercises the command-line terminal client `cretlink-cli shell` as a real
 host-terminal profile against a consented session — the interactive ergonomics
 and raw-mode host that the automated engine tests cannot cover (the security
-duplex itself is proven headlessly by `apps/shell-cli/tests/engine.rs` and the
-real-IPC fail-closed by `apps/shell-cli/tests/ipc_closed.rs`).
+duplex itself is proven headlessly by `apps/cli/tests/shell_engine.rs` and the
+real-IPC fail-closed by `apps/cli/tests/shell_ipc_closed.rs`).
 
 Prerequisites as above, plus **Windows Terminal** and/or **WezTerm** installed
-on the technician machine. The technician runs the console and the local MCP
-bridge; a full-control session is consented on the customer machine.
+on the technician machine. The technician runs `cretlink` (Give help); a
+full-control session is consented on the customer machine.
 
 1. Add a profile that launches the client against the running console's
    same-user IPC endpoint, for example a Windows Terminal profile with
-   `commandline` set to `cretlink-shell.exe` (optionally
-   `cretlink-shell.exe --shell cmd` or `--endpoint <name>`), and an equivalent
+   `commandline` set to `cretlink-cli.exe shell` (optionally
+   `cretlink-cli.exe shell --shell cmd` or `--endpoint <name>`), and an equivalent
    WezTerm `spawn`/`prog` entry. Open the profile.
    - Expected: the client prints its target-and-session identity banner on
      stderr (hostname, session id), then drops into the remote pseudo-console.
@@ -296,8 +301,11 @@ ADR-0014.
 > run the proof during a real post-reboot reconnect, so this scenario cannot
 > pass until that wiring exists. It stays here as the acceptance procedure.
 
-Prerequisites as above; a full-control session is consented on the customer
-machine before arming.
+Prerequisites as above, except that the customer side is the development tool
+`cretlink-support-agent`: the application does not offer reboot-resume arming
+yet. The recovery command is the application's (`cretlink recover`, also
+`cretlink-cli recover` or a `CretLink-Support*` copy's `recover`). A full-control session is consented on the
+customer machine before arming.
 
 1. In the active consented session, **arm reboot-resume** through the attended
    local flow on the agent window.
@@ -327,7 +335,9 @@ machine before arming.
    - Arm, copy the sealed ticket file to a second machine, and attempt a
      reconnect from it: refused (target-bound, single-use, sealed per-user).
 6. Residual check (the MT-4 discipline, extended): after a consumed reconnect, or
-   after an armed-but-expired ticket, run the **recovery command** and confirm it
+   after an armed-but-expired ticket, run the **recovery command**
+   (`cretlink recover`, then `cretlink recover --remove`, from an elevated
+   terminal) and confirm it
    reports and removes every CretLink residual — staged trees, the ticket file,
    and the OS auto-start entry — without hiding a failure (REQ-F-019, REQ-S-012,
    REQ-N-008). A cleanup that cannot remove something reports it prominently and
@@ -406,6 +416,157 @@ was doing.
    desktop surface exposed no hidden capture or keylogging path — only the
    discrete, audited ops actually invoked (REQ-S-013, REQ-S-015).
 
+### MT-10 — End reports and the customer's record (ST-M009-012)
+
+1. Run a Give help session against a Get help customer on Windows, with at
+   least one command, one file each way, and (as in MT-5) one staged
+   artifact held open so it cannot be removed. Stop from the technician side;
+   on a second pass, from the customer side; on a third, unplug the network.
+   - Expected on the technician side: the end screen and the Sessions page
+     say who ended it, and the cleanup result is **1 residual** naming the
+     held file on the first two passes and **Cleanup unknown** on the third,
+     never "Cleaned up" (REQ-F-027, REQ-F-019). **Open audit log** opens that
+     session's `.jsonl`, which ends with `session_ended`, `cleanup_report` and
+     the seal.
+2. On the customer computer, before using **Save a copy**, search the
+   customer's profile, `%ProgramData%`, `%TEMP%` and the folder CretLink ran
+   from for any file written during the session (for example with
+   `Get-ChildItem -Recurse | Where-Object LastWriteTime -gt <start>`).
+   - Expected: no session record or report exists, and `Documents\CretLink`
+     does not exist (REQ-F-027, REQ-F-001).
+3. Choose **Save a copy**, then cancel the dialog.
+   - Expected: the dialog opened on `Documents\CretLink\` with
+     `YYYY-MM-DD <hostname>.html`; after cancelling, no file and no
+     `Documents\CretLink` folder remain.
+4. Choose **Save a copy** again and save; then **Open**.
+   - Expected: one HTML file opens in the browser with no network access
+     needed; it holds the activity the window showed, the cleanup notes with
+     the residual first, and no approval code, connection code or key.
+
+### MT-11 — Install, update and uninstall the technician role (ST-M009-006)
+
+The per-user install of Give help on a real Windows and macOS computer (Linux
+is covered by the automated tests over a temporary home directory). Use a
+release archive, or a local build with both `cretlink` and `cretlink-cli` in
+one folder, for example `Downloads`. Take screenshots of the start screen,
+the install screen and the uninstall prompt.
+
+1. **Start screen.** Start `cretlink` from `Downloads`. Windows shows Get help
+   and Give help, macOS only Give help; Give help offers **Install for me**
+   and **Run once without installing**, and the screen shows the version and
+   the `Downloads` folder.
+2. **Run once.** Choose **Run once without installing**. The technician window
+   says the copy runs once; on AI assistants, Connect warns that the
+   registration points at this copy. Close it. Expect nothing new outside the
+   audit folder (`%LOCALAPPDATA%\CretLink\audit`, `~/.local/share/CretLink/audit`
+   or the macOS equivalent) other than the webview profile (see the README's
+   known gaps).
+3. **Install.** Start it again and choose **Install for me**. The screen shows
+   the location (`%LOCALAPPDATA%\Programs\CretLink` or
+   `~/Applications/CretLink.app`), the Start-menu option (Windows), and each AI
+   client with what was found and the exact command. Select Claude Code (and
+   Codex CLI if present) and press **Install**. Expect: no UAC prompt; the
+   installed copy opens in the technician role and the first window closes;
+   `cretlink mcp status` from a terminal shows the registrations pointing at
+   the installed program; on Windows, a *CretLink* Start-menu entry that opens
+   Give help, and *CretLink* in *Settings → Apps → Installed apps* with the
+   version and publisher; on macOS, `CretLink` in `~/Applications` that opens
+   from Finder (Gatekeeper may ask, the build is unsigned). No service, no
+   scheduled task, no Run key and no login item was added (Windows:
+   `Get-ScheduledTask`, `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`;
+   macOS: *Login Items*).
+4. **Running copy.** With the installed copy open, start the `Downloads` copy
+   and press **Install** again. Expect the install screen to say the installed
+   copy is running, and **Install** to be unavailable.
+5. **Update.** Close the installed copy, replace the `Downloads` copy with a
+   newer build and install again. Expect the version in Settings to change and
+   the AI clients to keep working without reconnecting.
+6. **Uninstall.** In the installed copy, open Settings → **Uninstall…**. Expect
+   the list of what it removes (files, shortcut, uninstall entry, the
+   registrations) and that the audit trail stays. Confirm, close the window,
+   and expect the folder (Windows: after the window closed), the shortcut, the
+   *Installed apps* entry and the registrations to be gone, and the audit
+   folder to be kept.
+7. **Uninstall entry and CLI.** Install again, then uninstall from *Installed
+   apps* (Windows): a message box lists what will be removed and asks; **No**
+   changes nothing, **Yes** removes it. On macOS run
+   `~/Applications/CretLink.app/Contents/MacOS/cretlink-cli uninstall` and
+   answer `y`.
+8. **Changed by hand.** Install with Claude Code, point its `cretlink`
+   registration at another path by hand, then uninstall. Expect that
+   registration to be left alone and the uninstall to say so.
+9. **Customer copy.** Rename a copy to `CretLink-Support.exe`; `CretLink-Support
+   uninstall` and `CretLink-Support install` are refused, and its window never
+   offers to install. `CretLink-Support recover` lists what CretLink left on
+   the computer and names `CretLink-Support recover --remove` (ST-M009-010).
+
+### MT-12 — The customer interface on Windows (ST-M009-009)
+
+A walk-through of Get help on a real Windows computer against Give help on a
+second computer, compared with the approved mock, with screenshots of every
+screen (`#c-admin`, `#c-find`, `#c-sac`, `#c-consent`, `#c-live`, `#c-mini`,
+`#c-end`). Run it once with Narrator on and record that pass too.
+
+1. **Before the prompt.** Start `cretlink` and choose **Get help**. Expect the
+   new window to show *Windows will ask for permission* with four steps and
+   *Nothing happens to this computer before step 4, and nothing is
+   installed*, before any UAC prompt. **Back** returns to the start screen.
+   Rename a copy to `CretLink-Support.exe` and start it: the same screen, and
+   **Close** closes it.
+2. **Declined.** Choose **Get help**, **Continue**, and answer **No** in the
+   UAC prompt. Expect *Windows did not get permission* and *Administrator
+   tasks will not work*, with **Try again** and **Continue without admin
+   rights**. Choose **Continue without admin rights**: the technician list
+   shows *Admin rights: No*, and a session's `remote_system_info` reports
+   `elevated = false` (REQ-S-011).
+3. **Accepted.** Start again, **Continue**, answer **Yes**. Expect the first
+   window to close and an elevated window to open on the technician list with
+   *Admin rights: Yes, approved in Windows* and no second explanation.
+4. **Choose your technician.** Start a session on the technician computer.
+   Expect it in the list with its name and host name, its address and *this
+   network*, nothing selected and nothing connecting until **Connect**; the
+   code field is there either way. The footer reads *Nothing is installed ·
+   closing CretLink ends everything*. With no session, `Escape` does nothing
+   and there is no Stop.
+5. **Compare and decide.** Expect the same six digits on both sides,
+   *It doesn't match — stop* (`Escape`), then *Allow <name> full control?*
+   with the summary above the full disclosure; Tab reaches **Decline** and
+   **Allow full control** without either being focused first.
+6. **Under full control.** Let an AI client run a command, send a file to
+   the customer, copy a file from it and fail one command. Expect *Happening
+   now* while each runs, the Files and Commands tiles counting, the copied
+   file marked *left this computer*, and the filters showing only their
+   kind.
+7. **Compact bar.** Press **Make small**: the main window goes and a small bar
+   stays on top of other windows, can be dragged, and shows the state, the
+   current action and the counts. `Alt+F4` on the bar does nothing. **Open**
+   brings the main window back. Minimise the main window: the bar appears.
+8. **Closing.** Press `Alt+F4` on the main window during the session. Expect
+   *Stop the session and close?*; **Keep the session** keeps it. Again, and
+   **Stop and close**: the technician's end screen says the customer ended it,
+   with the cleanup result, and the customer's CretLink exits afterwards. In
+   Task Manager no `cretlink.exe` of the customer remains.
+9. **Session ended.** In another session press **Stop now** (or `Escape`).
+   Expect *You stopped the session*, the counts and each cleanup step; from
+   the technician side *<name> ended the session*; unplugging the network
+   *The connection was lost* with the cleanup not confirmed. **Save a copy**
+   then shows the saved path with **Open** (as in MT-10). **Close CretLink**
+   exits at once.
+10. **Left from an earlier session (ST-M009-010).** End a session during a
+    file upload by killing the customer's `cretlink.exe` in Task Manager, and
+    hold one file of `%ProgramData%\CretLink\staging` open in another program.
+    Start Get help again. Expect *Who is helping you?* to say that a file
+    from an earlier CretLink session could not be removed, with the command
+    to run in an administrator Windows PowerShell and the full path of the
+    running program: `& '<folder>\cretlink-cli.exe' recover --remove` when
+    `cretlink-cli.exe` sits next to it, else
+    `& '<folder>\CretLink-Support.exe' recover --remove | Out-Host` (the
+    GUI-subsystem program, which PowerShell waits for only when its output is
+    piped). Close the other program, open Windows PowerShell as administrator
+    and paste the command exactly as shown: PowerShell waits for it, it lists
+    what it removed, says the computer is clean, and `$LASTEXITCODE` is 0;
+    `CretLink-Support uninstall` is still refused.
+
 ### MT-E2E — Full attended-LAN acceptance walk-through (ST-M006-006)
 
 The scenarios above are targeted failure and edge slices; this one is the single
@@ -423,9 +584,10 @@ freshly prepared (no prior CretLink state); official artifacts for each side
 downloaded and integrity-verified. Do **not** pre-pair or pre-consent — this
 scenario exercises those steps.
 
-1. **Launch.** On the customer machine start `cretlink-support-agent`; on the
-   technician machine start the console and the `cretlink-mcp` bridge under the
-   MCP client, all as the same OS user (REQ-F-013).
+1. **Launch.** On the customer machine start `cretlink.exe` and choose **Get
+   help**; on the technician machine start `cretlink`, choose **Give help**, and
+   let the MCP client start `cretlink mcp`, both as the same OS user
+   (REQ-F-013).
    - Expected: the agent shows its process and connection state openly — no
      stealth, no hidden window or tray state (REQ-S-002).
 2. **UAC.** Accept the agent's elevation prompt.
@@ -491,7 +653,11 @@ hardware.
 | --- | --- | --- | --- | --- |
 | 2026-08-12 | Target: Windows 11 Home test laptop (Win 11 Home 22H2, 22621.900, elevated, non-simulated); console + Claude Code 2.1.228 on Win 11 Pro (10.0.26200) | development build (agent self-reported `0.0.0`) | MT-3a — graceful agent exit (Ctrl-C, reaping property) | PASS. Console reported the running job as `cancelled` with `exit_code` null (never `Completed`); stdout ended at the process's `Control-C` line. Survivor check (`tasklist /fi "imagename eq ping.exe"`) showed **zero** PING.EXE. `Spawned::Drop` → `kill_tree` → `TerminateJobObject` reaped the whole tree (REQ-S-009/REQ-S-014, REQ-N-008). |
 | 2026-08-12 | Target: Windows 11 Home test laptop (as above); console + Claude Code 2.1.228 | development build (agent self-reported `0.0.0`) | MT-3b — hard kill (`taskkill /f /im cretlink-support-agent.exe`) | One survivor observed — expected before ST-M006-007; superseded, re-run pending (row below). |
+| 2026-11-10 | Technician: a Windows 11 laptop with the installed copy and Claude Desktop (Code tab). Customer: a Windows 11 Pro 25H2 (build 26200) computer, elevated, non-simulated, started from a `CretLink-Support.exe` copy | pull request preview `0.0.0-pr.6.gc6b7c0b` | MT-1, MT-2, MT-4, MT-6; MT-10 steps 2 to 4 and the stops of step 1; MT-11 steps 1, 3 and 6 on Windows; MT-12 steps 1 to 9 | PASS for every point that was run. The UAC prompt was declined, then accepted; `remote_system_info` reported an elevated target and `whoami /groups` high integrity. An upload and a download were verified by SHA-256, and a failing command reported exit code 3 as failed. A customer **Stop now** during a 180-second command ended it with no surviving process; `Alt+F4` asked first; a lost network ended honestly, with the cleanup not confirmed and no automatic reconnect. No file existed on the customer computer before **Save a copy**; afterwards there was no process, service, scheduled task or autostart entry and the staging folder was empty. The webview profile folder remained (known gap). The install needed no UAC prompt and added the Start-menu and Installed apps entries; the uninstall removed them and kept the audit folder. Two defects were found and are fixed with this change: a download into a missing local folder was reported as a lost session (ST-M003-005), and a Command Prompt command with double quotes was mangled (ST-M003-001). Not confirmed: whether Windows Firewall asked for permission, and the behaviour on a network that Windows marks as public. |
 | _pending_ | | | MT-3b re-run (hard kill, expect **zero** survivors under ST-M006-007) | not yet recorded on hardware |
-| _pending_ | | | MT-1 (UAC decline/accept), MT-2 (revoke + survivor), MT-4 (residual after session), MT-5 (locked-file cleanup + retry), MT-6 (network disconnect mid-job) | not yet recorded on hardware |
-| _pending_ | | | MT-7 (`cretlink-shell` host-terminal profile smoke: interactive/resize/Ctrl-C-to-remote/Ctrl-] detach, no-consent + revoke fail-closed, no-secret check) | not yet recorded on hardware |
+| _pending_ | | | MT-5 (locked-file cleanup + retry) | not yet recorded on hardware |
+| _pending_ | | | MT-7 (`cretlink-cli shell` host-terminal profile smoke: interactive/resize/Ctrl-C-to-remote/Ctrl-] detach, no-consent + revoke fail-closed, no-secret check) | not yet recorded on hardware |
+| _pending_ | | | MT-10 step 1 with a staged file held open (the residual case — ST-M009-012) | not yet recorded on hardware |
 | _pending_ | | | MT-8 (reboot-resume: arm under UAC, survive a reboot, one attended reconnect via the `K_rr` proof, single-use consumption, expired/cloned refusal, residual removal via the recovery command — ST-M006-001/002/003) | not yet recorded on hardware |
+| _pending_ | | | MT-11 steps 2, 4, 5 and 7 to 9 on Windows, and all of it on macOS (ST-M009-006) | not yet recorded on hardware |
+| _pending_ | | | MT-12 step 10 (files left from an earlier session and `cretlink recover`) and the Narrator pass (ST-M009-009, ST-M009-010) | not yet recorded on hardware |

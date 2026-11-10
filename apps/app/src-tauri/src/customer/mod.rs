@@ -1,4 +1,5 @@
-//! The customer role, Get help (ST-M002-005, ST-M002-009, ST-M009-005).
+//! The customer role, Get help (ST-M002-005, ST-M002-009, ST-M009-005,
+//! ST-M009-009).
 //!
 //! This module is the customer-facing UI half of the *one informed full-control
 //! consent* story, the agent-side mirror of the console GUI. It is a thin
@@ -33,7 +34,17 @@
 //! The clearly-labelled **simulated** consent demo — where granting binds a
 //! simulated [`SessionId`] and confers no real control — is compiled only under
 //! the `dev-simulate` cargo feature. The shipped exe therefore has no way to
-//! reach a fabricated-consent path (AC #4).
+//! reach a fabricated-consent path (AC #4). Both builds boot resting; the
+//! `dev-simulate` build offers the demo from the technician list
+//! ([`reset_demo`]).
+//!
+//! # Before the session, and the two windows (ST-M009-009)
+//!
+//! An unelevated window first explains the UAC prompt ([`admin`]). During a
+//! session the main window or the compact bar is always visible, and no path
+//! closes the process without revoking the session ([`windows`]). **Stop** and
+//! `Escape` act only while a session exists ([`session_exists`]); on the
+//! resting window a stop is refused, never turned into a "stopped" session.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -41,13 +52,32 @@ use std::time::Duration;
 
 use cretlink_discovery::{Browser, DiscoveredConsole, DiscoveryError, parse_manual_entry};
 use cretlink_protocol::{CAP_FS_V1, PROTOCOL_V1, RevokeReason, SessionId, TargetIdentity};
-use cretlink_session::{DisclosureSummary, SessionJoiner};
+use cretlink_session::{ActivityEntry, CustomerActivity, DisclosureSummary, SessionJoiner};
 use cretlink_support_agent::{AgentPhase, AgentState, VisibleStatus, current_identity, sysinfo};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
+use tokio::sync::watch;
 
+use crate::launch::Entry;
+
+// Before the UAC prompt (ST-M009-009).
+mod admin;
+// The end report and its saved copy (ST-M009-012).
+mod report;
 mod session_driver;
-use session_driver::{ActivityDelta, Intent, ViewSink, is_terminal, lock, pump};
+// The startup sweep of stale staging trees (ST-M009-010).
+mod startup;
+pub(crate) use startup::StartupCleanupView;
+// The compact bar and closing (ST-M009-009).
+mod windows;
+use session_driver::{Intent, ViewSink, is_terminal, lock, pump};
+pub(crate) use windows::on_exit_requested;
+
+/// The event every rendered [`ConsentView`] is emitted on, to both windows.
+pub(crate) const AGENT_VIEW_EVENT: &str = "agent-view";
+
+/// The event every changed [`ActivityEntry`] is emitted on (ST-M009-011).
+pub(crate) const AGENT_ACTIVITY_EVENT: &str = "agent-activity";
 
 /// How long a single LAN browse listens before returning what it has collected.
 /// A short, bounded window keeps discovery responsive and denies a hostile peer
@@ -66,33 +96,22 @@ const MAX_CONSOLES: usize = 16;
 #[derive(Debug, Clone)]
 pub struct AppState {
     inner: Arc<Mutex<ConsentSession>>,
+    /// The report copies this process saved, the only files **Open** opens
+    /// (ST-M009-012).
+    saved_reports: report::SavedReports,
+    /// This process's startup sweep, which a dial waits for (ST-M009-010).
+    pub(crate) startup: startup::StartupSweep,
 }
 
 impl AppState {
-    /// Builds the shipped initial window: a resting, honest consent window ready
-    /// to dial a real technician. No simulated demo exists in this build.
+    /// Builds the initial window of both builds: a resting, honest consent
+    /// window ready to dial a real technician.
     #[must_use]
-    #[cfg_attr(
-        feature = "dev-simulate",
-        allow(
-            dead_code,
-            reason = "the dev-simulate build boots the seeded demo instead"
-        )
-    )]
     pub fn idle() -> Self {
         Self {
             inner: Arc::new(Mutex::new(ConsentSession::idle())),
-        }
-    }
-
-    /// Builds the window seeded with the clearly-labelled simulated consent demo.
-    /// Compiled only under `dev-simulate`, so the shipped exe can never boot into
-    /// the demo (ST-M002-009, AC #4).
-    #[cfg(feature = "dev-simulate")]
-    #[must_use]
-    pub fn seeded() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(ConsentSession::seeded())),
+            saved_reports: report::SavedReports::default(),
+            startup: startup::StartupSweep::default(),
         }
     }
 
@@ -101,22 +120,12 @@ impl AppState {
     }
 }
 
-/// The initial window for both [`run`] and [`Default`]: the resting live-idle
-/// window in the shipped build, and the simulated demo only under `dev-simulate`.
-#[cfg(feature = "dev-simulate")]
-fn default_app_state() -> AppState {
-    AppState::seeded()
-}
-
-/// The initial window for both [`run`] and [`Default`]: resting and honest.
-#[cfg(not(feature = "dev-simulate"))]
-fn default_app_state() -> AppState {
-    AppState::idle()
-}
-
 impl Default for AppState {
+    /// Resting and honest, in both builds: the `dev-simulate` demo starts only
+    /// when asked for ([`reset_demo`]), so a development build can also dial a
+    /// real technician (ST-M009-009).
     fn default() -> Self {
-        default_app_state()
+        Self::idle()
     }
 }
 
@@ -133,15 +142,19 @@ impl ViewSink for TauriSink {
     fn emit(&self, view: &ConsentView) {
         // A dropped frontend (e.g. window closed) is not an error the backend
         // must act on; the session lifecycle continues to be driven and audited.
-        let _ = self.app.emit("agent-view", view);
+        let _ = self.app.emit(AGENT_VIEW_EVENT, view);
+        // Once the session is over, the compact bar goes and the main window
+        // shows the end (REQ-S-002).
+        windows::sync_windows(&self.app, view.session_active);
     }
 
-    fn activity(&self, delta: &ActivityDelta) {
-        // The activity mirror rides a separate `"agent-activity"` channel so the
-        // higher-frequency command stream never forces a whole `ConsentView`
-        // re-render. Like `emit`, a dropped frontend is not a backend error — the
-        // feed is non-authoritative and the lifecycle continues underneath.
-        let _ = self.app.emit("agent-activity", delta);
+    fn activity(&self, entry: &ActivityEntry) {
+        // The activity feed rides a separate `"agent-activity"` channel (the
+        // frontend's `ActivityEvent`, ST-M009-011) so the higher-frequency
+        // action stream never forces a whole `ConsentView` re-render. Like
+        // `emit`, a dropped frontend is not a backend error — the feed is
+        // non-authoritative and the lifecycle continues underneath.
+        let _ = self.app.emit(AGENT_ACTIVITY_EVENT, entry);
     }
 }
 
@@ -168,6 +181,41 @@ pub(crate) struct ConsentSession {
     /// session. Consent/decline/stop route their wire action through this
     /// instead of acting locally, so control is never fabricated on this side.
     live: Option<session_driver::IntentSender>,
+    /// This session's activity feed (ST-M009-011), folded from the agent's
+    /// events and read by [`get_activity`]. It lives as long as this session
+    /// state: a new dial starts a new one.
+    pub(crate) activity: CustomerActivity,
+    /// The technician's display name from the pairing handshake: what the
+    /// technician's computer says, never a verified identity (ST-M009-011).
+    technician_name: Option<String>,
+    /// What this session's end report is built from, and the report once the
+    /// session has ended (ST-M009-012). In memory only.
+    pub(crate) report: report::ReportState,
+    /// When full control was granted, in Unix milliseconds (ST-M009-009).
+    control_since: Option<i64>,
+    /// When the screen was last observed and last controlled, from the
+    /// agent's `DesktopActivity` signals (ST-M009-009, REQ-F-020).
+    screen: ScreenUseView,
+    /// Becomes `true` once a live session's task has finished, its cleanup
+    /// report included: closing waits for it (ST-M009-009).
+    pub(crate) settled: Option<watch::Receiver<bool>>,
+    /// Files from an earlier session the startup sweep could not remove
+    /// (ST-M009-010). It belongs to the process, not to one session, so it is
+    /// carried into every new session state ([`Self::replace_with`]).
+    pub(crate) startup_cleanup: Option<StartupCleanupView>,
+    /// Which dial this state belongs to: every live dial gets a new one, the
+    /// resting window and the demo `0`. A dial's pump, teardown and failure
+    /// path write the shared state only while it still carries their
+    /// generation, so a finished dial never writes into the next session
+    /// ([`session_driver::lock_current`]).
+    pub(crate) generation: u64,
+}
+
+/// The generation of the next live dial (see [`ConsentSession::generation`]).
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl ConsentSession {
@@ -176,13 +224,6 @@ impl ConsentSession {
     /// for the customer to enter the technician's connection code and dial out
     /// via [`start_live_session`]; control can then appear only when the real
     /// wire consent echoes back (REQ-S-001). Never `simulated`.
-    #[cfg_attr(
-        feature = "dev-simulate",
-        allow(
-            dead_code,
-            reason = "the dev-simulate build boots the seeded demo instead"
-        )
-    )]
     fn idle() -> Self {
         Self {
             agent: AgentState::new(current_identity()),
@@ -192,6 +233,14 @@ impl ConsentSession {
             approval_code: None,
             simulated: false,
             live: None,
+            activity: CustomerActivity::new(),
+            technician_name: None,
+            report: report::ReportState::default(),
+            control_since: None,
+            screen: ScreenUseView::default(),
+            settled: None,
+            startup_cleanup: None,
+            generation: 0,
         }
     }
 
@@ -217,6 +266,14 @@ impl ConsentSession {
             approval_code: Some(approval_code),
             simulated: true,
             live: None,
+            activity: CustomerActivity::new(),
+            technician_name: None,
+            report: report::ReportState::default(),
+            control_since: None,
+            screen: ScreenUseView::default(),
+            settled: None,
+            startup_cleanup: None,
+            generation: 0,
         }
     }
 
@@ -224,7 +281,10 @@ impl ConsentSession {
     /// its intent channel to the pump. Pairing, the approval code, and consent
     /// then arrive from the wire — no control without the customer's grant
     /// echoing back (REQ-S-001).
-    pub(crate) fn live_dialing(intents: session_driver::IntentSender) -> Self {
+    pub(crate) fn live_dialing(
+        intents: session_driver::IntentSender,
+        settled: Option<watch::Receiver<bool>>,
+    ) -> Self {
         let mut agent = AgentState::new(current_identity());
         // Announce locally so the window honestly shows it is reaching out, not
         // idle; the adapter expects an announced agent before folding the wire
@@ -236,7 +296,22 @@ impl ConsentSession {
             approval_code: None,
             simulated: false,
             live: Some(intents),
+            activity: CustomerActivity::new(),
+            technician_name: None,
+            report: report::ReportState::default(),
+            control_since: None,
+            screen: ScreenUseView::default(),
+            settled,
+            startup_cleanup: None,
+            generation: next_generation(),
         }
+    }
+
+    /// Replaces this state with `next`, a new session's, keeping what belongs
+    /// to the process: the startup sweep's notice.
+    pub(crate) fn replace_with(&mut self, mut next: Self) {
+        next.startup_cleanup = self.startup_cleanup.take();
+        *self = next;
     }
 
     /// Replaces the candidate Session Approval Code (the live wire code, or
@@ -244,6 +319,29 @@ impl ConsentSession {
     /// [`visible_approval_code`](Self::visible_approval_code).
     pub(crate) fn set_approval_code(&mut self, code: Option<String>) {
         self.approval_code = code;
+    }
+
+    /// Notes what the window shows beside the agent model: when full control
+    /// began, and when the screen was last observed or controlled.
+    pub(crate) fn observe(&mut self, event: &cretlink_session::SessionEvent, now: i64) {
+        use cretlink_protocol::DesktopAccess;
+        use cretlink_session::SessionEvent;
+        match event {
+            SessionEvent::ConsentGranted { .. } => {
+                self.control_since.get_or_insert(now);
+            }
+            SessionEvent::DesktopActivity { access } => match access {
+                DesktopAccess::Observe => self.screen.observed_at_ms = Some(now),
+                DesktopAccess::Control => self.screen.controlled_at_ms = Some(now),
+            },
+            _ => {}
+        }
+    }
+
+    /// Records the technician's display name the console sent in the pairing
+    /// handshake (`None` when it sent none).
+    pub(crate) fn set_technician_name(&mut self, name: Option<String>) {
+        self.technician_name = name;
     }
 
     /// The approval code is visible across the whole pre-decision window — while
@@ -274,12 +372,66 @@ impl ConsentSession {
     pub(crate) fn view(&self) -> ConsentView {
         ConsentView {
             status: self.agent.visible_status(),
+            hostname: detect_hostname(),
+            session_active: session_exists(self),
+            control_since_ms: self.control_since,
+            screen: self.screen,
             approval_code: self.visible_approval_code(),
             disclosure: DisclosureSummary::DEFAULT_TEXT.to_string(),
             simulated: self.simulated,
             can_connect: self.can_connect(),
+            technician: self
+                .technician_name
+                .clone()
+                .map(|display_name| TechnicianNameView {
+                    display_name,
+                    provenance: TECHNICIAN_NAME_PROVENANCE,
+                }),
+            startup_cleanup: self.startup_cleanup.clone(),
         }
     }
+}
+
+/// Whether a session exists: a live dial that has not ended, or the running
+/// `dev-simulate` demo. **Stop**, `Escape`, the compact bar and the close
+/// question exist only then — never on the resting window (ST-M009-009).
+pub(crate) fn session_exists(session: &ConsentSession) -> bool {
+    if is_terminal(session) {
+        return false;
+    }
+    session.live.is_some()
+        || (session.simulated && !matches!(session.agent.phase(), AgentPhase::Idle))
+}
+
+/// When the screen was last observed and last controlled, in Unix
+/// milliseconds, from the agent's `DesktopActivity` signals (ST-M009-009,
+/// REQ-F-020). The signals carry the class of access only, never what was seen
+/// or typed.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct ScreenUseView {
+    /// The last screen observation (a screenshot).
+    pub observed_at_ms: Option<i64>,
+    /// The last time the mouse or keyboard was driven.
+    pub controlled_at_ms: Option<i64>,
+}
+
+/// How the customer surface labels the technician's display name: as what the
+/// technician's computer says, never as a verified identity (ST-M009-011).
+pub const TECHNICIAN_NAME_PROVENANCE: &str = "as the technician's computer reports it";
+
+/// The technician's display name in the [`ConsentView`] (ST-M009-011).
+///
+/// **Unverified.** It is the label the technician's computer chose (its
+/// account's full name, else user name) and sent in the pairing handshake;
+/// trust in the peer still comes only from the Session Approval Code
+/// (REQ-S-006). The frontend writes it with `textContent` beside
+/// [`provenance`](Self::provenance).
+#[derive(Debug, Clone, Serialize)]
+pub struct TechnicianNameView {
+    /// The name, one bounded line.
+    pub display_name: String,
+    /// The label to show with it ([`TECHNICIAN_NAME_PROVENANCE`]).
+    pub provenance: &'static str,
 }
 
 /// What the consent window renders (see [`ConsentSession::view`]).
@@ -287,6 +439,15 @@ impl ConsentSession {
 pub struct ConsentView {
     /// The authoritative agent visible status (REQ-S-002).
     pub status: VisibleStatus,
+    /// This computer's host name, as the technician will see it.
+    pub hostname: String,
+    /// Whether a session exists ([`session_exists`]): Stop, `Escape`, the
+    /// compact bar and the close question exist only then (ST-M009-009).
+    pub session_active: bool,
+    /// When full control was granted, Unix milliseconds.
+    pub control_since_ms: Option<i64>,
+    /// When the screen was last observed or controlled.
+    pub screen: ScreenUseView,
     /// The Session Approval Code to compare with the technician's console,
     /// present only before the consent decision. Display-only.
     pub approval_code: Option<String>,
@@ -299,6 +460,14 @@ pub struct ConsentView {
     pub simulated: bool,
     /// Whether the connect panel should offer to dial a real technician now.
     pub can_connect: bool,
+    /// The technician's display name from the pairing handshake, once
+    /// connected, labelled as what the technician's computer says
+    /// (ST-M009-011). `None` before pairing or when the console sent none.
+    pub technician: Option<TechnicianNameView>,
+    /// Files from an earlier session that the startup sweep could not remove,
+    /// with the recovery command (ST-M009-010). `None` when nothing was kept
+    /// or the sweep has not finished.
+    pub startup_cleanup: Option<StartupCleanupView>,
 }
 
 /// One console the customer may pick from the discovered list (ADR-0007).
@@ -398,6 +567,15 @@ fn get_view(state: State<'_, AppState>) -> ConsentView {
     state.guard().view()
 }
 
+/// Returns this session's activity feed, oldest first (ST-M009-011): every
+/// item and gap the `"agent-activity"` event has carried, so a frontend that
+/// (re)loads shows the same feed. It lasts as long as this session window's
+/// session; a new dial starts a new feed.
+#[tauri::command]
+fn get_activity(state: State<'_, AppState>) -> Vec<ActivityEntry> {
+    state.guard().activity.entries()
+}
+
 /// The customer's single informed full-control consent: the only path to
 /// control (REQ-S-001, REQ-S-003). Valid only while awaiting consent.
 ///
@@ -423,6 +601,7 @@ fn grant_consent(state: State<'_, AppState>) -> Result<ConsentView, CommandError
         .agent
         .grant_consent(bound)
         .map_err(|e| CommandError::new("consent", e))?;
+    session.control_since = Some(session_driver::now_unix_millis());
     Ok(session.view())
 }
 
@@ -450,20 +629,32 @@ fn decline_consent(state: State<'_, AppState>) -> Result<ConsentView, CommandErr
     Ok(session.view())
 }
 
-/// The emergency stop, always available while a session is live: revokes control
-/// and rejects new actions (REQ-F-018, REQ-S-004). Fail-closed and idempotent.
+/// The emergency stop, always available while a session exists: revokes control
+/// and rejects new actions (REQ-F-018, REQ-S-004). Fail-closed.
 ///
 /// In a live session it sends the wire revoke and ends the local model at once,
 /// so the surface goes safe immediately even if the wire acknowledgement is
-/// delayed or lost.
+/// delayed or lost. Without a session — the resting window, or a session that
+/// already ended — there is nothing to stop: it is refused and changes nothing,
+/// so a stray `Escape` never shows a "stopped" session that never existed
+/// (ST-M009-009).
 #[tauri::command]
 fn stop_session(state: State<'_, AppState>) -> Result<ConsentView, CommandError> {
     let mut session = state.guard();
+    stop_now(&mut session)?;
+    Ok(session.view())
+}
+
+/// The stop of [`stop_session`], without Tauri.
+fn stop_now(session: &mut ConsentSession) -> Result<(), CommandError> {
+    if !session_exists(session) {
+        return Err(CommandError::new("stop", "there is no session to stop"));
+    }
     if let Some(tx) = session.live.as_ref() {
         let _ = tx.send(Intent::Stop(RevokeReason::CustomerRequested));
     }
     session.agent.stop();
-    Ok(session.view())
+    Ok(())
 }
 
 /// Simulates the technician ending the session from the console, exercising the
@@ -484,22 +675,22 @@ fn simulate_technician_stop(state: State<'_, AppState>) -> Result<ConsentView, C
     Ok(session.view())
 }
 
-/// Re-arms the demo with a fresh simulated session at the consent step, so the
-/// disclosure flow can be exercised repeatedly. A reconnect always re-pairs and
-/// re-consents — control is never silently restored (REQ-S-009). Refused while a
-/// live session is still in progress. Developer-only: compiled out of the
-/// shipped exe (ST-M002-009).
+/// Starts (or re-arms) the demo with a fresh simulated session at the consent
+/// step, so the disclosure flow can be exercised without a technician. A
+/// reconnect always re-pairs and re-consents — control is never silently
+/// restored (REQ-S-009). Refused while a session is in progress.
+/// Developer-only: compiled out of the shipped exe (ST-M002-009).
 #[cfg(feature = "dev-simulate")]
 #[tauri::command]
 fn reset_demo(state: State<'_, AppState>) -> Result<ConsentView, CommandError> {
     let mut session = state.guard();
-    if session.live.is_some() && !is_terminal(&session) {
+    if session_exists(&session) {
         return Err(CommandError::new(
             "session",
             "stop the live session before restarting the demo",
         ));
     }
-    *session = ConsentSession::seeded();
+    session.replace_with(ConsentSession::seeded());
     Ok(session.view())
 }
 
@@ -507,8 +698,16 @@ fn reset_demo(state: State<'_, AppState>) -> Result<ConsentView, CommandError> {
 /// endpoint per window. A finished (terminal) session may be retried. Both dial
 /// entry points — [`start_live_session`] and [`connect_console`] — gate on this
 /// before touching any state, so a second dial can never race a live one.
-fn ensure_can_connect(session: &ConsentSession) -> Result<(), CommandError> {
-    if session.live.is_some() && !is_terminal(session) {
+fn ensure_can_connect(session: &ConsentSession, ready: bool) -> Result<(), CommandError> {
+    if !ready {
+        // Nothing happens before the customer has passed the permission step
+        // (`#c-admin`, ST-M009-009).
+        return Err(CommandError::new(
+            "connect",
+            "answer the Windows permission question first",
+        ));
+    }
+    if session_exists(session) {
         return Err(CommandError::new(
             "connect",
             "a session is already in progress; stop it before connecting again",
@@ -534,35 +733,49 @@ fn begin_live_dial(app: AppHandle, state: &State<'_, AppState>, addr: SocketAddr
     let identity = honest_target_identity();
 
     let (tx, rx) = session_driver::intent_channel();
+    let (settled_tx, settled_rx) = watch::channel(false);
+    let app_for_sweep = app.clone();
     let sink: Arc<dyn ViewSink> = Arc::new(TauriSink { app });
 
-    {
+    let generation = {
         let mut session = state.guard();
-        *session = ConsentSession::live_dialing(tx);
+        session.replace_with(ConsentSession::live_dialing(tx, Some(settled_rx)));
         // Show the "reaching out" state right away; the pump takes over once the
         // dial resolves.
         sink.emit(&session.view());
-    }
+        session.generation
+    };
 
     let shared = state.inner.clone();
+    // Never connect before the startup sweep has finished (ST-M009-010); it is
+    // normally long done, having started with the window.
+    state.startup.start(&app_for_sweep, state);
+    let startup = state.startup.clone();
     tauri::async_runtime::spawn(async move {
+        startup.finished().await;
         // Dial the listening console. A dial failure is an honest terminal
         // state, never a silent no-op.
         let handle =
             match SessionJoiner::join(addr, identity, PROTOCOL_V1, honest_capabilities()).await {
                 Ok(handle) => handle,
                 Err(error) => {
-                    let mut session = lock(&shared);
-                    session.agent.fail(
-                        "connect",
-                        format!("could not reach the technician: {error}"),
-                    );
-                    sink.emit(&session.view());
+                    // Only this dial's state: a stopped dial may already have
+                    // been replaced by the next one.
+                    if let Some(mut session) = session_driver::lock_current(&shared, generation) {
+                        session.agent.fail(
+                            "connect",
+                            format!("could not reach the technician: {error}"),
+                        );
+                        sink.emit(&session.view());
+                    }
+                    let _ = settled_tx.send(true);
                     return;
                 }
             };
-        // Fold the live event stream (and route button intents) until it ends.
-        pump(handle, shared, sink, rx).await;
+        // Fold the live event stream (and route button intents) until it ends,
+        // the session task's teardown included.
+        pump(handle, shared, generation, sink, rx).await;
+        let _ = settled_tx.send(true);
     });
 
     state.guard().view()
@@ -585,8 +798,9 @@ fn start_live_session(
     app: AppHandle,
     code: String,
     state: State<'_, AppState>,
+    admin: State<'_, admin::AdminState>,
 ) -> Result<ConsentView, CommandError> {
-    ensure_can_connect(&state.guard())?;
+    ensure_can_connect(&state.guard(), admin.ready())?;
 
     // Parse the technician's connection code into a dialable address *before*
     // mutating any state, so a typo leaves the window untouched. This grants no
@@ -630,8 +844,9 @@ fn connect_console(
     app: AppHandle,
     address: String,
     state: State<'_, AppState>,
+    admin: State<'_, admin::AdminState>,
 ) -> Result<ConsentView, CommandError> {
-    ensure_can_connect(&state.guard())?;
+    ensure_can_connect(&state.guard(), admin.ready())?;
 
     // The discovered address is validated by exactly the parser the typed code
     // uses; a malformed or address-less candidate leaves the window untouched.
@@ -643,9 +858,17 @@ fn connect_console(
 /// Adds the customer role's state and commands to the application. Only this
 /// role's commands are registered in a customer process (ST-M009-005), plus the
 /// shared [`crate::start::get_role`]: no technician command, IPC endpoint or
-/// listener exists in it.
-pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
-    let builder = builder.manage(default_app_state());
+/// listener exists in it. Both customer windows — the main window and the
+/// compact bar — use this one command set.
+pub(crate) fn attach(
+    builder: tauri::Builder<tauri::Wry>,
+    entry: Entry,
+) -> tauri::Builder<tauri::Wry> {
+    let elevated = current_identity().elevated;
+    let builder = builder
+        .manage(AppState::default())
+        .manage(admin::AdminState::new(entry, elevated))
+        .on_window_event(windows::on_window_event);
 
     // The shipped exe exposes only the real-transport command surface. The
     // demo-only commands are added only under `dev-simulate`, so a release build
@@ -654,6 +877,7 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
     let builder = builder.invoke_handler(tauri::generate_handler![
         crate::start::get_role,
         get_view,
+        get_activity,
         grant_consent,
         decline_consent,
         stop_session,
@@ -661,20 +885,61 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         reset_demo,
         start_live_session,
         browse_consoles,
-        connect_console
+        connect_console,
+        report::get_end_report,
+        report::save_report,
+        report::open_saved_report,
+        admin::get_launch,
+        admin::relaunch_elevated,
+        admin::continue_without_admin,
+        admin::go_back,
+        windows::make_small,
+        windows::open_main,
+        windows::drag_window,
+        windows::stop_and_close
     ]);
     #[cfg(not(feature = "dev-simulate"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         crate::start::get_role,
         get_view,
+        get_activity,
         grant_consent,
         decline_consent,
         stop_session,
         start_live_session,
         browse_consoles,
-        connect_console
+        connect_console,
+        report::get_end_report,
+        report::save_report,
+        report::open_saved_report,
+        admin::get_launch,
+        admin::relaunch_elevated,
+        admin::continue_without_admin,
+        admin::go_back,
+        windows::make_small,
+        windows::open_main,
+        windows::drag_window,
+        windows::stop_and_close
     ]);
     builder
+}
+
+/// Called once the customer window exists: a process already past the
+/// permission step starts its startup sweep now (ST-M009-010). One still
+/// explaining the UAC prompt starts it when the customer goes on without admin
+/// rights ([`admin::continue_without_admin`]), or never, when it hands over to
+/// the elevated child.
+pub(crate) fn on_window_start(app: &AppHandle) {
+    use tauri::Manager;
+    let (Some(admin), Some(state)) = (
+        app.try_state::<admin::AdminState>(),
+        app.try_state::<AppState>(),
+    ) else {
+        return;
+    };
+    if admin.ready() {
+        state.startup.start(app, &state);
+    }
 }
 
 /// Builds the honest wire identity this agent presents on a live dial, from live
@@ -690,6 +955,9 @@ fn honest_target_identity() -> TargetIdentity {
         elevated: identity.elevated,
         simulated: false,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        // The customer's own account, shown in the technician's identity
+        // line (ST-M009-008); omitted when it could not be read.
+        account: identity.account(),
     }
 }
 
@@ -725,7 +993,7 @@ fn honest_capabilities() -> Vec<String> {
 
 /// Detects this machine's host name without a runtime dependency, falling back
 /// to a neutral label when detection fails (never an invented value).
-fn detect_hostname() -> String {
+pub(crate) fn detect_hostname() -> String {
     std::env::var("COMPUTERNAME")
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -831,7 +1099,7 @@ mod tests {
     #[test]
     fn live_dialing_starts_announced_honest_and_without_a_code() {
         let (tx, _rx) = session_driver::intent_channel();
-        let session = ConsentSession::live_dialing(tx);
+        let session = ConsentSession::live_dialing(tx, None);
         assert!(matches!(session.agent.phase(), AgentPhase::Announced));
         assert!(!session.agent.control_granted());
         let view = session.view();
@@ -840,6 +1108,101 @@ mod tests {
         assert!(!view.simulated);
         assert!(view.approval_code.is_none());
         assert!(!view.can_connect);
+    }
+
+    #[test]
+    fn stop_is_refused_on_the_resting_window_and_changes_nothing() {
+        // ST-M009-009: Stop and Escape act only while a session exists. The
+        // resting window has none, so a stop is an honest refusal, not a
+        // "stopped" session that never existed.
+        let mut session = ConsentSession::idle();
+        assert!(!session_exists(&session));
+        assert!(!session.view().session_active);
+        let refused = stop_now(&mut session);
+        assert!(refused.is_err());
+        assert!(matches!(session.agent.phase(), AgentPhase::Idle));
+        // The window can still dial afterwards.
+        assert!(session.view().can_connect);
+    }
+
+    #[test]
+    fn stop_acts_on_a_live_session_and_then_there_is_none() {
+        let (tx, mut rx) = session_driver::intent_channel();
+        let mut session = ConsentSession::live_dialing(tx, None);
+        assert!(session_exists(&session));
+        assert!(session.view().session_active);
+        assert!(stop_now(&mut session).is_ok());
+        // The wire revoke went to the pump, and the model is safe at once.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Intent::Stop(RevokeReason::CustomerRequested))
+        ));
+        assert!(matches!(session.agent.phase(), AgentPhase::Stopped { .. }));
+        assert!(!session_exists(&session));
+        // A second stop has nothing left to stop.
+        assert!(stop_now(&mut session).is_err());
+    }
+
+    #[test]
+    fn the_startup_notice_belongs_to_the_process_not_the_session() {
+        let mut session = ConsentSession::idle();
+        assert!(session.view().startup_cleanup.is_none());
+        let kept = StartupCleanupView {
+            failed: 3,
+            command: "& 'C:\\x\\cretlink.exe' recover --remove | Out-Host".to_owned(),
+        };
+        session.startup_cleanup = Some(kept.clone());
+        let (tx, _rx) = session_driver::intent_channel();
+        session.replace_with(ConsentSession::live_dialing(tx, None));
+        assert_eq!(session.view().startup_cleanup, Some(kept));
+        let json = serde_json::to_value(session.view()).unwrap_or_default();
+        assert_eq!(json["startup_cleanup"]["failed"], 3);
+        assert_eq!(
+            json["startup_cleanup"]["command"],
+            "& 'C:\\x\\cretlink.exe' recover --remove | Out-Host"
+        );
+    }
+
+    #[test]
+    fn no_dial_before_the_permission_step() {
+        let session = ConsentSession::idle();
+        assert!(ensure_can_connect(&session, false).is_err());
+        assert!(ensure_can_connect(&session, true).is_ok());
+        let (tx, _rx) = session_driver::intent_channel();
+        let live = ConsentSession::live_dialing(tx, None);
+        assert!(ensure_can_connect(&live, true).is_err());
+    }
+
+    #[test]
+    fn the_view_tracks_control_and_the_screen() {
+        use cretlink_protocol::DesktopAccess;
+        use cretlink_session::SessionEvent;
+
+        let (tx, _rx) = session_driver::intent_channel();
+        let mut session = ConsentSession::live_dialing(tx, None);
+        let view = session.view();
+        assert_eq!(view.control_since_ms, None);
+        assert_eq!(view.screen, ScreenUseView::default());
+        assert!(!view.hostname.is_empty());
+        session.observe(
+            &SessionEvent::DesktopActivity {
+                access: DesktopAccess::Observe,
+            },
+            1_000,
+        );
+        session.observe(
+            &SessionEvent::DesktopActivity {
+                access: DesktopAccess::Control,
+            },
+            2_000,
+        );
+        let view = session.view();
+        assert_eq!(view.screen.observed_at_ms, Some(1_000));
+        assert_eq!(view.screen.controlled_at_ms, Some(2_000));
+        let json = serde_json::to_value(&view).unwrap_or_default();
+        assert_eq!(json["screen"]["controlled_at_ms"], 2_000);
+        assert_eq!(json["session_active"], true);
+        assert!(json.get("hostname").is_some());
     }
 
     #[test]

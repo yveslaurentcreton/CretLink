@@ -18,16 +18,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use cretlink_console::{
-    AuditEntry, AuditServiceConfig, ChannelAudit, ConsoleRoute, ConsoleSessionService,
-    ConsoleState, EventContext, EventOutcome, IpcAudit, IpcServer, SHUTDOWN_GRACE,
-    SessionAuditStart, SessionPhase, TargetId, apply_session_event, open_session_log,
+    AuditServiceConfig, ChannelAudit, ConsoleRoute, ConsoleSessionService, ConsoleState,
+    EventContext, EventOutcome, IpcAudit, IpcServer, LiveEcho, SHUTDOWN_GRACE, SessionAuditStart,
+    SessionPhase, TargetId, TechnicianActivity, apply_session_event, open_session_log,
 };
 use cretlink_mcp::{IpcEndpoint, IpcListener};
-use cretlink_protocol::{DesktopAccess, JobOutcome, RevokeReason, SessionId, TargetIdentity};
-use cretlink_session::{HostHandle, SessionEvent};
-use serde::Serialize;
+use cretlink_protocol::{RevokeReason, SessionId, TargetIdentity};
+use cretlink_session::{ActivityEntry, HostHandle, SessionEvent};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{broadcast, oneshot};
+
+use super::bridge::{BridgeSlot, BridgeStatus, lock_bridge, tool_count};
 
 /// The sender half of the button-intent channel, held by [`AppState`](super::AppState)
 /// so the synchronous Tauri commands can hand a technician decision to the async
@@ -77,200 +78,74 @@ pub enum Intent {
     Stop(RevokeReason),
 }
 
-/// One live activity line for the console's Activity view (ST-M004-007,
-/// REQ-F-017). It is the data form of the CLI's `[ai]`/`[job …]` renderers: the
-/// hosted backbone maps every attributable signal — a bridge call starting, a
-/// job finishing, output shed to stay bounded, desktop access — to one of these
-/// and the frontend appends it. Every string is backend-built; the frontend
-/// writes it with `textContent`, never as HTML (REQ-S-016, REQ-S-018).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActivityLine {
-    /// Who drove this line: `"claude"` for MCP bridge activity, `"session"` for
-    /// a job outcome or desktop access observed on the wire, `"note"` for a
-    /// backbone status line. Never fabricated: the live echo carries only
-    /// `Actor::Mcp` records, and job outcomes on the console side carry no
-    /// origin, so they are attributed neutrally to the session.
-    pub source: &'static str,
-    /// A coarse kind so the frontend can style outcomes distinctly: `"start"`,
-    /// `"finished"`, `"dropped"`, `"desktop"`, or `"note"`.
-    pub kind: &'static str,
-    /// The backend-built, single-line human text.
-    pub text: String,
-    /// The job this line concerns, when it concerns one.
-    pub job: Option<u64>,
-    /// The honest process exit code, when a finished job carried one.
-    pub exit_code: Option<i32>,
-    /// Whether a finished job's outcome was a clean success, for ok/bad styling.
-    pub ok: Option<bool>,
-    /// The AI client's stated purpose of a bridge call, on its start line
-    /// (REQ-F-026, ST-M009-007): the caller's unverified claim, shown beside
-    /// `text` (the real operation), never instead of it. Absent for session and
-    /// note lines and for a call from a bridge that sent none.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub purpose: Option<String>,
+/// The current session's technician activity feed (ST-M009-011), shared by the
+/// pump that folds into it and the `get_activity` command that reads it. It
+/// survives the end of a session and is replaced only when the next session
+/// starts, so the end screen and a reloaded frontend still see what happened.
+pub(crate) type ActivitySlot = Arc<Mutex<TechnicianActivity>>;
+
+/// Locks the activity feed, recovering from a poisoned mutex rather than
+/// panicking (panics are denied in library code).
+pub(crate) fn lock_activity(slot: &ActivitySlot) -> MutexGuard<'_, TechnicianActivity> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-impl ActivityLine {
-    /// A backbone status note (bridge endpoint ready or unavailable). Attributed
-    /// to the session itself, never to Claude or the technician.
-    fn note(text: String) -> Self {
-        Self {
-            source: "note",
-            kind: "note",
-            text,
-            job: None,
-            exit_code: None,
-            ok: None,
-            purpose: None,
-        }
-    }
+/// Emits the current bridge status, its lock released first.
+fn emit_bridge(bridge: &BridgeSlot, sink: &dyn StateSink) {
+    let status = lock_bridge(bridge).status(tool_count());
+    sink.emit_bridge(&status);
 }
 
-/// Maps a capture-time bridge audit record to a live activity line, mirroring
-/// the CLI's `render_ai_activity` exactly (REQ-F-017). The live echo carries
-/// only `Actor::Mcp` records (`ChannelAudit::record_entry`), so every line here
-/// is Claude's; read-only inspection calls return `None` and stay in the durable
-/// log only, keeping the feed readable.
-fn ai_activity_line(entry: &AuditEntry) -> Option<ActivityLine> {
-    let text = match entry.action {
-        "mcp_remote_exec_start" => format!("exec started: {}", arg_preview(entry, "command")),
-        "mcp_remote_write_stdin_start" => {
-            format!("stdin -> job {}", arg_preview(entry, "job_id"))
-        }
-        "mcp_remote_cancel_start" => format!("cancel job {}", arg_preview(entry, "job_id")),
-        "mcp_remote_make_dir_start" => format!("make-dir {}", arg_preview(entry, "path")),
-        "mcp_remote_move_start" => format!(
-            "move {} -> {}",
-            arg_preview(entry, "path"),
-            arg_preview(entry, "to")
-        ),
-        "mcp_remote_delete_start" => format!("delete {}", arg_preview(entry, "path")),
-        "mcp_remote_remove_dir_start" => format!("remove-dir {}", arg_preview(entry, "path")),
-        "mcp_remote_upload_start" => format!("upload -> {}", arg_preview(entry, "path")),
-        "mcp_remote_download_start" => format!("download {}", arg_preview(entry, "path")),
-        "mcp_remote_cleanup_start" => format!("cleanup ({})", arg_preview(entry, "trigger")),
-        "mcp_remote_write_stdin"
-        | "mcp_remote_cancel"
-        | "mcp_remote_make_dir"
-        | "mcp_remote_move"
-        | "mcp_remote_delete"
-        | "mcp_remote_remove_dir"
-        | "mcp_remote_upload"
-        | "mcp_remote_download"
-        | "mcp_remote_cleanup" => format!(
-            "{} finished: {:?}",
-            entry.action.trim_start_matches("mcp_remote_"),
-            entry.outcome
-        ),
-        _ => return None,
-    };
-    let kind = if entry.action.ends_with("_start") {
-        "start"
-    } else {
-        "finished"
-    };
-    // The stated purpose rides the start record only (REQ-F-026, ST-M009-007).
-    // It is already bounded to one line of at most 200 characters, so it is
-    // shown whole rather than clipped like a command preview.
-    let purpose = entry
-        .args
-        .0
-        .get("purpose")
-        .filter(|_| kind == "start")
-        .map(ToString::to_string);
-    Some(ActivityLine {
-        source: "claude",
-        kind,
-        text,
-        job: None,
-        exit_code: None,
-        ok: None,
-        purpose,
-    })
+/// The current time in Unix milliseconds (UTC), for activity timestamps.
+pub(crate) fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_millis()).ok())
+        .unwrap_or(0)
 }
 
-/// Maps one post-active session event to an activity line, mirroring the CLI's
-/// `report_active_event` finish/drop/desktop rendering (REQ-F-017). Raw
-/// `ExecOutput` bytes are deliberately not rendered here — they belong to the
-/// terminal panel (ST-M008-001); the Activity feed shows attributable outcomes.
-/// Lifecycle terminals (Revoked/Failed) are folded through [`step`], not here.
-/// The console side sees no per-job origin on `ExecFinished`, so the outcome is
-/// attributed neutrally to the session rather than fabricated as Claude's.
-fn session_activity_line(event: &SessionEvent) -> Option<ActivityLine> {
-    match event {
-        SessionEvent::ExecOutputDropped { job, bytes } => Some(ActivityLine {
-            source: "session",
-            kind: "dropped",
-            text: format!(
-                "cretlink: {bytes} bytes of output from job {job} were dropped to stay within the console buffer"
-            ),
-            job: Some(job.0),
-            exit_code: None,
-            ok: None,
-            purpose: None,
-        }),
-        SessionEvent::ExecFinished {
-            job,
-            exit_code,
-            outcome,
-        } => {
-            let text = match exit_code {
-                Some(code) => format!("job {job} finished: {outcome:?} (exit code {code})"),
-                None => format!("job {job} finished: {outcome:?}"),
-            };
-            let ok = matches!(outcome, JobOutcome::Completed) && exit_code.is_none_or(|c| c == 0);
-            Some(ActivityLine {
-                source: "session",
-                kind: "finished",
-                text,
-                job: Some(job.0),
-                exit_code: *exit_code,
-                ok: Some(ok),
-                purpose: None,
-            })
-        }
-        SessionEvent::DesktopActivity { access } => {
-            let text = match access {
-                DesktopAccess::Observe => {
-                    "screen observation active — a screenshot was captured".to_string()
-                }
-                DesktopAccess::Control => {
-                    "remote input active — controlling the customer desktop".to_string()
-                }
-            };
-            Some(ActivityLine {
-                source: "session",
-                kind: "desktop",
-                text,
-                job: None,
-                exit_code: None,
-                ok: None,
-                purpose: None,
-            })
-        }
-        _ => None,
+/// Folds one live audit echo into the technician feed (ST-M009-011): first a
+/// gap for the echoes the bounded live channel dropped right before it, at the
+/// place they were dropped (REQ-N-008), then the record's item, when the record
+/// is an action on the customer computer. Returns the entries to emit, in
+/// order. Every attributable source is covered — the AI (with its client
+/// label), the technician terminal, and manual console actions — because the
+/// echo carries every such audit actor.
+pub(crate) fn fold_live_echo(
+    activity: &mut TechnicianActivity,
+    echo: &LiveEcho,
+    now: i64,
+) -> Vec<ActivityEntry> {
+    let mut changed = Vec::new();
+    if echo.shed_before > 0 {
+        changed.push(activity.shed(echo.shed_before, now));
     }
+    changed.extend(activity.apply(&echo.entry, now));
+    changed
 }
 
-/// A short, single-line preview of one audit arg for live rendering, ported
-/// verbatim from the console CLI: it uses the audit value's display form
-/// (`[REDACTED]`/`[TRUNCATED]` markers preserved) and clamps it on a char
-/// boundary so a long command or path never floods the feed.
-fn arg_preview(entry: &AuditEntry, key: &str) -> String {
-    const PREVIEW_BYTES: usize = 120;
-    let Some(value) = entry.args.0.get(key) else {
-        return "?".to_string();
-    };
-    let text = value.to_string().replace(['\r', '\n'], " ");
-    if text.len() <= PREVIEW_BYTES {
-        return text;
+/// The feed's honest end (ST-M009-011, REQ-N-008), once the bridge endpoint
+/// has shut down: first the echoes still queued — the completion records the
+/// shutdown let in-flight calls write — then a trailing gap for the echoes
+/// dropped after the last one delivered (`shed`), then every action still
+/// running is shown as ended with the session, never as done. Returns the
+/// entries to emit, in order.
+pub(crate) fn end_of_feed(
+    activity: &mut TechnicianActivity,
+    queued: &[LiveEcho],
+    shed: u64,
+    now: i64,
+) -> Vec<ActivityEntry> {
+    let mut changed = Vec::new();
+    for echo in queued {
+        changed.extend(fold_live_echo(activity, echo, now));
     }
-    let mut end = PREVIEW_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
+    if shed > 0 {
+        changed.push(activity.shed(shed, now));
     }
-    format!("{}…", &text[..end])
+    changed.extend(activity.session_ended(now));
+    changed
 }
 
 /// Receives whole-state snapshots to render.
@@ -281,12 +156,17 @@ fn arg_preview(entry: &AuditEntry, key: &str) -> String {
 pub trait StateSink: Send + Sync + 'static {
     /// Renders one snapshot of the console state.
     fn emit(&self, state: &ConsoleState);
-    /// Renders one live activity line to a separate channel. Defaults to a no-op
-    /// so in-memory test sinks need not implement it. The GUI sink emits a
+    /// Renders one changed activity entry (an `ActivityEvent` in the frontend
+    /// contract, ST-M009-011) on a separate channel. Defaults to a no-op so
+    /// in-memory test sinks need not implement it. The GUI sink emits a
     /// `"console-activity"` Tauri event; routing activity apart from whole-state
-    /// snapshots means high-frequency job output never triggers a full
-    /// `console-state` re-emit (REQ-N-006).
-    fn emit_activity(&self, _line: &ActivityLine) {}
+    /// snapshots means a burst of actions never triggers a full
+    /// `console-state` re-emit (REQ-N-006). An item whose id was emitted before
+    /// replaces the earlier one in place.
+    fn emit_activity(&self, _entry: &ActivityEntry) {}
+    /// Renders a changed bridge status for the rail (ST-M009-008) on its own
+    /// `"console-bridge"` channel. Defaults to a no-op for test sinks.
+    fn emit_bridge(&self, _status: &BridgeStatus) {}
 }
 
 /// Locks the shared state, recovering the inner value if a prior holder panicked
@@ -389,6 +269,8 @@ pub async fn pump(
     audit_config: AuditServiceConfig,
     start_tx: oneshot::Sender<SessionAuditStart>,
     service_slot: ServiceSlot,
+    activity: ActivitySlot,
+    bridge: BridgeSlot,
 ) {
     // The consent-bound identity, captured from `ConsentGranted` before the fold,
     // so it can be moved into the hosted service at handoff (REQ-F-016).
@@ -475,7 +357,7 @@ pub async fn pump(
                                 // activity (ST-M004-007); the guard is out of scope.
                                 run_active(
                                     handle, session, target, shared, sink, intents,
-                                    audit, service_slot,
+                                    audit, service_slot, activity, bridge,
                                 )
                                 .await;
                                 return;
@@ -552,12 +434,13 @@ enum FoldStep {
 /// GUI session is what the MCP bridge and any interactive terminal attach to,
 /// then renders the shared live activity feed. It owns three sources:
 ///
-/// - `service.subscribe()` — job outcomes, output-drop markers, and desktop
-///   activity become [`ActivityLine`]s on the separate activity channel; a
-///   `Revoked`/`Failed` lifecycle event is folded through [`step`] and ends the
-///   session fail-closed.
-/// - the live audit echo — bridge-originated (`Actor::Mcp`) start-lines become
-///   Claude-attributed [`ActivityLine`]s the instant the call starts.
+/// - `service.subscribe()` — a `Revoked`/`Failed` lifecycle event is folded
+///   through [`step`] and ends the session fail-closed.
+/// - the live audit echo — every audit record of an action on the customer
+///   computer (the AI, the technician terminal, manual console actions) is
+///   folded into the shared [`TechnicianActivity`] feed and the changed
+///   [`ActivityEntry`] is emitted the instant the call starts and again when it
+///   finishes (ST-M009-011).
 /// - the technician intent channel — an emergency Stop revokes the service,
 ///   whose `Revoked` echo the subscribe arm then folds (control is never
 ///   fabricated).
@@ -577,6 +460,8 @@ async fn run_active(
     mut intents: UnboundedReceiver<Intent>,
     audit: ChannelAudit,
     service_slot: ServiceSlot,
+    activity: ActivitySlot,
+    bridge: BridgeSlot,
 ) {
     // Hand the live handle to the hosted session service; its driver task now
     // solely owns the handle and pumps every wire event into the broadcast.
@@ -605,9 +490,6 @@ async fn run_active(
             let ipc_audit: Arc<dyn IpcAudit> = Arc::new(audit.clone());
             let in_flight = service.activity_counter();
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
-            sink.emit_activity(&ActivityLine::note(
-                "MCP bridge endpoint ready — Claude can attach to this session".to_string(),
-            ));
             Some((
                 tokio::spawn(IpcServer::serve(
                     listener,
@@ -620,12 +502,20 @@ async fn run_active(
             ))
         }
         Err(error) => {
-            sink.emit_activity(&ActivityLine::note(format!(
-                "MCP bridge endpoint unavailable ({error}); interactive control still works"
-            )));
+            // Not an action on the customer computer, so not an activity item;
+            // the rail says so with a next step (ST-M009-008), and interactive
+            // control still works without the bridge.
+            eprintln!(
+                "note: the MCP bridge endpoint is unavailable ({error}); interactive control still works"
+            );
+            lock_bridge(&bridge).failed(&error);
             None
         }
     };
+    if ipc_server.is_some() {
+        lock_bridge(&bridge).ready();
+    }
+    emit_bridge(&bridge, sink.as_ref());
 
     let mut terminated = false;
     loop {
@@ -654,12 +544,10 @@ async fn run_active(
                                 terminated = true;
                                 break;
                             }
-                        } else if let Some(line) = session_activity_line(&event) {
-                            // Non-lifecycle activity is routed apart from the
-                            // whole-state channel, so high-frequency job output
-                            // never triggers a `console-state` re-emit (REQ-N-006).
-                            sink.emit_activity(&line);
                         }
+                        // Every other event is consumed elsewhere: job output by
+                        // the terminal panel, and the actions themselves reach
+                        // the feed from their audit records below (ST-M009-011).
                     }
                     // The consumer fell behind the bounded broadcast; some activity
                     // lines were missed, but the lifecycle stream is intact — keep
@@ -672,9 +560,17 @@ async fn run_active(
             }
             maybe_entry = live_rx.recv(), if live_open => {
                 match maybe_entry {
-                    Some(entry) => {
-                        if let Some(line) = ai_activity_line(&entry) {
-                            sink.emit_activity(&line);
+                    Some(echo) => {
+                        // An AI client calling for the first time this session
+                        // joins the rail (ST-M009-008).
+                        let new_client = lock_bridge(&bridge).note(&echo.entry);
+                        if new_client {
+                            emit_bridge(&bridge, sink.as_ref());
+                        }
+                        let changed =
+                            fold_live_echo(&mut lock_activity(&activity), &echo, now_unix_millis());
+                        for entry in &changed {
+                            sink.emit_activity(entry);
                         }
                     }
                     // The audit sink was dropped; stop polling this branch so it
@@ -718,6 +614,35 @@ async fn run_active(
             // ending regardless, so this is a best-effort note only.
         }
     }
+    // The echoes still queued: the completion records the endpoint's shutdown
+    // let in-flight calls write after the loop stopped reading (ST-M009-011).
+    let mut queued = Vec::new();
+    if live_open {
+        while let Ok(echo) = live_rx.try_recv() {
+            queued.push(echo);
+        }
+    }
+    for echo in &queued {
+        // A client whose first call is among them still joins the rail.
+        let _ = lock_bridge(&bridge).note(&echo.entry);
+    }
+    // The endpoint is released with the session (ST-M009-008).
+    lock_bridge(&bridge).closed();
+    emit_bridge(&bridge, sink.as_ref());
+    // The feed's honest end: the queued echoes, then the trailing gap, then
+    // what is still running ended with the session ([`end_of_feed`]).
+    {
+        let shed = audit.take_live_shed();
+        let changed = end_of_feed(
+            &mut lock_activity(&activity),
+            &queued,
+            shed,
+            now_unix_millis(),
+        );
+        for entry in &changed {
+            sink.emit_activity(entry);
+        }
+    }
     if !terminated {
         // The active loop ended without a Revoked/Failed fold (driver closed or
         // every intent handle dropped). Drive the model to an honest end rather
@@ -736,9 +661,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use cretlink_console::{
-        DiscoveredTarget, DiscoverySource, SessionPhase, TargetId, TechnicianHost,
+        AuditEntry, DiscoveredTarget, DiscoverySource, SessionPhase, TargetId, TechnicianHost,
     };
-    use cretlink_protocol::{JobId, RevokeReason, SessionId, TargetIdentity};
+    use cretlink_protocol::{RevokeReason, SessionId, TargetIdentity};
+    use cretlink_session::{ActivitySource, ActivityState};
     // The audit vocabulary used to build sample bridge records for the
     // activity-mapping tests. `cretlink-console` re-exports `AuditEntry` but not
     // these building blocks, so the tests reach them from the shared crate (a
@@ -767,6 +693,7 @@ mod tests {
             label: "This computer (technician)".to_string(),
             hostname: "TECH-PC".to_string(),
             os: "Windows 11".to_string(),
+            display_name: Some("Sam".to_string()),
         }
     }
 
@@ -778,6 +705,7 @@ mod tests {
             elevated: true,
             simulated: false,
             agent_version: "0.0.0".to_string(),
+            account: None,
         }
     }
 
@@ -1008,133 +936,120 @@ mod tests {
         assert_eq!(sink.count(), 1);
     }
 
-    // --- Activity mapping (ST-M004-007, plan §5g) ---------------------------
+    // --- Activity feed (ST-M009-011) ---------------------------------------
     //
-    // The two pure mapping functions the pump fans out to the Activity feed take
-    // one sample event/record and must yield an `ActivityLine` with the right
-    // source, kind, attribution and — where present — exit code and ok verdict.
-    // No transport, no I/O: the mapping *is* the contract the frontend renders.
+    // The pump folds every live audit echo into the shared technician feed. The
+    // fold is pure, so the contract the frontend renders is tested here without
+    // a transport.
 
-    #[test]
-    fn exec_finished_maps_to_a_completed_session_line() {
-        // A clean completion is attributed to the *session* (the console sees no
-        // per-job origin on `ExecFinished`) and marked ok, carrying the job id
-        // and exit code so the feed can show "done" with the code.
-        let line = session_activity_line(&SessionEvent::ExecFinished {
-            job: JobId(3),
-            exit_code: Some(0),
-            outcome: JobOutcome::Completed,
-        })
-        .expect("ExecFinished maps to an activity line");
-        assert_eq!(line.source, "session");
-        assert_eq!(line.kind, "finished");
-        assert_eq!(line.job, Some(3));
-        assert_eq!(line.exit_code, Some(0));
-        assert_eq!(line.ok, Some(true));
-        assert!(line.text.contains("job 3 finished"));
+    fn echo(shed_before: u64, entry: AuditEntry) -> LiveEcho {
+        LiveEcho { shed_before, entry }
     }
 
     #[test]
-    fn exec_finished_with_a_nonzero_code_is_not_ok() {
-        // A non-zero exit under an otherwise-Completed outcome is a failure
-        // verdict, never reported as success (AGENTS.md honesty).
-        let line = session_activity_line(&SessionEvent::ExecFinished {
-            job: JobId(7),
-            exit_code: Some(1),
-            outcome: JobOutcome::Completed,
-        })
-        .expect("ExecFinished maps to an activity line");
-        assert_eq!(line.ok, Some(false));
-        assert_eq!(line.exit_code, Some(1));
-    }
-
-    #[test]
-    fn a_failed_outcome_is_not_ok_even_without_an_exit_code() {
-        // No exit code (e.g. the job died before reporting one) plus a Failed
-        // outcome must still read as a failure, not an absent/ok verdict.
-        let line = session_activity_line(&SessionEvent::ExecFinished {
-            job: JobId(9),
-            exit_code: None,
-            outcome: JobOutcome::Failed,
-        })
-        .expect("ExecFinished maps to an activity line");
-        assert_eq!(line.ok, Some(false));
-        assert_eq!(line.exit_code, None);
-    }
-
-    #[test]
-    fn dropped_output_maps_to_an_honest_truncation_line() {
-        // Dropped bytes are surfaced with their count, never silently swallowed
-        // (REQ-N-008). The verdict stays `None` — a drop is not a pass or fail.
-        let line = session_activity_line(&SessionEvent::ExecOutputDropped {
-            job: JobId(4),
-            bytes: 2048,
-        })
-        .expect("ExecOutputDropped maps to an activity line");
-        assert_eq!(line.source, "session");
-        assert_eq!(line.kind, "dropped");
-        assert_eq!(line.job, Some(4));
-        assert_eq!(line.ok, None);
-        assert!(line.text.contains("2048 bytes"));
-        assert!(line.text.contains("dropped"));
-    }
-
-    #[test]
-    fn raw_exec_output_is_not_an_activity_line() {
-        // Streaming stdout belongs to the terminal panel (ST-M008-001), not the
-        // attributable Activity feed, so non-outcome events map to nothing.
-        assert!(session_activity_line(&SessionEvent::Active).is_none());
-    }
-
-    #[test]
-    fn mcp_exec_start_maps_to_a_claude_start_line() {
-        // A bridge exec-start record is Claude's; the feed shows the command
-        // preview under a "start" line, sourced "claude".
-        let mut entry = AuditEntry::event(Actor::Mcp, None, "mcp_remote_exec_start", Outcome::Ok);
-        entry
-            .args
-            .insert("command", AuditValue::text("Get-Process"));
-        let line = ai_activity_line(&entry).expect("exec-start maps to an activity line");
-        assert_eq!(line.source, "claude");
-        assert_eq!(line.kind, "start");
-        assert!(line.text.starts_with("exec started:"));
-        assert!(line.text.contains("Get-Process"));
-    }
-
-    #[test]
-    fn mcp_start_record_carries_the_stated_purpose_beside_the_real_operation() {
-        // The AI's stated purpose rides the start line next to — never instead
-        // of — the real command (REQ-F-026, ST-M009-007); an older bridge's
-        // call carries none and none is invented.
-        let mut entry = AuditEntry::event(Actor::Mcp, None, "mcp_remote_exec_start", Outcome::Ok);
-        entry
+    fn an_ai_call_starts_running_and_finishes_in_place() {
+        let mut feed = TechnicianActivity::new();
+        let mut start = AuditEntry::event(Actor::Mcp, None, "mcp_remote_exec_start", Outcome::Ok);
+        start.args.insert("call_id", AuditValue::Int(5));
+        start
             .args
             .insert("command", AuditValue::text("Get-PSDrive C"));
-        let line = ai_activity_line(&entry).expect("exec-start maps to an activity line");
-        assert!(line.purpose.is_none());
-        entry
+        start
             .args
             .insert("purpose", AuditValue::text("Checking free disk space"));
-        let line = ai_activity_line(&entry).expect("exec-start maps to an activity line");
-        assert!(line.text.contains("Get-PSDrive C"));
-        assert_eq!(line.purpose.as_deref(), Some("Checking free disk space"));
+        start
+            .args
+            .insert("client", AuditValue::text("codex-mcp-client"));
+        let changed = fold_live_echo(&mut feed, &echo(0, start.clone()), 1_000);
+        let [ActivityEntry::Item { item }] = changed.as_slice() else {
+            panic!("expected one item, got {changed:?}");
+        };
+        assert_eq!(item.id, "call-5");
+        assert_eq!(item.source, ActivitySource::Ai);
+        assert_eq!(item.client_label.as_deref(), Some("Codex CLI"));
+        assert_eq!(item.purpose.as_deref(), Some("Checking free disk space"));
+        assert!(item.operation.contains("Get-PSDrive C"));
+        assert_eq!(item.state, ActivityState::Running);
+
+        let mut done = AuditEntry::event(Actor::Mcp, None, "mcp_remote_exec", Outcome::Ok);
+        done.args.insert("call_id", AuditValue::Int(5));
+        done.args.insert("exit_code", AuditValue::Int(0));
+        done.duration_ms = Some(250);
+        let changed = fold_live_echo(&mut feed, &echo(0, done), 1_250);
+        let [ActivityEntry::Item { item }] = changed.as_slice() else {
+            panic!("expected one item, got {changed:?}");
+        };
+        assert_eq!(item.id, "call-5");
+        assert_eq!(item.state, ActivityState::Done { exit_code: Some(0) });
+        assert_eq!(item.duration_ms, Some(250));
+        assert_eq!(feed.entries().len(), 1, "updated in place");
     }
 
     #[test]
-    fn mcp_finish_record_maps_to_a_finished_line() {
-        // The paired finish record folds to a "finished" line naming the action.
-        let entry = AuditEntry::event(Actor::Mcp, None, "mcp_remote_delete", Outcome::Ok);
-        let line = ai_activity_line(&entry).expect("finish record maps to an activity line");
-        assert_eq!(line.source, "claude");
-        assert_eq!(line.kind, "finished");
-        assert!(line.text.starts_with("delete finished:"));
+    fn read_only_ai_calls_are_in_the_feed() {
+        // Unlike the old feed, read-only inspection calls are shown too.
+        let mut feed = TechnicianActivity::new();
+        let mut start =
+            AuditEntry::event(Actor::Mcp, None, "mcp_remote_fs_stat_start", Outcome::Ok);
+        start.args.insert("call_id", AuditValue::Int(1));
+        start.args.insert("path", AuditValue::text("C:\\Logs"));
+        assert_eq!(fold_live_echo(&mut feed, &echo(0, start), 0).len(), 1);
     }
 
     #[test]
-    fn read_only_bridge_records_stay_out_of_the_feed() {
-        // Read-only inspection calls (stat/list/system-info) are deliberately
-        // unmapped: they live in the durable log only, keeping the feed readable.
-        let entry = AuditEntry::event(Actor::Mcp, None, "mcp_remote_stat", Outcome::Ok);
-        assert!(ai_activity_line(&entry).is_none());
+    fn dropped_echoes_become_a_gap_before_the_next_item() {
+        let mut feed = TechnicianActivity::new();
+        let mut entry =
+            AuditEntry::event(Actor::Mcp, None, "mcp_remote_list_jobs_start", Outcome::Ok);
+        entry.args.insert("call_id", AuditValue::Int(2));
+        let changed = fold_live_echo(&mut feed, &echo(3, entry), 0);
+        assert!(matches!(changed[0], ActivityEntry::Gap { count: 3, .. }));
+        assert!(matches!(changed[1], ActivityEntry::Item { .. }));
+    }
+
+    #[test]
+    fn echoes_queued_at_the_end_are_folded_before_the_session_ends() {
+        // An AI call was running when the session was revoked; its completion
+        // record reached the echo channel after the loop stopped reading.
+        let mut feed = TechnicianActivity::new();
+        let mut start = AuditEntry::event(Actor::Mcp, None, "mcp_remote_exec_start", Outcome::Ok);
+        start.args.insert("call_id", AuditValue::Int(9));
+        start.args.insert("command", AuditValue::text("dir"));
+        fold_live_echo(&mut feed, &echo(0, start), 1_000);
+        let mut done = AuditEntry::event(Actor::Mcp, None, "mcp_remote_exec", Outcome::Ok);
+        done.args.insert("call_id", AuditValue::Int(9));
+        done.args.insert("exit_code", AuditValue::Int(0));
+        let changed = end_of_feed(&mut feed, &[echo(1, done)], 2, 2_000);
+        // In order: the gap before the queued record, its item, the trailing
+        // gap; nothing left running to end.
+        assert!(
+            matches!(changed[0], ActivityEntry::Gap { count: 1, .. }),
+            "{changed:?}"
+        );
+        let ActivityEntry::Item { item } = &changed[1] else {
+            panic!("expected the item, got {changed:?}");
+        };
+        assert_eq!(item.state, ActivityState::Done { exit_code: Some(0) });
+        assert!(
+            matches!(changed[2], ActivityEntry::Gap { count: 2, .. }),
+            "{changed:?}"
+        );
+        assert_eq!(changed.len(), 3, "{changed:?}");
+        let items: Vec<ActivityState> = feed
+            .entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                ActivityEntry::Item { item } => Some(item.state),
+                ActivityEntry::Gap { .. } => None,
+            })
+            .collect();
+        assert_eq!(items, vec![ActivityState::Done { exit_code: Some(0) }]);
+    }
+
+    #[test]
+    fn lifecycle_records_do_not_reach_the_feed() {
+        let mut feed = TechnicianActivity::new();
+        let entry = AuditEntry::event(Actor::Console, None, "pairing_completed", Outcome::Ok);
+        assert!(fold_live_echo(&mut feed, &echo(0, entry), 0).is_empty());
     }
 }

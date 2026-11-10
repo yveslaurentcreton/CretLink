@@ -229,6 +229,7 @@ pub fn apply_session_event(
         // drives a phase transition.
         SessionEvent::CommandStarted { .. }
         | SessionEvent::RequestHandled { .. }
+        | SessionEvent::ActivityShed { .. }
         | SessionEvent::ExecOutput { .. }
         | SessionEvent::ExecOutputDropped { .. }
         | SessionEvent::ExecFinished { .. }
@@ -265,6 +266,7 @@ mod tests {
             label: "This computer (technician)".to_string(),
             hostname: "TECH-PC".to_string(),
             os: "Windows 11".to_string(),
+            display_name: Some("Sam".to_string()),
         }
     }
 
@@ -276,6 +278,7 @@ mod tests {
             elevated: true,
             simulated: false,
             agent_version: "0.0.0".to_string(),
+            account: None,
         }
     }
 
@@ -504,11 +507,17 @@ mod tests {
                 purpose: None,
             },
             SessionEvent::RequestHandled {
+                id: 1,
                 origin: cretlink_protocol::Origin::Mcp,
                 purpose: cretlink_protocol::Purpose::new("Checking free disk space").ok(),
+                kind: cretlink_session::ActivityKind::SystemInformation,
                 operation: "read system information".to_string(),
+                path: None,
+                bytes: None,
                 outcome: cretlink_session::ActionOutcome::Succeeded,
+                duration_ms: Some(3),
             },
+            SessionEvent::ActivityShed { count: 2 },
             SessionEvent::ExecOutputDropped {
                 job: cretlink_protocol::JobId(2),
                 bytes: 42,

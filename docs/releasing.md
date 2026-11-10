@@ -66,7 +66,7 @@ local builds report `0.0.0-dev`. The local semantic-release plugin
 decides a different one, so a release never carries binaries stamped with
 another version.
 
-### Release artifacts (ST-M006-004, ST-M009-004)
+### Release artifacts (ST-M006-004, ST-M009-004, ST-M009-010)
 
 Every release attaches verifiable platform artifacts, built by the `build`
 matrix in `release.yml` from the exact commit semantic-release tags and gathered
@@ -76,21 +76,54 @@ into the GitHub release by `@semantic-release/github`:
   `cretlink-<version>-windows-x86_64.zip`, `cretlink-<version>-macos-aarch64.tar.gz`
   and `cretlink-<version>-linux-x86_64.tar.gz`. Each holds a folder of the same
   name with the application `cretlink` (both roles; on Windows also the
-  program the customer runs, ST-M009-005), its console build `cretlink-cli`,
-  and `cretlink-console`, `cretlink-mcp` and `cretlink-shell` — in the Windows
-  archive also the headless `cretlink-support-agent` — plus `README.txt`,
-  `LICENSE` and the target's checksum file;
+  program the customer runs, ST-M009-005) and its console build
+  `cretlink-cli`, plus `README.txt`, `LICENSE` and the target's checksum file.
+  The development tools `cretlink-console` and `cretlink-support-agent` are not
+  released (ST-M009-010);
 - `SHA256SUMS.txt` — SHA-256 over the archives, written by the `release` job;
 - `cretlink-relay-server-<target>[.exe]` — operator-hosted public
   infrastructure on neither endpoint (see [`docs/relay-server.md`](relay-server.md)),
   attached on its own and not in the archives;
 - `CHECKSUMS-<target>.txt` — SHA-256 over every binary for that target;
 - `dependency-inventory-<target>.txt` — the resolved normal-dependency graph and
-  pinned versions from the locked workspace (`cargo tree --locked`);
-- `sbom-<binary>-<target>.cdx.json` — one CycloneDX SBOM per shipped binary,
+  pinned versions of the shipped packages (`cretlink`, `cretlink-cli`,
+  `cretlink-relay-server`) from the locked manifests (`cargo tree --locked`);
+- `sbom-<binary>-<target>.cdx.json` — one CycloneDX SBOM per shipped binary
+  (`cretlink`, `cretlink-cli`, `cretlink-relay-server`),
   its own component stamped with the release version. Official artifacts fail
   without them; locally a missing `cargo-cyclonedx` is a warning, never a silent
   gap, and the dependency inventory is the portable fallback.
+
+### Preview builds
+
+To test a pull request by hand before it is merged, a maintainer adds the
+`preview-build` label to it. `preview.yml` then builds the Windows and macOS
+archives from the pull request and keeps them as workflow artifacts for seven
+days; to build again after new commits, remove the label and add it again.
+Nothing runs without the label, so a preview costs CI minutes only when asked
+for. A preview is a development build: unsigned, versioned
+`0.0.0-pr.<number>.g<commit>`, without SBOMs, and never published. Build the
+Linux archive locally with `scripts/gen-artifacts.sh`.
+
+### Linux baseline (ST-M009-013)
+
+Linux binaries run on glibc 2.35 or newer (Ubuntu 22.04 LTS, Debian 12 and
+later; REQ-N-021). A binary needs the glibc of the system it was linked on, so
+the release `build` job and the CI `app` job build Linux on `ubuntu-22.04`
+(glibc 2.35), the oldest GitHub runner that offers webkit2gtk 4.1; do not move
+them to `ubuntu-latest`. Two scripts guard the baseline:
+
+- `scripts/check-glibc.sh [--max VERSION] PATH...` fails when an ELF binary —
+  given directly, in a folder or in a `.tar.gz` archive — needs a `GLIBC_`
+  symbol version above 2.35, and lists the symbols that do. It reads the
+  version needs with `readelf` (or `objdump`) from binutils and fails when
+  neither is installed or no binary is found. The release runs it on the Linux
+  archive and the relay server, CI on `cretlink` and `cretlink-cli`.
+- `scripts/smoke-debian.sh [--expect VERSION] PATH` installs the runtime
+  libraries (`libwebkit2gtk-4.1-0`) in a `debian:12` container with docker and
+  runs `cretlink version` and `cretlink-cli version` from the archive or a
+  folder like it, without a display. The release runs it on the archive and
+  expects the release version; CI runs it on the binaries the `app` job built.
 
 `scripts/gen-artifacts.sh [--stage | --pack] [VERSION]` is the single portable
 producer, runnable both in CI and locally in any bash (Linux, macOS, or Git Bash
@@ -148,7 +181,8 @@ CretLink uses GitHub Flow:
 4. Open a pull request and reference the requirement, milestone, and story.
 5. Run all required CI and record acceptance evidence.
 6. Resolve review findings without expanding scope silently.
-7. Squash-merge using a valid Conventional Commit title.
+7. Squash-merge, once the branch is up to date with `main` and CI has passed
+   on it, using a valid Conventional Commit title.
 8. Delete the merged branch.
 9. Let semantic-release evaluate the resulting commit on `main`.
 
@@ -192,10 +226,28 @@ The GitHub Flow merge policy is squash merge:
 - Pull-request title follows Conventional Commits.
 - The title or body references the Ready story.
 - Acceptance evidence is present before merge.
+- The pull request is up to date with `main` when it is merged, so the tree
+  that its CI run tested is the tree that is merged.
 - The squash commit is the release input.
 
 If the project later preserves individual commits, every release-relevant
 commit must remain valid and the merge strategy must be documented here.
+
+### CI runs (ST-M006-017)
+
+While the repository is private, CI minutes are limited, so a change is
+verified once:
+
+- CI (`ci.yml`) runs on pull requests and not again on `main` after the merge.
+  The pull request run tests the merge result, and `release.yml` builds the
+  tagged commit. CI on `main` returns when the repository is public and the
+  minutes are free.
+- A newer push to a pull request cancels the run in progress for it.
+- A pull request that changes only documentation (`*.md`, `docs/`, `LICENSE`)
+  runs the hygiene checks only (`hygiene.yml`): the secret scan and the
+  private-data check, which every pull request runs. The build and test matrix
+  does not start.
+- Every job has a time limit.
 
 ## Breaking changes
 

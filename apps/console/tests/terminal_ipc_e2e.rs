@@ -67,6 +67,7 @@ fn simulated_identity() -> TargetIdentity {
         elevated: false,
         simulated: true,
         agent_version: "test".to_string(),
+        account: None,
     }
 }
 
@@ -1121,6 +1122,7 @@ mod real_conpty {
     async fn active_session() -> (HostHandle, SessionJoinHandle, SessionId, TargetIdentity) {
         let hints = ConsoleHints {
             label: "This computer (technician)".to_string(),
+            display_name: None,
         };
         let mut host = SessionHost::host(loopback(), hints, PROTOCOL_V1, caps_with_terminal())
             .await

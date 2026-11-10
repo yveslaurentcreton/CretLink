@@ -81,7 +81,7 @@ impl SessionHost {
             .map_err(SessionError::Io)?;
         let local_addr = listener.local_addr().map_err(SessionError::Io)?;
 
-        let shared = Arc::new(Shared::new());
+        let shared = Arc::new(Shared::for_console(hints.display_name.clone()));
         // The event stream is bounded so a remote target that floods command
         // output cannot exhaust technician-side memory (REQ-N-006); the session
         // task applies a drop-and-mark policy when it is under pressure. Control
@@ -140,7 +140,7 @@ impl SessionHost {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let shared = Arc::new(Shared::new());
+        let shared = Arc::new(Shared::for_console(hints.display_name.clone()));
         // Same channel shapes as `host_with_audit`: a bounded event stream so a
         // flooding target cannot exhaust technician memory (REQ-N-006) and
         // unbounded control channels so revoke/commands never block.
@@ -321,6 +321,22 @@ impl HostHandle {
     #[must_use]
     pub fn cleanup_report(&self) -> Option<CleanupReport> {
         self.shared.cleanup()
+    }
+
+    /// The teardown report the agent sent at the end of an active session
+    /// (protocol minor 11, ST-M009-012), or `None` when none arrived — a lost
+    /// connection, or a session that never reached full control. `None` is
+    /// never a success.
+    #[must_use]
+    pub fn peer_cleanup_report(&self) -> Option<CleanupReport> {
+        self.shared.peer_cleanup()
+    }
+
+    /// Who ended the session, from the console's point of view, once it has
+    /// torn down (ST-M009-012).
+    #[must_use]
+    pub fn ended_by(&self) -> Option<crate::EndedBy> {
+        self.shared.ended_by()
     }
 
     /// Awaits the next lifecycle event, or `None` once the session task has

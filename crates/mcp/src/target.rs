@@ -203,7 +203,8 @@ pub struct CaptureReport {
     pub staged: Option<RemotePath>,
 }
 
-/// The agent-reported error that ended a failed transfer (secret-free).
+/// The error that ended a failed transfer (secret-free): the agent's report of
+/// an operation it refused, or an error on the technician's own file.
 ///
 /// Decoupled from the session crate's transfer error so the bridge, target
 /// trait, and IPC contract share one stable shape without the bridge depending
@@ -211,11 +212,17 @@ pub struct CaptureReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransferFailure {
-    /// Machine-readable category the agent returned.
+    /// Machine-readable category: the one the agent returned, or the cause of
+    /// an error on the technician's own file.
     pub code: ErrorCode,
-    /// Human-readable, secret-free description.
+    /// Human-readable, secret-free description. In the `local` stage it names
+    /// the local path and the reason and says that the file is on the
+    /// technician computer.
     pub message: String,
-    /// The transfer stage the failure occurred in.
+    /// The transfer stage the failure occurred in: a stage on the target, or
+    /// `local` for an error on the technician's own file (an upload's source, a
+    /// download's destination), which is not a lost session and leaves the
+    /// session usable (ST-M003-005).
     pub stage: String,
 }
 
@@ -273,7 +280,7 @@ pub struct UploadReport {
     pub resumed_from: u64,
     /// Whether a mismatch forced an abort-and-restart from zero.
     pub restarted: bool,
-    /// The agent error that ended a `Failed` transfer, if any.
+    /// The error that ended a `Failed` transfer, if any.
     pub error: Option<TransferFailure>,
 }
 
@@ -296,7 +303,7 @@ pub struct DownloadReport {
     pub resumed_from: u64,
     /// Whether a mismatch forced a restart from zero.
     pub restarted: bool,
-    /// The agent error that ended a `Failed` transfer, if any.
+    /// The error that ended a `Failed` transfer, if any.
     pub error: Option<TransferFailure>,
 }
 
@@ -434,6 +441,12 @@ impl From<TargetError> for CallError {
 /// never fabricate a success for a lost session.
 #[async_trait::async_trait]
 pub trait TargetSession: Send + Sync + 'static {
+    /// Records the AI client's self-reported `clientInfo.name` from the MCP
+    /// `initialize` request, so the console can label the client's activity
+    /// (ST-M009-011). A label only, never authority, and never sent to the
+    /// customer computer. The default ignores it.
+    fn set_client_name(&self, _name: &str) {}
+
     /// The last-known session id, for labelling an error envelope only.
     fn session_id(&self) -> SessionId;
 

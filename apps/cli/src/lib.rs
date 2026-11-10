@@ -9,15 +9,24 @@
 //! - `cretlink-cli mcp install | uninstall | status` registers that bridge with the
 //!   technician's AI clients (REQ-F-025), see [`setup`].
 //! - `cretlink-cli shell` attaches a host terminal to the consented session
-//!   (ST-M008-002).
+//!   (ST-M008-002), see [`shell`].
 //! - `cretlink-cli version` prints the release version (ST-M006-014).
+//! - `cretlink-cli uninstall` removes the per-user install of the technician
+//!   role, after showing what it removes (ST-M009-006), see [`install`].
+//! - `cretlink-cli recover [--remove]` lists, or removes, what CretLink left on
+//!   a customer computer (ST-M006-003, ST-M009-010): the report and the
+//!   fail-closed exit codes of the support agent's recovery verb, which it
+//!   replaces in the product ([`cretlink_support_agent::recovery`]). A
+//!   `CretLink-Support*` copy of the application accepts this command only.
 //!
 //! None of the subcommands opens a session, a listener or a window. The
 //! dispatch is a library so the one CretLink application (ST-M009-005) can run
 //! the same subcommands before it opens its window.
 
+pub mod install;
 pub mod process;
 pub mod setup;
+pub mod shell;
 
 /// The release version this build belongs to (ST-M006-014).
 pub use cretlink_shared::RELEASE_VERSION;
@@ -48,6 +57,16 @@ pub enum Command {
     McpSetup(Action, SetupOptions),
     /// Run the technician terminal client with the remaining arguments.
     Shell(Vec<String>),
+    /// Remove the per-user install; `yes` skips the confirmation.
+    Uninstall {
+        /// Remove without asking (`--yes`).
+        yes: bool,
+    },
+    /// List (or with `remove`, remove) the CretLink residue on this computer.
+    Recover {
+        /// Remove what was found (`--remove`); otherwise only list it.
+        remove: bool,
+    },
 }
 
 /// Parses the arguments after the program name.
@@ -65,6 +84,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
         "version" | "-V" | "--version" => no_more(args, Command::Version),
         "shell" => Ok(Command::Shell(args.collect())),
         "mcp" => parse_mcp(args),
+        "uninstall" => parse_uninstall(args),
+        "recover" => parse_recover(args),
         other => Err(format!("unknown command '{other}'")),
     }
 }
@@ -99,6 +120,28 @@ fn parse_mcp(mut args: impl Iterator<Item = String>) -> Result<Command, String> 
     Ok(Command::McpSetup(action, options))
 }
 
+fn parse_uninstall(args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let mut yes = false;
+    for arg in args {
+        match arg.as_str() {
+            "--yes" | "-y" => yes = true,
+            other => return Err(format!("unknown option '{other}' for 'uninstall'")),
+        }
+    }
+    Ok(Command::Uninstall { yes })
+}
+
+fn parse_recover(args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let mut remove = false;
+    for arg in args {
+        match arg.as_str() {
+            "--remove" => remove = true,
+            other => return Err(format!("unknown option '{other}' for 'recover'")),
+        }
+    }
+    Ok(Command::Recover { remove })
+}
+
 fn no_more(mut args: impl Iterator<Item = String>, command: Command) -> Result<Command, String> {
     match args.next() {
         None => Ok(command),
@@ -111,11 +154,13 @@ fn no_more(mut args: impl Iterator<Item = String>, command: Command) -> Result<C
 /// or `cretlink` for the application (ST-M009-005) — and names the command in
 /// usage text and diagnostics.
 pub async fn run(program: &str, args: impl IntoIterator<Item = String>) -> ExitCode {
-    if GUI_SUBSYSTEM {
+    let console = if GUI_SUBSYSTEM {
         // Write to the terminal that started us, if any. Redirected handles —
         // an MCP client's pipes — are left exactly as they are.
-        let _ = process::attach_parent_console();
-    }
+        process::attach_parent_console()
+    } else {
+        process::ConsoleAttach::Inherited
+    };
     let command = match parse(args) {
         Ok(command) => command,
         Err(err) => {
@@ -167,9 +212,207 @@ pub async fn run(program: &str, args: impl IntoIterator<Item = String>) -> ExitC
             ExitCode::from(EXIT_USAGE)
         }
         Command::Shell(rest) => {
-            cretlink_shell::cli::run(&format!("{program} shell"), rest.into_iter()).await
+            shell::cli::run(&format!("{program} shell"), rest.into_iter()).await
+        }
+        Command::Uninstall { yes } => uninstall_command(program, yes, console),
+        Command::Recover { remove } => recover_command(program, remove).await,
+    }
+}
+
+/// `cretlink recover [--remove]` (ST-M009-010): the support agent's offline
+/// residual recovery (ST-M006-003) with its report and exit codes. Inspecting
+/// always succeeds; removing succeeds only when the computer was proved clean,
+/// so kept or unreadable residue is never reported as success (REQ-N-008). It
+/// opens no connection and grants no control.
+async fn recover_command(program: &str, remove: bool) -> ExitCode {
+    use cretlink_support_agent::recovery;
+    print!(
+        "{}",
+        recovery::identity_text(program, &cretlink_support_agent::current_identity())
+    );
+    let store = cretlink_support_agent::TicketStore::new(
+        cretlink_support_agent::default_ticket_store_path(),
+    );
+    let run = recovery::run_recover(program, remove, &store).await;
+    print!("{}", run.text);
+    if run.success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// `cretlink uninstall`: shows what it will remove, asks, then removes the
+/// per-user install (ST-M009-006). `console` tells whether a terminal can be
+/// asked: a GUI-subsystem build without usable standard handles — started by
+/// the Windows uninstall entry, or from a terminal that does not wait for it —
+/// asks in a message box instead.
+fn uninstall_command(program: &str, yes: bool, console: process::ConsoleAttach) -> ExitCode {
+    let in_box = GUI_SUBSYSTEM && console != process::ConsoleAttach::Inherited;
+    let tell = |title: &str, text: &str, failed: bool| {
+        if in_box {
+            if failed {
+                process::alert(title, text);
+            } else {
+                process::inform(title, text);
+            }
+        } else if failed {
+            eprintln!("{program}: {}", text.trim_end());
+        } else {
+            println!("{}", text.trim_end());
+        }
+    };
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            tell(
+                "CretLink",
+                &format!("cannot determine the path of this program: {err}"),
+                true,
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(layout) = install::Layout::current() else {
+        tell(
+            "CretLink",
+            "cannot find this user's folders (HOME, LOCALAPPDATA or APPDATA is not set)",
+            true,
+        );
+        return ExitCode::FAILURE;
+    };
+    let context = setup::Context::from_env(exe.clone());
+    let system = install::OsSystem;
+    let plan = match install::uninstall_plan(&layout, &system, &context, &exe) {
+        Ok(plan) => plan,
+        Err(install::InstallError::NotInstalled(location)) => {
+            tell(
+                "CretLink",
+                &format!(
+                    "CretLink is not installed for this user (nothing of it in {}); nothing to do.",
+                    location.display()
+                ),
+                false,
+            );
+            return ExitCode::SUCCESS;
+        }
+        Err(err @ install::InstallError::CustomerCopy) => {
+            tell("CretLink", &err.to_string(), true);
+            return ExitCode::from(EXIT_USAGE);
+        }
+        Err(err) => {
+            tell("CretLink", &err.to_string(), true);
+            return ExitCode::FAILURE;
+        }
+    };
+    let text = uninstall_plan_text(&plan);
+    let confirmed = if yes {
+        if !in_box {
+            print!("{text}");
+        }
+        true
+    } else if in_box {
+        process::confirm("Uninstall CretLink", &format!("{text}\nUninstall now?"))
+    } else {
+        print!("{text}Uninstall now? [y/N] ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        confirmed(&mut std::io::stdin().lock())
+    };
+    if !confirmed {
+        tell(
+            "CretLink",
+            "Uninstall cancelled; nothing was changed.",
+            false,
+        );
+        return ExitCode::FAILURE;
+    }
+    match install::uninstall(
+        &layout,
+        &system,
+        &setup::SystemRunner,
+        &context,
+        &plan,
+        &exe,
+    ) {
+        Ok(report) => {
+            let complete = report.complete();
+            tell(
+                "Uninstall CretLink",
+                &uninstall_report_text(&report, &plan.audit_dir),
+                !complete,
+            );
+            if complete {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(err) => {
+            tell(
+                "Uninstall CretLink",
+                &format!("{err}. Nothing was changed."),
+                true,
+            );
+            ExitCode::FAILURE
         }
     }
+}
+
+/// Reads one answer line: only `y` or `yes` (any case) confirms; end of
+/// input or anything else does not.
+fn confirmed(input: &mut dyn std::io::BufRead) -> bool {
+    let mut line = String::new();
+    match input.read_line(&mut line) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+    }
+}
+
+/// What uninstall will remove and what stays, before anything changes.
+fn uninstall_plan_text(plan: &install::UninstallPlan) -> String {
+    let mut text = format!(
+        "Uninstall CretLink from {}.\nThis removes:\n",
+        plan.location.display()
+    );
+    for line in plan.lines() {
+        text.push_str(&format!("  - {line}\n"));
+    }
+    text.push_str("This stays:\n");
+    for line in &plan.kept {
+        text.push_str(&format!("  - {line}\n"));
+    }
+    text.push_str(&format!(
+        "  - The audit trail in {}\n",
+        plan.audit_dir.display()
+    ));
+    text
+}
+
+/// What uninstall did, failures first.
+fn uninstall_report_text(report: &install::UninstallReport, audit_dir: &std::path::Path) -> String {
+    let mut text = String::new();
+    let mut section = |title: &str, lines: &[String]| {
+        if lines.is_empty() {
+            return;
+        }
+        text.push_str(title);
+        text.push('\n');
+        for line in lines {
+            text.push_str(&format!("  - {line}\n"));
+        }
+    };
+    section("Could not remove:", &report.failed);
+    section("Removed:", &report.removed);
+    section("Removed once CretLink has closed:", &report.pending);
+    let mut kept = report.kept.clone();
+    kept.push(format!("The audit trail in {}", audit_dir.display()));
+    section("Left in place:", &kept);
+    if report.complete() {
+        text.push_str("CretLink was uninstalled.\n");
+    } else {
+        text.push_str("CretLink was not completely uninstalled; remove what is listed under 'Could not remove' by hand, or run 'cretlink uninstall' again.\n");
+    }
+    text
 }
 
 fn usage(program: &str) -> String {
@@ -185,6 +428,13 @@ Commands:
   mcp status          Show where CretLink is registered.
   shell [OPTIONS]     Open a terminal on the consented session
                       (see '{program} shell --help').
+  uninstall [--yes]   Remove CretLink installed for this user: its files, menu
+                      entry, uninstall entry and the AI client registrations it
+                      made. Shows what it removes and asks first, unless --yes.
+                      The audit trail stays.
+  recover [--remove]  List what CretLink left on this computer (staged files,
+                      reboot-resume tickets); with --remove, remove it. Exits
+                      with an error when something could not be removed.
   version             Print the version.
   help                Print this help.
 
@@ -300,6 +550,87 @@ mod tests {
         assert!(parse(args(&["mcp", "install", "--client"])).is_err());
         assert!(parse(args(&["mcp", "install", "--client", "copilot"])).is_err());
         assert!(parse(args(&["mcp", "install", "--force"])).is_err());
+    }
+
+    #[test]
+    fn uninstall_asks_unless_told_yes() {
+        assert_eq!(
+            parse(args(&["uninstall"])),
+            Ok(Command::Uninstall { yes: false })
+        );
+        for spelling in ["--yes", "-y"] {
+            assert_eq!(
+                parse(args(&["uninstall", spelling])),
+                Ok(Command::Uninstall { yes: true })
+            );
+        }
+        assert!(parse(args(&["uninstall", "--force"])).is_err());
+        // Install is a choice of the application's start screen, not a
+        // subcommand.
+        assert!(parse(args(&["install"])).is_err());
+    }
+
+    #[test]
+    fn only_yes_confirms_an_uninstall() {
+        for (answer, expected) in [
+            ("y\n", true),
+            ("YES\n", true),
+            (" yes \r\n", true),
+            ("\n", false),
+            ("no\n", false),
+            ("yep\n", false),
+            ("", false),
+        ] {
+            assert_eq!(confirmed(&mut answer.as_bytes()), expected, "{answer:?}");
+        }
+    }
+
+    #[test]
+    fn the_uninstall_plan_says_what_stays() {
+        let plan = install::UninstallPlan {
+            location: std::path::PathBuf::from("/home/ann/.local/bin"),
+            files: vec![std::path::PathBuf::from("/home/ann/.local/bin/cretlink")],
+            after_exit: false,
+            entry: None,
+            uninstall_entry: false,
+            registrations: vec![],
+            kept: vec!["The Codex CLI registration, which now starts /x mcp".to_owned()],
+            audit_dir: std::path::PathBuf::from("/home/ann/.local/share/CretLink/audit"),
+        };
+        let text = uninstall_plan_text(&plan);
+        assert!(
+            text.contains("This removes:\n  - /home/ann/.local/bin/cretlink\n"),
+            "{text}"
+        );
+        assert!(text.contains("  - The Codex CLI registration, which now starts /x mcp\n"));
+        assert!(text.contains("  - The audit trail in /home/ann/.local/share/CretLink/audit\n"));
+
+        let report = install::UninstallReport {
+            removed: vec!["/home/ann/.local/bin/cretlink".to_owned()],
+            failed: vec!["/home/ann/.local/bin/cretlink-cli: denied".to_owned()],
+            ..install::UninstallReport::default()
+        };
+        let text = uninstall_report_text(&report, &plan.audit_dir);
+        assert!(
+            text.starts_with("Could not remove:\n  - /home/ann/.local/bin/cretlink-cli: denied\n"),
+            "{text}"
+        );
+        assert!(text.contains("The audit trail in /home/ann/.local/share/CretLink/audit"));
+        assert!(text.contains("not completely uninstalled"));
+    }
+
+    #[test]
+    fn recover_lists_unless_told_to_remove() {
+        assert_eq!(
+            parse(args(&["recover"])),
+            Ok(Command::Recover { remove: false })
+        );
+        assert_eq!(
+            parse(args(&["recover", "--remove"])),
+            Ok(Command::Recover { remove: true })
+        );
+        assert!(parse(args(&["recover", "--force"])).is_err());
+        assert!(parse(args(&["recover", "remove"])).is_err());
     }
 
     #[test]

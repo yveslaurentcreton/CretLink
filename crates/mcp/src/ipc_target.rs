@@ -24,8 +24,8 @@ use cretlink_protocol::{
     RemotePath, SessionId, StagedEntry, TargetIdentity,
 };
 
-use crate::ipc::wire::{IpcRequest, IpcResponse, read_message, write_message};
-use crate::ipc::{IPC_PROTOCOL, IPC_PURPOSE_MINOR, IpcEndpoint};
+use crate::ipc::wire::{ClientName, IpcRequest, IpcResponse, read_message, write_message};
+use crate::ipc::{IPC_CLIENT_MINOR, IPC_PROTOCOL, IPC_PURPOSE_MINOR, IpcEndpoint};
 use crate::target::{
     CallError, CaptureParams, CaptureReport, CleanupSummary, DirPage, DownloadParams,
     DownloadReport, ExecParams, ExecReport, Routed, StatReport, SystemInfoReport, TargetError,
@@ -45,6 +45,10 @@ pub struct IpcTargetSession {
     /// placeholder holds until a consented session is observed, so a fail-closed
     /// error still names something deterministic.
     cached: Mutex<Identity>,
+    /// The AI client's `clientInfo.name` from the MCP `initialize` request,
+    /// passed to a console on IPC minor 10 or later with every routed call
+    /// (ST-M009-011). `None` until the client has initialized.
+    client: Mutex<Option<ClientName>>,
 }
 
 /// The routed identity the bridge reports, with a stable placeholder for the
@@ -66,6 +70,7 @@ impl Identity {
                 elevated: false,
                 simulated: false,
                 agent_version: "unknown".to_string(),
+                account: None,
             },
         }
     }
@@ -80,6 +85,7 @@ impl IpcTargetSession {
         let session = Self {
             endpoint,
             cached: Mutex::new(Identity::placeholder()),
+            client: Mutex::new(None),
         };
         // Best-effort handshake to seed the identity; a failure just leaves the
         // placeholder in place.
@@ -150,8 +156,16 @@ impl IpcTargetSession {
             .await
             .map_err(|_| TargetError::Disconnected)?;
         let request = if console_accepts_purpose(&hello) {
+            // The client name rides only to a console that understands it
+            // (IPC minor 10); an older console would refuse the field.
+            let client = if console_minor_at_least(&hello, IPC_CLIENT_MINOR) {
+                self.client_name()
+            } else {
+                None
+            };
             IpcRequest::WithPurpose {
                 purpose,
+                client,
                 call: Box::new(request),
             }
         } else {
@@ -167,6 +181,13 @@ impl IpcTargetSession {
             self.store_identity(session, target.clone());
         }
         Ok(response)
+    }
+
+    fn client_name(&self) -> Option<ClientName> {
+        self.client
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poison| poison.into_inner().clone())
     }
 
     fn store_identity(&self, session: SessionId, target: TargetIdentity) {
@@ -214,9 +235,15 @@ impl IpcTargetSession {
 /// [`IpcRequest::WithPurpose`]: a compatible major at minor
 /// [`IPC_PURPOSE_MINOR`] or later (ST-M009-007).
 fn console_accepts_purpose(hello: &IpcResponse) -> bool {
+    console_minor_at_least(hello, IPC_PURPOSE_MINOR)
+}
+
+/// Whether a `Hello` answer comes from a compatible console at `minor` or
+/// later.
+fn console_minor_at_least(hello: &IpcResponse, minor: u16) -> bool {
     match hello {
         IpcResponse::Hello { protocol, .. } => {
-            protocol.is_compatible_with(IPC_PROTOCOL) && protocol.minor >= IPC_PURPOSE_MINOR
+            protocol.is_compatible_with(IPC_PROTOCOL) && protocol.minor >= minor
         }
         _ => false,
     }
@@ -298,6 +325,14 @@ fn routed_identity(response: &IpcResponse) -> Option<(SessionId, &TargetIdentity
 
 #[async_trait]
 impl TargetSession for IpcTargetSession {
+    fn set_client_name(&self, name: &str) {
+        let name = ClientName::from_client_info(name);
+        match self.client.lock() {
+            Ok(mut guard) => *guard = name,
+            Err(poison) => *poison.into_inner() = name,
+        }
+    }
+
     fn session_id(&self) -> SessionId {
         self.snapshot().session
     }
@@ -802,6 +837,7 @@ mod tests {
             elevated: false,
             simulated: true,
             agent_version: "test".to_string(),
+            account: None,
         }
     }
 
@@ -856,6 +892,45 @@ mod tests {
             seen.lock().await.as_slice(),
             &[IpcRequest::WithPurpose {
                 purpose,
+                client: None,
+                call: Box::new(IpcRequest::ListJobs {}),
+            }]
+        );
+    }
+
+    /// The AI client's `clientInfo.name` rides with each call to a console on
+    /// IPC minor 10 (ST-M009-011), bounded and on one line.
+    #[tokio::test]
+    async fn client_name_is_sent_to_a_console_that_understands_it() {
+        let (endpoint, seen) = fake_console(IPC_CLIENT_MINOR);
+        let target = IpcTargetSession::connect(endpoint).await;
+        target.set_client_name("claude-code\n");
+        let purpose = Purpose::new("Checking running jobs").unwrap();
+        target.list_jobs(purpose.clone()).await.unwrap();
+        assert_eq!(
+            seen.lock().await.as_slice(),
+            &[IpcRequest::WithPurpose {
+                purpose,
+                client: Some(ClientName::new("claude-code").unwrap()),
+                call: Box::new(IpcRequest::ListJobs {}),
+            }]
+        );
+    }
+
+    /// A minor-9 console would refuse the unknown field, so it receives the
+    /// wrapper without the client name and the call still runs (REQ-N-012).
+    #[tokio::test]
+    async fn client_name_is_dropped_for_a_minor_9_console() {
+        let (endpoint, seen) = fake_console(IPC_CLIENT_MINOR - 1);
+        let target = IpcTargetSession::connect(endpoint).await;
+        target.set_client_name("codex-mcp-client");
+        let purpose = Purpose::new("Checking running jobs").unwrap();
+        target.list_jobs(purpose.clone()).await.unwrap();
+        assert_eq!(
+            seen.lock().await.as_slice(),
+            &[IpcRequest::WithPurpose {
+                purpose,
+                client: None,
                 call: Box::new(IpcRequest::ListJobs {}),
             }]
         );

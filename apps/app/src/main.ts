@@ -8,6 +8,7 @@
 
 import "./base.css";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 /** What the backend tells the window about this process (`get_role`). */
 export interface RoleView {
@@ -17,38 +18,32 @@ export interface RoleView {
   version: string;
   /** Whether Get help exists here (Windows only). */
   can_get_help: boolean;
-  /** Set when the customer declined the UAC prompt of Get help. */
-  declined: boolean;
 }
 
-/** Each role's skip link target, so keyboard users reach its controls first. */
-const SKIP_LINKS: Record<RoleView["screen"], [string, string]> = {
-  start: ["#choices", "Skip to the choices"],
-  technician: ["#session", "Skip to session controls"],
-  customer: ["#consent", "Skip to consent controls"],
-};
-
-function addSkipLink(screen: RoleView["screen"]): void {
-  const [target, label] = SKIP_LINKS[screen];
-  const link = document.createElement("a");
-  link.className = "skip-link";
-  link.href = target;
-  link.textContent = label;
-  document.body.prepend(link);
+/** The customer's second window, the compact bar (ST-M009-009), loads this
+ * same frontend; its label selects the compact view. Every interface renders
+ * its own skip link. */
+function windowLabel(): string {
+  try {
+    return getCurrentWindow().label;
+  } catch {
+    return "main";
+  }
 }
 
 async function boot(): Promise<void> {
   const view = await invoke<RoleView>("get_role");
-  addSkipLink(view.screen);
   switch (view.screen) {
     case "technician":
       document.title = "CretLink — Give help";
-      await (await import("./technician/main")).start();
+      await (await import("./technician/main")).start({ version: view.version });
       break;
-    case "customer":
-      document.title = "CretLink — Get help";
-      await (await import("./customer/main")).start();
+    case "customer": {
+      const mini = windowLabel() === "mini";
+      document.title = mini ? "CretLink — compact bar" : "CretLink — Get help";
+      await (await import("./customer/main")).start({ window: mini ? "mini" : "main" });
       break;
+    }
     case "start":
       document.title = "CretLink";
       (await import("./start/start")).start(view);

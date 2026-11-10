@@ -1,122 +1,186 @@
-// The start screen: Get help or Give help (ST-M009-005, mock `#start`).
+// The start screen's controller (ST-M009-005, ST-M009-006, mock `#start` and
+// `#t-install`).
 //
-// It only reports the choice. The backend starts the chosen role in a new
-// process — elevated through UAC for Get help — and closes this one, so the
-// role stays fixed for the life of each process (ADR-0018).
+// It only reports choices. The backend starts the chosen role in a new
+// process and closes this one, so the role stays fixed for the life of each
+// process (ADR-0018). Get help opens the customer window, which explains the
+// UAC prompt before Windows shows it (`#c-admin`, ST-M009-009). **Run once**
+// starts this copy in the technician role; **Install** copies it to the fixed
+// per-user location, connects the selected AI clients, starts the installed
+// copy and closes this one.
 
 import "./start.css";
 import { invoke } from "@tauri-apps/api/core";
+import type { AppInfo, ClientId, InstallOptions, InstallOutcome } from "../shared/contract";
+import { type ActionEvent, bindActions } from "../shared/dom";
+import { morph } from "../shared/morph";
 import type { RoleView } from "../main";
+import { type StartSnapshot, defaultSelection, renderStart } from "./views";
 
 /** The backend's answer to `choose_role`. */
 interface ChooseOutcome {
-  outcome: "started" | "declined" | "failed";
+  outcome: "started" | "failed";
   message: string;
 }
 
-const DECLINED =
-  "Windows did not get permission, so nothing was started. To get help, choose Get help again and answer Yes when Windows asks.";
+let root: HTMLElement | null = null;
+let live: HTMLElement | null = null;
+let snap: StartSnapshot = {
+  page: "start",
+  version: "",
+  canGetHelp: false,
+  app: null,
+  options: undefined,
+  entry: true,
+  selected: [],
+};
+let lastPage = "";
 
-function el<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  className?: string,
-  text?: string,
-): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
+function set(patch: Partial<StartSnapshot>): void {
+  snap = { ...snap, ...patch };
+  render();
 }
 
-function fact(text: string): HTMLLIElement {
-  return el("li", undefined, text);
+function render(): void {
+  if (!root) return;
+  const next = renderStart(snap);
+  if (!live) {
+    root.replaceChildren(next);
+    root.removeAttribute("aria-busy");
+    live = next;
+  } else {
+    live = morph(live, next) as HTMLElement;
+  }
+  // `morph` copies attributes; a checkbox's state is a property.
+  for (const box of live.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')) {
+    box.checked = box.hasAttribute("checked");
+  }
+  if (snap.page !== lastPage) {
+    lastPage = snap.page;
+    const target =
+      live.querySelector<HTMLElement>("[data-autofocus]:not([disabled])") ??
+      live.querySelector<HTMLElement>("#main");
+    target?.focus({ preventScroll: true });
+  }
+}
+
+function describe(error: unknown): string {
+  if (typeof error === "object" && error !== null && "message" in error) {
+    return String((error as { message: unknown }).message);
+  }
+  if (typeof error === "string") return error;
+  return "Something went wrong.";
+}
+
+async function choose(role: "technician" | "customer"): Promise<void> {
+  set({ busy: role, alert: undefined });
+  try {
+    const result = await invoke<ChooseOutcome>("choose_role", { role });
+    if (result.outcome === "failed") set({ busy: undefined, alert: result.message });
+    // `started`: this window is closing.
+  } catch (error) {
+    set({ busy: undefined, alert: `CretLink could not start that: ${describe(error)}` });
+  }
+}
+
+async function loadApp(): Promise<void> {
+  try {
+    set({ app: await invoke<AppInfo>("get_app_info") });
+  } catch {
+    set({ app: null });
+  }
+}
+
+async function openInstall(): Promise<void> {
+  set({ page: "install", alert: undefined, outcome: undefined, options: undefined });
+  try {
+    const options = await invoke<InstallOptions>("install_options");
+    set({ options, selected: defaultSelection(options), entry: options.entry !== undefined });
+  } catch (error) {
+    set({ options: null, alert: `The install options could not be read: ${describe(error)}` });
+  }
+}
+
+async function install(): Promise<void> {
+  set({ busy: "install", alert: undefined, outcome: undefined });
+  try {
+    const outcome = await invoke<InstallOutcome>("install_app", {
+      entry: snap.entry,
+      clients: snap.selected,
+    });
+    // `started`: the installed copy is starting and this window closes.
+    set({ busy: outcome.state === "started" ? "open" : undefined, outcome });
+    if (outcome.state === "installed") live?.querySelector<HTMLElement>("#outcome")?.focus();
+  } catch (error) {
+    set({
+      busy: undefined,
+      alert: `CretLink was not installed: ${describe(error)} You can run it once without installing instead.`,
+    });
+  }
+}
+
+async function openInstalled(): Promise<void> {
+  set({ busy: "open", alert: undefined });
+  try {
+    await invoke<void>("open_installed");
+  } catch (error) {
+    set({ busy: undefined, alert: describe(error) });
+  }
+}
+
+function toggleClient(id: string | undefined): void {
+  const client = snap.options?.clients.find((c) => c.id === id);
+  if (!client || !client.present) return;
+  const selected = snap.selected.includes(client.id)
+    ? snap.selected.filter((c) => c !== client.id)
+    : [...snap.selected, client.id as ClientId];
+  set({ selected });
+}
+
+function onAction(event: ActionEvent): void {
+  if (snap.busy !== undefined && event.action !== "skip") return;
+  switch (event.action) {
+    case "skip":
+      document.getElementById("main")?.focus();
+      break;
+    case "choose":
+      if (event.arg === "technician" || (event.arg === "customer" && snap.canGetHelp)) {
+        void choose(event.arg);
+      }
+      break;
+    case "install-screen":
+      void openInstall();
+      break;
+    case "back":
+      set({ page: "start", alert: undefined, outcome: undefined });
+      break;
+    case "toggle-entry":
+      set({ entry: !snap.entry });
+      break;
+    case "toggle-client":
+      toggleClient(event.arg);
+      break;
+    case "install":
+      void install();
+      break;
+    case "open-installed":
+      void openInstalled();
+      break;
+    default:
+      break;
+  }
 }
 
 export function start(view: RoleView): void {
-  const root = document.getElementById("app");
+  root = document.getElementById("app");
   if (!root) return;
-  root.removeAttribute("aria-busy");
-  document.body.classList.add("app-start");
-
-  const main = el("main", "start");
-  main.append(el("h1", undefined, "What do you want to do?"));
-  main.append(el("p", "muted", `CretLink ${view.version}`));
-
-  const notice = el("p", "notice");
-  notice.setAttribute("role", "alert");
-  notice.hidden = true;
-  main.append(notice);
-  const say = (message: string | null): void => {
-    notice.textContent = message ?? "";
-    notice.hidden = message === null;
-  };
-  if (view.declined) say(DECLINED);
-
-  const choices = el("div", "choices");
-  choices.id = "choices";
-
-  const buttons: HTMLButtonElement[] = [];
-  const choose = async (role: "technician" | "customer"): Promise<void> => {
-    for (const button of buttons) button.disabled = true;
-    say(null);
-    try {
-      const result = await invoke<ChooseOutcome>("choose_role", { role });
-      if (result.outcome === "declined") say(DECLINED);
-      if (result.outcome === "failed") say(result.message);
-    } catch (error) {
-      say(`CretLink could not start that: ${String(error)}`);
-    } finally {
-      for (const button of buttons) button.disabled = false;
+  snap = { ...snap, version: view.version, canGetHelp: view.can_get_help };
+  bindActions(root, onAction);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && snap.page === "install" && snap.busy === undefined) {
+      set({ page: "start", alert: undefined, outcome: undefined });
     }
-  };
-
-  if (view.can_get_help) {
-    const card = el("section", "card get");
-    card.setAttribute("aria-labelledby", "get-title");
-    const title = el("h2", undefined, "Get help");
-    title.id = "get-title";
-    card.append(title);
-    card.append(
-      el(
-        "p",
-        undefined,
-        "Someone you are talking to helps you with this computer. You approve the connection, see everything that happens, and can stop at any time.",
-      ),
-    );
-    const facts = el("ul", "facts");
-    facts.append(fact("Nothing is installed"), fact("Windows asks for administrator permission"));
-    card.append(facts);
-    const button = el("button", "btn primary customer", "Get help");
-    button.type = "button";
-    button.addEventListener("click", () => void choose("customer"));
-    buttons.push(button);
-    card.append(button);
-    choices.append(card);
-  }
-
-  const card = el("section", "card give");
-  card.setAttribute("aria-labelledby", "give-title");
-  const title = el("h2", undefined, "Give help");
-  title.id = "give-title";
-  card.append(title);
-  card.append(
-    el(
-      "p",
-      undefined,
-      "Help another computer yourself, or through your AI assistant: Claude, Codex or Gemini.",
-    ),
-  );
-  const facts = el("ul", "facts");
-  facts.append(fact("No administrator rights needed"), fact("Connects your AI assistants"));
-  card.append(facts);
-  const button = el("button", "btn primary technician", "Give help");
-  button.type = "button";
-  button.addEventListener("click", () => void choose("technician"));
-  buttons.push(button);
-  card.append(button);
-  choices.append(card);
-
-  main.append(choices);
-  root.replaceChildren(main);
-  buttons[0]?.focus();
+  });
+  render();
+  void loadApp();
 }

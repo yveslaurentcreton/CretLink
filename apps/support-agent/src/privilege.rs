@@ -15,10 +15,15 @@
 
 use core::fmt;
 
+use cretlink_protocol::AccountName;
 use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
 mod windows_token;
+
+/// The user name reported when the account could not be read: shown as is,
+/// and never sent to the technician as an account ([`EffectiveIdentity::account`]).
+pub const UNKNOWN_USERNAME: &str = "unknown";
 
 /// The Windows mandatory integrity level of the process, derived from the
 /// integrity SID's relative identifier (RID).
@@ -118,6 +123,20 @@ pub struct EffectiveIdentity {
     pub note: Option<String>,
 }
 
+impl EffectiveIdentity {
+    /// The account this process runs as, for the technician's identity line
+    /// (ST-M009-008, protocol minor 11): `DOMAIN\user` when the domain is
+    /// known, else the user name. `None` when the account could not be read,
+    /// so the field is omitted rather than guessed (REQ-S-011).
+    #[must_use]
+    pub fn account(&self) -> Option<AccountName> {
+        if self.username == UNKNOWN_USERNAME {
+            return None;
+        }
+        AccountName::qualified(self.domain.as_deref(), &self.username)
+    }
+}
+
 /// Reports the current process's effective identity.
 ///
 /// On Windows this queries the real process token; any failure degrades to an
@@ -136,13 +155,27 @@ pub fn current_identity() -> EffectiveIdentity {
     }
 }
 
+/// Splits a SAM-compatible account name (`DOMAIN\user`, from
+/// `GetUserNameExW(NameSamCompatible)`) into its domain — the machine name for
+/// a local account — and user name. `None` for a name that is not of that
+/// form, so the caller falls back to the bare user name (ST-M009-008).
+#[cfg_attr(not(windows), allow(dead_code, reason = "tested on every platform"))]
+fn split_sam_compatible(name: &str) -> Option<(String, String)> {
+    let (domain, user) = name.split_once('\\')?;
+    let (domain, user) = (domain.trim(), user.trim());
+    if domain.is_empty() || user.is_empty() || user.contains('\\') {
+        return None;
+    }
+    Some((domain.to_owned(), user.to_owned()))
+}
+
 /// The deterministic identity reported off-Windows, where the elevation and
 /// integrity model does not apply.
 #[cfg(not(windows))]
 fn non_windows_identity() -> EffectiveIdentity {
     let username = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
+        .unwrap_or_else(|_| UNKNOWN_USERNAME.to_string());
     EffectiveIdentity {
         username,
         domain: None,
@@ -214,6 +247,56 @@ mod tests {
             assert_eq!(identity.integrity, IntegrityLevel::Unknown);
             assert!(identity.note.is_some());
         }
+    }
+
+    #[test]
+    fn a_sam_compatible_name_gives_the_domain_and_the_user() {
+        assert_eq!(
+            split_sam_compatible(r"ACME\ann"),
+            Some(("ACME".to_owned(), "ann".to_owned()))
+        );
+        assert_eq!(
+            split_sam_compatible(r"DESKTOP-7Q2\Jo Doe"),
+            Some(("DESKTOP-7Q2".to_owned(), "Jo Doe".to_owned()))
+        );
+        for odd in ["ann", r"\ann", r"ACME\", r"A\b\c", ""] {
+            assert_eq!(split_sam_compatible(odd), None, "{odd:?}");
+        }
+        // The account the technician sees is then `DOMAIN\user`.
+        let (domain, user) = split_sam_compatible(r"ACME\ann").unwrap();
+        let account = identity(&user, Some(&domain)).account().unwrap();
+        assert_eq!(account.as_str(), r"ACME\ann");
+    }
+
+    fn identity(username: &str, domain: Option<&str>) -> EffectiveIdentity {
+        EffectiveIdentity {
+            username: username.to_owned(),
+            domain: domain.map(str::to_owned),
+            elevated: true,
+            integrity: IntegrityLevel::High,
+            is_windows: true,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn the_account_is_domain_qualified_when_known_and_omitted_when_unknown() {
+        assert_eq!(
+            identity("jdoe", Some("ACME")).account().map(String::from),
+            Some("ACME\\jdoe".to_owned())
+        );
+        assert_eq!(
+            identity("jdoe", None).account().map(String::from),
+            Some("jdoe".to_owned())
+        );
+        assert_eq!(
+            identity("jdoe", Some(" ")).account().map(String::from),
+            Some("jdoe".to_owned())
+        );
+        assert_eq!(identity(UNKNOWN_USERNAME, None).account(), None);
+        assert_eq!(identity("", Some("ACME")).account(), None);
+        // A name the wire would refuse is omitted, never sent.
+        assert_eq!(identity("j\ndoe", None).account(), None);
     }
 
     #[cfg(not(windows))]

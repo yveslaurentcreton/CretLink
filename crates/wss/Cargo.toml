@@ -20,9 +20,8 @@ system-roots = ["dep:rustls-native-certs"]
 test-cert = [
   "dep:x509-cert",
   "dep:p256",
-  "dep:rand_core",
   "dep:const-oid",
-  "dep:sha2",
+  "dep:sha2-p256",
 ]
 
 [dependencies]
@@ -40,10 +39,9 @@ rustls-native-certs = { workspace = true, optional = true }
 # test-cert feature only — pure-Rust cert minting, no committed secrets.
 x509-cert = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
-rand_core = { workspace = true, optional = true }
 const-oid = { workspace = true, optional = true }
 # The ECDSA-with-SHA-256 signer needs SHA-256's algorithm identifier.
-sha2 = { workspace = true, optional = true, features = ["oid"] }
+sha2-p256 = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = [
@@ -60,7 +58,7 @@ cretlink-wss = { path = ".", features = ["test-cert"] }
 [lints]
 workspace = true
 
-# `sha2` is only enabled for its `oid` feature, which the test-certificate
+# `sha2-p256` is only enabled for its `oid` feature, which the test-certificate
 # signer needs; it is never named in code.
 [package.metadata.cargo-machete]
-ignored = ["sha2"]
+ignored = ["sha2-p256"]

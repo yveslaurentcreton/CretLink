@@ -22,7 +22,9 @@ mod stdio;
 mod target;
 
 pub use bridge::{MAX_EXEC_OUTPUT_BYTES, MAX_STDIN_BASE64_CHARS, McpBridge};
-pub use ipc::{IpcEndpoint, IpcError, IpcListener, IpcRequest, IpcResponse, IpcStream, TermFrame};
+pub use ipc::{
+    ClientName, IpcEndpoint, IpcError, IpcListener, IpcRequest, IpcResponse, IpcStream, TermFrame,
+};
 pub use ipc_target::IpcTargetSession;
 pub use stdio::serve_stdio;
 pub use target::{

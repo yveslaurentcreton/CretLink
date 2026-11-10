@@ -1,0 +1,67 @@
+# Preview builds of a pull request, for hands-on testing before a merge.
+#
+# Runs only when a maintainer adds the `preview-build` label to a pull request
+# from this repository: never on a push, so CI minutes are spent only when a
+# build is wanted. To build again after new commits, remove the label and add
+# it again.
+#
+# A preview is a development build (REQ-N-017): unsigned, stamped
+# `0.0.0-pr.<number>.g<commit>`, without SBOMs, and kept as a workflow artifact
+# for seven days. Nothing is published and the job holds a read-only token and
+# no secrets (REQ-S-020). Official binaries come only from release.yml.
+#
+# Windows and macOS only: the manual tests that need a preview run there, and
+# the Linux archive is built locally with scripts/gen-artifacts.sh.
+#
+# Third-party actions are pinned to full commit SHAs (REQ-S-019).
+
+name: Preview build
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Preview (${{ matrix.os }})
+    if: >-
+      github.event.label.name == 'preview-build' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Build the archive
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/gen-artifacts.sh "0.0.0-pr.${PR_NUMBER}.g${HEAD_SHA:0:7}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: preview-${{ matrix.os }}
+          path: |
+            dist/cretlink-0.0.0-*
+            dist/CHECKSUMS-*.txt
+          retention-days: 7
+          if-no-files-found: error

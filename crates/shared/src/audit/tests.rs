@@ -706,3 +706,36 @@ fn actor_terminal_is_additive_and_existing_variants_serialize_unchanged() {
     let back: Actor = serde_json::from_str("\"terminal\"").unwrap();
     assert_eq!(back, Actor::Terminal);
 }
+
+// --- reading timestamps back (ST-M009-012) ---
+
+#[test]
+fn rfc3339_parse_inverts_format() {
+    for millis in [
+        0,
+        FIXED_MILLIS,
+        951_782_400_000,   // 2000-02-29 (leap day)
+        1_761_141_605_123, // 2025-10-22T14:00:05.123Z
+        4_102_444_799_999, // 2099-12-31T23:59:59.999Z
+    ] {
+        assert_eq!(
+            crate::audit::parse_rfc3339_millis(&format_rfc3339_millis(millis)),
+            Some(millis)
+        );
+    }
+}
+
+#[test]
+fn rfc3339_parse_rejects_other_forms() {
+    for bad in [
+        "",
+        "2025-10-22T14:00:05Z",
+        "2025-10-22 14:00:05.123Z",
+        "2025-13-22T14:00:05.123Z",
+        "2025-10-22T24:00:05.123Z",
+        "2025-10-22T14:00:05.12xZ",
+        "+025-10-22T14:00:05.123Z",
+    ] {
+        assert_eq!(crate::audit::parse_rfc3339_millis(bad), None, "{bad:?}");
+    }
+}

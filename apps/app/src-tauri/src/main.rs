@@ -20,16 +20,21 @@ const EXIT_USAGE: u8 = 2;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let stem = std::env::current_exe()
-        .ok()
+    let exe = std::env::current_exe().ok();
+    let stem = exe
+        .as_ref()
         .and_then(|exe| {
             exe.file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
         })
         .unwrap_or_default();
+    // Whether this copy runs from the per-user install location (ST-M009-006).
+    let installed = exe.as_deref().is_some_and(|exe| {
+        cretlink_cli::install::Layout::current().is_some_and(|layout| layout.is_installed_exe(exe))
+    });
 
-    match launch::resolve(&args, &stem, CUSTOMER_AVAILABLE) {
-        Launch::Subcommand(args) => subcommand(args),
+    match launch::resolve(&args, &stem, CUSTOMER_AVAILABLE, installed) {
+        Launch::Subcommand(args) => subcommand(&launch::program_name(&stem), args),
         Launch::Refuse(message) => {
             if cretlink_cli::process::attach_parent_console()
                 == cretlink_cli::process::ConsoleAttach::None
@@ -40,20 +45,22 @@ fn main() -> ExitCode {
             }
             ExitCode::from(EXIT_USAGE)
         }
-        Launch::Start => cretlink_app::run(Screen::Start { declined: false }),
+        Launch::Start => cretlink_app::run(Screen::Start),
         Launch::Role {
             role: Role::Technician,
             ..
         } => cretlink_app::run(Screen::Role(Role::Technician)),
         Launch::Role {
             role: Role::Customer,
-            relaunched,
-        } => cretlink_app::run_customer(relaunched),
+            entry,
+        } => cretlink_app::run_customer(entry),
     }
 }
 
 /// Runs a subcommand without a window, exactly as `cretlink-cli` does.
-fn subcommand(args: Vec<String>) -> ExitCode {
+/// `program` names the command in its texts: `cretlink`, or the file name of a
+/// `CretLink-Support*` copy, whose only subcommand is `recover` (ST-M009-010).
+fn subcommand(program: &str, args: Vec<String>) -> ExitCode {
     // Route panics to stderr only — never stdout, which may be the JSON-RPC
     // stream of `cretlink mcp`.
     std::panic::set_hook(Box::new(|info| {
@@ -63,7 +70,7 @@ fn subcommand(args: Vec<String>) -> ExitCode {
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime.block_on(cretlink_cli::run("cretlink", args)),
+        Ok(runtime) => runtime.block_on(cretlink_cli::run(program, args)),
         Err(err) => {
             eprintln!("cretlink: cannot start the async runtime: {err}");
             ExitCode::FAILURE

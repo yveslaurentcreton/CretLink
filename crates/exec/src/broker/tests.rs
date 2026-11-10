@@ -953,3 +953,111 @@ async fn interactive_external_kill_is_never_a_clean_exit() {
         "an externally killed console child must never carry a success exit code"
     );
 }
+
+// --- A Command Prompt command reaches cmd.exe as written (ST-M003-001) ---
+//
+// `cmd.exe` does not read the C runtime's quoting, so both backends append the
+// command to its command line raw, as `/S /C "<command>"`. The exact tail is
+// pinned on every platform in the `platform` tests; these run the real shell
+// in both backends. Each checked text is one the old quoting could not produce,
+// and none holds a space: a pseudo-console may draw a space as a cursor
+// movement, which would break a plain text comparison.
+
+/// `echo` prints its quoted argument with the quotes, and the `&` inside them
+/// is text. Quoted by the C runtime rules the command reached `cmd.exe` with
+/// `\"` for each quote, and `echo` printed those backslashes too.
+#[cfg(windows)]
+const CMD_QUOTED_ARGUMENT: (&str, &str) = (r#"echo "a&b""#, r#""a&b""#);
+
+/// A program started by the command receives its quoted argument, spaces and
+/// all, as one argument. The printed text occurs nowhere in the command text,
+/// so only the program's own output can hold it: with the old quoting
+/// PowerShell received a quoted literal and printed the command text instead,
+/// and a pseudo-console stream also carries the window title, where `cmd.exe`
+/// may name the program it is running.
+#[cfg(windows)]
+const CMD_NESTED_PROGRAM: (&str, &str) = (
+    r#"powershell -NoProfile -NonInteractive -Command "Write-Output ('x' + '-' + 'y')""#,
+    "x-y",
+);
+
+/// A quoted path with a space in it (`%ProgramFiles%` is `C:\Program Files`) is
+/// one path. With the old quoting the path began with a backslash and did not
+/// exist, so nothing was printed.
+#[cfg(windows)]
+const CMD_QUOTED_PATH: (&str, &str) = (
+    r#"if exist "%ProgramFiles%" (echo quoted-path-found)"#,
+    "quoted-path-found",
+);
+
+/// Runs `command` in the Command Prompt to its end and returns what it
+/// printed: piped, or under a pseudo-console when `interactive`.
+///
+/// A pseudo-console renders the screen asynchronously, so a short pause is
+/// appended there to give the render pass a window before the job ends (see
+/// `interactive_program_runs_under_conpty_and_completes`).
+#[cfg(windows)]
+async fn cmd_prints(command: &str, interactive: bool) -> String {
+    let spec = if interactive {
+        JobSpec::new(Shell::Cmd, format!("{command} & ping -n 2 127.0.0.1 > nul"))
+            .interactive(term_size())
+    } else {
+        JobSpec::new(Shell::Cmd, command)
+    };
+    let (broker, mut rx) = Broker::new();
+    let job = broker.spawn(spec).await.unwrap().job;
+    let c = drain_job(&mut rx, job).await;
+    assert_eq!(
+        c.done.outcome,
+        JobOutcome::Completed,
+        "`{command}` should run to a clean end, stderr was {:?}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    String::from_utf8_lossy(&c.stdout).into_owned()
+}
+
+/// Asserts that `command` prints `expected` in the given backend.
+#[cfg(windows)]
+async fn assert_cmd_prints((command, expected): (&str, &str), interactive: bool) {
+    let printed = cmd_prints(command, interactive).await;
+    assert!(
+        printed.contains(expected),
+        "`{command}` should print {expected:?}, printed {printed:?}"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn piped_cmd_keeps_a_quoted_argument() {
+    assert_cmd_prints(CMD_QUOTED_ARGUMENT, false).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn piped_cmd_passes_a_quoted_argument_to_a_nested_program() {
+    assert_cmd_prints(CMD_NESTED_PROGRAM, false).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn piped_cmd_keeps_a_quoted_path_with_a_space() {
+    assert_cmd_prints(CMD_QUOTED_PATH, false).await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_cmd_keeps_a_quoted_argument() {
+    assert_cmd_prints(CMD_QUOTED_ARGUMENT, true).await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_cmd_passes_a_quoted_argument_to_a_nested_program() {
+    assert_cmd_prints(CMD_NESTED_PROGRAM, true).await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_cmd_keeps_a_quoted_path_with_a_space() {
+    assert_cmd_prints(CMD_QUOTED_PATH, true).await;
+}

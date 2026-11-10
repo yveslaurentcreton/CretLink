@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
+use crate::{AccountName, AccountNameError, DisplayName, DisplayNameError, Purpose, PurposeError};
 use crate::{
     B64Bytes, CAP_DESKTOP_V1, CAP_FS_V1, CAP_REBOOT_RESUME_V1, CAP_TERM_V1, CleanupFailure,
     CleanupPolicy, CleanupTrigger, ControlMessage, DesktopAccess, DesktopFrameMeta, DesktopState,
@@ -16,7 +17,6 @@ use crate::{
     RequestId, RevokeReason, Role, SAC_COMMITMENT_LEN, SAC_NONCE_LEN, SessionId, Shell,
     StagedEntry, TargetIdentity, canonical_capabilities, limits,
 };
-use crate::{Purpose, PurposeError};
 
 fn simulated_target() -> TargetIdentity {
     TargetIdentity {
@@ -26,6 +26,7 @@ fn simulated_target() -> TargetIdentity {
         elevated: false,
         simulated: true,
         agent_version: "0.0.0".to_owned(),
+        account: None,
     }
 }
 
@@ -136,6 +137,7 @@ fn cross_architecture_identity_fixtures_round_trip() {
             elevated: true,
             simulated: false,
             agent_version: "1.2.3".to_owned(),
+            account: None,
         },
         TargetIdentity {
             hostname: "ARM-CONSOLE-VIEW".to_owned(),
@@ -144,6 +146,7 @@ fn cross_architecture_identity_fixtures_round_trip() {
             elevated: false,
             simulated: false,
             agent_version: "0.9.0".to_owned(),
+            account: None,
         },
     ];
     for target in fixtures {
@@ -315,6 +318,7 @@ fn round_trip_pairing_nonce() {
     round_trip(Message::Pairing {
         pairing: PairingMessage::Nonce {
             nc: B64Bytes::new(vec![0x11; SAC_NONCE_LEN]),
+            display_name: None,
         },
     });
 }
@@ -400,6 +404,70 @@ fn round_trip_control_reboot_resume_disarmed() {
     round_trip(control(ControlMessage::RebootResumeDisarmed {
         ticket_id: B64Bytes(vec![0x01; REBOOT_RESUME_TICKET_ID_LEN]),
     }));
+}
+
+// --- The agent's cleanup report (ST-M009-012, minor 11) ---
+
+#[test]
+fn round_trip_control_cleanup_reported() {
+    round_trip(control(ControlMessage::CleanupReported {
+        ok: false,
+        notes: vec![
+            "session revoked by the peer; secure channel and session keys dropped".to_owned(),
+            "staged artifact not removed: C:\\Temp\\x.bin (access denied)".to_owned(),
+        ],
+    }));
+    round_trip(control(ControlMessage::CleanupReported {
+        ok: true,
+        notes: Vec::new(),
+    }));
+}
+
+#[test]
+fn cleanup_reported_wire_format_is_stable() {
+    let bytes = control(ControlMessage::CleanupReported {
+        ok: true,
+        notes: vec!["done".to_owned()],
+    })
+    .encode()
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value["control"],
+        json!({ "control": "cleanup_reported", "ok": true, "notes": ["done"] })
+    );
+}
+
+#[test]
+fn cleanup_reported_is_bounded() {
+    assert_limit_exceeded(&control(ControlMessage::CleanupReported {
+        ok: false,
+        notes: vec!["x".to_owned(); limits::MAX_CLEANUP_NOTES + 1],
+    }));
+    assert_limit_exceeded(&control(ControlMessage::CleanupReported {
+        ok: false,
+        notes: vec!["x".repeat(limits::MAX_CLEANUP_NOTE_BYTES + 1)],
+    }));
+    // The largest report the bounds allow fits one secure-channel record,
+    // even when every byte needs JSON escaping.
+    let largest = control(ControlMessage::CleanupReported {
+        ok: false,
+        notes: vec!["\"".repeat(limits::MAX_CLEANUP_NOTE_BYTES); limits::MAX_CLEANUP_NOTES],
+    });
+    assert!(largest.encode().unwrap().len() < 65_000);
+}
+
+#[test]
+fn cleanup_reported_notes_are_single_lines() {
+    for bad in ["two\nlines", "tab\there", "sep\u{2028}arator"] {
+        let message = control(ControlMessage::CleanupReported {
+            ok: false,
+            notes: vec![bad.to_owned()],
+        });
+        let err = message.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::MalformedMessage, "{bad:?}");
+        assert!(message.encode().is_err());
+    }
 }
 
 #[test]
@@ -695,8 +763,8 @@ fn hello_wire_format_is_stable() {
         value,
         json!({
             "type": "hello",
-            // Deliberately updated with the 1.9 minor bump (ST-M009-007).
-            "protocol": { "major": 1, "minor": 9 },
+            // Deliberately updated with the 1.11 minor bump (ST-M009-012).
+            "protocol": { "major": 1, "minor": 11 },
             "role": "console",
             "capabilities": ["exec"],
         })
@@ -1271,6 +1339,7 @@ fn oversized_pairing_nonce_rejected() {
     assert_limit_exceeded(&Message::Pairing {
         pairing: PairingMessage::Nonce {
             nc: B64Bytes::new(vec![0; SAC_NONCE_LEN + 1]),
+            display_name: None,
         },
     });
 }
@@ -1501,9 +1570,9 @@ fn negotiation_answers_with_own_minor() {
 }
 
 #[test]
-fn protocol_v1_is_one_dot_nine() {
-    assert_eq!(PROTOCOL_V1, ProtocolVersion::new(1, 9));
-    assert_eq!(PROTOCOL_V1.to_string(), "1.9");
+fn protocol_v1_is_one_dot_eleven() {
+    assert_eq!(PROTOCOL_V1, ProtocolVersion::new(1, 11));
+    assert_eq!(PROTOCOL_V1.to_string(), "1.11");
 }
 
 // --- File operations and transfer (ADR-0012, ST-M003-004/005) ---
@@ -2459,4 +2528,215 @@ fn unknown_desktop_capture_field_rejected() {
     });
     let err = Message::decode(payload.to_string().as_bytes()).unwrap_err();
     assert_eq!(err.code(), ErrorCode::MalformedMessage);
+}
+
+// --- Technician display name in the handshake (ST-M009-011, minor 10) ---
+
+#[test]
+fn display_name_is_trimmed_bounded_and_single_line() {
+    assert_eq!(
+        DisplayName::new("  Sam Taylor  ").unwrap().as_str(),
+        "Sam Taylor"
+    );
+    let at_limit = "y".repeat(limits::MAX_DISPLAY_NAME_CHARS);
+    assert!(DisplayName::new(&at_limit).is_ok());
+    assert!(matches!(
+        DisplayName::new(&format!("{at_limit}y")),
+        Err(DisplayNameError::TooLong { .. })
+    ));
+    assert_eq!(DisplayName::new("   "), Err(DisplayNameError::Empty));
+    for bad in ["Sam\nAdmin", "Sam\u{202E}nimdA", "tab\there"] {
+        assert_eq!(
+            DisplayName::new(bad),
+            Err(DisplayNameError::NotSingleLine),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn sanitized_display_name_keeps_what_can_be_shown() {
+    assert_eq!(DisplayName::sanitized("Sam\r\n").unwrap().as_str(), "Sam");
+    let long = "z".repeat(limits::MAX_DISPLAY_NAME_CHARS + 10);
+    assert_eq!(
+        DisplayName::sanitized(&long)
+            .unwrap()
+            .as_str()
+            .chars()
+            .count(),
+        limits::MAX_DISPLAY_NAME_CHARS
+    );
+    assert!(DisplayName::sanitized("\u{0007}\u{0008}").is_none());
+}
+
+#[test]
+fn nonce_without_display_name_keeps_the_minor_9_wire_form() {
+    let message = Message::Pairing {
+        pairing: PairingMessage::Nonce {
+            nc: B64Bytes::new(vec![0x11; SAC_NONCE_LEN]),
+            display_name: None,
+        },
+    };
+    let value: serde_json::Value = serde_json::from_slice(&message.encode().unwrap()).unwrap();
+    assert!(value["pairing"].get("display_name").is_none(), "{value}");
+    // A minor-9-shaped nonce (no `display_name`) decodes to `None`.
+    let decoded = Message::decode(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn round_trip_nonce_with_display_name() {
+    let message = Message::Pairing {
+        pairing: PairingMessage::Nonce {
+            nc: B64Bytes::new(vec![0x11; SAC_NONCE_LEN]),
+            display_name: Some(DisplayName::new("Sam").unwrap()),
+        },
+    };
+    let value: serde_json::Value = serde_json::from_slice(&message.encode().unwrap()).unwrap();
+    assert_eq!(value["pairing"]["display_name"], json!("Sam"));
+    round_trip(message);
+}
+
+#[test]
+fn decode_rejects_an_invalid_display_name() {
+    // A peer cannot smuggle a multi-line, empty, or over-long name past the
+    // decoder: the frame fails closed like any other out-of-contract field.
+    for bad in [
+        json!(""),
+        json!("two\nlines"),
+        json!("x".repeat(limits::MAX_DISPLAY_NAME_CHARS + 1)),
+    ] {
+        let payload = json!({
+            "type": "pairing",
+            "pairing": {
+                "kind": "nonce",
+                "nc": serde_json::to_value(B64Bytes::new(vec![0x11; SAC_NONCE_LEN])).unwrap(),
+                "display_name": bad,
+            },
+        });
+        assert!(
+            Message::decode(payload.to_string().as_bytes()).is_err(),
+            "{payload}"
+        );
+    }
+}
+
+// --- The customer's account in the target identity (ST-M009-008, minor 11) ---
+
+fn target_with_account(account: &str) -> TargetIdentity {
+    TargetIdentity {
+        hostname: "ACME-PC-07".to_owned(),
+        os_version: "Windows 11 Pro 24H2 (build 26100.1234)".to_owned(),
+        arch: "x86_64".to_owned(),
+        elevated: true,
+        simulated: false,
+        agent_version: "1.2.3".to_owned(),
+        account: Some(AccountName::new(account).unwrap()),
+    }
+}
+
+#[test]
+fn account_name_is_trimmed_bounded_and_single_line() {
+    assert_eq!(
+        AccountName::new("  ACME\\jdoe ").unwrap().as_str(),
+        "ACME\\jdoe"
+    );
+    let at_limit = "a".repeat(limits::MAX_ACCOUNT_NAME_CHARS);
+    assert!(AccountName::new(&at_limit).is_ok());
+    assert!(matches!(
+        AccountName::new(&format!("{at_limit}a")),
+        Err(AccountNameError::TooLong { .. })
+    ));
+    assert_eq!(AccountName::new(" "), Err(AccountNameError::Empty));
+    for bad in ["ACME\\jdoe\nAdmin", "jdoe\u{202E}nimda", "a\tb"] {
+        assert_eq!(
+            AccountName::new(bad),
+            Err(AccountNameError::NotSingleLine),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        AccountName::qualified(Some("ACME"), "jdoe").map(String::from),
+        Some("ACME\\jdoe".to_owned())
+    );
+    assert_eq!(
+        AccountName::qualified(None, "jdoe").map(String::from),
+        Some("jdoe".to_owned())
+    );
+    assert_eq!(AccountName::qualified(Some("ACME"), "  "), None);
+}
+
+#[test]
+fn identity_with_account_round_trips_in_every_carrier() {
+    let target = target_with_account("ACME\\jdoe");
+    round_trip(Message::HelloAck {
+        protocol: PROTOCOL_V1,
+        session: SessionId::new(),
+        target: target.clone(),
+    });
+    round_trip(response(OpResult::SystemInfo {
+        target: target.clone(),
+        reboot_pending: false,
+    }));
+    round_trip(control(ControlMessage::ConsentGranted {
+        target: target.clone(),
+    }));
+    let json = serde_json::to_value(&target).unwrap();
+    assert_eq!(json["account"], json!("ACME\\jdoe"));
+}
+
+#[test]
+fn identity_without_account_keeps_the_minor_10_wire_form() {
+    let message = control(ControlMessage::ConsentGranted {
+        target: simulated_target(),
+    });
+    let value: serde_json::Value = serde_json::from_slice(&message.encode().unwrap()).unwrap();
+    assert!(
+        value["control"]["target"].get("account").is_none(),
+        "{value}"
+    );
+    // An identity without `account` decodes to `None`.
+    let decoded = Message::decode(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn decode_rejects_an_invalid_account() {
+    for bad in [
+        json!(""),
+        json!("ACME\\jdoe\r\nAdministrator"),
+        json!("x".repeat(limits::MAX_ACCOUNT_NAME_CHARS + 1)),
+        json!(42),
+    ] {
+        let payload = json!({
+            "type": "hello_ack",
+            "protocol": { "major": 1, "minor": 11 },
+            "session": SessionId::new().to_string(),
+            "target": {
+                "hostname": "ACME-PC-07",
+                "os_version": "Windows 11",
+                "arch": "x86_64",
+                "elevated": true,
+                "simulated": false,
+                "agent_version": "1.2.3",
+                "account": bad,
+            },
+        });
+        assert!(
+            Message::decode(payload.to_string().as_bytes()).is_err(),
+            "{payload}"
+        );
+    }
+}
+
+#[test]
+fn the_account_is_not_part_of_the_reboot_resume_binding() {
+    // The binding's pre-image is frozen (ADR-0014): adding the account does
+    // not change the fingerprint of an otherwise identical target.
+    let with = target_with_account("ACME\\jdoe");
+    let without = TargetIdentity {
+        account: None,
+        ..with.clone()
+    };
+    assert!(crate::TargetBinding::of(&with) == crate::TargetBinding::of(&without));
 }

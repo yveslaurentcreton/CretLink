@@ -262,6 +262,15 @@ impl JoinHandle {
         self.shared.approval_code()
     }
 
+    /// The display name the technician's console sent in the pairing
+    /// handshake, available once [`SessionEvent::Connected`] has been observed
+    /// (ST-M009-011). It is what the technician's computer says, never a
+    /// verified identity; `None` when the console sent no name.
+    #[must_use]
+    pub fn technician_display_name(&self) -> Option<cretlink_protocol::DisplayName> {
+        self.shared.peer_display_name()
+    }
+
     /// Whether attended full control is active right now (REQ-S-001). `false`
     /// before consent and after any teardown.
     #[must_use]
@@ -288,6 +297,13 @@ impl JoinHandle {
     #[must_use]
     pub fn cleanup_report(&self) -> Option<CleanupReport> {
         self.shared.cleanup()
+    }
+
+    /// Who ended the session, from the customer's point of view, once it has
+    /// torn down (ST-M009-012).
+    #[must_use]
+    pub fn ended_by(&self) -> Option<crate::EndedBy> {
+        self.shared.ended_by()
     }
 
     /// Awaits the next lifecycle event, or `None` once the session task has

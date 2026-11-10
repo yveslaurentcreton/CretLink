@@ -11,7 +11,8 @@
 //! process, so an *interactive* command (`shell`) cannot share the console with
 //! the prompt; the console-subsystem `cretlink-cli` serves that.
 //!
-//! The FFI lives in the `win` adapter, the only `unsafe` code of this crate.
+//! The FFI lives in the `win` adapter; with `install::win` it is the only
+//! `unsafe` code of this crate.
 
 use std::io;
 use std::path::Path;
@@ -58,6 +59,36 @@ pub fn alert(title: &str, message: &str) {
     #[cfg(not(windows))]
     {
         eprintln!("{title}: {message}");
+    }
+}
+
+/// Asks a yes-or-no question in a native message box (Windows), for a
+/// GUI-subsystem program that has no terminal to ask in (`cretlink uninstall`
+/// from the Windows uninstall entry, ST-M009-006). "No" is the default
+/// button. Elsewhere there is no such box and the answer is no.
+#[must_use]
+pub fn confirm(title: &str, message: &str) -> bool {
+    #[cfg(windows)]
+    {
+        win::confirm(title, message)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (title, message);
+        false
+    }
+}
+
+/// Tells the user how something went in a native message box (Windows), or
+/// on stdout elsewhere.
+pub fn inform(title: &str, message: &str) {
+    #[cfg(windows)]
+    {
+        win::inform(title, message);
+    }
+    #[cfg(not(windows))]
+    {
+        println!("{title}: {message}");
     }
 }
 

@@ -1,9 +1,12 @@
-//! CretLink Support command-line entry point (ST-M002-001 / ST-M002-005 wiring).
+//! The headless `cretlink-support-agent` binary (ST-M002-001 / ST-M002-005
+//! wiring), a development and test tool: the release archives ship the
+//! application `cretlink`, whose Get help role is the customer's program
+//! (ST-M009-010, ADR-0018).
 //!
 //! The customer-facing agent is the dialing side of an attended LAN session
 //! (ADR-0003: the agent is the Noise initiator). This binary reports the
 //! process's honest effective identity (REQ-S-011), then either discovers a
-//! CretLink Console over mDNS or takes a manual address / connection code,
+//! technician console over mDNS or takes a manual address / connection code,
 //! dials it with the real [`cretlink_session`] runtime, shows the Session
 //! Approval Code and the full-control disclosure, and asks the customer for
 //! one informed consent (REQ-F-006, REQ-S-003). Nothing runs under control
@@ -16,15 +19,18 @@
 //! consent still runs after any reconnect — and it is never reachable from the
 //! console or the MCP surface (REQ-S-001, REQ-S-003).
 //!
-//! This binary is the headless stdout agent; `apps/app` (Get help) is the graphical
-//! consent window over the same session runtime (it advertises file operations
-//! and, on Windows, the terminal, but not the desktop or reboot-resume). Once
-//! consent is granted the runtime serves command execution, file operations,
-//! and — where this build advertises them — the terminal and the desktop.
+//! This binary is the headless stdout agent; `apps/app` (Get help) is the
+//! graphical consent window over the same session runtime (it advertises file
+//! operations and, on Windows, the terminal, but not the desktop or
+//! reboot-resume). Once consent is granted the runtime serves command
+//! execution, file operations, and — where this build advertises them — the
+//! terminal and the desktop.
 //!
 //! # Offline residual recovery (ST-M006-003)
 //!
-//! Invoked as `cretlink-support-agent recover [--remove]`, the agent runs a
+//! Invoked as `cretlink-support-agent recover [--remove]` — the same verb, report
+//! and exit codes as `cretlink recover [--remove]` and `cretlink-cli recover
+//! [--remove]`, which replace it in the product (ST-M009-010) — the agent runs a
 //! self-contained, offline pass over the resources it owns on the customer
 //! machine — staged file trees and sealed reboot-resume tickets today, with
 //! every other ownable kind asserted empty. Without `--remove` it only inspects
@@ -38,19 +44,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cretlink_discovery::{Browser, parse_manual_entry};
-use cretlink_exec::FileStore;
 use cretlink_protocol::{PROTOCOL_V1, TargetIdentity};
 use cretlink_session::{
-    ActionOutcome, AdmissionToken, DesktopAccess, Dial, JoinHandle, NoAudit, Origin,
+    ActionOutcome, ActivityKind, AdmissionToken, DesktopAccess, Dial, JoinHandle, NoAudit, Origin,
     RebootResumeArmer, RelayDial, RendezvousTicket, RevokeReason, SessionError, SessionEvent,
     SessionJoiner, WssRelayDial,
 };
 use cretlink_support_agent::{
-    EffectiveIdentity, Inventory, RecoveryReport, TicketStore, current_identity,
-    default_ticket_store_path, reboot_resume_arming_disclosure, sysinfo,
+    EffectiveIdentity, TicketStore, current_identity, default_ticket_store_path,
+    reboot_resume_arming_disclosure, sysinfo,
 };
 use tokio::sync::mpsc;
 
+/// The program name the shared customer-side texts carry.
+const PROGRAM: &str = "cretlink-support-agent";
 /// How long each mDNS browse waits before the agent tries again.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Pause between connection attempts when the console is not reachable yet.
@@ -136,8 +143,10 @@ async fn run(
     // now (ST-M003-005 AC5b, REQ-F-019). This runs at the shutdown-strength
     // trigger, so it also enforces the "removed on shutdown" policy for the last
     // run's Keep-until-shutdown artifacts. It is best-effort and never blocks a
-    // new session.
-    sweep_stale_staging().await;
+    // new session. The returned share of the staging base is held for the
+    // whole run, so another customer-side process never sweeps this run's
+    // staging while it is live (ST-M009-010).
+    let _staging_in_use = sweep_stale_staging().await;
 
     // Reboot-resume is opt-in and platform-gated: on Windows a real DPAPI-backed
     // armer is injected and the capability advertised; elsewhere it stays off
@@ -252,6 +261,11 @@ fn on_event(
                 println!("\nConnected. Session Approval Code:  {code}");
                 println!("  Compare this with the code shown on the technician's console.");
             }
+            // What the technician's computer says its user is called: a label
+            // it chose, not a verified identity (ST-M009-011).
+            if let Some(name) = handle.technician_display_name() {
+                println!("  The technician's computer says its user is: {name}");
+            }
             Flow::Continue
         }
         SessionEvent::AwaitingApprovalCompare => {
@@ -317,20 +331,36 @@ fn on_event(
         SessionEvent::RequestHandled {
             origin,
             purpose,
+            kind,
             operation,
+            bytes,
             outcome,
+            ..
         } => {
             // Every other action on this computer: who did it, the real
             // operation, the honest result, and — for the AI — its stated
-            // reason (REQ-F-017, REQ-F-026, ST-M009-007).
+            // reason (REQ-F-017, REQ-F-026, ST-M009-007). A file leaving the
+            // computer is marked as such, with its size (ST-M009-011,
+            // REQ-S-016).
+            let leaving = if *kind == ActivityKind::FileSent {
+                " [a file is leaving this computer]"
+            } else {
+                ""
+            };
+            let size = bytes.map_or_else(String::new, |n| format!(" ({n} bytes)"));
             println!(
-                "{}: {operation} — {}",
+                "{}: {operation}{size}{leaving} — {}",
                 source_label(*origin),
                 outcome_label(*outcome)
             );
             if let Some(purpose) = purpose {
                 println!("  Stated reason (from the AI, not verified): {purpose}");
             }
+            Flow::Continue
+        }
+        SessionEvent::ActivityShed { count } => {
+            // Never a silent gap (ST-M009-011, REQ-N-008).
+            println!("({count} activity item(s) could not be shown here.)");
             Flow::Continue
         }
         SessionEvent::ExecOutput { .. } => {
@@ -411,6 +441,7 @@ fn source_label(origin: Origin) -> &'static str {
 /// The honest result of an action, in the customer's words (REQ-N-008).
 fn outcome_label(outcome: ActionOutcome) -> String {
     match outcome {
+        ActionOutcome::InProgress => "in progress".to_string(),
         ActionOutcome::Succeeded => "done".to_string(),
         ActionOutcome::Failed { code } => format!("refused or failed ({code:?})"),
         ActionOutcome::Unknown => "result unknown".to_string(),
@@ -553,138 +584,29 @@ fn build_reboot_resume() -> (Arc<dyn RebootResumeArmer>, Vec<String>, bool) {
 /// with nothing to do stays silent; anything removed or any failure is printed,
 /// and failures are the ones a later start will retry — they are never dressed
 /// up as success (REQ-N-008, REQ-F-019).
-async fn sweep_stale_staging() {
-    let report = FileStore::sweep_startup().await;
-    if report.sessions_removed == 0 && report.artifacts_removed == 0 && report.ok() {
-        return;
+async fn sweep_stale_staging() -> Option<cretlink_support_agent::recovery::StagingInUse> {
+    let (report, in_use) = cretlink_support_agent::sweep_stale_staging().await;
+    if let Some(text) = cretlink_support_agent::recovery::sweep_text(&report) {
+        print!("{text}");
     }
-
-    println!(
-        "Startup cleanup: reclaimed {} stale session area(s), removed {} leftover artifact(s).",
-        report.sessions_removed, report.artifacts_removed
-    );
-    if !report.ok() {
-        println!(
-            "  {} artifact(s) could NOT be removed and will be retried on the next start:",
-            report.failed.len()
-        );
-        for failure in &report.failed {
-            println!("  - {} ({})", failure.canonical_path, failure.reason);
-        }
-    }
+    in_use
 }
 
-/// Runs the offline residual-recovery verb (ST-M006-003). Without `--remove` it
-/// inspects and prints the CretLink-owned residue on this machine, removing
+/// Runs the offline residual-recovery verb (ST-M006-003) with the report and
+/// exit code shared with `cretlink recover` (ST-M009-010). Without `--remove`
+/// it inspects and prints the CretLink-owned residue on this machine, removing
 /// nothing so the customer can see it first. With `--remove` it removes the
-/// known residue and prints an honest report — what was found, what was removed,
-/// and, for anything it could not remove, the residue kept, the reason, and safe
-/// manual remediation. It grants no control and needs no session (REQ-F-019,
-/// REQ-N-008).
+/// known residue and prints an honest report; a recovery that could not prove
+/// a clean result exits non-zero, so a script never mistakes kept residue for
+/// success. It grants no control and needs no session (REQ-F-019, REQ-N-008).
 async fn run_recover(remove: bool) -> ExitCode {
     let store = TicketStore::new(default_ticket_store_path());
-    if remove {
-        let report = cretlink_support_agent::recover(&store).await;
-        print_recovery_report(&report);
-        // Fail closed: a recovery that could not prove a clean result exits
-        // non-zero, so a script never mistakes kept residue for success.
-        if report.ok() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        }
-    } else {
-        let inventory = cretlink_support_agent::scan(&store).await;
-        print_inventory(&inventory);
+    let run = cretlink_support_agent::run_recover(PROGRAM, remove, &store).await;
+    print!("{}", run.text);
+    if run.success {
         ExitCode::SUCCESS
-    }
-}
-
-/// Prints an owned-resource inventory in secret-free terms (never key material).
-fn print_inventory(inventory: &Inventory) {
-    println!("CretLink owned-resource inventory (ST-M006-003):");
-    if inventory.found.is_empty() {
-        println!("  No CretLink-owned resources were found on this machine.");
     } else {
-        println!(
-            "  Found {} resource(s) still on this machine:",
-            inventory.found.len()
-        );
-        for resource in &inventory.found {
-            match resource.session {
-                Some(session) => println!(
-                    "  - {}: {}  (session {session})",
-                    resource.kind.label(),
-                    resource.description
-                ),
-                None => println!("  - {}: {}", resource.kind.label(), resource.description),
-            }
-        }
-    }
-    for unknown in &inventory.unreadable {
-        println!(
-            "  ! Could not read {} ({}) — treating it as possibly present.",
-            unknown.kind.label(),
-            unknown.reason
-        );
-    }
-    if !inventory.asserted_empty.is_empty() {
-        let checked: Vec<&str> = inventory
-            .asserted_empty
-            .iter()
-            .map(|kind| kind.label())
-            .collect();
-        println!("  Checked and empty: {}.", checked.join(", "));
-    }
-    if inventory.is_clean() {
-        println!("  This machine is clean — nothing to remove.");
-    } else {
-        println!("  To remove the resources above, run:  cretlink-support-agent recover --remove");
-    }
-}
-
-/// Prints an honest recovery report: removals, kept failures with remediation,
-/// and any state that could not be read (REQ-N-008).
-fn print_recovery_report(report: &RecoveryReport) {
-    println!("CretLink residual recovery (ST-M006-003):");
-    if report.found.is_empty() && report.unreadable.is_empty() {
-        println!("  Nothing owned by CretLink was present — nothing to remove.");
-        return;
-    }
-    println!(
-        "  Removed {} of {} resource(s) found.",
-        report.removed.len(),
-        report.found.len()
-    );
-    for resource in &report.removed {
-        println!(
-            "  - removed {}: {}",
-            resource.kind.label(),
-            resource.description
-        );
-    }
-    if !report.failed.is_empty() {
-        println!(
-            "  KEPT {} resource(s) that could NOT be removed (a later start will retry):",
-            report.failed.len()
-        );
-        for failure in &report.failed {
-            println!("  - {}: {}", failure.kind.label(), failure.description);
-            println!("      reason:      {}", failure.reason);
-            println!("      remediation: {}", failure.remediation);
-        }
-    }
-    for unknown in &report.unreadable {
-        println!(
-            "  ! Could not read {} ({}) — state unknown.",
-            unknown.kind.label(),
-            unknown.reason
-        );
-    }
-    if report.ok() {
-        println!("  Recovery complete — this machine is clean.");
-    } else {
-        println!("  Recovery did NOT fully complete — see the kept/unknown items above.");
+        ExitCode::FAILURE
     }
 }
 
@@ -702,26 +624,10 @@ fn report_cleanup(handle: &JoinHandle) {
 }
 
 fn print_identity(identity: &EffectiveIdentity) {
-    println!(
-        "CretLink Support {} — effective identity (REQ-S-011):",
-        cretlink_shared::RELEASE_VERSION
+    print!(
+        "{}",
+        cretlink_support_agent::recovery::identity_text(PROGRAM, identity)
     );
-    println!("  account:   {}", identity.username);
-    if let Some(domain) = identity.domain.as_deref() {
-        println!("  domain:    {domain}");
-    }
-    println!("  windows:   {}", identity.is_windows);
-    println!("  elevated:  {}", identity.elevated);
-    println!("  integrity: {}", identity.integrity);
-    if let Some(note) = identity.note.as_deref() {
-        println!("  note:      {note}");
-    }
-    if !identity.elevated {
-        println!(
-            "  (not elevated — if UAC was declined, the agent gains no admin capability, REQ-F-002)"
-        );
-    }
-    println!();
 }
 
 /// The resolved transport the agent uses to reach the console: LAN discovery or
@@ -970,10 +876,10 @@ async fn connect_lan_with_retries(
 
     match fixed_target {
         Some(addr) => {
-            println!("Waiting for CretLink Console at {addr} ... (press Ctrl+C to cancel)")
+            println!("Waiting for the technician's console at {addr} ... (press Ctrl+C to cancel)")
         }
         None => println!(
-            "Searching the local network for CretLink Console ... (press Ctrl+C to cancel)\n  \
+            "Searching the local network for the technician's console ... (press Ctrl+C to cancel)\n  \
              Tip: you can also pass the console's address or connection code as an argument."
         ),
     }
@@ -1045,7 +951,7 @@ async fn connect_relay_with_retries(
     armer: Arc<dyn RebootResumeArmer>,
 ) -> Result<Option<JoinHandle>, String> {
     println!(
-        "Connecting to CretLink Console through the relay at {relay} ... (press Ctrl+C to cancel)"
+        "Connecting to the technician's console through the relay at {relay} ... (press Ctrl+C to cancel)"
     );
     if token.is_some() {
         println!("  Presenting the relay admission token.");
@@ -1180,6 +1086,7 @@ fn build_target_identity(identity: &EffectiveIdentity) -> TargetIdentity {
         elevated: identity.elevated,
         simulated: false,
         agent_version: cretlink_shared::RELEASE_VERSION.to_string(),
+        account: identity.account(),
     }
 }
 

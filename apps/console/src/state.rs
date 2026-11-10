@@ -78,6 +78,12 @@ pub struct TechnicianHost {
     pub hostname: String,
     /// The technician host's operating-system description.
     pub os: String,
+    /// The technician's display name as the operating-system account reports
+    /// it (full name, else user name; ST-M009-011), or `None` when neither is
+    /// available. Sent to the customer side, which shows it as what the
+    /// technician's computer says.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 /// How a target came to be known to the console.
@@ -659,6 +665,7 @@ mod tests {
             label: "This computer (technician)".to_string(),
             hostname: "TECH-MAC".to_string(),
             os: "macOS 15".to_string(),
+            display_name: Some("Sam".to_string()),
         }
     }
 
@@ -670,6 +677,7 @@ mod tests {
             elevated: true,
             simulated: true,
             agent_version: "sim".to_string(),
+            account: None,
         }
     }
 

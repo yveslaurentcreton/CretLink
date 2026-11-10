@@ -47,6 +47,7 @@ sha2.workspace = true
 tokio = { workspace = true, features = ["net", "fs"] }
 
 [dev-dependencies]
+serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread", "time"] }
 # `cretlink-relay` is a real dependency now (the endpoint dialer writes the
 # rendezvous preamble, ST-M007-008), so it is automatically available to the

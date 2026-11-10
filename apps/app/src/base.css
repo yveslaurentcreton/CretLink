@@ -1,4 +1,77 @@
-/* Shared by every screen of the application (ST-M009-005). */
+/* Shared by every screen of the application (ST-M009-005, ST-M009-008).
+ *
+ * The design tokens of the approved UI mock and the building blocks both
+ * roles' interfaces use: buttons, pills, cards, key/value lists, source chips,
+ * the approval-code digits, activity items, check lines, stats, the state
+ * bands and the spinner. ST-M009-009 reuses them for the customer.
+ *
+ * The building blocks apply only inside an element with the `cl-ui` class
+ * (the root of a role's interface), so a screen that does not opt in keeps its
+ * own look. `:where()` keeps their specificity that of a single class, so a
+ * role's own stylesheet can refine any of them. The role colour is chosen on
+ * the same root: `cl-ui tech` (indigo) or `cl-ui cust` (teal).
+ *
+ * State is never shown by colour alone: every band and pill carries a text
+ * label, and icons are decorative (REQ-N-013). */
+
+:root {
+  /* Neutrals */
+  --ink: #0f172a;
+  --ink-2: #334155;
+  --muted: #64748b;
+  --faint: #94a3b8;
+  --line: #e2e8f0;
+  --line-2: #f1f5f9;
+  --bg: #f8fafc;
+  --paper: #fff;
+
+  /* Role colours: the technician is indigo, the customer teal */
+  --tech: #4f46e5;
+  --tech-deep: #4338ca;
+  --tech-soft: #eef2ff;
+  --tech-line: #c7d2fe;
+  --cust: #0d9488;
+  --cust-deep: #0f766e;
+  --cust-soft: #f0fdfa;
+  --cust-line: #99f6e4;
+  --ai: #7c3aed;
+  --ai-soft: #f5f3ff;
+
+  /* Status */
+  --warn: #b45309;
+  --warn-soft: #fffbeb;
+  --warn-line: #fde68a;
+  --bad: #dc2626;
+  --bad-deep: #b91c1c;
+  --bad-soft: #fef2f2;
+  --bad-line: #fecaca;
+  --ok: #16a34a;
+  --ok-deep: #15803d;
+  --ok-soft: #f0fdf4;
+
+  /* Type */
+  --font: Inter, "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Code", "SF Mono", Consolas, ui-monospace, monospace;
+
+  /* Depth */
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow: 0 1px 3px rgba(15, 23, 42, 0.08), 0 1px 2px rgba(15, 23, 42, 0.04);
+
+  /* Spacing scale (4 px steps) and radii */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 28px;
+  --sp-8: 32px;
+  --r-sm: 6px;
+  --r: 9px;
+  --r-md: 12px;
+  --r-lg: 14px;
+  --r-pill: 99px;
+}
 
 /* The skip link stays out of sight until a keyboard user tabs to it
  * (REQ-N-014). */
@@ -16,4 +89,305 @@
   border-radius: 6px;
   background: #ffffff;
   color: #141925;
+}
+
+/* ---------- Root of a role interface ---------- */
+.cl-ui {
+  --role: var(--tech);
+  --role-deep: var(--tech-deep);
+  --role-soft: var(--tech-soft);
+  --role-line: var(--tech-line);
+  font-family: var(--font);
+  color: var(--ink);
+  background: var(--paper);
+  color-scheme: light;
+  -webkit-font-smoothing: antialiased;
+}
+.cl-ui.cust {
+  --role: var(--cust);
+  --role-deep: var(--cust-deep);
+  --role-soft: var(--cust-soft);
+  --role-line: var(--cust-line);
+}
+:where(.cl-ui) *,
+:where(.cl-ui) *::before,
+:where(.cl-ui) *::after {
+  box-sizing: border-box;
+}
+:where(.cl-ui) button {
+  font: inherit;
+  cursor: pointer;
+  color: inherit;
+}
+:where(.cl-ui) a {
+  color: var(--role);
+}
+:where(.cl-ui) :focus-visible {
+  outline: 2.5px solid var(--role);
+  outline-offset: 2px;
+}
+:where(.cl-ui) h2,
+:where(.cl-ui) h3 {
+  margin: 0 0 6px;
+  font-size: 22px;
+  letter-spacing: -0.015em;
+}
+:where(.cl-ui) h4 {
+  margin: 0 0 10px;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  font-weight: 700;
+}
+:where(.cl-ui) p {
+  margin: 0 0 12px;
+  line-height: 1.55;
+  color: var(--ink-2);
+}
+
+/* ---------- Utilities ---------- */
+:where(.cl-ui) .row { display: flex; gap: 10px; align-items: center; }
+:where(.cl-ui) .row.end { justify-content: flex-end; }
+:where(.cl-ui) .row.wrap { flex-wrap: wrap; }
+:where(.cl-ui) .spacer { flex: 1; }
+:where(.cl-ui) .muted { color: var(--muted); font-size: 13px; }
+:where(.cl-ui) .mono { font-family: var(--mono); }
+:where(.cl-ui) .label {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------- Icons ---------- */
+:where(.cl-ui) .ic {
+  width: 18px; height: 18px; flex: none;
+  stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round;
+}
+:where(.cl-ui) .ic.sm { width: 15px; height: 15px; }
+:where(.cl-ui) .ic.lg { width: 24px; height: 24px; }
+:where(.cl-ui) .ic.xl { width: 30px; height: 30px; }
+:where(.cl-ui) .iconbox {
+  width: 44px; height: 44px; border-radius: var(--r-md); display: grid; place-items: center; flex: none;
+  background: var(--role-soft); color: var(--role);
+}
+
+/* ---------- Buttons ---------- */
+:where(.cl-ui) .btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  border: 1px solid var(--line); background: #fff; color: var(--ink);
+  padding: 9px 16px; border-radius: var(--r); font-weight: 600; font-size: 14px;
+  box-shadow: var(--shadow-sm); transition: background 0.12s; text-decoration: none; white-space: nowrap;
+}
+:where(.cl-ui) .btn:hover { background: var(--bg); }
+:where(.cl-ui) .btn.primary { background: var(--role); border-color: var(--role); color: #fff; }
+:where(.cl-ui) .btn.primary:hover { background: var(--role-deep); }
+:where(.cl-ui) .btn.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+:where(.cl-ui) .btn.danger:hover { background: var(--bad-deep); }
+:where(.cl-ui) .btn.ghost { background: transparent; border-color: transparent; box-shadow: none; color: var(--muted); }
+:where(.cl-ui) .btn.ghost:hover { background: var(--line-2); }
+:where(.cl-ui) .btn.big { padding: 13px 22px; font-size: 15px; border-radius: 10px; }
+:where(.cl-ui) .btn.sm { padding: 5px 10px; font-size: 12.5px; border-radius: 7px; }
+:where(.cl-ui) .btn.block { width: 100%; }
+:where(.cl-ui) .btn:disabled,
+:where(.cl-ui) .btn[aria-disabled="true"] { opacity: 0.45; cursor: default; }
+:where(.cl-ui) .btn kbd { font: 600 11px var(--mono); opacity: 0.75; }
+:where(.cl-ui) .linkbtn {
+  border: 0; background: none; padding: 0; color: var(--role); font-weight: 600; text-decoration: underline;
+}
+
+/* ---------- Pills (state in words, never colour alone) ---------- */
+:where(.cl-ui) .pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: var(--r-pill);
+  font-size: 12px; font-weight: 700; white-space: nowrap;
+}
+:where(.cl-ui) .pill.none { background: var(--line-2); color: var(--ink-2); }
+:where(.cl-ui) .pill.wait { background: var(--warn-soft); color: var(--warn); }
+:where(.cl-ui) .pill.full { background: var(--bad); color: #fff; }
+:where(.cl-ui) .pill.bad { background: var(--bad-soft); color: var(--bad-deep); }
+:where(.cl-ui) .pill.ok { background: var(--ok-soft); color: var(--ok-deep); }
+:where(.cl-ui) .pill.role { background: var(--role-soft); color: var(--role-deep); }
+
+/* Status dot beside a text label */
+:where(.cl-ui) .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
+:where(.cl-ui) .dot.off { background: #cbd5e1; }
+:where(.cl-ui) .dot.warn { background: #f59e0b; }
+:where(.cl-ui) .dot.bad { background: var(--bad); }
+
+/* ---------- State bands: no access, your decision, connected, full control ---------- */
+:where(.cl-ui) .band {
+  flex: none; padding: 14px 22px; display: flex; gap: 14px; align-items: center;
+}
+:where(.cl-ui) .band .g {
+  width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; flex: none;
+  font-size: 18px; font-weight: 800;
+}
+:where(.cl-ui) .band b { display: block; font-size: 13.5px; letter-spacing: 0.04em; }
+:where(.cl-ui) .band small { display: block; font-size: 12.5px; opacity: 0.9; margin-top: 1px; }
+:where(.cl-ui) .band .since { margin-left: auto; font-size: 12px; opacity: 0.85; text-align: right; }
+:where(.cl-ui) .band.none { background: var(--bg); color: var(--ink-2); border-bottom: 1px solid var(--line); }
+:where(.cl-ui) .band.none .g { background: #fff; border: 1.5px solid #cbd5e1; color: var(--muted); }
+:where(.cl-ui) .band.decide,
+:where(.cl-ui) .band.connected { background: var(--warn-soft); color: var(--warn); border-bottom: 1px solid var(--warn-line); }
+:where(.cl-ui) .band.decide .g,
+:where(.cl-ui) .band.connected .g { background: #fff; border: 1.5px solid var(--warn-line); }
+:where(.cl-ui) .band.full { background: linear-gradient(90deg, var(--bad-deep), var(--bad)); color: #fff; }
+:where(.cl-ui) .band.full .g { background: rgba(255, 255, 255, 0.18); }
+/* The slim full-control strip of the technician's live session. */
+:where(.cl-ui) .band.full.slim {
+  padding: 6px 18px; gap: 16px; font-size: 12px; font-weight: 700; letter-spacing: 0.03em;
+}
+:where(.cl-ui) .band.full .pulse { background: #fff; }
+:where(.cl-ui) .band.full .pulse::after { border-color: #fff; }
+
+/* ---------- Cards, lists, key/value ---------- */
+:where(.cl-ui) .card {
+  border: 1px solid var(--line); border-radius: var(--r-lg); padding: 18px 20px;
+  background: #fff; box-shadow: var(--shadow-sm);
+}
+:where(.cl-ui) .list { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; }
+:where(.cl-ui) .list .it {
+  display: flex; gap: 12px; align-items: center; padding: 11px 0; border-top: 1px solid var(--line-2); font-size: 14px;
+}
+:where(.cl-ui) .list .it:first-child { border-top: 0; padding-top: 2px; }
+:where(.cl-ui) .kv { display: grid; grid-template-columns: 120px 1fr; gap: 7px 12px; font-size: 13.5px; margin: 0; }
+:where(.cl-ui) .kv dt { color: var(--muted); }
+:where(.cl-ui) .kv dd { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+
+/* Who started an action */
+:where(.cl-ui) .who {
+  display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 700;
+  padding: 2px 7px; border-radius: var(--r-sm); white-space: nowrap;
+}
+:where(.cl-ui) .who .ic { width: 12px; height: 12px; stroke-width: 2.2; }
+:where(.cl-ui) .who.ai { background: var(--ai-soft); color: var(--ai); }
+:where(.cl-ui) .who.tech { background: var(--tech-soft); color: var(--tech-deep); }
+:where(.cl-ui) .who.sys { background: var(--line-2); color: var(--muted); }
+:where(.cl-ui) .who.cust { background: var(--cust-soft); color: var(--cust-deep); }
+
+/* ---------- Codes ---------- */
+:where(.cl-ui) .conn-code {
+  font-family: var(--mono); font-size: 28px; font-weight: 600; letter-spacing: 0.14em;
+  padding: 10px 18px; border: 2px dashed var(--role-line); border-radius: var(--r-md);
+  background: var(--role-soft); color: var(--role-deep); display: inline-block;
+}
+/* The approval code: large digit boxes in two groups */
+:where(.cl-ui) .sac { display: flex; gap: 8px; justify-content: center; margin: 0; }
+:where(.cl-ui) .sac span {
+  width: 56px; height: 72px; border-radius: var(--r-md); background: var(--ink); color: #fff;
+  font: 600 38px/72px var(--mono); text-align: center; box-shadow: inset 0 -3px 0 rgba(255, 255, 255, 0.08);
+}
+:where(.cl-ui) .sac i { width: 14px; }
+:where(.cl-ui) .disclose {
+  font-size: 12.5px; line-height: 1.6; color: var(--muted); border-left: 3px solid var(--bad-line);
+  padding-left: 12px; margin: 0;
+}
+:where(.cl-ui) .cli {
+  background: #0b1120; color: #cbd5e1; font: 12.5px/1.65 var(--mono); border-radius: var(--r-md);
+  padding: 14px 16px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0;
+}
+:where(.cl-ui) .cli .p { color: #7dd3fc; }
+:where(.cl-ui) .cli .d { color: #64748b; }
+
+/* ---------- Activity items ---------- */
+:where(.cl-ui) .ev {
+  display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line);
+}
+:where(.cl-ui) .ev:last-child { border-bottom: 0; }
+:where(.cl-ui) .ev .k {
+  width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center;
+  background: #fff; border: 1px solid var(--line); color: var(--ink-2);
+}
+:where(.cl-ui) .ev .k .ic { width: 15px; height: 15px; }
+:where(.cl-ui) .ev .t { font-size: 13px; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+/* The AI's stated purpose is labelled as its own unverified claim (REQ-F-026). */
+:where(.cl-ui) .claim { font-size: 11px; font-weight: 600; color: var(--muted); }
+:where(.cl-ui) .ev .m {
+  display: flex; gap: 6px; align-items: center; margin-top: 4px; font-size: 11.5px; color: var(--muted); flex-wrap: wrap;
+}
+:where(.cl-ui) .ev code {
+  display: block; margin-top: 5px; font: 11.5px/1.45 var(--mono); color: var(--ink-2); background: #fff;
+  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 4px 7px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+:where(.cl-ui) .ev.fail .k { background: var(--bad-soft); border-color: var(--bad-line); color: var(--bad); }
+:where(.cl-ui) .ev.run .k { background: var(--role-soft); border-color: var(--role-line); color: var(--role); }
+:where(.cl-ui) .ev.out .k { background: var(--warn-soft); border-color: var(--warn-line); color: var(--warn); }
+:where(.cl-ui) .ev.gap .t { color: var(--warn); }
+:where(.cl-ui) .ev.gap .k { background: var(--warn-soft); border-color: var(--warn-line); color: var(--warn); }
+:where(.cl-ui) .flag {
+  font-size: 11px; font-weight: 700; color: var(--warn); background: var(--warn-soft);
+  border: 1px solid var(--warn-line); border-radius: var(--r-sm); padding: 1px 6px;
+}
+/* An action's result in words */
+:where(.cl-ui) .res { font-size: 11px; font-weight: 700; display: inline-flex; gap: 3px; align-items: center; }
+:where(.cl-ui) .res .ic { width: 12px; height: 12px; stroke-width: 2.6; }
+:where(.cl-ui) .res.run { color: var(--role); }
+:where(.cl-ui) .res.done { color: var(--ok-deep); }
+:where(.cl-ui) .res.fail { color: var(--bad); }
+:where(.cl-ui) .res.stop { color: var(--warn); }
+
+/* ---------- Check lines and stats ---------- */
+:where(.cl-ui) .okline { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; padding: 6px 0; line-height: 1.45; }
+:where(.cl-ui) .okline .i {
+  width: 22px; height: 22px; border-radius: 50%; background: var(--ok-soft); color: var(--ok-deep);
+  display: grid; place-items: center; flex: none;
+}
+:where(.cl-ui) .okline .i .ic { width: 13px; height: 13px; stroke-width: 3; }
+:where(.cl-ui) .okline .i.w { background: var(--warn-soft); color: var(--warn); }
+:where(.cl-ui) .okline .i.b { background: var(--bad-soft); color: var(--bad); }
+:where(.cl-ui) .okline .i.n { background: var(--line-2); color: var(--ink-2); font-size: 12px; font-weight: 700; }
+:where(.cl-ui) .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+:where(.cl-ui) .stats > div { border: 1px solid var(--line); border-radius: var(--r-md); padding: 10px 12px; }
+:where(.cl-ui) .stats b { display: block; font-size: 20px; letter-spacing: -0.02em; }
+:where(.cl-ui) .stats small { color: var(--muted); font-size: 12px; }
+
+/* ---------- Alerts and notes ---------- */
+:where(.cl-ui) .alert:empty { display: none; }
+:where(.cl-ui) .alert {
+  border: 1px solid var(--bad-line); background: var(--bad-soft); color: var(--bad-deep);
+  border-radius: var(--r-md); padding: 12px 14px; font-size: 13.5px; display: flex; gap: 10px; align-items: flex-start;
+}
+:where(.cl-ui) .alert p { margin: 0; color: inherit; }
+:where(.cl-ui) .alert b { display: block; }
+:where(.cl-ui) .note {
+  border: 1px solid var(--warn-line); background: var(--warn-soft); color: var(--warn);
+  border-radius: var(--r-md); padding: 10px 14px; font-size: 13px; display: flex; gap: 10px; align-items: flex-start;
+}
+:where(.cl-ui) .note p { margin: 0; color: inherit; }
+
+/* ---------- Motion: spinner and pulse ---------- */
+:where(.cl-ui) .spinner {
+  width: 16px; height: 16px; border: 2.5px solid var(--role-soft); border-top-color: var(--role);
+  border-radius: 50%; animation: cl-spin 0.9s linear infinite; display: inline-block; vertical-align: middle; flex: none;
+}
+:where(.cl-ui) .spinner.xs { width: 10px; height: 10px; border-width: 2px; }
+:where(.cl-ui) .pulse { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); position: relative; flex: none; }
+:where(.cl-ui) .pulse::after {
+  content: ""; position: absolute; inset: -4px; border-radius: 50%; border: 2px solid var(--bad);
+  opacity: 0.5; animation: cl-ping 1.6s ease-out infinite;
+}
+@keyframes cl-spin { to { transform: rotate(360deg); } }
+@keyframes cl-ping {
+  from { transform: scale(0.6); opacity: 0.7; }
+  to { transform: scale(1.6); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  :where(.cl-ui) .spinner,
+  :where(.cl-ui) .pulse::after { animation: none; }
+  :where(.cl-ui) .btn { transition: none; }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "cretlink-support-agent"
-description = "CretLink Support: temporary attended support agent for the customer Windows computer"
+description = "The customer role of CretLink (Get help) on the Windows computer, as a library, plus the headless `cretlink-support-agent` development tool"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
@@ -54,11 +54,14 @@ zeroize.workspace = true
 # Microsoft's windows-rs bindings for the process-token privilege query
 # (REQ-S-011) and the DPAPI at-rest sealer for reboot-resume key material
 # (ADR-0014 §4, ST-M006-001: Win32_Security_Cryptography for CryptProtectData /
-# CryptUnprotectData, Win32_System_Memory for LocalFree). Matches the
+# CryptUnprotectData, Win32_System_Memory for LocalFree;
+# Win32_Security_Authentication_Identity for GetUserNameExW, the customer's
+# DOMAIN\user account, ST-M009-008). Matches the
 # windows-core 0.62 line already in the lockfile.
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Security",
+  "Win32_Security_Authentication_Identity",
   "Win32_Security_Cryptography",
   "Win32_System_Memory",
   "Win32_System_Threading",

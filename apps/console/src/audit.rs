@@ -19,6 +19,20 @@
 //! cleanup, and close boundaries; when every sender is gone the log is sealed
 //! so a truncated tail is detectable (`verify_sealed`).
 //!
+//! # The end of a session (ST-M009-012)
+//!
+//! Before the log is sealed, the runtime's `SessionAudit::record_end` hook
+//! writes two records: `session_ended` (who ended it — `technician`,
+//! `customer`, `connection_lost` or `failure` — how, and whether full control
+//! was granted) and `cleanup_report`, the teardown report the agent sent over
+//! the wire with every note (`source: agent`). Without one it says why:
+//! `not_needed` when control was never granted (nothing ran on the customer
+//! computer), `missing` when control was granted but no report arrived, which
+//! the history shows as unknown, never as success. At consent,
+//! `record_target` writes `target_identity`, the honest identity the consent
+//! bound. These records are bounded and never elided above the soft cap;
+//! [`crate::history`] reads them back.
+//!
 //! # No audit without an explicit choice (ADR-0008)
 //!
 //! ADR-0008 is explicit: *"continuing a session without audit requires an
@@ -57,8 +71,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use cretlink_protocol::{JobId, JobOutcome, SessionId};
-use cretlink_session::SessionAudit;
+use cretlink_protocol::{JobId, JobOutcome, SessionId, TargetIdentity};
+use cretlink_session::{SessionAudit, SessionEnd};
 use cretlink_shared::{
     Actor, AuditArgs, AuditFileMeta, AuditValue, AuditWriter, Clock,
     DEFAULT_SESSION_SOFT_CAP_BYTES, Outcome, RetentionPolicy, SystemClock, files_to_prune,
@@ -105,7 +119,49 @@ const FSYNC_BOUNDARY_ACTIONS: &[&str] = &[
     "revoked",
     "cleanup",
     "fs_cleanup",
+    SESSION_ENDED_ACTION,
+    CLEANUP_REPORT_ACTION,
 ];
+
+/// Records kept whole above the soft cap: bounded, and what the session
+/// history reads (ST-M009-012).
+const NEVER_ELIDED_ACTIONS: &[&str] = &[
+    SESSION_ENDED_ACTION,
+    CLEANUP_REPORT_ACTION,
+    TARGET_IDENTITY_ACTION,
+];
+
+/// The audit action of the record of who ended a session (ST-M009-012).
+pub const SESSION_ENDED_ACTION: &str = "session_ended";
+
+/// The audit action of the record of the agent's teardown report
+/// (ST-M009-012).
+pub const CLEANUP_REPORT_ACTION: &str = "cleanup_report";
+
+/// The audit action of the record of the consent-bound target identity
+/// (ST-M009-012).
+pub const TARGET_IDENTITY_ACTION: &str = "target_identity";
+
+/// The `source` of a [`CLEANUP_REPORT_ACTION`] record: the agent sent its
+/// report, none was needed because control was never granted, or none
+/// arrived.
+pub mod cleanup_source {
+    /// The agent's own report, with every note.
+    pub const AGENT: &str = "agent";
+    /// Full control was never granted, so nothing ran on the customer
+    /// computer and there was nothing to clean up there.
+    pub const NOT_NEEDED: &str = "not_needed";
+    /// Control was granted but no report arrived: the cleanup is unknown.
+    pub const MISSING: &str = "missing";
+}
+
+/// The note of a session that never reached full control.
+pub const NOT_NEEDED_NOTE: &str =
+    "full control was never granted, so nothing ran on the customer computer";
+
+/// The note of a session whose agent report never arrived.
+pub const MISSING_NOTE: &str =
+    "the customer computer sent no cleanup report before the connection ended";
 
 /// Configuration of the audit service; injectable so tests can point it at a
 /// temporary directory and shrink the caps.
@@ -230,6 +286,106 @@ impl SessionAudit for ChannelAudit {
     fn record(&self, actor: Actor, action: &'static str, outcome: Outcome) {
         self.record_entry(AuditEntry::event(actor, None, action, outcome));
     }
+
+    /// The consent-bound identity, so the history can name the computer
+    /// (ST-M009-012).
+    fn record_target(&self, identity: &TargetIdentity) {
+        self.record_entry(target_identity_entry(identity));
+    }
+
+    /// Who ended the session and the agent's teardown report, before the log
+    /// is sealed (ST-M009-012).
+    fn record_end(&self, end: &SessionEnd) {
+        for entry in end_entries(end) {
+            self.record_entry(entry);
+        }
+    }
+}
+
+/// The record of the honest identity the customer's consent bound
+/// (ST-M009-012, REQ-F-016), as the agent reported it.
+#[must_use]
+pub fn target_identity_entry(identity: &TargetIdentity) -> AuditEntry {
+    let mut entry = AuditEntry::event(Actor::Agent, None, TARGET_IDENTITY_ACTION, Outcome::Ok);
+    entry.args = AuditArgs::new()
+        .with("hostname", truncate_field(&identity.hostname))
+        .with("os_version", truncate_field(&identity.os_version))
+        .with("arch", truncate_field(&identity.arch))
+        .with("elevated", AuditValue::Bool(identity.elevated))
+        .with("simulated", AuditValue::Bool(identity.simulated))
+        .with("agent_version", truncate_field(&identity.agent_version));
+    entry
+}
+
+/// The two end records (ST-M009-012): who ended the session, then the
+/// cleanup report the agent sent with every note — or, without one, whether
+/// none was needed (control never granted) or none arrived (unknown, never
+/// success).
+#[must_use]
+pub fn end_entries(end: &SessionEnd) -> [AuditEntry; 2] {
+    let mut ended = AuditEntry::event(Actor::System, None, SESSION_ENDED_ACTION, Outcome::Ok);
+    ended.args = AuditArgs::new()
+        .with(
+            "ended_by",
+            AuditValue::String(end.ended_by.as_str().to_owned()),
+        )
+        .with("how", AuditValue::String(end.action.to_owned()))
+        .with("control_granted", AuditValue::Bool(end.control_granted));
+
+    let cleanup = match &end.peer_cleanup {
+        Some(report) => {
+            let mut entry = AuditEntry::event(
+                Actor::Agent,
+                None,
+                CLEANUP_REPORT_ACTION,
+                if report.ok {
+                    Outcome::Ok
+                } else {
+                    Outcome::Failed
+                },
+            );
+            entry.args = AuditArgs::new()
+                .with(
+                    "source",
+                    AuditValue::String(cleanup_source::AGENT.to_owned()),
+                )
+                .with("ok", AuditValue::Bool(report.ok))
+                .with(
+                    "notes",
+                    AuditValue::List(
+                        report
+                            .notes
+                            .iter()
+                            .map(|note| truncate_field(note))
+                            .collect(),
+                    ),
+                );
+            entry
+        }
+        None if !end.control_granted => {
+            let mut entry =
+                AuditEntry::event(Actor::System, None, CLEANUP_REPORT_ACTION, Outcome::Ok);
+            entry.args = AuditArgs::new()
+                .with(
+                    "source",
+                    AuditValue::String(cleanup_source::NOT_NEEDED.to_owned()),
+                )
+                .with("reason", AuditValue::String(NOT_NEEDED_NOTE.to_owned()));
+            entry
+        }
+        None => {
+            let mut entry =
+                AuditEntry::event(Actor::System, None, CLEANUP_REPORT_ACTION, Outcome::Unknown);
+            entry.args = AuditArgs::new()
+                .with(
+                    "source",
+                    AuditValue::String(cleanup_source::MISSING.to_owned()),
+                )
+                .with("reason", AuditValue::String(MISSING_NOTE.to_owned()));
+            entry
+        }
+    };
+    [ended, cleanup]
 }
 
 /// The opened, named session log the drain writes to: created **before**
@@ -360,7 +516,10 @@ pub fn spawn_audit_service(
                     config.soft_cap_bytes
                 );
             }
-            let args = if eliding {
+            // The small, bounded records the session history reads (who ended
+            // it, the cleanup report, the target identity) are never elided
+            // (ST-M009-012).
+            let args = if eliding && !NEVER_ELIDED_ACTIONS.contains(&entry.action) {
                 elide_payload(entry.args)
             } else {
                 entry.args
@@ -696,4 +855,81 @@ fn manual_command_value(command: &str, redact_command: bool) -> AuditValue {
 /// The Appendix A `job_id` value.
 fn job_id_value(job: JobId) -> AuditValue {
     AuditValue::Int(i64::try_from(job.0).unwrap_or(i64::MAX))
+}
+
+// --- Technician terminal in the console GUI (actor `terminal`, ST-M009-011) ---
+//
+// The GUI hosts the session in-process, so its embedded terminal reaches the
+// service directly rather than through the IPC server that audits a terminal
+// client. These records give it the same attributable trail (REQ-S-023): a
+// capture-time start before anything reaches the target, then the honest
+// completion. Without an IPC `call_id` the activity fold shows the completion
+// as one item.
+
+/// The capture-time record of a terminal the GUI is about to open.
+#[must_use]
+pub fn terminal_open_started(session: SessionId, cols: u16, rows: u16) -> AuditEntry {
+    let mut entry = AuditEntry::event(
+        Actor::Terminal,
+        Some(session),
+        "terminal_open_start",
+        Outcome::Ok,
+    );
+    entry.args = AuditArgs::new().with("size", AuditValue::String(format!("{cols}x{rows}")));
+    entry
+}
+
+/// The completion record of a terminal the GUI opened: its job id, or the
+/// secret-free reason it could not be opened, and how long opening took.
+#[must_use]
+pub fn terminal_opened(
+    session: SessionId,
+    cols: u16,
+    rows: u16,
+    result: Result<JobId, &str>,
+    duration_ms: u64,
+) -> AuditEntry {
+    let mut entry = AuditEntry::event(
+        Actor::Terminal,
+        Some(session),
+        "terminal_open",
+        if result.is_ok() {
+            Outcome::Ok
+        } else {
+            Outcome::Failed
+        },
+    );
+    entry.args = AuditArgs::new().with("size", AuditValue::String(format!("{cols}x{rows}")));
+    match result {
+        Ok(job) => entry.args.insert("job_id", job_id_value(job)),
+        Err(reason) => entry.args.insert("reason", truncate_field(reason)),
+    }
+    entry.duration_ms = Some(duration_ms);
+    entry
+}
+
+/// The record of a terminal the GUI closed, with its honest outcome.
+#[must_use]
+pub fn terminal_closed(
+    session: SessionId,
+    term: JobId,
+    result: Result<(), &str>,
+    duration_ms: u64,
+) -> AuditEntry {
+    let mut entry = AuditEntry::event(
+        Actor::Terminal,
+        Some(session),
+        "terminal_close",
+        if result.is_ok() {
+            Outcome::Ok
+        } else {
+            Outcome::Failed
+        },
+    );
+    entry.args = AuditArgs::new().with("job_id", job_id_value(term));
+    if let Err(reason) = result {
+        entry.args.insert("reason", truncate_field(reason));
+    }
+    entry.duration_ms = Some(duration_ms);
+    entry
 }

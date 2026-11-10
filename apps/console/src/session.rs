@@ -1405,6 +1405,7 @@ mod tests {
             elevated: false,
             simulated: true,
             agent_version: "fake-agent".to_string(),
+            account: None,
         }
     }
 

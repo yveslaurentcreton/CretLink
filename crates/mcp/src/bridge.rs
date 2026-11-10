@@ -724,7 +724,11 @@ impl McpBridge {
                        preserved WITHIN each stream, but interleaving order BETWEEN the two \
                        streams is not. Output is single-shot up to a fixed cap: there is no \
                        continuation or resume; when the cap (or a dropped stream) hides later \
-                       bytes, `truncated` is set to true rather than the output being continued."
+                       bytes, `truncated` is set to true rather than the output being continued. \
+                       Every process the command starts ends with the command, also on cancel, \
+                       timeout and stop, so a program that must keep running (an installer, an \
+                       upgrade that continues in the background) does not survive it. Wait for \
+                       such work inside the command."
     )]
     async fn remote_exec(
         &self,
@@ -1500,8 +1504,36 @@ impl McpBridge {
     }
 }
 
+impl McpBridge {
+    /// The names of the remote tools this bridge exposes, sorted: the same list
+    /// an MCP client's `tools/list` returns, read from the bridge's own tool
+    /// router so a count shown elsewhere (the technician's rail, ST-M009-008)
+    /// can never drift from what the bridge serves.
+    #[must_use]
+    pub fn tool_names() -> Vec<String> {
+        let mut names: Vec<String> = Self::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+}
+
 #[tool_handler]
-impl ServerHandler for McpBridge {}
+impl ServerHandler for McpBridge {
+    /// Once the MCP client has initialized, hands its self-reported
+    /// `clientInfo.name` to the target session, so the console labels this
+    /// client's activity ("Claude Code", "Codex CLI", ...) on the technician
+    /// side (ST-M009-011). The name is a label only and never reaches the
+    /// customer computer.
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
+        if let Some(info) = context.peer.peer_info() {
+            self.session.set_client_name(&info.client_info.name);
+        }
+    }
+}
 
 /// Validates raw tool input against the shared [`limits`] and builds
 /// [`ExecParams`]. Every violation becomes an `invalid_params` tool error so
