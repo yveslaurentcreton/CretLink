@@ -3,6 +3,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActivityEvent } from "../shared/contract";
+import { type TimerTracker, trackTimers } from "../shared/test-timers";
 import type { ConsoleState } from "./api";
 import { AUDIT, CLIENTS, FEED, SESSIONS, SESSION_ID, consoleIn } from "./fixtures";
 
@@ -53,6 +54,8 @@ vi.mock("./terminal", () => ({
 }));
 
 let state: ConsoleState = consoleIn({ phase: "idle" });
+// Cancels what a test leaves running, so it cannot call the fake during a later test.
+let timers: TimerTracker;
 
 function push(next: ConsoleState): void {
   state = next;
@@ -89,6 +92,7 @@ async function boot(handlers: Record<string, Handler> = {}): Promise<void> {
 }
 
 beforeEach(() => {
+  timers = trackTimers();
   vi.resetModules();
   backend.handlers = {};
   backend.listeners = {};
@@ -100,6 +104,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  timers.clear();
   document.body.replaceChildren();
 });
 
