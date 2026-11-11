@@ -2207,7 +2207,8 @@ published by the release workflow (ST-M006-004, ST-M009-004). Authenticode
 signing is implemented but gated, and no signing identity is configured, so
 current releases are unsigned (ST-M006-005); build provenance attestation is
 not yet implemented. A ruleset on `main` accepts changes only through a pull
-request, merged as a squash commit, and rejects force pushes and deletion.
+request that passed the required checks, merged as a squash commit, and
+rejects force pushes and deletion.
 Each mitigation below is marked with its honest implementation status.
 
 **Entry points.**
@@ -2280,11 +2281,11 @@ review plus secret scanning run on pull requests (REQ-N-010, REQ-N-016,
 REQ-N-017; M001 exit criteria, ST-M001-004) — *configured and enforced on
 `main` (ST-M001-004, Done; ST-M006-017): `ci.yml` runs `cargo-deny` licence,
 advisory, ban, and source checks on every pull request that changes more than
-documentation, and `hygiene.yml` runs gitleaks secret scanning and the
-private-data check (ST-M006-016) on every pull request, with all actions
-SHA-pinned. Neither runs again on the release branch: a pull request is
-merged only when it is up to date with `main`, so the merged tree is the
-tested one, and the ruleset on `main` rejects a direct push, which the
+documentation, and again on `main` after the merge, and `hygiene.yml` runs
+gitleaks secret scanning and the private-data check (ST-M006-016) on every
+pull request, with all actions SHA-pinned. The ruleset on `main` requires the
+result of both, merges a pull request only when it is up to date with `main`,
+so the merged tree is the tested one, and rejects a direct push, which the
 [release policy](releasing.md) forbids*. The committed Cargo lockfile pins the
 exact dependency graph, so a release builds from reviewed, recorded versions
 rather than whatever resolves on the day — *in place: the Cargo workspace,

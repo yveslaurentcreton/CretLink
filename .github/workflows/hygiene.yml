@@ -1,19 +1,19 @@
 # Hygiene checks on every pull request (ST-M006-016, ST-M006-017).
 #
-# ci.yml does not start for a pull request that changes only documentation.
-# This workflow has no path filter, because a secret or private data can sit
-# in any file and in any commit message; it is one short job on a Linux runner.
+# ci.yml skips its build and test jobs for a pull request that changes only
+# documentation. This workflow skips nothing, because a secret or private data
+# can sit in any file and in any commit message; it is one short job on a
+# Linux runner, and the ruleset on main requires it.
 #
 # - Secret scan: gitleaks over the commits of the pull request (REQ-N-017).
-# - Private-data check: scripts/check-private-data.mjs, after its own tests,
-#   over the tracked files of the merge result and the commit messages of the
-#   pull request (REQ-N-022). The list of private terms comes from the
-#   PRIVATE_TERMS secret. Where the secret is not set, and in a pull request
-#   from a fork, the list is empty: the script then skips that rule and says
-#   so in its summary line.
+# - Private-data check: scripts/check-private-data.mjs, after the tests of the
+#   scripts, over the tracked files of the merge result and the commit
+#   messages of the pull request (REQ-N-022). It runs without a list of
+#   private terms: that list never leaves the maintainer's computer, where the
+#   same check runs with it before a push.
 #
-# The job holds a read-only token and no release secret (REQ-S-020). A newer
-# push to the pull request cancels the run in progress for it.
+# The job holds a read-only token and no secret (REQ-S-020). A newer push to
+# the pull request cancels the run in progress for it.
 #
 # Third-party actions are pinned to full commit SHAs (REQ-S-019).
 
@@ -48,7 +48,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-      - name: Test the private-data check
+      - name: Test the scripts
         run: node --test "scripts/*.test.mjs"
       # The checkout is the merge commit of the pull request, with the whole
       # history. The commits of the pull request itself are those between its
@@ -58,5 +58,4 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          CRETLINK_PRIVATE_TERMS: ${{ secrets.PRIVATE_TERMS }}
         run: node scripts/check-private-data.mjs --commits "${BASE_SHA:?}..${HEAD_SHA:?}"
