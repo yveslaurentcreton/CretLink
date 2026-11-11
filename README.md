@@ -16,6 +16,10 @@ key.
 </p>
 <p align="center"><sub>One session from both sides: the technician's window and the customer's window. Sample data.</sub></p>
 
+**New here?** The [documentation site](https://yveslaurentcreton.github.io/CretLink/)
+explains CretLink in six short pages with pictures: what it is, how a session
+works, how to get started, and what it promises about security.
+
 ## How a session goes
 
 1. **The technician** starts `cretlink`, chooses **Give help** and waits for
@@ -134,6 +138,8 @@ checksums, a dependency inventory, and CycloneDX SBOMs.
 
 ## Documentation
 
+- The [documentation site](https://yveslaurentcreton.github.io/CretLink/): the
+  short introduction. Its source is in [`website/`](website/).
 - [MCP client setup](docs/mcp-clients.md)
 - [Verifying release artifacts](docs/verifying-artifacts.md)
 - [Relay server operation](docs/relay-server.md)

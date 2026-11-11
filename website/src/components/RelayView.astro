@@ -1,0 +1,109 @@
+---
+// What a relay does and what it can and cannot see: both computers dial out to
+// it, and the session passes through it still encrypted from end to end.
+---
+
+<figure class="relay not-content">
+  <div class="relay-row">
+    <div class="relay-end tech">
+      <strong>Technician's computer</strong>
+      <span>dials out to the relay</span>
+    </div>
+    <div class="relay-leg" aria-hidden="true"><i></i></div>
+    <div class="relay-mid">
+      <strong>Relay</strong>
+      <span>a small server on the internet that you host</span>
+    </div>
+    <div class="relay-leg" aria-hidden="true"><i></i></div>
+    <div class="relay-end cust">
+      <strong>Customer's computer</strong>
+      <span>dials out to the relay</span>
+    </div>
+  </div>
+  <p class="relay-tunnel">
+    <span>The session runs between the two computers, encrypted from end to end. The relay only passes it on.</span>
+  </p>
+
+  <div class="relay-lists">
+    <div class="relay-list sees">
+      <h3>What the relay sees</h3>
+      <ul>
+        <li>that two connections present the same one-time ticket</li>
+        <li>the network addresses they come from</li>
+        <li>how much data passes, and when</li>
+      </ul>
+    </div>
+    <div class="relay-list cannot">
+      <h3>What the relay cannot do</h3>
+      <ul>
+        <li>read a command, a file or anything else of the session</li>
+        <li>learn the six-digit code or a key</li>
+        <li>start, approve or take over a session</li>
+      </ul>
+    </div>
+  </div>
+  <figcaption>
+    A relay that misbehaves can delay or drop a session. It cannot read it or steer it, and both computers notice
+    when it tampers.
+  </figcaption>
+</figure>
+
+<style>
+  .relay { margin: 1.75rem 0; }
+  .relay-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(2rem, 0.35fr) minmax(0, 1fr) minmax(2rem, 0.35fr) minmax(0, 1fr);
+    align-items: center;
+  }
+  .relay-end, .relay-mid {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    padding: 0.8rem 0.9rem;
+    border: 1px solid var(--cl-line);
+    border-radius: 0.55rem;
+    background: var(--cl-panel);
+    text-align: center;
+  }
+  .relay-end.tech { border-color: var(--cl-tech-line); background: var(--cl-tech-soft); }
+  .relay-end.cust { border-color: var(--cl-cust-line); background: var(--cl-cust-soft); }
+  .relay-end.tech strong { color: var(--cl-tech); }
+  .relay-end.cust strong { color: var(--cl-cust); }
+  .relay-mid { border-style: dashed; }
+  .relay-mid strong { color: var(--sl-color-white); }
+  .relay-row span { font-size: 0.82rem; line-height: 1.4; color: var(--sl-color-gray-2); }
+  .relay-leg i { display: block; height: 0; border-top: 2px solid var(--sl-color-text-accent); }
+  .relay-tunnel {
+    margin: 0.75rem 0 0;
+    padding: 0.55rem 0.9rem;
+    border: 1px solid var(--sl-color-text-accent);
+    border-radius: 99px;
+    background: var(--sl-color-accent-low);
+    text-align: center;
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--sl-color-white);
+  }
+  .relay-lists { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1.1rem; }
+  .relay-list {
+    padding: 0.9rem 1.05rem 1rem;
+    border: 1px solid var(--cl-line);
+    border-top-width: 3px;
+    border-radius: 0.55rem;
+    background: var(--cl-panel);
+  }
+  .relay-list.sees { border-top-color: var(--cl-warn-line); }
+  .relay-list.cannot { border-top-color: var(--cl-cust-line); }
+  .relay-list h3 { margin: 0 0 0.5rem; font-size: 0.98rem; color: var(--sl-color-white); }
+  .relay-list ul { margin: 0; padding-left: 1.15rem; font-size: 0.92rem; line-height: 1.55; color: var(--sl-color-gray-1); }
+  .relay-list li { margin: 0.3rem 0; }
+  .relay figcaption { margin-top: 0.9rem; font-size: 0.9rem; color: var(--cl-muted); }
+
+  @media (max-width: 44rem) {
+    .relay-row { grid-template-columns: 1fr; gap: 0.5rem; }
+    .relay-leg { justify-self: center; width: 0; height: 1.2rem; }
+    .relay-leg i { height: 100%; border-top: 0; border-left: 2px solid var(--sl-color-text-accent); }
+    .relay-tunnel { border-radius: 0.6rem; }
+    .relay-lists { grid-template-columns: 1fr; }
+  }
+</style>

@@ -1,0 +1,31 @@
+---
+// A screenshot of the application. Every screenshot on this site is rendered
+// from the application's own screens with sample data (CONTRIBUTING.md,
+// "Sample data"): no real computer, account or address.
+import { Image, getImage } from 'astro:assets';
+import type { ImageMetadata } from 'astro';
+
+interface Props {
+  src: ImageMetadata;
+  alt: string;
+  caption?: string;
+  // `wide` for the technician's window, `narrow` for the customer's window,
+  // `bar` for the customer's small bar.
+  kind?: 'wide' | 'narrow' | 'bar';
+}
+
+const { src, alt, caption, kind = 'wide' } = Astro.props;
+const widths =
+  kind === 'wide' ? [640, 960, 1280, src.width] : kind === 'narrow' ? [384, 580, 768, src.width] : [470, src.width];
+const sizes =
+  kind === 'wide' ? '(max-width: 50rem) 100vw, 48rem' : kind === 'narrow' ? '(max-width: 26rem) 100vw, 24rem' : '(max-width: 30rem) 100vw, 28rem';
+// The picture links to itself at full size, because a small one is hard to read.
+const full = await getImage({ src });
+---
+
+<figure class:list={['shot', 'not-content', kind]}>
+  <a href={full.src} title="Open at full size">
+    <Image src={src} alt={alt} widths={[...new Set(widths.filter((w) => w <= src.width))]} sizes={sizes} />
+  </a>
+  {caption && <figcaption>{caption}</figcaption>}
+</figure>

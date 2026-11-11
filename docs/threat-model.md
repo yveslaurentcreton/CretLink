@@ -2233,6 +2233,9 @@ Each mitigation below is marked with its honest implementation status.
 - The distribution path to the customer: download on the technician computer,
   copy to removable media or a temporary local copy, and visible elevated
   launch on the customer computer (REQ-F-001, REQ-F-002).
+- The documentation site: built from `website/` on `main` and published
+  through GitHub Pages (`pages.yml`, ST-M011-001). It offers no download of
+  its own; it links to the release page, where the checksums are.
 
 **Threat actors.** A compromised or malicious dependency maintainer
 (crates.io account takeover, a hostile transitive dependency, or a
@@ -2325,6 +2328,15 @@ unsigned*. Staged tools and drivers transferred during a
 session are verified by cryptographic digest and recorded in the audit trail,
 which limits silent substitution during the last hop onto the customer machine
 (REQ-F-012, REQ-N-007).
+
+*Documentation site.* A site that an attacker could change would send
+technicians to a lookalike download. Only the publish job of `pages.yml` may
+write to Pages, through the `github-pages` environment that accepts `main`
+alone; pull-request jobs build the site with a read-only token and publish
+nothing, and the site's build dependencies are pinned in its own lockfile and
+audited in CI — *configured (ST-M011-001)*. The site carries no programs: a
+download always comes from the release page and is verified against its
+checksums ([`verifying-artifacts.md`](verifying-artifacts.md)).
 
 *Update authenticity.* The initial product has no automatic update mechanism.
 If one is introduced, update metadata and artifacts must be authenticated

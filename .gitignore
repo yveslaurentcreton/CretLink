@@ -10,6 +10,10 @@ apps/app/dist/
 # Node tooling (semantic-release runs from CI; local installs stay untracked)
 node_modules/
 
+# The documentation site (ST-M011-001): build output and Astro's cache
+website/dist/
+website/.astro/
+
 # Local machine state and editor files
 .DS_Store
 Thumbs.db
