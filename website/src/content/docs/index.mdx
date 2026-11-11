@@ -1,0 +1,80 @@
+---
+title: Attended remote support with your own AI agent
+description: Attended remote support, driven by your own AI agent. The customer starts, approves, watches and stops the session, and no AI program, account or key reaches their computer.
+template: splash
+hero:
+  title: Remote support, driven by your own AI agent
+  tagline: Your AI agent works on a customer's Windows computer, in a session that the customer starts, approves, watches and can stop at any moment.
+  actions:
+    - text: Get started
+      link: /CretLink/get-started/
+      icon: right-arrow
+    - text: How a session works
+      link: /CretLink/session/
+      variant: minimal
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+import Overview from '../../components/Overview.astro';
+import Shot from '../../components/Shot.astro';
+import session from '../../assets/screens/technician-session.png';
+import working from '../../assets/screens/customer-working.png';
+
+<Overview />
+
+## Why it is built this way
+
+<ul class="facts not-content">
+  <li>
+    <strong>The customer is in charge</strong>
+    <span>They start the program, answer Windows, compare a code and allow control. Nothing happens to their computer before that, and one click stops it.</span>
+  </li>
+  <li>
+    <strong>Your AI, your account</strong>
+    <span>The agent runs where you already use it. No AI program, AI account or API key ever reaches the customer's computer.</span>
+  </li>
+  <li>
+    <strong>Everything in sight</strong>
+    <span>Both screens show every action as it happens: what really runs, why the agent says it runs, and how it ended.</span>
+  </li>
+  <li>
+    <strong>Nothing left behind</strong>
+    <span>Nothing is installed on the customer's computer. At the end CretLink removes what it placed there and reports what it could not remove.</span>
+  </li>
+</ul>
+
+## One session, two windows
+
+<div class="shots not-content">
+  <Shot
+    src={session}
+    kind="wide"
+    alt="The technician's window during a session: the customer's computer, the connected AI assistants, and every action with its stated purpose and result."
+    caption="The technician sees the customer's computer, the connected AI agents and every action."
+  />
+  <Shot
+    src={working}
+    kind="narrow"
+    alt="The customer's window during the same session: what is happening now, what happened before, and a Stop now button."
+    caption="The customer sees the same actions, and a Stop button."
+  />
+</div>
+
+The screenshots on this site show sample data.
+
+## What it does today
+
+- **Works:** a session between two computers on the same network, commands in PowerShell and Command Prompt, jobs you can follow and cancel, files in both directions with a check that the copy is identical, and a history of sessions with a report of each.
+- **Experimental:** screenshots, mouse, keyboard and clipboard of the customer's computer, and a terminal for the technician.
+- **Planned:** sessions over the internet, through [a relay that you host](/CretLink/relay/).
+
+CretLink is open source under the MIT licence. It is a `0.x` pre-release: the [status in the README](https://github.com/yveslaurentcreton/CretLink#current-status) says what has been checked on real computers and what has not.
+
+## Where next
+
+<CardGrid>
+  <LinkCard title="How a session works" description="The seven steps, with what each person sees." href="/CretLink/session/" />
+  <LinkCard title="Get started" description="Download, install and connect your AI agent." href="/CretLink/get-started/" />
+  <LinkCard title="Help someone" description="What you do and what your customer does." href="/CretLink/help-someone/" />
+  <LinkCard title="Security in short" description="What CretLink promises, and where its limits are." href="/CretLink/security/" />
+</CardGrid>

@@ -1,0 +1,468 @@
+---
+// The seven steps of a session as a diagram the reader clicks through.
+//
+// Without script every step shows, one under the other, each with its own
+// heading. With script the steps become tabs: one step at a time, moved with
+// the buttons, a click on a step, or the arrow keys.
+import { Image, getImage } from 'astro:assets';
+import type { ImageMetadata } from 'astro';
+
+import start from '../assets/screens/start.png';
+import permission from '../assets/screens/customer-permission.png';
+import find from '../assets/screens/customer-find.png';
+import compare from '../assets/screens/technician-compare.png';
+import code from '../assets/screens/customer-code.png';
+import consent from '../assets/screens/customer-consent.png';
+import session from '../assets/screens/technician-session.png';
+import working from '../assets/screens/customer-working.png';
+import bar from '../assets/screens/customer-bar.png';
+import report from '../assets/screens/customer-report.png';
+
+type Link = 'none' | 'encrypted' | 'control' | 'closed';
+type Side = 'tech' | 'cust';
+
+interface Shot {
+  src: ImageMetadata;
+  alt: string;
+  kind: 'wide' | 'narrow' | 'bar';
+}
+
+interface Step {
+  name: string;
+  title: string;
+  acting: Side[];
+  tech: string;
+  cust: string;
+  link: Link;
+  text: string[];
+  shots: Shot[];
+}
+
+const LINK_LABEL: Record<Link, string> = {
+  none: 'No connection yet',
+  encrypted: 'Encrypted · no access',
+  control: 'Full control',
+  closed: 'Closed',
+};
+
+const steps: Step[] = [
+  {
+    name: 'Start',
+    title: 'Both people start the same program',
+    acting: ['tech', 'cust'],
+    tech: 'Chooses Give help and waits',
+    cust: 'Chooses Get help',
+    link: 'none',
+    text: [
+      'The technician starts CretLink, chooses Give help and waits for the customer.',
+      'The customer starts the same program and chooses Get help. A copy named CretLink-Support.exe opens Get help straight away, for example from a USB stick. Nothing is installed.',
+    ],
+    shots: [{ src: start, alt: 'The start screen with two choices: Get help and Give help.', kind: 'wide' }],
+  },
+  {
+    name: 'Permission',
+    title: 'Windows asks, then the customer picks the technician',
+    acting: ['cust'],
+    tech: 'Waits',
+    cust: 'Answers Windows, then picks the technician',
+    link: 'none',
+    text: [
+      'CretLink first says what will happen. Then Windows asks whether it may make changes to the computer: with that permission the technician can do administrator work later.',
+      'The customer picks the technician from the computers found on the network, or types the connection code the technician gives them. That code only says where to connect. It grants nothing.',
+    ],
+    shots: [
+      { src: permission, alt: 'The customer reads that Windows will ask for permission, and the four steps that follow.', kind: 'narrow' },
+      { src: find, alt: 'The customer chooses the technician from the computers found nearby, or enters a connection code.', kind: 'narrow' },
+    ],
+  },
+  {
+    name: 'Code',
+    title: 'Both screens show the same six digits',
+    acting: ['tech', 'cust'],
+    tech: 'Reads the six digits aloud',
+    cust: 'Checks them on the screen',
+    link: 'encrypted',
+    text: [
+      'The two programs set up an encrypted connection, and each one works out six digits from it. The technician reads them aloud.',
+      'If someone sat in between, the two screens would show different digits, and either person stops. Up to here nothing is shared and nobody has access.',
+    ],
+    shots: [
+      { src: compare, alt: 'The technician is asked to read the six digits aloud and to say whether the codes match.', kind: 'wide' },
+      { src: code, alt: 'The customer sees the same six digits and a button to stop when they do not match.', kind: 'narrow' },
+    ],
+  },
+  {
+    name: 'Consent',
+    title: 'The customer decides',
+    acting: ['cust'],
+    tech: 'Waits. Control cannot be given from here.',
+    cust: 'Reads what full control means, then allows or declines',
+    link: 'encrypted',
+    text: [
+      'The customer reads, in plain words, what the technician and their AI agent could do with full control, and that command output and files may be processed by the technician’s AI service.',
+      'Only the customer can allow it, on their own computer. Declining ends the session, and nothing was shared.',
+    ],
+    shots: [{ src: consent, alt: 'The customer is asked whether to allow full control, with the list of what that makes possible.', kind: 'narrow' }],
+  },
+  {
+    name: 'Work',
+    title: 'The AI agent works, and both people watch',
+    acting: ['tech'],
+    tech: 'The AI agent works through CretLink',
+    cust: 'Sees every action as it happens',
+    link: 'control',
+    text: [
+      'The AI agent on the technician’s computer runs commands in PowerShell or Command Prompt, follows and cancels jobs, and sends and fetches files.',
+      'Each action shows on both screens with what really runs, the purpose the agent stated for it, and its honest result: finished, failed, cancelled, timed out or unknown.',
+    ],
+    shots: [
+      { src: session, alt: 'The technician’s window during the session: the customer’s computer, the connected AI assistants and the list of actions.', kind: 'wide' },
+      { src: working, alt: 'The customer’s window during the session: what is happening now, what happened before and a Stop now button.', kind: 'narrow' },
+    ],
+  },
+  {
+    name: 'Stop',
+    title: 'Either person stops, at any moment',
+    acting: ['tech', 'cust'],
+    tech: 'Can stop with one click or Esc',
+    cust: 'Can stop with one click or Esc',
+    link: 'closed',
+    text: [
+      'Neither person needs the other to stop. Control ends at once: no further request is accepted, and the keys of the session are no longer valid.',
+      'The customer can make the window small while the work goes on. The Stop button stays in sight. A new session needs a new code and new permission.',
+    ],
+    shots: [{ src: bar, alt: 'The customer’s small bar: who has control, what is running now and a Stop button.', kind: 'bar' }],
+  },
+  {
+    name: 'Cleanup',
+    title: 'CretLink tidies up and reports',
+    acting: ['tech', 'cust'],
+    tech: 'Keeps the session in its history',
+    cust: 'Sees what was done and what was removed',
+    link: 'closed',
+    text: [
+      'CretLink stops the jobs that still run and removes what it placed on the customer’s computer. What it could not remove is named, with the command that removes it later.',
+      'The customer sees a report and may save a copy; nothing is saved otherwise. The technician keeps the session, with its audit trail, in the history.',
+    ],
+    shots: [{ src: report, alt: 'The customer’s end report: the counts of commands and files, and the list of what was cleaned up.', kind: 'narrow' }],
+  },
+];
+
+const widthsOf = (shot: Shot): number[] => {
+  const wanted = shot.kind === 'wide' ? [640, 960, 1280] : shot.kind === 'narrow' ? [384, 580, 768] : [470];
+  return [...new Set([...wanted.filter((w) => w < shot.src.width), shot.src.width])];
+};
+const sizesOf = (shot: Shot): string =>
+  shot.kind === 'wide' ? '(max-width: 50rem) 100vw, 36rem' : shot.kind === 'narrow' ? '(max-width: 26rem) 100vw, 20rem' : '(max-width: 30rem) 100vw, 28rem';
+// Every screenshot links to itself at full size, because a small one is hard to read.
+const fullSize = new Map<Shot, string>();
+for (const step of steps) {
+  for (const shot of step.shots) fullSize.set(shot, (await getImage({ src: shot.src })).src);
+}
+---
+
+<div class="steps not-content" data-steps>
+  <div class="steps-tabs" role="tablist" aria-label="The seven steps of a session" hidden>
+    {
+      steps.map((step, index) => (
+        <button
+          type="button"
+          role="tab"
+          id={`step-tab-${index + 1}`}
+          aria-controls={`step-${index + 1}`}
+          aria-label={`Step ${index + 1}: ${step.name}`}
+          aria-selected={index === 0 ? 'true' : 'false'}
+          tabindex={index === 0 ? 0 : -1}
+        >
+          <span class="n">{index + 1}</span>
+          <span class="t">{step.name}</span>
+        </button>
+      ))
+    }
+  </div>
+
+  {
+    steps.map((step, index) => (
+      <section class="step" id={`step-${index + 1}`} data-panel aria-labelledby={`step-title-${index + 1}`}>
+        <h3 id={`step-title-${index + 1}`}>
+          <span class="step-n">Step {index + 1} of {steps.length}</span>
+          {step.title}
+        </h3>
+
+        <div class={`scene link-${step.link}`}>
+          <div class:list={['side', 'tech', { acting: step.acting.includes('tech') }]}>
+            <span class="who">Technician</span>
+            <span class="what">{step.tech}</span>
+          </div>
+          <div class="wire">
+            <span class="wire-line" aria-hidden="true" />
+            <span class="wire-label">{LINK_LABEL[step.link]}</span>
+          </div>
+          <div class:list={['side', 'cust', { acting: step.acting.includes('cust') }]}>
+            <span class="who">Customer</span>
+            <span class="what">{step.cust}</span>
+          </div>
+        </div>
+
+        <div class="step-body">
+          {step.text.map((paragraph) => <p>{paragraph}</p>)}
+        </div>
+
+        <div class:list={['step-shots', `count-${step.shots.length}`, step.shots.map((shot) => shot.kind).join('-')]}>
+          {
+            step.shots.map((shot) => (
+              <a class={`shot-${shot.kind}`} href={fullSize.get(shot)} title="Open at full size">
+                <Image
+                  src={shot.src}
+                  alt={shot.alt}
+                  widths={widthsOf(shot)}
+                  sizes={sizesOf(shot)}
+                  loading={index === 0 ? 'eager' : 'lazy'}
+                />
+              </a>
+            ))
+          }
+        </div>
+      </section>
+    ))
+  }
+
+  <div class="steps-nav" data-nav hidden>
+    <button type="button" data-prev>← Previous</button>
+    <span data-count aria-live="polite"></span>
+    <button type="button" data-next>Next →</button>
+  </div>
+</div>
+
+<script>
+  for (const root of document.querySelectorAll<HTMLElement>('[data-steps]')) {
+    const tablist = root.querySelector<HTMLElement>('[role="tablist"]');
+    const tabs = [...root.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+    const panels = [...root.querySelectorAll<HTMLElement>('[data-panel]')];
+    const nav = root.querySelector<HTMLElement>('[data-nav]');
+    const previous = root.querySelector<HTMLButtonElement>('[data-prev]');
+    const next = root.querySelector<HTMLButtonElement>('[data-next]');
+    const count = root.querySelector<HTMLElement>('[data-count]');
+    if (!tablist || !nav || !previous || !next || !count || tabs.length !== panels.length) continue;
+
+    let current = 0;
+    const show = (index: number, focus = false): void => {
+      current = Math.max(0, Math.min(panels.length - 1, index));
+      tabs.forEach((tab, i) => {
+        tab.setAttribute('aria-selected', i === current ? 'true' : 'false');
+        tab.tabIndex = i === current ? 0 : -1;
+      });
+      panels.forEach((panel, i) => {
+        panel.hidden = i !== current;
+      });
+      previous.disabled = current === 0;
+      next.disabled = current === panels.length - 1;
+      count.textContent = `Step ${current + 1} of ${panels.length}`;
+      if (focus) tabs[current]?.focus();
+    };
+
+    // The steps become tab panels only now that the tabs work.
+    root.classList.add('is-interactive');
+    tablist.hidden = false;
+    nav.hidden = false;
+    panels.forEach((panel) => {
+      panel.setAttribute('role', 'tabpanel');
+      panel.tabIndex = 0;
+    });
+    tabs.forEach((tab, index) => {
+      tab.addEventListener('click', () => show(index));
+      tab.addEventListener('keydown', (event) => {
+        const move: Record<string, number> = {
+          ArrowRight: current + 1,
+          ArrowLeft: current - 1,
+          Home: 0,
+          End: panels.length - 1,
+        };
+        const target = move[event.key];
+        if (target === undefined) return;
+        event.preventDefault();
+        show((target + panels.length) % panels.length, true);
+      });
+    });
+    previous.addEventListener('click', () => show(current - 1));
+    next.addEventListener('click', () => show(current + 1));
+
+    // A link to one step, such as #step-4, opens that step.
+    const fromHash = (): void => {
+      const match = /^#step-(\d+)$/.exec(window.location.hash);
+      const index = match ? Number(match[1]) - 1 : -1;
+      if (index >= 0 && index < panels.length) show(index);
+    };
+    show(0);
+    fromHash();
+    window.addEventListener('hashchange', fromHash);
+  }
+</script>
+
+<style>
+  .steps { margin: 1.5rem 0 2rem; }
+
+  .steps-tabs {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 0.35rem;
+    margin-bottom: 1rem;
+  }
+  .steps-tabs[hidden], .steps-nav[hidden] { display: none; }
+  .steps-tabs button {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.55rem 0.2rem 0.5rem;
+    border: 1px solid var(--cl-line);
+    border-radius: 0.55rem;
+    background: var(--cl-panel);
+    color: var(--sl-color-gray-2);
+    font: inherit;
+    cursor: pointer;
+  }
+  .steps-tabs .n {
+    display: grid;
+    place-items: center;
+    width: 1.7rem;
+    height: 1.7rem;
+    border-radius: 99px;
+    background: var(--sl-color-gray-6);
+    font-size: 0.85rem;
+    font-weight: 700;
+  }
+  .steps-tabs .t { font-size: 0.8rem; font-weight: 600; }
+  .steps-tabs button:hover { border-color: var(--sl-color-text-accent); }
+  .steps-tabs button[aria-selected='true'] {
+    border-color: var(--sl-color-text-accent);
+    background: var(--sl-color-accent-low);
+    color: var(--sl-color-white);
+  }
+  .steps-tabs button[aria-selected='true'] .n { background: var(--sl-color-accent); color: #fff; }
+
+  .step {
+    padding: 1.1rem 1.2rem 1.3rem;
+    border: 1px solid var(--cl-line);
+    border-radius: 0.7rem;
+    background: var(--cl-panel);
+  }
+  /* A link to a step keeps the row of steps in sight under the page header. */
+  .step { scroll-margin-top: 10rem; }
+  .step + .step { margin-top: 1rem; }
+  .is-interactive .step + .step { margin-top: 0; }
+  .step[hidden] { display: none; }
+  .step h3 { margin: 0 0 1rem; font-size: 1.25rem; line-height: 1.3; color: var(--sl-color-white); }
+  .step-n {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--cl-muted);
+  }
+
+  /* The two computers and what is between them at this step. */
+  .scene {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(10.5rem, 0.7fr) minmax(0, 1fr);
+    align-items: stretch;
+    gap: 0.6rem;
+  }
+  .side {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    min-height: 4.6rem;
+    padding: 0.7rem 0.85rem;
+    border: 1px solid var(--cl-line);
+    border-radius: 0.55rem;
+    background: var(--sl-color-black);
+    opacity: 0.72;
+  }
+  .side.acting { opacity: 1; }
+  .side.tech.acting { border-color: var(--cl-tech-line); background: var(--cl-tech-soft); }
+  .side.cust.acting { border-color: var(--cl-cust-line); background: var(--cl-cust-soft); }
+  .side .who {
+    font-size: 0.74rem;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+  .side.tech .who { color: var(--cl-tech); }
+  .side.cust .who { color: var(--cl-cust); }
+  .side .what { font-size: 0.9rem; line-height: 1.4; color: var(--sl-color-white); }
+
+  .wire { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.35rem; }
+  .wire-line { width: 100%; height: 0; border-top: 2px dashed var(--sl-color-gray-4); }
+  .wire-label {
+    padding: 0.1rem 0.55rem;
+    border: 1px solid var(--cl-line);
+    border-radius: 99px;
+    font-size: 0.76rem;
+    font-weight: 650;
+    text-align: center;
+    white-space: nowrap;
+    color: var(--sl-color-gray-2);
+  }
+  .link-encrypted .wire-line { border-top: 2px solid var(--sl-color-text-accent); }
+  .link-encrypted .wire-label { border-color: var(--sl-color-text-accent); color: var(--sl-color-text-accent); }
+  .link-control .wire-line { border-top: 4px solid var(--cl-control-line); }
+  .link-control .wire-label {
+    border-color: var(--cl-control-line);
+    background: var(--cl-control-soft);
+    color: var(--cl-control);
+  }
+  .link-closed .wire-line { border-top: 2px dotted var(--sl-color-gray-4); }
+
+  .step-body { margin-top: 1rem; }
+  .step-body p { margin: 0.55rem 0 0; max-width: 46rem; line-height: 1.65; color: var(--sl-color-gray-1); }
+
+  .step-shots { display: grid; gap: 1rem; margin-top: 1.1rem; align-items: start; }
+  .step-shots a { display: block; border-radius: 0.55rem; cursor: zoom-in; }
+  .step-shots img {
+    display: block;
+    width: 100%;
+    height: auto;
+    border: 1px solid var(--cl-line);
+    border-radius: 0.55rem;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+  }
+  .step-shots.count-1.wide { max-width: 36rem; }
+  .step-shots.count-1.narrow { max-width: 20rem; }
+  .step-shots.count-1.bar { max-width: 28rem; }
+  .step-shots.narrow-narrow { grid-template-columns: repeat(2, minmax(0, 20rem)); }
+  .step-shots.wide-narrow { grid-template-columns: minmax(0, 1.77fr) minmax(0, 1fr); }
+
+  .steps-nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-top: 0.9rem;
+  }
+  .steps-nav button {
+    padding: 0.5rem 0.95rem;
+    border: 1px solid var(--cl-line);
+    border-radius: 0.5rem;
+    background: var(--cl-panel);
+    color: var(--sl-color-white);
+    font: inherit;
+    font-weight: 650;
+    cursor: pointer;
+  }
+  .steps-nav button:hover:not(:disabled) { border-color: var(--sl-color-text-accent); }
+  .steps-nav button:disabled { opacity: 0.45; cursor: default; }
+  .steps-nav [data-count] { font-size: 0.88rem; color: var(--cl-muted); }
+
+  @media (max-width: 46rem) {
+    .steps-tabs .t { display: none; }
+    .scene { grid-template-columns: 1fr; }
+    .wire { flex-direction: row; }
+    .wire-line { width: 2.5rem; flex: none; }
+    .step-shots.narrow-narrow, .step-shots.wide-narrow { grid-template-columns: 1fr; }
+    .step-shots .shot-narrow { max-width: 20rem; }
+  }
+</style>

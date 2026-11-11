@@ -241,6 +241,10 @@ commit must remain valid and the merge strategy must be documented here.
 - Its first job lists what the change touches (`scripts/changed-areas.mjs`).
   A change that holds only documentation (`*.md`, `docs/`, `LICENSE`) or the
   documentation site (`website/`) skips the build and test matrix.
+- A change that touches the documentation site builds it, runs the tests of
+  its check and checks every link of the built pages. `pages.yml` publishes
+  the site from `main`; it holds no release secret and is no part of a
+  release.
 - Its last job, `CI result`, always runs and fails when a job before it
   failed or was cancelled. The ruleset on `main` requires that check and
   `Secret scan and private-data check` of the hygiene workflow

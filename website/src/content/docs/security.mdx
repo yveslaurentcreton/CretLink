@@ -1,0 +1,55 @@
+---
+title: Security in short
+description: What CretLink promises about consent, visibility, stopping and cleanup, where its limits are, and what it will never contain.
+---
+
+<p class="lede">CretLink gives someone administrator access to another person's computer. That is only acceptable when the owner of that computer stays in charge. These are the promises, and the limits.</p>
+
+## Four promises
+
+<ul class="facts not-content">
+  <li>
+    <strong>Consent first</strong>
+    <span>Control exists only after the customer started the program, answered Windows, compared the code and allowed it. It cannot be granted from the technician's side.</span>
+  </li>
+  <li>
+    <strong>Always in sight</strong>
+    <span>A red bar shows as long as someone has control. Every action is listed on both screens, with what really runs next to what the AI agent says it is for.</span>
+  </li>
+  <li>
+    <strong>Stop at any moment</strong>
+    <span>Either person stops alone, with one click or Esc. No further request is accepted, and connecting again needs a new code and new consent.</span>
+  </li>
+  <li>
+    <strong>Nothing hidden stays</strong>
+    <span>Nothing is installed on the customer's computer, and nothing is left that starts by itself. At the end CretLink removes what it placed and names what it could not remove.</span>
+  </li>
+</ul>
+
+## How the connection is protected
+
+- **Encrypted from end to end** between the two programs, with an established protocol and established libraries. CretLink contains no cryptography of its own invention.
+- **The six digits** on both screens come from that connection. Equal digits mean nobody sits in between.
+- **Your AI account stays with you.** Credentials, tokens and keys of your AI service never go to the customer's computer.
+- **A record on your side.** Your computer keeps an audit trail of every session, and CretLink checks each record for damage when it shows the history.
+
+## Where the limits are
+
+CretLink makes misuse visible and stoppable. It cannot make it impossible.
+
+- **Granted access can be abused.** Once the customer allows full control, a command can do anything an administrator can. The protection is that they see it and can stop it, not that harmful commands are filtered out.
+- **What ran cannot be undone.** Stop ends the access. It does not reverse a change that was already made.
+- **Your AI service sees what the agent reads.** Command output and files that the agent asks for are processed by your AI provider. The customer is told so before they consent.
+- **A computer that is already compromised stays compromised.** CretLink does not defend a technician's or a customer's computer against malware that was there before.
+- **People can be rushed.** Confirming the digits without looking, or consenting under pressure, weakens every check above.
+- **The releases are not signed yet.** Until they are, the checksums are how you know a download is genuine.
+
+## What it will never contain
+
+No hidden mode, no way around the customer's consent or around Windows, no capture of passwords or logins, no silent or permanent access, and no AI credentials on the customer's computer. These are refused on purpose, and contributions that add them are rejected.
+
+## Read more
+
+- The [threat model](https://github.com/yveslaurentcreton/CretLink/blob/main/docs/threat-model.md) has every boundary, mitigation and remaining risk, with its status.
+- The [security policy](https://github.com/yveslaurentcreton/CretLink/blob/main/SECURITY.md) says how to report a vulnerability in private.
+- [Verifying release artifacts](https://github.com/yveslaurentcreton/CretLink/blob/main/docs/verifying-artifacts.md) shows how to check a download.

@@ -37,6 +37,8 @@ docs/               Threat model, release policy, artifact verification, relay
                     operation, MCP clients, manual tests, release sign-off
 scripts/            Release artifact generation, Windows signing helpers and
                     the private-data check
+website/            The documentation site (Astro with Starlight), published
+                    through GitHub Pages
 ```
 
 ## Prerequisites
@@ -93,6 +95,33 @@ npm run tauri dev           # run it in development
 
 See [`apps/app/README.md`](apps/app/README.md) for the roles, the release build
 and the remaining manual accessibility verification.
+
+### The documentation site
+
+The site in `website/` is a separate npm package with its own lockfile and
+pinned versions. It needs Node.js 22.12 or newer:
+
+```sh
+cd website
+npm ci                              # first time, and after a change of the lockfile
+npm run dev                         # write with a live preview
+npm run build                       # build the site into dist/
+npm run check                       # every link and picture of the built site
+node --test "scripts/*.test.mjs"    # the tests of that check
+```
+
+Three rules keep it honest and short:
+
+- A page describes what the latest release does. What is planned is marked
+  **Planned** or left out.
+- A page reads in about two minutes. The details stay in `docs/`, and the
+  site links to them.
+- A screenshot shows sample data and is rendered from the application's own
+  screens (see "Sample data"). The diagrams are components of the site, with
+  text that a screen reader reads in order, in a light and a dark theme.
+
+A pull request that touches `website/` builds and checks the site in CI. A
+merge to `main` publishes it (`.github/workflows/pages.yml`).
 
 ## Branches, commits, and releases
 

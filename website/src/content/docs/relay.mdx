@@ -1,0 +1,35 @@
+---
+title: Host your own relay
+description: What a CretLink relay is for, what it can and cannot see, and what exists today.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import RelayView from '../../components/RelayView.astro';
+
+<p class="lede">A relay lets two computers that are not on the same network find each other. It is a small server that you host yourself, and it never sees what a session does.</p>
+
+<Aside type="caution" title="Not in the application yet">
+<span class="planned">Planned</span> The application cannot connect through a relay yet. That is planned for a later release, together with a ready-made container image. This page explains the idea and says what exists already.
+</Aside>
+
+## Why a relay
+
+On the same network the customer's computer connects straight to yours. Across the internet that fails: routers and firewalls do not let a connection in. With a relay both computers connect **out**, to a server they can both reach, and that server joins the two connections.
+
+## What it can and cannot see
+
+<RelayView />
+
+The six digits, the customer's consent, the Stop button and the cleanup work between the two computers, exactly as on the same network. The relay has no part in them.
+
+## Why you host it yourself
+
+There is no central CretLink relay, on purpose. The relay does see who connects to whom and when, so it belongs to the person who gives the support: you. Hosting it yourself also means that nobody else can switch it off.
+
+## What exists today
+
+- **The relay server** ships with every release, as one program for Windows, macOS and Linux. It keeps nothing on disk and needs no special rights.
+- **A password for the relay** keeps strangers from using your server. It gives no access to any computer.
+- **A certificate** lets the relay prove who it is and hides the remaining details from the network in between.
+
+[Relay server operation](https://github.com/yveslaurentcreton/CretLink/blob/main/docs/relay-server.md) describes the server for people who want to run it now. Until the application can use it, only the development tools in the source tree can connect through it.
