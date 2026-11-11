@@ -33,7 +33,7 @@ use cretlink_console::{
 // never picks a target, so these compile only under `dev-simulate`.
 #[cfg(feature = "dev-simulate")]
 use cretlink_console::{DiscoveredTarget, DiscoverySource, TargetId};
-use cretlink_discovery::{Advertiser, ConnectionCode, private_interface_addrs};
+use cretlink_discovery::{Advertiser, ConnectionCode, default_route_addr, listen_candidates};
 // The technician terminal (ST-M008-001) addresses a hosted terminal by `JobId`,
 // picks a `Shell`, and reports its end via `JobOutcome`; `TargetError` is the
 // service's fail-closed error surface, mapped straight to a frontend
@@ -54,6 +54,8 @@ mod bridge;
 mod history;
 // This computer's operating system by name (ST-M009-008).
 mod host_os;
+// The network the technician waits on (ST-M009-016).
+mod network;
 mod session_driver;
 // This copy, its AI clients, and run once or install (ST-M009-006); the start
 // screen registers part of it too.
@@ -96,7 +98,17 @@ pub struct AppState {
     /// The local MCP bridge as the rail shows it: its endpoint and the AI
     /// clients that called during this session (ST-M009-008).
     bridge: bridge::BridgeSlot,
+    /// The network adapter the technician chose to wait on earlier in this
+    /// run (ST-M009-016). Kept in memory only.
+    network: network::NetworkChoice,
+    /// The task of the session that is live or was live last, so that a
+    /// change of network can wait until the old listener is gone before it
+    /// starts the new one (ST-M009-016).
+    pump: PumpSlot,
 }
+
+/// The slot of [`AppState::pump`].
+type PumpSlot = Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>;
 
 impl AppState {
     /// Builds the shipped initial console: this technician host, live and idle,
@@ -119,6 +131,8 @@ impl AppState {
             audit: Arc::new(Mutex::new(None)),
             audit_log: history::OpenLog::default(),
             bridge: bridge::BridgeSlot::default(),
+            network: network::NetworkChoice::default(),
+            pump: PumpSlot::default(),
         }
     }
 
@@ -136,6 +150,8 @@ impl AppState {
             audit: Arc::new(Mutex::new(None)),
             audit_log: history::OpenLog::default(),
             bridge: bridge::BridgeSlot::default(),
+            network: network::NetworkChoice::default(),
+            pump: PumpSlot::default(),
         }
     }
 
@@ -428,8 +444,98 @@ fn start_live_session(
         }
     }
 
+    begin_listening(app, &state, listen_ip(&state.network));
+    Ok(state.guard().clone())
+}
+
+/// How long a change of network waits for the old listener to go, and then
+/// for the new one to report.
+const NETWORK_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Moves the waiting session to another of this computer's networks
+/// (ST-M009-016).
+///
+/// Allowed only while the console waits and nobody is connecting. `address`
+/// must be one of the candidates [`network::get_listen_networks`] lists; any
+/// other address is refused before anything changes (REQ-S-010). The old
+/// listener is stopped and awaited, so that its last events cannot reach the
+/// new session's state, and a new listener starts on the chosen address with
+/// a new connection code. The adapter is remembered for the later sessions of
+/// this run.
+///
+/// The returned state is the new waiting state, or the honest failure when
+/// the chosen address could not be bound (REQ-N-008).
+#[tauri::command]
+async fn switch_listen_network(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    address: String,
+) -> Result<ConsoleState, CommandError> {
+    if !matches!(state.guard().phase, SessionPhase::Listening { .. }) {
+        return Err(CommandError::new(
+            "network",
+            "the network can be changed only while waiting for the customer",
+        ));
+    }
+    let candidates = listen_candidates().map_err(|e| CommandError::new("network", e))?;
+    let chosen = network::requested(&candidates, &address)
+        .map_err(|message| CommandError::new("network", message))?
+        .clone();
+
+    // Stop waiting on the old address, exactly as Cancel does: the wire
+    // revoke is best effort and the local stop is authoritative.
+    let _ = state.send_intent(Intent::Stop(RevokeReason::TechnicianRequested));
+    state
+        .guard()
+        .stop(StopReason::TechnicianRequested)
+        .map_err(|e| CommandError::new("network", e))?;
+    let previous = state
+        .pump
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some(task) = previous {
+        // Bounded: a listener that does not let go must not hold the window.
+        let _ = tokio::time::timeout(NETWORK_SWITCH_TIMEOUT, task).await;
+    }
+
+    state.network.set(&chosen.adapter);
+    begin_listening(app, &state, chosen.addr);
+
+    // The new listener reports from its own task: wait for it, so that the
+    // answer is the new waiting state and not the stop in between.
+    let deadline = tokio::time::Instant::now() + NETWORK_SWITCH_TIMEOUT;
+    loop {
+        {
+            let console = state.guard();
+            if !matches!(console.phase, SessionPhase::Stopped { .. }) {
+                return Ok(console.clone());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(state.guard().clone());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The address to wait on: the adapter the technician chose earlier in this
+/// run while it still has one, otherwise the first choice among this
+/// computer's private addresses (ST-M009-016). Never a public or wildcard
+/// address (REQ-S-010): without any private address the listener binds
+/// loopback, so a bind always targets a concrete address that is not
+/// reachable from outside.
+fn listen_ip(choice: &network::NetworkChoice) -> IpAddr {
+    let candidates = listen_candidates().unwrap_or_default();
+    network::pick(&candidates, choice.get().as_deref(), default_route_addr())
+        .map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), |chosen| chosen.addr)
+}
+
+/// Starts the listener on `bind_ip` and the task that drives the session it
+/// accepts; shared by [`start_live_session`] and [`switch_listen_network`].
+fn begin_listening(app: AppHandle, state: &AppState, bind_ip: IpAddr) {
     let shared = state.inner.clone();
-    let bind_addr = SocketAddr::new(private_bind_ip(), 0);
+    let bind_addr = SocketAddr::new(bind_ip, 0);
 
     // Open the intent channel so the compare-gate confirm/mismatch buttons and
     // the emergency stop can reach the live pump task, which exclusively owns the
@@ -452,7 +558,7 @@ fn start_live_session(
     let audit_slot = state.audit.clone();
     let audit_log = state.audit_log.clone();
 
-    tauri::async_runtime::spawn(async move {
+    let task = tauri::async_runtime::spawn(async move {
         let sink: Arc<dyn StateSink> = Arc::new(TauriSink { app });
 
         // Stand up the audit backbone the console CLI runs (ST-M003-006): one
@@ -527,8 +633,10 @@ fn start_live_session(
         //    list shows the name and host name the waiting screen tells them
         //    to pick (ST-M009-009); equally untrusted on their side.
         let instance = advertised_instance(&lock(&shared).technician.hostname);
+        //    Only the address the listener is bound to is announced, on its
+        //    own adapter (ST-M009-016).
         let _advertiser =
-            Advertiser::advertise(&instance, local_addr.port(), PROTOCOL_V1, &advertised_name).ok();
+            Advertiser::advertise(&instance, local_addr, PROTOCOL_V1, &advertised_name).ok();
 
         // 3. Enter the listening phase carrying the connection code the customer
         //    types in and the private listen address to read out. No target is
@@ -587,8 +695,7 @@ fn start_live_session(
         }
         audit_log.closed();
     });
-
-    Ok(state.guard().clone())
+    *state.pump.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
 }
 
 // --- Interactive terminal (ST-M008-001) ---
@@ -832,24 +939,6 @@ async fn term_close(state: State<'_, AppState>, term: u64) -> Result<(), Command
     closed.map_err(terminal_error)
 }
 
-/// Picks a private, non-loopback interface address to bind the listener to,
-/// mirroring the console CLI (REQ-S-010: never a public or wildcard address).
-/// The candidate list from `private_interface_addrs` is preference-ordered —
-/// routable-private (RFC1918 / ULA) ahead of automatically-assigned link-local,
-/// which is dropped unless it is the only option — so the GUI binds and
-/// advertises the reachable LAN address instead of a stray `169.254` APIPA one
-/// (ST-M002-010). Falls back to loopback only when no private
-/// interface is found, so a bind always targets a concrete private address.
-fn private_bind_ip() -> IpAddr {
-    let candidates = private_interface_addrs().unwrap_or_default();
-    candidates
-        .iter()
-        .find(|ip| !ip.is_loopback())
-        .copied()
-        .or_else(|| candidates.first().copied())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
-}
-
 /// Adds the technician role's state and commands to the application. Only this
 /// role's commands are registered in a technician process (ST-M009-005), plus
 /// the shared [`crate::start::get_role`].
@@ -871,6 +960,8 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         simulate_target_lost,
         stop_session,
         start_live_session,
+        switch_listen_network,
+        network::get_listen_networks,
         open_terminal,
         term_input,
         term_resize,
@@ -895,6 +986,8 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         report_code_mismatch,
         stop_session,
         start_live_session,
+        switch_listen_network,
+        network::get_listen_networks,
         open_terminal,
         term_input,
         term_resize,

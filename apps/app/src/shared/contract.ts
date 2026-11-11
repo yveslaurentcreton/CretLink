@@ -209,6 +209,19 @@ export interface BridgeStatus {
   clients: string[];
 }
 
+// --- The network the technician waits on (ST-M009-016) ---
+
+// `get_listen_networks`: this computer's private addresses, each with the
+// name of its network adapter, in the order the waiting screen lists them.
+export interface ListenNetwork {
+  // The private address, without a port.
+  address: string;
+  // The adapter's name as the operating system gives it ("Wi-Fi", "en0").
+  adapter: string;
+  // A point-to-point link, as many VPN tunnels are.
+  pointToPoint: boolean;
+}
+
 // --- This copy of the application (ST-M009-006, ST-M009-008) ---
 
 export interface AppInfo {

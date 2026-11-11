@@ -1,19 +1,21 @@
 //! The console-side mDNS advertiser (ADR-0007).
 //!
-//! The console registers [`SERVICE_TYPE`](crate::SERVICE_TYPE) on private
-//! interfaces only, per address, never on `0.0.0.0`/`::` (REQ-S-010). The SRV
-//! record's port is the ST-M002-004 control-channel TCP listener; the TXT
-//! record carries only the untrusted `v` and `name` hints. Discovery itself
-//! opens no internet-reachable listener — its only network accommodation is
-//! multicast UDP 5353.
+//! The console registers [`SERVICE_TYPE`](crate::SERVICE_TYPE) for the one
+//! private address its listener is bound to, on the adapter that owns that
+//! address, never on `0.0.0.0`/`::` (REQ-S-010, ST-M009-016). The SRV record's
+//! port is the ST-M002-004 control-channel TCP listener; the TXT record
+//! carries only the untrusted `v` and `name` hints. Discovery itself opens no
+//! internet-reachable listener — its only network accommodation is multicast
+//! UDP 5353.
 
 use std::fmt;
+use std::net::SocketAddr;
 
 use cretlink_protocol::ProtocolVersion;
 use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 
 use crate::error::DiscoveryError;
-use crate::interface::private_interface_addrs;
+use crate::interface::is_advertisable_addr;
 use crate::{SERVICE_TYPE, TXT_KEY_NAME, TXT_KEY_VERSION};
 
 /// A live console advertisement over mDNS.
@@ -32,61 +34,45 @@ impl Advertiser {
     ///
     /// - `instance_name` is the DNS-SD instance label (should be a stable,
     ///   DNS-safe identifier for the console).
-    /// - `port` is the ST-M002-004 control-channel TCP listener port that
-    ///   agents will dial after pairing.
+    /// - `listener` is the address and port of the ST-M002-004 control-channel
+    ///   TCP listener that agents will dial: the one private address the
+    ///   console waits on.
     /// - `protocol_version` and `display_name` become the TXT `v` and `name`
     ///   hints. They are advertised in the clear and are untrusted; never put
     ///   a secret in either (REQ-S-007).
     ///
-    /// Registration is scoped to private interfaces only. If the host has no
-    /// private LAN address the call fails with
-    /// [`DiscoveryError::NoPrivateInterface`] rather than falling back to a
-    /// public or unspecified bind (REQ-S-010); the caller should offer the
-    /// manual connection code instead.
+    /// Only `listener`'s address is announced, and only on the adapter that
+    /// owns it (ST-M009-016): a computer on several networks would otherwise
+    /// announce addresses that nothing listens on. An address that is not a
+    /// private LAN address is refused with [`DiscoveryError::NotPrivate`]
+    /// rather than announced (REQ-S-010); the caller should offer the manual
+    /// connection code instead.
     ///
     /// # Errors
     ///
-    /// Returns [`DiscoveryError`] if interfaces cannot be enumerated, no
-    /// private interface exists, or the mDNS daemon rejects the registration.
+    /// Returns [`DiscoveryError`] if the address is not private or the mDNS
+    /// daemon rejects the registration.
     pub fn advertise(
         instance_name: &str,
-        port: u16,
+        listener: SocketAddr,
         protocol_version: ProtocolVersion,
         display_name: &str,
     ) -> Result<Self, DiscoveryError> {
-        let addrs = private_interface_addrs()?;
-        if addrs.is_empty() {
-            return Err(DiscoveryError::NoPrivateInterface);
-        }
+        let info = service_info(instance_name, listener, protocol_version, display_name)?;
+        let fullname = info.get_fullname().to_owned();
 
         let daemon = ServiceDaemon::new().map_err(DiscoveryError::mdns)?;
 
-        // Scope to private interfaces only: turn everything off, then enable
-        // exactly the vetted private addresses. `IfKind::from(IpAddr)`
-        // identifies the interface owning each address, so mDNS binds only
-        // there and never on 0.0.0.0/:: (REQ-S-010).
+        // Scope to the listener's adapter only: turn everything off, then
+        // enable exactly the adapter that owns the vetted private address.
+        // `IfKind::from(IpAddr)` identifies it, so mDNS binds only there and
+        // never on 0.0.0.0/:: (REQ-S-010).
         daemon
             .disable_interface(IfKind::All)
             .map_err(DiscoveryError::mdns)?;
-        let if_kinds: Vec<IfKind> = addrs.iter().copied().map(IfKind::from).collect();
         daemon
-            .enable_interface(if_kinds)
+            .enable_interface(IfKind::from(listener.ip()))
             .map_err(DiscoveryError::mdns)?;
-
-        let version = protocol_version.to_string();
-        let properties = advertise_properties(&version, display_name);
-        let host_name = format!("{instance_name}.local.");
-
-        let info = ServiceInfo::new(
-            SERVICE_TYPE,
-            instance_name,
-            &host_name,
-            &addrs[..],
-            port,
-            &properties[..],
-        )
-        .map_err(DiscoveryError::mdns)?;
-        let fullname = info.get_fullname().to_owned();
 
         daemon.register(info).map_err(DiscoveryError::mdns)?;
 
@@ -119,8 +105,38 @@ pub(crate) fn advertise_properties<'a>(
     [(TXT_KEY_VERSION, version), (TXT_KEY_NAME, display_name)]
 }
 
+/// Builds the record a console announces: its instance, the one address and
+/// port its listener is bound to, and the two untrusted hints.
+///
+/// Kept apart from the daemon so that "exactly the bound address, and only a
+/// private one" has a test that needs no network (ST-M009-016, REQ-S-010).
+pub(crate) fn service_info(
+    instance_name: &str,
+    listener: SocketAddr,
+    protocol_version: ProtocolVersion,
+    display_name: &str,
+) -> Result<ServiceInfo, DiscoveryError> {
+    if !is_advertisable_addr(listener.ip()) {
+        return Err(DiscoveryError::NotPrivate(listener.ip()));
+    }
+    let version = protocol_version.to_string();
+    let properties = advertise_properties(&version, display_name);
+    let host_name = format!("{instance_name}.local.");
+    ServiceInfo::new(
+        SERVICE_TYPE,
+        instance_name,
+        &host_name,
+        listener.ip(),
+        listener.port(),
+        &properties[..],
+    )
+    .map_err(DiscoveryError::mdns)
+}
+
 #[cfg(test)]
 pub(crate) use self::advertise_properties as advertise_properties_for_tests;
+#[cfg(test)]
+pub(crate) use self::service_info as service_info_for_tests;
 
 impl Drop for Advertiser {
     fn drop(&mut self) {

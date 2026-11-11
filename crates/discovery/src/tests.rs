@@ -9,13 +9,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 
 use cretlink_protocol::ProtocolVersion;
 
-use crate::advertiser::advertise_properties_for_tests;
+use crate::advertiser::{advertise_properties_for_tests, service_info_for_tests};
 use crate::browser::{instance_from_fullname_for_tests, parse_protocol_version_for_tests};
 use crate::code::{crc8_for_tests, decode_symbol_for_tests, encode_symbols_for_tests};
 use crate::interface::{advertisable_for_tests, prefer_routable_private_for_tests};
+use crate::listen::order_candidates_for_tests;
 use crate::{
-    ConnectionCode, DiscoveredConsole, ManualEntryError, SERVICE_TYPE, TXT_KEY_NAME,
-    TXT_KEY_VERSION, TargetSource, is_private_addr, parse_manual_entry, private_interface_addrs,
+    ConnectionCode, DiscoveredConsole, DiscoveryError, ListenCandidate, ManualEntryError,
+    SERVICE_TYPE, TXT_KEY_NAME, TXT_KEY_VERSION, TargetSource, default_route_addr, first_choice,
+    is_private_addr, listen_candidates, parse_manual_entry, private_interface_addrs,
 };
 
 // ---------------------------------------------------------------------------
@@ -144,6 +146,11 @@ fn private_interface_addrs_only_returns_advertisable_addresses() {
 /// crate's classifier, kept here so the invariant check stays self-contained).
 fn is_ipv6_ll(addr: IpAddr) -> bool {
     matches!(addr, IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80)
+}
+
+/// True for an IPv4 or IPv6 link-local address (test-local, as above).
+fn is_link_local(addr: IpAddr) -> bool {
+    matches!(addr, IpAddr::V4(v4) if v4.octets()[..2] == [169, 254]) || is_ipv6_ll(addr)
 }
 
 #[test]
@@ -554,6 +561,212 @@ fn discovery_provenance_conveys_no_authority() {
 }
 
 // ---------------------------------------------------------------------------
+// The address a console waits on (ST-M009-016)
+// ---------------------------------------------------------------------------
+
+fn candidate(addr: IpAddr, adapter: &str) -> ListenCandidate {
+    ListenCandidate {
+        addr,
+        adapter: adapter.to_string(),
+        point_to_point: false,
+    }
+}
+
+fn tunnel(addr: IpAddr, adapter: &str) -> ListenCandidate {
+    ListenCandidate {
+        point_to_point: true,
+        ..candidate(addr, adapter)
+    }
+}
+
+/// The technician's computer of FND-0010 with its VPN connected: the VPN
+/// adapter sorts first, a virtual switch second, the local network last.
+fn three_networks() -> Vec<ListenCandidate> {
+    order_candidates_for_tests(vec![
+        candidate(v4(192, 168, 1, 20), "Wi-Fi"),
+        candidate(v4(172, 20, 0, 1), "vEthernet (Default Switch)"),
+        candidate(v4(10, 0, 0, 5), "VPN"),
+    ])
+}
+
+#[test]
+fn candidates_are_in_numeric_order_with_one_entry_for_each_address() {
+    let ordered = order_candidates_for_tests(vec![
+        candidate(v4(192, 168, 1, 20), "Wi-Fi"),
+        candidate(v4(10, 0, 0, 5), "VPN"),
+        candidate(v4(192, 168, 1, 20), "Wi-Fi"),
+        candidate(v6("fd00::1"), "Wi-Fi"),
+        candidate(v4(172, 20, 0, 1), "vEthernet (Default Switch)"),
+    ]);
+    let addrs: Vec<IpAddr> = ordered.iter().map(|c| c.addr).collect();
+    assert_eq!(
+        addrs,
+        vec![
+            v4(10, 0, 0, 5),
+            v4(172, 20, 0, 1),
+            v4(192, 168, 1, 20),
+            v6("fd00::1")
+        ]
+    );
+    assert_eq!(ordered[2].adapter, "Wi-Fi");
+}
+
+#[test]
+fn candidates_hold_a_link_local_address_only_when_nothing_else_exists() {
+    // ST-M002-010 still holds for the list the technician chooses from.
+    let ordered = order_candidates_for_tests(vec![
+        candidate(v4(169, 254, 248, 109), "Ethernet 2"),
+        candidate(v4(192, 168, 1, 20), "Wi-Fi"),
+        candidate(v6("fe80::1"), "Wi-Fi"),
+    ]);
+    assert_eq!(ordered, vec![candidate(v4(192, 168, 1, 20), "Wi-Fi")]);
+
+    // A direct cable without DHCP: link-local is the genuine address.
+    let cable = order_candidates_for_tests(vec![candidate(v4(169, 254, 1, 1), "Ethernet")]);
+    assert_eq!(cable, vec![candidate(v4(169, 254, 1, 1), "Ethernet")]);
+
+    assert!(order_candidates_for_tests(Vec::new()).is_empty());
+}
+
+#[test]
+fn first_choice_follows_the_default_route_not_the_numeric_order() {
+    let networks = three_networks();
+    // Numerically the VPN address comes first; that was the choice of FND-0010.
+    assert_eq!(networks[0].adapter, "VPN");
+
+    // The computer reaches other networks through its Wi-Fi.
+    let chosen = first_choice(&networks, Some(v4(192, 168, 1, 20))).unwrap();
+    assert_eq!(chosen.adapter, "Wi-Fi");
+    assert_eq!(chosen.addr, v4(192, 168, 1, 20));
+}
+
+#[test]
+fn first_choice_passes_over_a_virtual_adapter_that_routes_nowhere() {
+    // Without the VPN: a virtual switch (172.x) sorts before the local network
+    // (192.168.x), but only the local network has the default route.
+    let networks = order_candidates_for_tests(vec![
+        candidate(v4(192, 168, 1, 20), "Wi-Fi"),
+        candidate(v4(172, 20, 0, 1), "vEthernet (Default Switch)"),
+    ]);
+    assert_eq!(networks[0].adapter, "vEthernet (Default Switch)");
+    assert_eq!(
+        first_choice(&networks, Some(v4(192, 168, 1, 20)))
+            .unwrap()
+            .adapter,
+        "Wi-Fi"
+    );
+}
+
+#[test]
+fn first_choice_does_not_take_a_point_to_point_link_for_the_local_network() {
+    // A VPN that carries the default route is still not where the customer is.
+    let networks = order_candidates_for_tests(vec![
+        tunnel(v4(10, 0, 0, 5), "VPN"),
+        candidate(v4(192, 168, 1, 20), "Wi-Fi"),
+    ]);
+    assert_eq!(
+        first_choice(&networks, Some(v4(10, 0, 0, 5)))
+            .unwrap()
+            .adapter,
+        "Wi-Fi"
+    );
+    // Without any default route the first adapter that is no tunnel is taken.
+    assert_eq!(first_choice(&networks, None).unwrap().adapter, "Wi-Fi");
+}
+
+#[test]
+fn first_choice_falls_back_to_the_order_when_the_default_route_does_not_help() {
+    let networks = three_networks();
+    // No default route (an isolated network).
+    assert_eq!(first_choice(&networks, None).unwrap().adapter, "VPN");
+    // The default route leaves through an address that is no candidate, such
+    // as a public one.
+    assert_eq!(
+        first_choice(&networks, Some(v4(192, 0, 2, 1)))
+            .unwrap()
+            .adapter,
+        "VPN"
+    );
+    // Only point-to-point links: the first one, rather than none.
+    let tunnels = vec![
+        tunnel(v4(10, 0, 0, 5), "VPN"),
+        tunnel(v4(10, 0, 0, 9), "VPN 2"),
+    ];
+    assert_eq!(
+        first_choice(&tunnels, Some(v4(10, 0, 0, 9)))
+            .unwrap()
+            .adapter,
+        "VPN"
+    );
+    // Link-local only, and nothing at all.
+    let cable = vec![candidate(v4(169, 254, 1, 1), "Ethernet")];
+    assert_eq!(first_choice(&cable, None).unwrap().adapter, "Ethernet");
+    assert!(first_choice(&[], Some(v4(192, 168, 1, 20))).is_none());
+}
+
+#[test]
+fn listen_candidates_of_this_host_are_private_and_named() {
+    // Host-dependent, so only the invariants are asserted (REQ-S-010).
+    let candidates = listen_candidates().expect("interface enumeration should work on CI hosts");
+    for candidate in &candidates {
+        assert!(advertisable_for_tests(candidate.addr), "{candidate:?}");
+        assert!(!candidate.addr.is_loopback(), "{candidate:?}");
+        assert!(!candidate.adapter.is_empty(), "{candidate:?}");
+    }
+    let has_routable = candidates.iter().any(|c| !is_link_local(c.addr));
+    if has_routable {
+        assert!(candidates.iter().all(|c| !is_link_local(c.addr)));
+    }
+    // The first choice is one of the candidates, whatever this host routes through.
+    if let Some(chosen) = first_choice(&candidates, default_route_addr()) {
+        assert!(candidates.contains(chosen));
+    }
+}
+
+#[test]
+fn the_default_route_address_is_a_real_local_address_or_unknown() {
+    // A host without a default route answers `None`; one with a route answers
+    // a concrete address. Either way nothing is sent and nothing listens.
+    if let Some(addr) = default_route_addr() {
+        assert!(!addr.is_unspecified());
+    }
+}
+
+#[test]
+fn a_console_announces_exactly_the_address_it_listens_on() {
+    let listener = SocketAddr::new(v4(192, 168, 1, 20), 47141);
+    let info = service_info_for_tests("TECH-LAPTOP", listener, ProtocolVersion::new(1, 11), "Sam")
+        .expect("a private address is announced");
+    let announced: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
+    assert_eq!(announced, vec![v4(192, 168, 1, 20)]);
+    assert_eq!(info.get_port(), 47141);
+    assert_eq!(info.get_property_val_str(TXT_KEY_NAME), Some("Sam"));
+    assert_eq!(info.get_property_val_str(TXT_KEY_VERSION), Some("1.11"));
+}
+
+#[test]
+fn a_console_refuses_to_announce_an_address_that_is_not_private() {
+    for addr in [
+        v4(127, 0, 0, 1),
+        v4(0, 0, 0, 0),
+        v4(192, 0, 2, 1),
+        v6("::1"),
+        v6("::"),
+    ] {
+        let refused = service_info_for_tests(
+            "TECH-LAPTOP",
+            SocketAddr::new(addr, 47141),
+            ProtocolVersion::new(1, 11),
+            "Sam",
+        );
+        assert!(
+            matches!(refused, Err(DiscoveryError::NotPrivate(ip)) if ip == addr),
+            "{addr} must not be announced"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Live mDNS round trip — requires multicast, run manually
 // ---------------------------------------------------------------------------
 
@@ -567,9 +780,12 @@ fn loopback_advertise_then_browse_round_trip() {
 
     use crate::{Advertiser, Browser};
 
+    let candidates = listen_candidates().expect("interfaces should be readable");
+    let chosen = first_choice(&candidates, default_route_addr())
+        .expect("this test needs a private interface");
     let advertiser = Advertiser::advertise(
         "cretlink-test-console",
-        47001,
+        SocketAddr::new(chosen.addr, 47001),
         ProtocolVersion::new(1, 0),
         "Test Console",
     )

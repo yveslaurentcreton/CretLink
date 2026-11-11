@@ -20,6 +20,7 @@ import type {
   CleanupResult,
   ClientId,
   EndedBy,
+  ListenNetwork,
   SessionSummary,
 } from "../shared/contract";
 import {
@@ -96,6 +97,11 @@ export interface TechnicianSnapshot {
   // The local MCP bridge for the rail (ST-M009-008); `null` until the
   // backend has said, and again while a new session's endpoint starts.
   bridge: BridgeStatus | null;
+  // The networks this computer can wait on (ST-M009-016); `null` until the
+  // backend has said.
+  networks: ListenNetwork[] | null;
+  // The list of the other networks is open on the waiting screen.
+  networksOpen?: boolean;
   app: AppInfo | null;
   // The release version from `get_role`, when `app` is unavailable.
   version: string | null;
@@ -144,6 +150,7 @@ export function initialSnapshot(console: ConsoleState, now: number): TechnicianS
     sessions: null,
     clients: null,
     bridge: null,
+    networks: null,
     app: null,
     version: null,
     nav: "home",
@@ -203,6 +210,9 @@ function isEndPhase(phase: PhaseName): boolean {
 
 export function screenFor(s: TechnicianSnapshot): Screen {
   const phase = s.console.phase.phase;
+  // A change of network stops waiting on one address and starts on another:
+  // the screen stays the waiting screen in between (ST-M009-016).
+  if (s.busy === "network") return "wait";
   if (phase === "full_control") return "live";
   if (phase === "stopping") return "stopping";
   if (SESSION_PHASES.includes(phase) && s.nav === "home") {
@@ -505,6 +515,30 @@ export function shortId(id: string): string {
 }
 
 /** What the customer picks in their list: the display name and hostname. */
+/** The host of a listen address: `10.0.0.42:7000` and `[fd00::1]:7000` without the port. */
+export function listenHost(address: string): string {
+  const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(address);
+  if (bracketed?.[1]) return bracketed[1];
+  const colon = address.lastIndexOf(":");
+  return colon > 0 && address.indexOf(":") === colon ? address.slice(0, colon) : address;
+}
+
+/** The network the session waits on, when the backend listed it (ST-M009-016). */
+export function waitingNetwork(s: TechnicianSnapshot): ListenNetwork | undefined {
+  const phase = s.console.phase;
+  if (phase.phase !== "listening") return undefined;
+  const host = listenHost(phase.address);
+  return s.networks?.find((network) => network.address === host);
+}
+
+/** The networks this computer could wait on instead of the current one. */
+export function otherNetworks(s: TechnicianSnapshot): ListenNetwork[] {
+  const phase = s.console.phase;
+  if (phase.phase !== "listening" || !s.networks) return [];
+  const host = listenHost(phase.address);
+  return s.networks.filter((network) => network.address !== host);
+}
+
 export function technicianPick(console: ConsoleState): string {
   const host = console.technician.hostname;
   const name = console.technician.display_name?.trim();
@@ -586,6 +620,18 @@ export function phaseAnnouncement(s: TechnicianSnapshot): string {
     default:
       return "Ready to help. No session.";
   }
+}
+
+/** Whether a value is a `ListenNetwork` of the contract (ST-M009-016). */
+export function isListenNetwork(value: unknown): value is ListenNetwork {
+  if (typeof value !== "object" || value === null) return false;
+  const network = value as Record<string, unknown>;
+  return (
+    typeof network.address === "string" &&
+    network.address !== "" &&
+    typeof network.adapter === "string" &&
+    typeof network.pointToPoint === "boolean"
+  );
 }
 
 /** Whether a value is a `BridgeStatus` of the contract (ST-M009-008). */

@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActivityEvent } from "../shared/contract";
 import type { ConsoleState } from "./api";
-import { AUDIT, CLIENTS, FEED, SESSIONS, SESSION_ID, consoleIn } from "./fixtures";
+import { AUDIT, CLIENTS, FEED, NETWORKS, SESSIONS, SESSION_ID, consoleIn } from "./fixtures";
 
 type Handler = (args?: Record<string, unknown>) => unknown;
 
@@ -302,5 +302,177 @@ describe("technician controller", () => {
     });
     await flush();
     expect(app().querySelectorAll(".feed > li")).toHaveLength(0);
+  });
+});
+
+describe("the network to wait on (ST-M009-016)", () => {
+  const listening = (address = "10.0.0.42:7000", code = "6RRR-2H8F"): ConsoleState =>
+    consoleIn({ phase: "listening", code, address }, { displayName: "Sam" });
+  const asked = (cmd: string): number => backend.calls.filter(([name]) => name === cmd).length;
+  const escape = (): void => {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+  };
+
+  it("asks which networks this computer has when it starts to wait, and names the adapter", async () => {
+    await boot({ get_listen_networks: () => NETWORKS });
+    expect(asked("get_listen_networks")).toBe(0);
+    push(listening());
+    await flush();
+    expect(asked("get_listen_networks")).toBe(1);
+    expect(app().querySelector(".conn-addr")?.textContent).toContain("Wi-Fi · 10.0.0.42:7000");
+    // The same waiting state again is no reason to ask again.
+    push(listening());
+    await flush();
+    expect(asked("get_listen_networks")).toBe(1);
+  });
+
+  it("shows the address alone when the backend does not list networks", async () => {
+    await boot();
+    push(listening());
+    await flush();
+    expect(app().querySelector(".conn-addr")?.textContent).toContain("10.0.0.42:7000");
+    expect(app().querySelector(".net-adapter")).toBeNull();
+    expect(app().querySelector("#net-toggle")).toBeNull();
+  });
+
+  it("moves the waiting session to the chosen network and announces the new code", async () => {
+    await boot({
+      get_listen_networks: () => NETWORKS,
+      switch_listen_network: () => {
+        state = listening("192.168.1.20:7001", "7SSS-3J9G");
+        return state;
+      },
+    });
+    push(listening());
+    await flush();
+    click("#net-toggle");
+    await flush();
+    expect(app().querySelector("#net-toggle")?.getAttribute("aria-expanded")).toBe("true");
+    expect(app().querySelectorAll("#net-list li")).toHaveLength(2);
+
+    click('[data-action="network"][data-arg="192.168.1.20"]');
+    await flush();
+    expect(backend.calls.find(([cmd]) => cmd === "switch_listen_network")?.[1]).toEqual({
+      address: "192.168.1.20",
+    });
+    expect(app().querySelector(".conn-code")?.textContent).toBe("7SSS-3J9G");
+    expect(app().querySelector(".conn-addr")?.textContent).toContain("VPN · 192.168.1.20:7001");
+    expect(app().querySelector("#net-list")).toBeNull();
+    expect(app().querySelector("#announce")?.textContent).toBe(
+      "Now waiting on VPN. The connection code changed.",
+    );
+
+    // The list now offers the network that was left.
+    click("#net-toggle");
+    await flush();
+    const offered = Array.from(app().querySelectorAll("#net-list .net-name")).map(
+      (name) => name.textContent,
+    );
+    expect(offered).toEqual(["Wi-Fi · 10.0.0.42", "vEthernet (Default Switch) · 172.20.0.1"]);
+  });
+
+  it("keeps the waiting screen, without a code, while the network changes", async () => {
+    let finish: (next: ConsoleState) => void = () => undefined;
+    await boot({
+      get_listen_networks: () => NETWORKS,
+      switch_listen_network: () =>
+        new Promise<ConsoleState>((resolve) => {
+          finish = resolve;
+        }),
+    });
+    push(listening());
+    await flush();
+    click("#net-toggle");
+    await flush();
+    click('[data-action="network"][data-arg="172.20.0.1"]');
+    await flush();
+    // The backend stops the old listener before it starts the new one.
+    push(consoleIn({ phase: "stopped", reason: "technician_requested" }));
+    await flush();
+    expect(app().querySelector(".screen.wait")).not.toBeNull();
+    expect(app().querySelector(".conn-switching")?.textContent).toBe("Changing the network…");
+    expect(app().querySelector(".conn-code")).toBeNull();
+
+    const moved = listening("172.20.0.1:7002", "8TTT-4K2H");
+    push(moved);
+    finish(moved);
+    await flush();
+    expect(app().querySelector(".conn-code")?.textContent).toBe("8TTT-4K2H");
+    expect(app().querySelector(".conn-addr")?.textContent).toContain(
+      "vEthernet (Default Switch) · 172.20.0.1:7002",
+    );
+  });
+
+  it("does not step back when a customer connects before the answer arrives", async () => {
+    let finish: (next: ConsoleState) => void = () => undefined;
+    await boot({
+      get_listen_networks: () => NETWORKS,
+      switch_listen_network: () =>
+        new Promise<ConsoleState>((resolve) => {
+          finish = resolve;
+        }),
+    });
+    push(listening());
+    await flush();
+    click("#net-toggle");
+    await flush();
+    click('[data-action="network"][data-arg="172.20.0.1"]');
+    await flush();
+    const moved = listening("172.20.0.1:7002", "8TTT-4K2H");
+    push(consoleIn({ phase: "stopped", reason: "technician_requested" }));
+    push(moved);
+    push(consoleIn({ phase: "connecting" }, { session: true }));
+    finish(moved);
+    await flush();
+    expect(app().textContent).toContain("The customer is connecting");
+    expect(app().querySelector(".conn-code")).toBeNull();
+  });
+
+  it("says so when the network cannot be changed, and shows what the backend says now", async () => {
+    await boot({
+      get_listen_networks: () => NETWORKS,
+      switch_listen_network: () => {
+        throw {
+          stage: "network",
+          message:
+            "this computer no longer has that address; choose one of the networks listed",
+        };
+      },
+    });
+    push(listening());
+    await flush();
+    click("#net-toggle");
+    await flush();
+    click('[data-action="network"][data-arg="172.20.0.1"]');
+    await flush();
+    const alert = app().querySelector('[role="alert"]')?.textContent ?? "";
+    expect(alert).toContain("The network could not be changed");
+    expect(alert).toContain("no longer has that address");
+    expect(alert).toContain("(network)");
+    // Still waiting on the old address, as `get_state` says.
+    expect(app().querySelector(".conn-code")?.textContent).toBe("6RRR-2H8F");
+    // The networks were read again, in case one went away.
+    expect(asked("get_listen_networks")).toBeGreaterThanOrEqual(2);
+  });
+
+  it("closes the open list with Escape before Escape stops the session", async () => {
+    await boot({ get_listen_networks: () => NETWORKS });
+    push(listening());
+    await flush();
+    click("#net-toggle");
+    await flush();
+    expect(app().querySelector("#net-list")).not.toBeNull();
+
+    escape();
+    await flush();
+    expect(app().querySelector("#net-list")).toBeNull();
+    // Still waiting: this Escape closed the list and did not stop the session.
+    expect(app().querySelector(".conn-code")?.textContent).toBe("6RRR-2H8F");
+
+    // Now Escape stops, as it always does (REQ-F-018).
+    escape();
+    await flush();
+    expect(app().querySelector(".conn-code")).toBeNull();
+    expect(asked("stop_session")).toBeGreaterThanOrEqual(1);
   });
 });
