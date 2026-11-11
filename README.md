@@ -1,45 +1,61 @@
 # CretLink
 
-CretLink is a personal open-source project for secure, attended AI-assisted
-remote support.
+**Attended remote support, driven by your own AI agent.**
 
-It lets an MCP-capable AI agent running on a technician's own Windows or macOS
-computer operate a temporary elevated agent on a customer's Windows computer.
-The customer computer does not need Codex CLI, Claude CLI, an AI account, or an
-AI API key.
+CretLink lets an AI agent on a technician's computer work on a customer's
+Windows computer, in a session that the customer starts, approves, watches and
+can stop at any moment. The agent is the one you already use: Claude Code,
+Codex CLI, Gemini CLI or another client that speaks the Model Context Protocol
+(MCP). The customer's computer needs no AI program, no AI account and no API
+key.
 
-## Intended workflow
+<p align="center">
+  <img src="docs/images/technician-session.png" width="61%" align="top" alt="The technician's window during a session: the customer's computer, the connected AI assistants, and every action with its stated purpose and result.">
+  &nbsp;
+  <img src="docs/images/customer-working.png" width="30.5%" align="top" alt="The customer's window during the same session: what is happening now, what happened before, and a Stop now button.">
+</p>
+<p align="center"><sub>One session from both sides: the technician's window and the customer's window. Sample data.</sub></p>
 
-CretLink is one application, `cretlink` (`cretlink.exe` on Windows), with two
-roles: **Give help** for the technician and, on Windows, **Get help** for the
-customer.
+## How a session goes
 
-1. On the technician computer, unpack the release archive, start `cretlink`
-   and choose **Give help** (run once or install, see below).
-2. Connect your AI clients once with `cretlink mcp install`, or from the AI
-   assistants screen.
-3. On the customer's Windows computer, start the same `cretlink.exe`, for
-   example from removable media, and choose **Get help**. A copy renamed to
-   `CretLink-Support.exe` opens Get help straight away.
-4. Approve UAC, compare the session code, and grant full control for the
-   attended session.
-5. Use Codex, Claude, or another MCP client; it reaches the session through
-   the local bridge, `cretlink mcp`.
-6. Let the AI inspect the target, run arbitrary PowerShell or Command Prompt
-   work, control jobs, and transfer files.
-7. Stop the session from either endpoint and remove temporary access.
+1. **The technician** starts `cretlink`, chooses **Give help** and waits for
+   the customer.
+2. **The customer** starts the same program, chooses **Get help** and answers
+   the Windows administrator prompt. A copy named `CretLink-Support.exe` opens
+   Get help straight away, for example from a USB stick. Nothing is installed.
+3. The customer picks the technician from the computers found on the network,
+   or types the connection code the technician gives them.
+4. Both windows show the same six digits. The technician reads them aloud;
+   when they differ, either person stops.
+5. The customer reads what full control means, then allows or declines it.
+6. The technician's AI agent works through CretLink: it runs PowerShell and
+   Command Prompt commands, follows and cancels jobs, and sends and fetches
+   files. Both windows show every action as it happens, with the purpose the
+   agent stated for it.
+7. Either person stops the session. CretLink removes what it placed on the
+   customer's computer and reports what it could not remove.
 
-The primary path is a direct authenticated and encrypted LAN connection.
-On Windows, offline recovery of leftover CretLink resources is implemented
-(`cretlink recover [--remove]`; Get help also removes what an earlier session
-left before it connects, and says so when it cannot), as
-are the building blocks of attended reboot-resume: a customer-armed,
-single-use, expiring continuity ticket that never restores control without
-fresh consent. Wiring reboot-resume into an actual reboot (automatic restart of
-the agent and the reconnect) is not finished yet. An optional internet
-relay, which forwards only end-to-end encrypted traffic, is in progress.
-Interactive desktop control follows once the command, file, consent,
-revocation, and cleanup foundations are reliable.
+The connection is direct, authenticated and encrypted end to end, between two
+computers on the same network. AI credentials, provider tokens and login state
+stay on the technician's computer.
+
+## Get started
+
+1. Download the archive for your operating system from the
+   [latest release](https://github.com/yveslaurentcreton/CretLink/releases/latest)
+   and [verify it](docs/verifying-artifacts.md). Use the same release on both
+   computers: a session starts only when both speak the same protocol version.
+2. On the technician's computer, unpack it, start `cretlink` and choose
+   **Give help**, then **Install for me** or **Run once without installing**
+   (see below).
+3. Connect your AI clients from the **AI assistants** screen, or with
+   `cretlink mcp install`. [MCP client setup](docs/mcp-clients.md) has the
+   details and the manual configuration for each client.
+4. Give the customer `cretlink.exe` from the Windows archive, renamed to
+   `CretLink-Support.exe`, and follow the steps above.
+
+The releases are not code-signed yet, so Windows shows a warning for an
+unknown publisher. The checksums are the integrity check for now.
 
 ## Run once or install
 
@@ -90,31 +106,41 @@ later); the application `cretlink` also needs the WebKitGTK 4.1 webview
 
 ## Current status
 
-CretLink is under active development and not yet ready for production support
-work. The attended same-LAN session — discovery or manual pairing, the
-approval-code comparison, full-control consent, revocation from either side,
-and cleanup — is implemented (M001, M002). Remote execution and file transfer
-(M003) and MCP control (M004) are implemented, with hardware validation
-outstanding. Resilience and release hardening (M006) and the optional internet
-relay (M007) are in progress. Desktop control (M005) and the technician
-terminal (M008) are draft milestones with experimental code only.
+CretLink is under active development. Versions are `0.x` pre-releases;
+`1.0.0` is reserved for the first usable attended-LAN release.
 
-Versions are `0.x` pre-releases; `1.0.0` is reserved for the first usable
-attended-LAN release. Official releases are built by the release workflow and
-ship with SHA-256 checksums, a dependency inventory, and CycloneDX SBOMs. They
-are not code-signed yet; see
-[Verifying release artifacts](docs/verifying-artifacts.md).
+- **Works today:** the attended session on the same network (discovery or a
+  connection code, the code comparison, full-control consent, stop from either
+  side, cleanup), remote commands and jobs, file transfer, the MCP tools for
+  an AI agent, session history with an end report, and offline recovery of
+  leftover CretLink resources on Windows (`cretlink recover [--remove]`).
+- **Checked on real computers:** sessions between two Windows 11 computers,
+  driven by Claude Code and by the Code tab of Claude Desktop, last on
+  2026-11-10. The run log in [Manual tests](docs/manual-tests.md) names what
+  ran and what is still pending: among others macOS as the technician's
+  computer, Codex CLI as the second client, and the
+  [release sign-off](docs/release-signoff.md) on the official files.
+- **Experimental:** the screenshot, input and clipboard tools, and the
+  technician's interactive terminal.
+- **In progress:** sessions over the internet. The relay server, which forwards
+  only end-to-end encrypted traffic, is released and
+  [documented](docs/relay-server.md), but the application cannot use a relay
+  yet. Attended reboot-resume has its building blocks (a customer-armed,
+  single-use, expiring ticket that never restores control without fresh
+  consent) but is not wired into an actual reboot.
 
-Start with:
+Official releases are built by the release workflow and ship with SHA-256
+checksums, a dependency inventory, and CycloneDX SBOMs.
 
-- [Release policy](docs/releasing.md)
-- [Verifying release artifacts](docs/verifying-artifacts.md)
+## Documentation
+
 - [MCP client setup](docs/mcp-clients.md)
+- [Verifying release artifacts](docs/verifying-artifacts.md)
 - [Relay server operation](docs/relay-server.md)
-- [Threat model](docs/threat-model.md)
-- [Manual tests](docs/manual-tests.md)
-- [Release sign-off](docs/release-signoff.md)
-- [Security policy](SECURITY.md)
+- [Threat model](docs/threat-model.md) and [security policy](SECURITY.md)
+- [Manual tests](docs/manual-tests.md) and
+  [release sign-off](docs/release-signoff.md)
+- [Release policy](docs/releasing.md)
 
 Development setup, build commands, and the dependency policy are documented in
 [CONTRIBUTING.md](CONTRIBUTING.md).

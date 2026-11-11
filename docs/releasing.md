@@ -235,13 +235,11 @@ commit must remain valid and the merge strategy must be documented here.
 
 ### CI runs (ST-M006-017)
 
-While the repository is private, CI minutes are limited, so a change is
-verified once:
+A change is verified once:
 
 - CI (`ci.yml`) runs on pull requests and not again on `main` after the merge.
   The pull request run tests the merge result, and `release.yml` builds the
-  tagged commit. CI on `main` returns when the repository is public and the
-  minutes are free.
+  tagged commit.
 - A newer push to a pull request cancels the run in progress for it.
 - A pull request that changes only documentation (`*.md`, `docs/`, `LICENSE`)
   runs the hygiene checks only (`hygiene.yml`): the secret scan and the

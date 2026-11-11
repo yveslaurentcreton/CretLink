@@ -2200,14 +2200,15 @@ independent of the fact that the source is public.
 **Status.** Enforced on `main` and in the release workflow. The Cargo
 workspace with its committed lockfile and `deny.toml` (ST-M001-002), the
 continuous-verification pipeline (ST-M001-004), and semantic-release automation
-(ST-M001-005) are configured and verified. Official artifacts — five binaries
-per target, SHA-256 checksums, a dependency inventory, and CycloneDX SBOMs —
-are published by the release workflow (ST-M006-004). Authenticode signing is
-implemented but gated, and no signing identity is configured, so current
-releases are unsigned (ST-M006-005); build provenance attestation is not yet
-implemented. Branch protection is pending the repository becoming public (a
-GitHub free-plan limit on private repositories). Each mitigation below is
-marked with its honest implementation status.
+(ST-M001-005) are configured and verified. Official artifacts — one archive
+per operating system with the application and its console build, the relay
+server, SHA-256 checksums, a dependency inventory, and CycloneDX SBOMs — are
+published by the release workflow (ST-M006-004, ST-M009-004). Authenticode
+signing is implemented but gated, and no signing identity is configured, so
+current releases are unsigned (ST-M006-005); build provenance attestation is
+not yet implemented. A ruleset on `main` accepts changes only through a pull
+request, merged as a squash commit, and rejects force pushes and deletion.
+Each mitigation below is marked with its honest implementation status.
 
 **Entry points.**
 
@@ -2281,11 +2282,10 @@ REQ-N-017; M001 exit criteria, ST-M001-004) — *configured and enforced on
 advisory, ban, and source checks on every pull request that changes more than
 documentation, and `hygiene.yml` runs gitleaks secret scanning and the
 private-data check (ST-M006-016) on every pull request, with all actions
-SHA-pinned. While the repository is private, neither runs again on the release
-branch: a pull request is merged only when it is up to date with `main`, so
-the merged tree is the tested one, and a direct push to `main`, which the
-[release policy](releasing.md) forbids, would go unchecked until branch
-protection exists*. The committed Cargo lockfile pins the
+SHA-pinned. Neither runs again on the release branch: a pull request is
+merged only when it is up to date with `main`, so the merged tree is the
+tested one, and the ruleset on `main` rejects a direct push, which the
+[release policy](releasing.md) forbids*. The committed Cargo lockfile pins the
 exact dependency graph, so a release builds from reviewed, recorded versions
 rather than whatever resolves on the day — *in place: the Cargo workspace,
 `Cargo.lock`, and `deny.toml` are committed (ST-M001-002, Done)*.
@@ -2299,9 +2299,9 @@ non-privileged simulated agent, and release secrets and signing keys never
 enter untrusted pull-request jobs (REQ-N-011, REQ-N-017; [release policy](releasing.md))
 — *configured on `main` (ST-M001-004, Done): pull-request jobs carry no write
 tokens, and the release workflow runs only on `main` behind a fork guard*.
-Besides its read-only token, the only secret a pull-request job reads is the
-maintainer's list of private terms for the private-data check (ST-M006-016),
-which is no credential and which a pull request from a fork does not receive.
+A pull-request job reads no secret besides its read-only token: the
+maintainer's list of private terms for the private-data check (ST-M006-016)
+stays on the maintainer's computer and is applied there before a push.
 Only protected release automation may publish from the release branch;
 versions, tags, and changelogs come from semantic-release rather than manual
 steps that an attacker could imitate (REQ-N-018, REQ-N-019, ST-M001-005) —
@@ -2364,10 +2364,9 @@ handled without forcing public disclosure of exploitable detail —
   are configured and enforced on `main` (ST-M001-002, ST-M001-004, and
   ST-M001-005 are Done), and releases ship with checksums, a dependency
   inventory, and SBOMs, but no signing identity is configured and build
-  provenance attestation is not yet implemented, and branch protection cannot
-  be enabled until the repository is public (a GitHub free-plan limit on
-  private repositories). Until then, checksums verified against the official
-  release page are the practical integrity assurance.
+  provenance attestation is not yet implemented. Until then, checksums
+  verified against the official release page are the practical integrity
+  assurance.
 
 ## Residual risks and explicit non-goals
 
