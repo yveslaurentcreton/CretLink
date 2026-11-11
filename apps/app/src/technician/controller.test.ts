@@ -3,6 +3,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActivityEvent } from "../shared/contract";
+import { type TimerTracker, trackTimers } from "../shared/test-timers";
 import type { ConsoleState } from "./api";
 import { AUDIT, CLIENTS, FEED, NETWORKS, SESSIONS, SESSION_ID, consoleIn } from "./fixtures";
 
@@ -53,6 +54,8 @@ vi.mock("./terminal", () => ({
 }));
 
 let state: ConsoleState = consoleIn({ phase: "idle" });
+// Cancels what a test leaves running, so it cannot call the fake during a later test.
+let timers: TimerTracker;
 
 function push(next: ConsoleState): void {
   state = next;
@@ -89,6 +92,7 @@ async function boot(handlers: Record<string, Handler> = {}): Promise<void> {
 }
 
 beforeEach(() => {
+  timers = trackTimers();
   vi.resetModules();
   backend.handlers = {};
   backend.listeners = {};
@@ -100,6 +104,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  timers.clear();
   document.body.replaceChildren();
 });
 
@@ -144,6 +149,26 @@ describe("technician controller", () => {
       await flush();
       expect(backend.calls.map(([cmd]) => cmd)).toContain("stop_session");
     }
+  });
+
+  it("answers Escape once, however often the controller was started before", async () => {
+    // Every test loads the controller anew. An earlier one must not hear the
+    // key as well, or one Escape would stop the session several times over.
+    const waiting = consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" });
+    await boot();
+    push(waiting);
+    await flush();
+    // A second controller, as the next test would load it; the first one is
+    // still waiting and would stop on Escape too.
+    vi.resetModules();
+    document.body.innerHTML = '<div id="app" aria-busy="true"></div>';
+    await boot();
+    push(waiting);
+    await flush();
+    backend.calls = [];
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flush();
+    expect(backend.calls.filter(([cmd]) => cmd === "stop_session")).toHaveLength(1);
   });
 
   it("keeps the feed across tab switches and the terminal alive across renders", async () => {
