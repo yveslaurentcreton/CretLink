@@ -3,6 +3,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActivityEvent } from "../shared/contract";
+import { type TimerTracker, trackTimers } from "../shared/test-timers";
 import type { ConsentView, LaunchView } from "./api";
 import { CONSOLES, FEED, LAUNCH_READY, REPORT, viewIn } from "./fixtures";
 
@@ -32,6 +33,8 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 let view: ConsentView = viewIn({ phase: "idle" });
 let launch: LaunchView = LAUNCH_READY;
+// Cancels what a test leaves running, so it cannot call the fake during a later test.
+let timers: TimerTracker;
 
 function push(next: ConsentView): void {
   view = next;
@@ -86,6 +89,7 @@ async function boot(handlers: Record<string, Handler> = {}, window: "main" | "mi
 }
 
 beforeEach(() => {
+  timers = trackTimers();
   vi.resetModules();
   backend.handlers = {};
   backend.listeners = {};
@@ -96,6 +100,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  timers.clear();
   document.body.replaceChildren();
 });
 
