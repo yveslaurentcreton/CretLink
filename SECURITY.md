@@ -44,10 +44,6 @@ vulnerability reporting (Security Advisories) for this repository:
   vulnerability** (or use
   `https://github.com/yveslaurentcreton/CretLink/security/advisories/new`).
 
-(GitHub private vulnerability reporting becomes available once the repository
-is public; the maintainer enables and verifies this channel at public
-release. Until then, use the fallback below.)
-
 **Please do not open a public issue, discussion, or pull request containing
 exploitable details.** CretLink's own requirements commit the project to a
 private reporting path precisely so that reporters are never forced to publish

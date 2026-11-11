@@ -110,14 +110,12 @@ Follow [`docs/releasing.md`](docs/releasing.md):
   `v0.21.1` snapshot seed (see `docs/releasing.md`).
 - CI must be green before squash-merging, and the pull request must be up to
   date with `main`, so that the tree CI tested is the tree that is merged.
-  Branch protection with required checks is enabled once the repository
-  becomes public; on the current private free-plan repository these rules are
-  procedural.
-- While the repository is private, CI minutes are limited: CI runs on pull
-  requests and not again on `main`, a newer push cancels the run in progress,
-  and a pull request that changes only documentation runs the secret scan and
-  the private-data check without the build and test matrix. CI on `main`
-  returns when the repository is public.
+  A ruleset on `main` accepts changes only through a pull request, merged as
+  a squash commit.
+- CI runs on pull requests and not again on `main`, a newer push cancels the
+  run in progress, and a pull request that changes only documentation runs
+  the secret scan and the private-data check without the build and test
+  matrix.
 
 ## Dependency and license policy
 
@@ -175,13 +173,17 @@ node scripts/check-private-data.mjs --commits origin/main..HEAD
 ```
 
 A maintainer adds `--terms <file>` with a private list of real names, one per
-line; on a pull request the list comes from the `PRIVATE_TERMS` secret. The
+line, kept outside the repository; a pull request run has no such list. The
 check reports the place and the number of a term, never the term itself.
 
 Replace a reported value by a sample value. A new sample value goes into
 `scripts/private-data-samples.json`, with its reason, and into the table above
 in the same change. The tests of the check run with
 `node --test "scripts/*.test.mjs"`.
+
+The check cannot read images. A screenshot shows sample data only: render it
+from the fixtures of the application's screens (`apps/app/dev/gallery.html`),
+never from a real session.
 
 ## Security
 
