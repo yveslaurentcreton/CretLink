@@ -110,12 +110,14 @@ Follow [`docs/releasing.md`](docs/releasing.md):
   `v0.21.1` snapshot seed (see `docs/releasing.md`).
 - CI must be green before squash-merging, and the pull request must be up to
   date with `main`, so that the tree CI tested is the tree that is merged.
-  A ruleset on `main` accepts changes only through a pull request, merged as
-  a squash commit.
-- CI runs on pull requests and not again on `main`, a newer push cancels the
-  run in progress, and a pull request that changes only documentation runs
-  the secret scan and the private-data check without the build and test
-  matrix.
+  A ruleset on `main` enforces this: it accepts changes only through a pull
+  request, merged as a squash commit, and requires two checks, `CI result`
+  and `Secret scan and private-data check`.
+- CI runs on pull requests and again on `main` after the merge. A newer push
+  cancels the run in progress for a pull request. A pull request that changes
+  only documentation or the documentation site skips the build and test
+  matrix; `CI result` still reports, and the secret scan and the private-data
+  check always run.
 
 ## Dependency and license policy
 

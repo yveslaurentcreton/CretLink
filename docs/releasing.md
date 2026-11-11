@@ -235,16 +235,18 @@ commit must remain valid and the merge strategy must be documented here.
 
 ### CI runs (ST-M006-017)
 
-A change is verified once:
-
-- CI (`ci.yml`) runs on pull requests and not again on `main` after the merge.
-  The pull request run tests the merge result, and `release.yml` builds the
-  tagged commit.
+- CI (`ci.yml`) runs on every pull request and again on `main` after the
+  merge. The pull request run tests the merge result, and `release.yml`
+  builds the tagged commit.
+- Its first job lists what the change touches (`scripts/changed-areas.mjs`).
+  A change that holds only documentation (`*.md`, `docs/`, `LICENSE`) or the
+  documentation site (`website/`) skips the build and test matrix.
+- Its last job, `CI result`, always runs and fails when a job before it
+  failed or was cancelled. The ruleset on `main` requires that check and
+  `Secret scan and private-data check` of the hygiene workflow
+  (`hygiene.yml`), which runs on every pull request, and it requires the pull
+  request to be up to date with `main`.
 - A newer push to a pull request cancels the run in progress for it.
-- A pull request that changes only documentation (`*.md`, `docs/`, `LICENSE`)
-  runs the hygiene checks only (`hygiene.yml`): the secret scan and the
-  private-data check, which every pull request runs. The build and test matrix
-  does not start.
 - Every job has a time limit.
 
 ## Breaking changes
