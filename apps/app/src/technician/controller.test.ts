@@ -493,11 +493,12 @@ describe("the network to wait on (ST-M009-016)", () => {
     expect(app().querySelector("#net-list")).toBeNull();
     // Still waiting: this Escape closed the list and did not stop the session.
     expect(app().querySelector(".conn-code")?.textContent).toBe("6RRR-2H8F");
+    expect(asked("stop_session")).toBe(0);
 
     // Now Escape stops, as it always does (REQ-F-018).
     escape();
     await flush();
+    expect(asked("stop_session")).toBe(1);
     expect(app().querySelector(".conn-code")).toBeNull();
-    expect(asked("stop_session")).toBeGreaterThanOrEqual(1);
   });
 });
