@@ -1,0 +1,68 @@
+---
+title: Help someone
+description: What you do and what your customer does during a CretLink session on the same network, and how you put your AI agent to work.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Shot from '../../components/Shot.astro';
+import wait from '../../assets/screens/technician-wait.png';
+
+<p class="lede">You are with your customer, or on the phone with them, and both computers are on the same network. This is the whole visit.</p>
+
+## Who does what
+
+<div class="lanes not-content">
+  <div class="lane tech">
+    <h3>You</h3>
+    <ol>
+      <li>Start CretLink and choose <strong>Give help</strong>.</li>
+      <li>Read the six digits aloud when they appear, and confirm that they match.</li>
+      <li>Ask your AI agent to do the work, and watch what it does.</li>
+      <li>Stop the session when the work is done.</li>
+    </ol>
+  </div>
+  <div class="lane cust">
+    <h3>Your customer</h3>
+    <ol>
+      <li>Starts <code>CretLink-Support.exe</code> and answers <strong>Yes</strong> when Windows asks.</li>
+      <li>Picks you from the list and checks the six digits you read.</li>
+      <li>Reads what full control means and allows it.</li>
+      <li>Watches, and can press <strong>Stop now</strong> at any moment.</li>
+    </ol>
+  </div>
+</div>
+
+[How a session works](/CretLink/session/) shows each of these steps with its screen.
+
+## When their program does not find you
+
+Your waiting screen shows a connection code. Read it to your customer; they type it under the list of technicians.
+
+<Shot
+  src={wait}
+  kind="wide"
+  alt="The technician's waiting screen with the connection code and the address of this computer."
+  caption="The connection code only says where your computer is. It gives nobody access."
+/>
+
+## Put your AI agent to work
+
+Once the customer has allowed control, the agent you connected sees CretLink's remote tools. Ask it in your own words, for example:
+
+> Use CretLink to find out why the Wi-Fi adapter on the customer's computer reports an error. Tell me what you find before you change anything.
+
+Three habits make a session go well:
+
+- **Let it look first.** Every answer names the computer it came from, and the agent can ask for the computer's details and whether the session has administrator rights. A good first request is to ask where it is.
+- **Ask for a purpose.** The agent can state in a few words why it runs something. Your customer reads that purpose next to the real command.
+- **Read the results.** A failed command is reported as failed, a cancelled one as cancelled, and one that got lost as unknown. Nothing is reported as done when it is not.
+
+Files go both ways: the agent sends a file to the customer's computer and fetches one from it, and CretLink checks that every copy is identical to the original. A file that leaves the customer's computer is marked as such on both screens.
+
+## When you are done
+
+Press **Stop session**, or let your customer press **Stop now**. CretLink cleans up on their computer and both of you get a report. On your side the session stays under **Sessions**, with its audit trail.
+
+<Aside type="note" title="Over the internet">
+<span class="planned">Planned</span> Today both computers must be on the same network. Sessions over the internet will go through [a relay that you host](/CretLink/relay/).
+</Aside>

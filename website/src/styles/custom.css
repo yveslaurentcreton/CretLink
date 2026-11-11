@@ -1,0 +1,199 @@
+/* The site wears the application's colours (apps/app/src/base.css): slate
+ * neutrals, indigo for the technician, teal for the customer, violet for the
+ * AI agent and red for full control. Dark is Starlight's default theme; the
+ * light theme follows below. */
+
+@import '@fontsource-variable/inter';
+
+:root {
+  --sl-color-accent-low: #23215c;
+  --sl-color-accent: #6366f1;
+  --sl-color-accent-high: #c7d2fe;
+  --sl-color-white: #f8fafc;
+  --sl-color-gray-1: #e2e8f0;
+  --sl-color-gray-2: #cbd5e1;
+  --sl-color-gray-3: #94a3b8;
+  --sl-color-gray-4: #64748b;
+  --sl-color-gray-5: #334155;
+  --sl-color-gray-6: #1e293b;
+  --sl-color-gray-7: #172033;
+  --sl-color-black: #0f172a;
+  --sl-color-bg-nav: #0b1120;
+  --sl-color-bg-sidebar: #0b1120;
+  --sl-color-hairline-light: #334155;
+  --sl-color-hairline: #1e293b;
+  --sl-font: 'Inter Variable', 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  --sl-font-mono: 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Consolas, ui-monospace, monospace;
+  --sl-content-width: 50rem;
+
+  /* Roles and states, as the application shows them. */
+  --cl-tech: #a5b4fc;
+  --cl-tech-soft: #1e1b4b;
+  --cl-tech-line: #4338ca;
+  --cl-cust: #5eead4;
+  --cl-cust-soft: #0b2f2c;
+  --cl-cust-line: #0f766e;
+  --cl-ai: #c4b5fd;
+  --cl-ai-soft: #2a1b55;
+  --cl-ai-line: #6d28d9;
+  --cl-control: #fca5a5;
+  --cl-control-soft: #3b1113;
+  --cl-control-line: #dc2626;
+  --cl-ok: #86efac;
+  --cl-warn: #fcd34d;
+  --cl-warn-soft: #33260a;
+  --cl-warn-line: #a16207;
+  --cl-panel: #111a2e;
+  --cl-line: #334155;
+  --cl-muted: #94a3b8;
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #eef2ff;
+  --sl-color-accent: #4f46e5;
+  --sl-color-accent-high: #312e81;
+  --sl-color-white: #0f172a;
+  --sl-color-gray-1: #1e293b;
+  --sl-color-gray-2: #334155;
+  --sl-color-gray-3: #64748b;
+  --sl-color-gray-4: #94a3b8;
+  --sl-color-gray-5: #cbd5e1;
+  --sl-color-gray-6: #e2e8f0;
+  --sl-color-gray-7: #f1f5f9;
+  --sl-color-black: #ffffff;
+  --sl-color-bg-nav: #f8fafc;
+  --sl-color-bg-sidebar: #f8fafc;
+  --sl-color-hairline-light: #e2e8f0;
+  --sl-color-hairline: #e2e8f0;
+
+  --cl-tech: #4338ca;
+  --cl-tech-soft: #eef2ff;
+  --cl-tech-line: #c7d2fe;
+  --cl-cust: #0f766e;
+  --cl-cust-soft: #f0fdfa;
+  --cl-cust-line: #99f6e4;
+  --cl-ai: #6d28d9;
+  --cl-ai-soft: #f5f3ff;
+  --cl-ai-line: #ddd6fe;
+  --cl-control: #b91c1c;
+  --cl-control-soft: #fef2f2;
+  --cl-control-line: #dc2626;
+  --cl-ok: #15803d;
+  --cl-warn: #92400e;
+  --cl-warn-soft: #fffbeb;
+  --cl-warn-line: #fde68a;
+  --cl-panel: #f8fafc;
+  --cl-line: #e2e8f0;
+  --cl-muted: #64748b;
+}
+
+::selection { color: var(--sl-color-white); background: var(--sl-color-accent-low); }
+:focus-visible { outline: 2px solid var(--sl-color-text-accent); outline-offset: 3px; }
+
+.site-title { gap: 0.6rem; font-weight: 700; letter-spacing: -0.02em; color: var(--sl-color-white); }
+.site-title img { width: 1.9rem; height: 1.9rem; border-radius: 0.45rem; }
+h1, h2, h3, h4 { letter-spacing: -0.02em; }
+.sl-markdown-content :is(h2, h3):not(:where(.not-content *)) { margin-top: 2.2rem; }
+.sl-markdown-content a:not(:where(.not-content *)) { text-underline-offset: 0.2em; }
+.sl-link-button { border-radius: 0.5rem; font-weight: 650; }
+
+/* The start page: a short, centred hero, so that the one diagram of the page
+ * is on the first screen. */
+.hero { grid-template-columns: 100%; padding-block: clamp(1.25rem, 3.5vw, 2.75rem) 0.25rem; }
+.hero .stack { text-align: center; }
+.hero .copy { align-items: center; }
+.hero .copy > * { max-width: none; }
+.hero .actions { justify-content: center; }
+.hero h1 { max-width: 24ch; font-size: clamp(2.1rem, 4.4vw, 3.25rem); line-height: 1.12; font-weight: 700; text-wrap: balance; }
+.hero .tagline { max-width: 40rem; font-size: 1.1rem; line-height: 1.65; }
+
+/* A one-line fact under a heading. */
+.lede { font-size: 1.1rem; color: var(--sl-color-gray-2); max-width: 44rem; }
+
+/* A marker for what a later release brings. */
+.planned {
+  display: inline-block;
+  padding: 0.1rem 0.55rem;
+  border: 1px solid var(--cl-warn-line);
+  border-radius: 99px;
+  background: var(--cl-warn-soft);
+  color: var(--cl-warn);
+  font-size: 0.78rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+}
+
+/* A screenshot of the application, always on the application's own light paper. */
+.shot {
+  margin: 1.25rem 0;
+  padding: 0;
+}
+.shot a { display: block; border-radius: 0.6rem; cursor: zoom-in; }
+.shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--cl-line);
+  border-radius: 0.6rem;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+}
+.shot figcaption { margin-top: 0.5rem; font-size: 0.85rem; color: var(--cl-muted); }
+.shot.narrow { max-width: 24rem; }
+.shot.bar { max-width: 28rem; }
+.shots {
+  display: grid;
+  grid-template-columns: 1.95fr 1fr;
+  gap: 1rem;
+  align-items: start;
+  margin: 1.25rem 0;
+}
+.shots .shot { margin: 0; }
+@media (max-width: 40rem) {
+  .shots { grid-template-columns: 1fr; }
+}
+
+/* Short facts in a row of cards. */
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13.5rem, 1fr));
+  gap: 0.9rem;
+  margin: 1.5rem 0;
+  padding: 0;
+  list-style: none;
+}
+.facts > li {
+  margin: 0;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--cl-line);
+  border-radius: 0.6rem;
+  background: var(--cl-panel);
+}
+.facts strong { display: block; margin-bottom: 0.3rem; color: var(--sl-color-white); }
+.facts span { font-size: 0.93rem; line-height: 1.55; color: var(--sl-color-gray-2); }
+
+/* Two columns: one for each person. */
+.lanes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+.lane {
+  padding: 1rem 1.15rem 1.1rem;
+  border: 1px solid var(--cl-line);
+  border-top-width: 3px;
+  border-radius: 0.6rem;
+  background: var(--cl-panel);
+}
+.lane.tech { border-top-color: var(--cl-tech-line); }
+.lane.cust { border-top-color: var(--cl-cust-line); }
+.lane h3 { margin: 0 0 0.6rem; font-size: 1rem; }
+.lane.tech h3 { color: var(--cl-tech); }
+.lane.cust h3 { color: var(--cl-cust); }
+.lane ol { margin: 0; padding-left: 1.2rem; font-size: 0.95rem; }
+.lane li { margin: 0.35rem 0; }
+@media (max-width: 40rem) {
+  .lanes { grid-template-columns: 1fr; }
+}

@@ -16,8 +16,9 @@
 # - The "Changed areas" job says what the change touches
 #   (scripts/changed-areas.mjs). The build and test jobs are skipped only when
 #   it says that the change holds nothing but documentation (`*.md`, `docs/`,
-#   `LICENSE`) or the documentation site (`website/`). hygiene.yml runs the
-#   secret scan and the private-data check on every pull request.
+#   `LICENSE`) or the documentation site (`website/`), and the job of the site
+#   only when the change does not touch it. hygiene.yml runs the secret scan
+#   and the private-data check on every pull request.
 # - "CI result" always runs and fails when a job before it failed or was
 #   cancelled; a skipped job does not fail it. Require this one check, never
 #   the single jobs, so that a skipped job cannot block a pull request.
@@ -227,13 +228,40 @@ jobs:
         with:
           command: check licenses advisories bans sources
 
+  # The documentation site (ST-M011-001): its build, the tests of its check,
+  # and the check of every link and picture of the built pages. pages.yml
+  # publishes it from main.
+  website:
+    name: Documentation site
+    needs: changes
+    if: needs.changes.outputs.website != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm audit
+      - run: npm run build
+      - run: node --test "scripts/*.test.mjs"
+      - run: npm run check
+
   # The one check the ruleset on main requires from this workflow. It runs
   # whatever happened before it: a failed or cancelled job fails it, a skipped
   # job does not.
   result:
     name: CI result
     if: always()
-    needs: [changes, lint, test, app, msrv, deny]
+    needs: [changes, lint, test, app, msrv, deny, website]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

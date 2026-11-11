@@ -1,0 +1,82 @@
+---
+title: Get started
+description: Download CretLink, install it on your own computer, connect your AI agent and prepare the copy your customer runs.
+---
+
+import { Steps, Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Shot from '../../components/Shot.astro';
+import install from '../../assets/screens/install.png';
+
+<p class="lede">Four steps on your own computer. They take a few minutes, and you do them once.</p>
+
+**You need:** a Windows or macOS computer for yourself, with an AI agent that speaks MCP (Claude Code, Codex CLI or Gemini CLI), and a Windows computer on the customer's side.
+
+<Steps>
+
+1. **Download and check**
+
+   Take the archive for your operating system from the [latest release](https://github.com/yveslaurentcreton/CretLink/releases/latest), together with `SHA256SUMS.txt`, and check that the two belong together:
+
+   <Tabs syncKey="os">
+     <TabItem label="Windows">
+       ```powershell
+       $line = Select-String -Path .\SHA256SUMS.txt -Pattern 'windows-x86_64.zip'
+       $expected, $name = $line.Line -split '\s+', 2
+       if ((Get-FileHash -Algorithm SHA256 $name).Hash.ToLowerInvariant() -eq $expected) { "OK    $name" } else { "FAIL  $name" }
+       ```
+     </TabItem>
+     <TabItem label="macOS">
+       ```sh
+       shasum -a 256 -c --ignore-missing SHA256SUMS.txt
+       ```
+     </TabItem>
+   </Tabs>
+
+   The answer must be `OK`. [Verifying release artifacts](https://github.com/yveslaurentcreton/CretLink/blob/main/docs/verifying-artifacts.md) explains the rest.
+
+2. **Start it and install**
+
+   Unpack the archive, start `cretlink` and choose **Give help**, then **Install for me**. CretLink copies itself to a fixed place in your own user folder. It needs no administrator rights, adds no background service and nothing that starts by itself.
+
+   **Run once without installing** also works, for a first look: the program then runs from where you unpacked it.
+
+3. **Connect your AI agent**
+
+   The install screen lists the AI agents it found, with the exact command it will run for each. Leave the ones you use ticked.
+
+   <Shot
+     src={install}
+     kind="wide"
+     alt="The install screen: the folder CretLink is copied to, the Start menu option, and the AI assistants found on this computer with the command that connects each one."
+     caption="The install screen shows where CretLink goes and what it runs to connect each AI agent."
+   />
+
+   Later you connect or disconnect an agent on the **AI assistants** screen, or from a terminal:
+
+   ```sh
+   cretlink mcp install      # connect every agent that is found
+   cretlink mcp status       # show where CretLink is connected
+   ```
+
+   The Code tab of Claude Desktop uses the connection of Claude Code. [MCP client setup](https://github.com/yveslaurentcreton/CretLink/blob/main/docs/mcp-clients.md) has the manual configuration for every client.
+
+4. **Prepare your customer's copy**
+
+   Take `cretlink.exe` from the **Windows** archive, name the copy `CretLink-Support.exe` and bring it to your customer, for example on a USB stick. A copy with that name opens **Get help** straight away and can never install anything.
+
+</Steps>
+
+<Aside type="caution" title="Use the same release on both computers">
+A session starts only when both programs speak the same version of the protocol. When you update your own copy, replace the customer's copy too.
+</Aside>
+
+## Good to know
+
+- **Windows warns about an unknown publisher.** The releases are not code-signed yet, so the checksum of step 1 is how you know the file is genuine.
+- **macOS as your own computer** builds and passes the automated tests, but has not been checked on a real Mac yet.
+- **Updating** is the same as installing: start the newer download and choose **Install for me** again. Your AI agents stay connected.
+- **Removing it** is `cretlink uninstall`, or **Uninstall** in Settings. It shows what it will remove and asks first. The audit trail stays.
+
+## Next
+
+You are ready to [help someone](/CretLink/help-someone/).
