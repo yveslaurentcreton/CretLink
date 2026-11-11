@@ -45,6 +45,10 @@ export interface StartOptions {
   version?: string;
 }
 
+// Where a running controller keeps the handle that removes its document-wide
+// listeners, so that one started again (a reload, the tests) replaces them.
+const LISTENERS = Symbol.for("cretlink.technician.listeners");
+
 const SESSIONS_RETRY_MS = 2000;
 // The Audit tab asks for the session's entries at most this often while the
 // session changes (ST-M009-008).
@@ -552,7 +556,14 @@ export async function start(options: StartOptions = {}): Promise<void> {
   if (!root) return;
   snap = { ...snap, version: options.version ?? null };
   bindActions(root, onAction);
-  document.addEventListener("keydown", onKeydown);
+  // Document-wide keys, so Escape stops wherever the focus is. A controller
+  // started again (a reload, the tests) replaces the previous listeners:
+  // an earlier one would otherwise answer the same key a second time.
+  const store = globalThis as { [LISTENERS]?: AbortController };
+  store[LISTENERS]?.abort();
+  const listeners = new AbortController();
+  store[LISTENERS] = listeners;
+  document.addEventListener("keydown", onKeydown, { signal: listeners.signal });
   // Subscribe before the first state so no live transition is missed.
   await listen<ConsoleState>(CONSOLE_STATE_EVENT, (event) => {
     pushGeneration += 1;

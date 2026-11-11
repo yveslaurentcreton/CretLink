@@ -151,6 +151,26 @@ describe("technician controller", () => {
     }
   });
 
+  it("answers Escape once, however often the controller was started before", async () => {
+    // Every test loads the controller anew. An earlier one must not hear the
+    // key as well, or one Escape would stop the session several times over.
+    const waiting = consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" });
+    await boot();
+    push(waiting);
+    await flush();
+    // A second controller, as the next test would load it; the first one is
+    // still waiting and would stop on Escape too.
+    vi.resetModules();
+    document.body.innerHTML = '<div id="app" aria-busy="true"></div>';
+    await boot();
+    push(waiting);
+    await flush();
+    backend.calls = [];
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flush();
+    expect(backend.calls.filter(([cmd]) => cmd === "stop_session")).toHaveLength(1);
+  });
+
   it("keeps the feed across tab switches and the terminal alive across renders", async () => {
     await boot();
     push(consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" }));
