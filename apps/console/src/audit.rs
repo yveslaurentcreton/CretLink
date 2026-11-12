@@ -90,10 +90,12 @@ pub const AUDIT_CHANNEL_CAPACITY: usize = 8192;
 /// Args keys preserved when the per-session soft cap elides payload detail:
 /// the small correlation fields that keep request → job → transfer → result
 /// reconstructable and destructive actions identified by canonical path
-/// (ST-M003-004). Everything else (command text, env maps, other large
+/// (ST-M003-004), with what a folder removal removed and left behind
+/// (ST-M010-001). Everything else (command text, env maps, other large
 /// values) is elided.
 const ELISION_KEEP_KEYS: &[&str] = &[
     "call_id",
+    "action_id",
     "job_id",
     "path",
     "to",
@@ -108,6 +110,10 @@ const ELISION_KEEP_KEYS: &[&str] = &[
     "removed",
     "failed",
     "dropped",
+    "removed_files",
+    "removed_dirs",
+    "not_removed",
+    "overwrite",
 ];
 
 /// Actions after which the drain syncs the file to disk (ADR-0008: fsync at

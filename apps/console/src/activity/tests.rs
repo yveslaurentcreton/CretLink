@@ -632,3 +632,246 @@ fn the_gui_terminal_records_map_to_terminal_items() {
     ));
     assert_eq!(closed.operation, "close terminal job 3");
 }
+
+/// The technician's own file actions (ST-M010-001): each is one item of the
+/// technician, opened by its start record and closed by its completion, in
+/// the words the customer's feed uses.
+#[test]
+fn the_file_actions_of_the_technician_are_items_of_the_technician() {
+    let mut fold = TechnicianActivity::new();
+
+    let drives = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_fs_drives_start",
+            Outcome::Ok,
+            &[("action_id", int(1))],
+        ),
+        T0,
+    ));
+    assert_eq!(drives.id, "action-1");
+    assert_eq!(drives.source, ActivitySource::Technician);
+    assert_eq!(drives.kind, ActivityKind::FileOperation);
+    assert_eq!(drives.operation, "list the drives");
+    assert_eq!(drives.description, "Worked with files and folders");
+    assert_eq!(drives.state, ActivityState::Running);
+    assert_eq!(drives.client_label, None);
+    assert_eq!(drives.purpose, None);
+    let mut listed = record(
+        Actor::Console,
+        "console_fs_drives",
+        Outcome::Ok,
+        &[("action_id", int(1)), ("drives", int(2))],
+    );
+    listed.duration_ms = Some(8);
+    let drives = item_of(fold.apply(&listed, T0 + 8));
+    assert_eq!(drives.id, "action-1");
+    assert_eq!(drives.state, ActivityState::Done { exit_code: None });
+    assert_eq!(drives.duration_ms, Some(8));
+
+    let removing = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_remove_tree_start",
+            Outcome::Ok,
+            &[
+                ("action_id", int(2)),
+                ("path", text("C:\\Users\\ann\\Documents\\old")),
+            ],
+        ),
+        T0 + 10,
+    ));
+    assert_eq!(removing.id, "action-2");
+    assert_eq!(removing.kind, ActivityKind::FileOperation);
+    assert_eq!(
+        removing.operation,
+        "delete the folder C:\\Users\\ann\\Documents\\old and everything in it"
+    );
+    assert_eq!(
+        removing.path.as_deref(),
+        Some("C:\\Users\\ann\\Documents\\old")
+    );
+    assert_eq!(removing.state, ActivityState::Running);
+    let removed = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_remove_tree",
+            Outcome::Ok,
+            &[
+                ("action_id", int(2)),
+                ("path", text("C:\\Users\\ann\\Documents\\old")),
+                ("removed_files", int(40)),
+                ("removed_dirs", int(3)),
+            ],
+        ),
+        T0 + 900,
+    ));
+    assert_eq!(removed.id, "action-2");
+    assert_eq!(removed.state, ActivityState::Done { exit_code: None });
+    assert_eq!(removed.bytes, None);
+
+    let sending = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_send_start",
+            Outcome::Ok,
+            &[
+                ("action_id", int(3)),
+                ("path", text("D:\\Tools\\setup.exe")),
+            ],
+        ),
+        T0 + 1000,
+    ));
+    assert_eq!(sending.id, "action-3");
+    assert_eq!(sending.kind, ActivityKind::FileReceived);
+    assert_eq!(
+        sending.description,
+        "Copied a file to the customer computer"
+    );
+    assert_eq!(
+        sending.operation,
+        "copy a file to the customer computer at D:\\Tools\\setup.exe"
+    );
+    let sent = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_send",
+            Outcome::Ok,
+            &[
+                ("action_id", int(3)),
+                ("path", text("D:\\Tools\\setup.exe")),
+                ("len", int(4096)),
+            ],
+        ),
+        T0 + 1500,
+    ));
+    assert_eq!(sent.id, "action-3");
+    assert_eq!(sent.bytes, Some(4096));
+    assert_eq!(sent.state, ActivityState::Done { exit_code: None });
+    assert_eq!(fold.entries().len(), 3);
+}
+
+/// A removal that left something behind, a cancelled one, one whose session
+/// was lost and a send refused before it began are never shown as done.
+#[test]
+fn a_file_action_of_the_technician_ends_honestly() {
+    let mut fold = TechnicianActivity::new();
+    let start = |fold: &mut TechnicianActivity, id: i64| {
+        fold.apply(
+            &record(
+                Actor::Console,
+                "console_remove_tree_start",
+                Outcome::Ok,
+                &[("action_id", int(id)), ("path", text("staging:old"))],
+            ),
+            T0,
+        )
+    };
+    let end = |fold: &mut TechnicianActivity, id: i64, outcome, reason: Option<&str>| {
+        let mut args = vec![("action_id", int(id)), ("path", text("staging:old"))];
+        if let Some(reason) = reason {
+            args.push(("reason", text(reason)));
+        }
+        item_of(fold.apply(
+            &record(Actor::Console, "console_remove_tree", outcome, &args),
+            T0 + 5,
+        ))
+    };
+
+    let opened = item_of(start(&mut fold, 1));
+    assert_eq!(
+        opened.operation,
+        "delete the folder old (CretLink staging folder) and everything in it"
+    );
+    let left = end(
+        &mut fold,
+        1,
+        Outcome::Failed,
+        Some("2 entries could not be removed, the first: held (AccessDenied)"),
+    );
+    assert_eq!(
+        left.state,
+        ActivityState::failed("2 entries could not be removed, the first: held (AccessDenied)")
+    );
+
+    start(&mut fold, 2);
+    assert_eq!(
+        end(&mut fold, 2, Outcome::Cancelled, None).state,
+        ActivityState::Cancelled
+    );
+
+    start(&mut fold, 3);
+    assert_eq!(
+        end(&mut fold, 3, Outcome::Unknown, None).state,
+        ActivityState::failed(UNKNOWN_RESULT)
+    );
+
+    // A removal still running when the session ends is failed, not done.
+    start(&mut fold, 4);
+    let ended = fold.session_ended(T0 + 50);
+    assert_eq!(ended.len(), 1);
+    assert_eq!(
+        item_of(ended.into_iter().next()).state,
+        ActivityState::failed(SESSION_ENDED)
+    );
+
+    // A send refused before it began is one failed item; nothing was running.
+    let refused = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_send_start",
+            Outcome::Failed,
+            &[
+                ("path", text("C:\\Users\\ann\\..\\x.txt")),
+                ("reason", text("invalid path")),
+            ],
+        ),
+        T0 + 60,
+    ));
+    assert_eq!(refused.kind, ActivityKind::FileReceived);
+    assert_eq!(refused.state, ActivityState::failed("invalid path"));
+    assert_eq!(fold.entries().len(), 5);
+}
+
+/// A file action of the technician and a routed AI call that happen to carry
+/// the same number are two items: the two are numbered apart.
+#[test]
+fn a_technician_action_never_shares_an_item_with_a_routed_call() {
+    let mut fold = TechnicianActivity::new();
+    let ai = item_of(fold.apply(
+        &record(
+            Actor::Mcp,
+            "mcp_remote_remove_dir_start",
+            Outcome::Ok,
+            &[("call_id", int(1)), ("path", text("C:\\a"))],
+        ),
+        T0,
+    ));
+    let technician = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_remove_tree_start",
+            Outcome::Ok,
+            &[("action_id", int(1)), ("path", text("C:\\b"))],
+        ),
+        T0,
+    ));
+    assert_ne!(ai.id, technician.id);
+    assert_eq!(ai.source, ActivitySource::Ai);
+    assert_eq!(technician.source, ActivitySource::Technician);
+    assert_eq!(fold.entries().len(), 2);
+
+    // An `action_id` on a record of another actor is not a technician action.
+    assert!(
+        fold.apply(
+            &record(
+                Actor::Agent,
+                "console_remove_tree_start",
+                Outcome::Ok,
+                &[("action_id", int(2)), ("path", text("C:\\c"))],
+            ),
+            T0,
+        )
+        .is_none()
+    );
+}

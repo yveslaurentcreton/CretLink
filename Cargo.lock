@@ -383,6 +383,7 @@ dependencies = [
  "async-trait",
  "base64",
  "cretlink-discovery",
+ "cretlink-exec",
  "cretlink-mcp",
  "cretlink-protocol",
  "cretlink-session",
