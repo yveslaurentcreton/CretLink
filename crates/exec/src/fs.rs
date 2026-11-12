@@ -1056,10 +1056,7 @@ impl FileStore {
                     manifest.remove(&canonical_path);
                 }
                 Err(e) if failed.len() < limits::MAX_DIR_PAGE => {
-                    failed.push(CleanupFailure {
-                        canonical_path,
-                        reason: cleanup_reason(&e).to_string(),
-                    });
+                    failed.push(cleanup_failure(&canonical_path, cleanup_reason(&e)));
                 }
                 Err(_) => {}
             }
@@ -1088,10 +1085,7 @@ impl FileStore {
                 Ok(false) => {}
                 Err(reason) => {
                     if failed.len() < limits::MAX_DIR_PAGE {
-                        failed.push(CleanupFailure {
-                            canonical_path: part.to_string_lossy().into_owned(),
-                            reason: reason.to_string(),
-                        });
+                        failed.push(cleanup_failure(&part.to_string_lossy(), reason));
                     }
                     continue;
                 }
@@ -1118,10 +1112,9 @@ impl FileStore {
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => removed = removed.saturating_add(1),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) if failed.len() < limits::MAX_DIR_PAGE => failed.push(CleanupFailure {
-                    canonical_path: path.to_string_lossy().into_owned(),
-                    reason: cleanup_reason(&e).to_string(),
-                }),
+                Err(e) if failed.len() < limits::MAX_DIR_PAGE => {
+                    failed.push(cleanup_failure(&path.to_string_lossy(), cleanup_reason(&e)));
+                }
                 Err(_) => {}
             }
         }
@@ -1801,6 +1794,17 @@ fn drive_letter(path: &Path) -> Option<char> {
         }
     }
     None
+}
+
+/// The report of one artifact a cleanup could not remove, within the bounds
+/// of the wire: the path is the target's own text, so it is cut to the length
+/// of a path and kept on one line, and the answer that carries it can always
+/// be sent.
+fn cleanup_failure(path: &str, reason: &'static str) -> CleanupFailure {
+    CleanupFailure {
+        canonical_path: one_line(path, limits::MAX_PATH_BYTES),
+        reason: reason.to_string(),
+    }
 }
 
 /// A short, secret-free reason for a cleanup failure, drawn from the error kind.

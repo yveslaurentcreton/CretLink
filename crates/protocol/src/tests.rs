@@ -1961,6 +1961,34 @@ fn cleanup_report_oversized_reason_is_rejected() {
     }));
 }
 
+/// The path of an artifact that could not be removed is the target's own
+/// text: it is bounded like any path, and it is one line, so that it cannot
+/// forge a line where the failures are listed.
+#[test]
+fn cleanup_failure_paths_are_bounded_single_lines() {
+    let failure = |canonical_path: String| {
+        response(OpResult::CleanupReport {
+            removed: 0,
+            failed: vec![CleanupFailure {
+                canonical_path,
+                reason: "in use".to_owned(),
+            }],
+        })
+    };
+
+    round_trip(failure("p".repeat(limits::MAX_PATH_BYTES)));
+    assert_limit_exceeded(&failure("p".repeat(limits::MAX_PATH_BYTES + 1)));
+    for bad in ["C:\\Temp\\a\nb", "C:\\Temp\\a\rb", "C:\\Temp\\a\u{2028}b"] {
+        let message = failure(bad.to_owned());
+        assert_eq!(
+            message.validate().unwrap_err().code(),
+            ErrorCode::MalformedMessage,
+            "{bad:?}"
+        );
+        assert!(message.encode().is_err(), "{bad:?}");
+    }
+}
+
 // Adversarial path rejection (ADR-0012 path-safety, REQ-S-013).
 
 #[test]

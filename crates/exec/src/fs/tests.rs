@@ -2149,6 +2149,30 @@ async fn creating_a_folder_that_exists_is_already_exists() {
     assert_eq!(error.code, ErrorCode::AlreadyExists);
 }
 
+/// What a cleanup could not remove is named by a path that the wire carries,
+/// whatever the name on the disk is: cut to the length of a path, and on one
+/// line. The answer of a cleanup can therefore always be sent.
+#[test]
+fn a_cleanup_failure_names_its_path_within_the_wire_bounds() {
+    use cretlink_protocol::limits::MAX_PATH_BYTES;
+
+    let named = super::cleanup_failure("C:\\Temp\\locked.bin", "in use");
+    assert_eq!(named.canonical_path, "C:\\Temp\\locked.bin");
+    assert_eq!(named.reason, "in use");
+
+    let long = format!("/tmp/{}", "n".repeat(2 * MAX_PATH_BYTES));
+    let broken = "/tmp/first\nsecond.part";
+    for path in [long.as_str(), broken] {
+        let failure = super::cleanup_failure(path, "in use");
+        assert!(failure.canonical_path.len() <= MAX_PATH_BYTES);
+        assert!(!failure.canonical_path.contains('\n'));
+        assert_on_the_wire(&OpResult::CleanupReport {
+            removed: 0,
+            failed: vec![failure],
+        });
+    }
+}
+
 #[test]
 fn a_text_for_the_wire_is_kept_on_one_line_and_within_its_bound() {
     use super::one_line;

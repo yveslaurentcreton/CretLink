@@ -223,7 +223,9 @@ pub struct StagedEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CleanupFailure {
-    /// The artifact that could not be removed.
+    /// The artifact that could not be removed (at most
+    /// [`limits::MAX_PATH_BYTES`] bytes, one line). A longer path is cut and
+    /// ends in `…`. Untrusted input: the name is the target's.
     pub canonical_path: String,
     /// Why removal failed (at most [`limits::MAX_REASON_BYTES`] bytes).
     pub reason: String,
@@ -1974,6 +1976,15 @@ fn validate_result(result: &OpResult) -> Result<(), ProtocolError> {
                 limits::MAX_DIR_PAGE as u64,
             )?;
             for failure in failed {
+                check_limit(
+                    "cleanup failure canonical_path length",
+                    failure.canonical_path.len() as u64,
+                    limits::MAX_PATH_BYTES as u64,
+                )?;
+                require_single_line(
+                    &failure.canonical_path,
+                    "a cleanup failure path must be one line",
+                )?;
                 check_limit(
                     "cleanup failure reason length",
                     failure.reason.len() as u64,
