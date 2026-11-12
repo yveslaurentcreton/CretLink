@@ -100,6 +100,13 @@ use crate::target::{
 /// client minor of at least [`IPC_ACCOUNT_MINOR`], and strips it otherwise —
 /// also on a connection that sent no `Hello` ([`IpcResponse::for_peer`],
 /// [`identity_for_peer`]).
+///
+/// Minor `12` adds no IPC message. The number moves because this contract
+/// tracks the wire [`PROTOCOL_V1`], which gained the drive list and the removal
+/// of a folder with its content for the technician's file explorer
+/// (ST-M010-001). Neither is offered over IPC: the tool surface of the bridge
+/// is unchanged, so a bridge or terminal client on minor `11` works with a
+/// console on minor `12` as before (REQ-N-012).
 pub const IPC_PROTOCOL: ProtocolVersion = PROTOCOL_V1;
 
 /// The first IPC contract minor whose clients decode the `account` of a

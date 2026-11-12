@@ -597,6 +597,20 @@ impl Connection {
                     .await?;
                 Ok(Flow::Continue)
             }
+            // The drives and the removal of a folder with its content
+            // (ADR-0012, ST-M010-001, CAP_FS_V2) are not simulated yet: an
+            // honest `Unsupported`, as from an agent without the capability.
+            Operation::FsDrives {} | Operation::RemoveTree { .. } => {
+                framed
+                    .send(&self.error_message(
+                        Some(id),
+                        ErrorCode::Unsupported,
+                        "the simulator does not advertise the explorer file capability",
+                        ErrorStage::Execution,
+                    ))
+                    .await?;
+                Ok(Flow::Continue)
+            }
             // File and staging operations (ADR-0012, CAP_FS_V1): run the real
             // FileStore engine against this connection's private temp tree, so a
             // simulated target enforces the same staging root, verified-commit,

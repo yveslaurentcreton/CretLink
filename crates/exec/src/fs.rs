@@ -318,6 +318,13 @@ impl FileStore {
             Operation::RemoveDir { path } => self.remove_dir(&path).await,
             Operation::ListStaged {} => self.list_staged().await,
             Operation::StagingCleanup { trigger } => self.cleanup(trigger).await,
+            // The drives and the removal of a folder with its content
+            // (ST-M010-001) are not served by this store yet: an honest
+            // `Unsupported`, never a guess.
+            Operation::FsDrives {} | Operation::RemoveTree { .. } => Err(FsError::new(
+                ErrorCode::Unsupported,
+                "this agent does not serve the operation",
+            )),
             // Not file operations: the session layer routes these to the broker
             // and never here. Answering fail-closed keeps a misroute honest.
             Operation::SystemInfo {}

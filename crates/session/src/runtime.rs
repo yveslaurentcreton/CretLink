@@ -3324,6 +3324,21 @@ async fn handle_agent_request<C: FrameSink>(
             }
             AgentStep::Continue
         }
+        // The drives and the removal of a folder with its content (ADR-0012,
+        // ST-M010-001, CAP_FS_V2). No agent advertises the capability yet, so
+        // both are answered `Unsupported` before any side effect (REQ-N-012).
+        Operation::FsDrives {} | Operation::RemoveTree { .. } => {
+            let _ = send_error(
+                channel,
+                Some(id),
+                Some(session),
+                ErrorCode::Unsupported,
+                "explorer file capability (fs.v2) is not advertised by this agent",
+                ErrorStage::Execution,
+            )
+            .await;
+            AgentStep::Continue
+        }
         // File operations (ADR-0012, CAP_FS_V1) run against a real filesystem at
         // the agent's privilege via the session file store. Mutating operations
         // are audited by their honest outcome (REQ-N-008); read-only inspection

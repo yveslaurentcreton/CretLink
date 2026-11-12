@@ -110,7 +110,9 @@ impl ActivityKind {
             | Operation::FsDelete { .. }
             | Operation::RemoveDir { .. }
             | Operation::ListStaged {}
-            | Operation::StagingCleanup { .. } => Self::FileOperation,
+            | Operation::StagingCleanup { .. }
+            | Operation::FsDrives {}
+            | Operation::RemoveTree { .. } => Self::FileOperation,
             Operation::DesktopCapture { .. } => Self::ScreenObserved,
             Operation::DesktopPointer { .. }
             | Operation::DesktopScroll { .. }
@@ -303,7 +305,8 @@ pub fn path_of(op: &Operation) -> Option<String> {
         | Operation::FsRead { path, .. }
         | Operation::FsDigest { path, .. }
         | Operation::FsDelete { path }
-        | Operation::RemoveDir { path } => path,
+        | Operation::RemoveDir { path }
+        | Operation::RemoveTree { path, .. } => path,
         Operation::FsWrite { dest, .. }
         | Operation::FsCommit { dest, .. }
         | Operation::FsAbort { dest } => dest,

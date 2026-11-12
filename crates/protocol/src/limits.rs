@@ -139,6 +139,53 @@ pub const MAX_LABEL_BYTES: usize = 512;
 /// Length in bytes of a SHA-256 digest ([`crate::DigestAlgo::Sha256`]).
 pub const DIGEST_LEN: usize = 32;
 
+// --- Drives and folder removal (ADR-0012, ST-M010-001, minor 12) ---
+//
+// Every answer of the agent travels in one record of the secure channel
+// (about 64 KiB), so the two results below are bounded in number and in the
+// size of each text, and a full one stays well inside a record.
+
+/// Maximum number of drives in one [`crate::OpResult::Drives`]. A Windows
+/// target has at most 26 drive letters.
+pub const MAX_DRIVES: usize = 32;
+
+/// Maximum byte length of a drive's root path ([`crate::DriveEntry::root`]),
+/// such as `C:\`.
+pub const MAX_DRIVE_ROOT_BYTES: usize = 256;
+
+/// Maximum byte length of a drive's label ([`crate::DriveEntry::label`]). A
+/// volume label is at most 32 UTF-16 code units, which encode to at most 96
+/// UTF-8 bytes.
+pub const MAX_DRIVE_LABEL_BYTES: usize = 128;
+
+/// The most entries one [`crate::Operation::RemoveTree`] step settles: removes
+/// or finds it cannot remove. A step that reaches this bound answers and the
+/// caller asks for the next one, so one request never holds the agent for the
+/// whole of a large folder: between two steps the agent serves a stop from the
+/// customer, a revocation and every other request (REQ-S-004, REQ-N-006).
+pub const MAX_TREE_STEP_ENTRIES: u64 = 4096;
+
+/// How long one [`crate::Operation::RemoveTree`] step works before it answers,
+/// in milliseconds, once it has removed something. With
+/// [`MAX_TREE_STEP_ENTRIES`] this bounds how long a folder removal can delay a
+/// stop or a cancellation.
+pub const MAX_TREE_STEP_MS: u64 = 1000;
+
+/// The deepest level below the folder being removed that
+/// [`crate::Operation::RemoveTree`] walks. A folder nested deeper is reported
+/// as not removed, never walked without bound.
+pub const MAX_TREE_DEPTH: usize = 256;
+
+/// Maximum number of entries one [`crate::OpResult::TreeRemoval`] names as not
+/// removed: the first ones, each with its reason. The rest are counted in
+/// `failed_more`.
+pub const MAX_TREE_FAILURES: usize = 16;
+
+/// Maximum byte length of the path of one [`crate::TreeFailure`]. A longer
+/// path is cut on a character boundary and ends in `…`, so it is never taken
+/// for a whole one.
+pub const MAX_TREE_FAILURE_PATH_BYTES: usize = 1024;
+
 // --- Interactive terminal (ADR-0013, ST-M003-009) ---
 
 /// The smallest accepted terminal column count for a `TermOpen`/`TermResize`.

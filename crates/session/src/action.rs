@@ -126,6 +126,13 @@ pub fn describe_operation(op: &Operation) -> String {
         }
         Operation::FsDelete { path } => format!("delete the file {}", path_text(path)),
         Operation::RemoveDir { path } => format!("remove the folder {}", path_text(path)),
+        Operation::FsDrives {} => "list the drives".to_owned(),
+        Operation::RemoveTree { path, stop: false } => {
+            format!("delete the folder {} and everything in it", path_text(path))
+        }
+        Operation::RemoveTree { path, stop: true } => {
+            format!("stop deleting the folder {}", path_text(path))
+        }
         Operation::ListStaged {} => "list the files CretLink staged".to_owned(),
         Operation::StagingCleanup { trigger } => format!(
             "remove files CretLink staged ({})",
