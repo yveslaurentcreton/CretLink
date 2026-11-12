@@ -58,7 +58,7 @@ use crate::{Attribution, CancelToken, HostHandle, JobOutcome, Origin, SessionErr
 /// folder that nobody adds to ends by itself. One that never ends is a folder
 /// that something keeps filling while it is being removed; the engine then
 /// gives up and says so, instead of asking for as long as the session lasts.
-/// A million steps are far more than any real folder takes: a step settles up
+/// A million steps are far more than any real folder takes: a step removes up
 /// to [`cretlink_protocol::limits::MAX_TREE_STEP_ENTRIES`] entries.
 pub const MAX_TREE_REMOVAL_STEPS: u64 = 1_000_000;
 

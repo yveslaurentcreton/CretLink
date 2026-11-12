@@ -1353,9 +1353,11 @@ outstanding.
 The operations the technician's file explorer adds (ST-M010-001, REQ-F-028) —
 the list of drives, the removal of a folder with its content, and a file sent
 into a folder on any drive — have landed with automated tests on every CI
-platform. What only Windows has (junctions and other reparse points, a file
-held open by another program, a second drive) is covered by tests that run on
-the Windows CI runner only; the run on real hardware is scenario MT-14 in
+platform. What only Windows has (junctions and other reparse points, a path
+that leads through one, a folder that is held while it is removed, an open
+and a rename inside an opened folder, a file held open by another program, a
+second drive) is covered by tests that run on the Windows CI runner only; the
+run on real hardware is scenario MT-14 in
 [`manual-tests.md`](manual-tests.md), not yet recorded. The technician reaches
 these operations through the console library; the explorer screen that calls
 them is ST-M010-002. The AI tool surface does not contain them.
@@ -1523,17 +1525,20 @@ rejected rather than buffered (REQ-N-010, ST-M003-007).
 
 *FT-7 — Removal of a folder with its content (ST-M010-001).* One operation
 removes a whole folder tree, and what it removes is gone: there is no recycle
-bin. Beyond a wrong path, four things can go wrong. The removal can be led out
-of its folder: the agent is elevated, the folder may belong to an account that
+bin. Beyond a wrong path, four things can go wrong. The removal can be led to
+another place: the agent is elevated, the folder may belong to an account that
 is not, and a program of that account can plant a junction or a symbolic link
-in the folder, or swap a folder for a link while the removal is on its way to
-it, so that the removal reaches the system folders or another user's files.
-The removal can hold the agent: the agent serves one request at a time, so a
-removal that ran to its end inside one request would keep a stop by the
-customer waiting for as long as the tree takes. A removal that left something
-behind can be reported as done. And an answer that names every entry it could
-not remove can outgrow what the channel carries, or carry a file name made to
-forge a line in the activity view or the audit log. Mitigations:
+in the folder, swap a folder for a link while the removal is on its way to it,
+or swap the folder itself or a folder above it for a junction — before the
+removal begins or between two of its steps — so that the removal reaches the
+system folders or another user's files. The removal can hold the agent: the
+agent serves one request at a time, so a removal that ran to its end inside
+one request, or a step that a program keeps busy by creating and deleting
+entries, would keep a stop by the customer waiting. A removal that left
+something behind, or a folder that was only renamed away, can be reported as
+done. And an answer that names every entry it could not remove can outgrow
+what the channel carries, or carry a file name made to forge a line in the
+activity view or the audit log. Mitigations:
 
 - *Consent, attribution and visibility.* The operation exists only inside an
   attended session with full-control consent, whose disclosure names reading,
@@ -1547,6 +1552,28 @@ forge a line in the activity view or the audit log. Mitigations:
   before the first request and `console_remove_tree` after the last, with the
   path, the number of files and folders removed, the number of entries left
   behind and the first of them with its reason (REQ-S-017).
+- *The folder is the one that lies at the path.* On Windows a step opens the
+  folder once, without following a link in the last part of its path, reads
+  from the opened handle where the folder really lies, and compares that with
+  the path it was asked, without regard to letter case and with short names
+  written out. A path that reaches the folder through a junction or a
+  symbolic link does not compare equal and is refused as `invalid_path`
+  before anything is removed; so is a path on a drive made with `subst` and
+  one on a network drive, whose real location is not the path that was asked.
+  The step then holds the folder: for as long as it runs, nobody else renames
+  or removes it. A link in the place of the folder itself is removed as a
+  link, by the first step of a removal only. The root of a drive is refused,
+  judged from the path and again from where the opened folder lies, and the
+  path of the request passes the same rules as every remote path on both ends
+  (FT-1).
+- *One removal, one folder.* Between two steps the agent holds nothing, and
+  the folder could be swapped for another. An answer that says more remains
+  therefore names the folder by its identity — its volume and its file
+  identifier, at most `MAX_FOLDER_ID_BYTES` (32) bytes — and the console gives
+  that back with the next request. A step that finds a folder with another
+  identity at the path, or a link, refuses with `invalid_path` before it
+  removes anything. Both ends validate the rule: the identity is present
+  exactly when more remains.
 - *Never out of the folder.* An entry that stands for another place — a
   symbolic link, a junction, a volume mount point — is removed as that entry
   and never entered; what it points at is not looked at. On Windows nothing is
@@ -1554,46 +1581,73 @@ forge a line in the activity view or the audit log. Mitigations:
   what it is and where it really lies are read from the opened handle, an
   entry whose real location is not inside the folder is refused as
   `invalid_path`, and the removal goes through that same handle. The check and
-  the removal are about one object, so a swap between them changes nothing. A
-  link in the place of the folder itself is removed as a link, the root of a
-  drive is refused, and the path of the request passes the same rules as every
-  remote path on both ends (FT-1).
-- *Bounded steps.* One request settles at most `MAX_TREE_STEP_ENTRIES` (4096)
-  entries and, once it has removed something, answers after
-  `MAX_TREE_STEP_MS` (one second); the console asks again while the answer
-  says that more remains. The agent keeps nothing between two steps, so there
-  is no state to tear down when the session ends. A folder nested deeper than
-  `MAX_TREE_DEPTH` (256) is reported and left. The answer names at most
-  `MAX_TREE_FAILURES` (16) entries, each path cut to
-  `MAX_TREE_FAILURE_PATH_BYTES` and kept on one line, counts the others, and
-  always fits one record of the secure channel (REQ-N-006).
+  the removal are about one object, so a swap between them changes nothing.
+  The paths of the entries are built from the folder's verified location in a
+  form that Windows does not rewrite, so a name that ends in a dot or a space,
+  or the name of a device such as `nul`, names the entry of that very name.
+  The folder itself is removed through the hold the step has on it.
+- *Bounded steps.* One request meets at most `MAX_TREE_STEP_ENTRIES` (4096)
+  entries — one it removes, one it cannot remove, one that is gone by the time
+  it reaches for it, a folder it enters — and answers after
+  `MAX_TREE_STEP_MS` (one second) once it has met an entry, whether or not it
+  removed anything. A program that keeps creating and deleting entries in the
+  folder therefore cannot keep a step going. A step that ends at a bound
+  without having removed anything says so (`blocked`) and names what stood in
+  its way. The console asks again while the answer says that more remains, at
+  most a million times; then the removal ends as failed. The agent keeps
+  nothing between two steps, so there is no state to tear down when the
+  session ends. A folder nested deeper than `MAX_TREE_DEPTH` (256) is reported
+  and left. The answer names at most `MAX_TREE_FAILURES` (16) entries, each
+  path cut to `MAX_TREE_FAILURE_PATH_BYTES` and kept on one line, counts the
+  others, and always fits one record of the secure channel (REQ-N-006).
 - *Stop and cancel.* Between two steps the agent serves whatever arrives, so a
   stop or a revocation from either side takes effect within one step
   (REQ-S-004, REQ-F-018). A cancellation is the console no longer asking; it
   tells the agent that the removal ended, so the customer's item ends as
   cancelled and does not stay in progress.
-- *Honest outcome.* Only a folder that is gone is reported as removed. A
-  removal that left an entry behind is a failure that names it, a cancelled
-  one says what it had removed, and one cut short by the end of the session is
-  never recorded as done: the agent records its result as unknown. The console
-  treats an answer that contradicts itself — more to do but nothing removed,
-  gone but with failures — as an error, never as a result (REQ-N-008).
+- *Honest outcome.* Only a folder that the step itself removed is reported as
+  removed; one that is gone from its path for another reason is reported as
+  not found. A removal that left an entry behind is a failure that names it,
+  a cancelled one says what it had removed, and one cut short by the end of
+  the session is never recorded as done: the agent records its result as
+  unknown. The console treats an answer that contradicts itself — more to do
+  but nothing removed or no folder named, gone but with failures — as an
+  error, never as a result (REQ-N-008).
 - *Capability gate.* An agent that does not advertise `fs.v2` answers
   `unsupported` before it lists or removes anything (REQ-N-012).
 
 Evidence: `links_in_the_folder_are_removed_and_never_followed`,
 `a_link_in_the_place_of_the_folder_is_removed_as_a_link`,
+`a_continuation_in_another_folder_is_refused_and_removes_nothing`,
+`a_step_that_leaves_more_to_do_names_its_folder_and_no_other_step_does`,
 `a_step_stops_at_its_entry_bound_and_the_next_one_gets_further`,
+`a_step_counts_every_entry_it_meets_and_ends_at_its_bound`,
+`entries_that_are_gone_when_the_walk_reaches_them_count_toward_the_bound`,
+`a_step_ends_at_its_time_bound_although_it_removed_nothing`,
+`a_folder_that_vanishes_during_the_step_is_never_reported_as_removed`,
 `what_cannot_be_removed_is_named_and_the_rest_is_removed` and
 `a_drive_is_not_a_folder` (`crates/exec/src/fs/tree/tests.rs`), with
+`a_folder_reached_through_a_junction_is_refused_and_its_target_keeps_everything`,
+`a_parent_swapped_for_a_junction_between_two_steps_is_refused`,
+`the_folder_cannot_be_renamed_away_while_a_step_holds_it`,
+`names_that_win32_would_rewrite_are_removed_as_plain_names`,
 `a_junction_in_the_folder_is_removed_and_never_followed`,
 `a_junction_in_the_place_of_the_folder_is_removed_as_a_link` and
 `a_file_held_open_by_another_program_is_named_as_in_use` on Windows;
+`a_folder_reached_through_a_junction_is_refused` and
+`another_spelling_of_the_real_location_is_accepted` on Windows
+(`crates/exec/src/fs/anchor/tests.rs`);
+`every_step_names_the_folder_the_step_before_answered_with` and
+`a_removal_that_never_ends_is_given_up_after_a_bounded_number_of_steps`
+(`crates/session/src/files/tests.rs`);
+`a_folder_swapped_between_two_steps_is_not_removed_in_its_place`,
 `a_cancelled_removal_stops_between_steps_and_says_so_on_both_sides`,
 `a_revoke_during_a_removal_never_reads_as_a_success`,
 `a_removal_that_leaves_something_behind_is_a_failure_with_its_reasons` and
 `without_the_capability_the_explorer_operations_are_unsupported`
 (`crates/session/tests/e2e.rs`);
+`only_a_removal_that_continues_names_its_folder`,
+`a_folder_id_is_bounded_and_never_empty` and
 `the_largest_drives_and_tree_removal_answers_fit_one_secure_record`
 (`crates/protocol/src/tests.rs`); and
 `a_stop_ends_a_removal_and_later_actions_fail_closed`
@@ -1606,10 +1660,13 @@ technician's file actions are the first to send a file straight into a
 folder. Such a file is the customer's to keep: it lies outside the staging
 area, in no manifest, and no cleanup removes it. What can go wrong: the
 unfinished part of a transfer that never completes stays in the customer's
-folder; a program of an unprivileged account plants a link under the part's
-name, so that the elevated agent writes somewhere else; a file that was
-already there is replaced unasked; a torn or unverified file appears under the
-final name; a full disk is reported as something else. Mitigations:
+folder; a program of an unprivileged account turns the elevated agent
+elsewhere — it plants a link under the part's name, gives the part a second
+name, or swaps the folder for a junction between two requests of the
+transfer, so that a chunk, the verified file or the cleanup lands in another
+directory; a file that was already there is replaced unasked; a torn or
+unverified file appears under the final name; a full disk or a file in use is
+reported as something else. Mitigations:
 
 - *Verified before it has its name.* The bytes go to a part file beside the
   destination — on the same drive, so the commit is one rename on any drive,
@@ -1617,39 +1674,73 @@ final name; a full disk is reported as something else. Mitigations:
   permissions — and the file appears under its name only after its length and
   SHA-256 are verified (FT-2, FT-3, REQ-N-007).
 - *Replaced only on request.* Without the request to replace, a file of that
-  name fails the transfer with `already_exists` and stays as it is.
-- *No write through a planted link.* The part is opened without following a
-  link, and a part that is not a regular file is refused: never written to,
+  name fails the transfer with `already_exists` and stays as it is; the
+  rename that publishes the file refuses a taken name in the same step. A
+  file that another program holds open is not replaced either, and the answer
+  says `file_in_use`.
+- *Inside the folder that was opened.* On Windows every request of the
+  transfer — each chunk, the commit, the discard and the cleanup — opens the
+  folder once as a verified folder (FT-7): it must be a real folder that lies
+  where the request says, so a junction or a symbolic link in its place or
+  in a folder above it is refused as `invalid_path`, as is a `subst` drive or
+  a network drive. Everything after that happens inside the opened folder.
+  The part is opened by its one name relative to the folder's handle, where
+  neither a path, nor a junction, nor a link in the object manager's
+  namespace takes part. The commit reads the length and the digest through
+  the handle it then publishes, which only readers share, and publishes with
+  a rename inside the directory the part lies in. Nothing that happens to a
+  path meanwhile changes where the bytes go.
+- *The part is the transfer's own.* The part must be a regular file with
+  exactly one name. A link under its name, a folder, and a second name (a
+  hard link) of a file that lies elsewhere are refused: never written to,
   never published.
 - *The part is cleaned up.* The agent remembers every unfinished part that
   lies outside the staging area (at most 1024 at a time; one more is refused)
   and removes them with every cleanup: the one the session runs by itself
   when it ends by a stop, a revocation or a lost connection, and one the
-  console asks for. A part it could not remove is reported like any other
-  cleanup failure and tried again by the next cleanup (REQ-F-019).
+  console asks for. On Windows the part is removed through its handle inside
+  the verified folder; a folder that is a link by then is not followed. A
+  part it could not remove is reported like any other cleanup failure and
+  tried again by the next cleanup (REQ-F-019). A commit of an empty file that
+  is refused removes the empty part it made, so refused commits leave nothing
+  to remember.
 - *A name is one name.* The technician computer refuses, before anything is
   sent, a name that is a path and a folder that is not a rooted path on a
   drive; the wire validation applies the path rules again on both ends (FT-1).
 - *Attributed, visible, recorded.* The transfer carries the origin `console`,
   the customer's activity shows a received file with its path and size, and
   the console records `console_send_start` and `console_send` with the path
-  the agent committed, the length and the verified digest, and whether a
-  replacement was asked for (REQ-F-017, REQ-S-017). A full disk is reported as
-  `storage_exhausted` (REQ-N-015).
+  the agent committed — the folder's real location and the file's name — the
+  length and the verified digest, and whether a replacement was asked for
+  (REQ-F-017, REQ-S-017). A full disk is reported as `storage_exhausted`
+  (REQ-N-015).
 
 Evidence: `the_part_lies_beside_the_destination_until_the_verified_commit`,
 `a_file_sent_to_a_folder_is_kept_and_not_staged`,
 `the_part_of_an_unfinished_transfer_to_a_folder_is_removed_by_the_cleanup`,
 `a_part_the_cleanup_cannot_remove_is_reported_and_tried_again`,
-`a_link_planted_under_the_parts_name_is_never_written_through` and
+`a_link_planted_under_the_parts_name_is_never_written_through`,
+`a_folder_under_the_parts_name_is_refused`,
+`a_refused_commit_of_an_empty_file_leaves_no_part_and_no_memory_of_one` and
 `a_full_disk_is_reported_as_exhausted_storage`
-(`crates/exec/src/fs/tests.rs`); `a_name_that_is_a_path_is_refused`
+(`crates/exec/src/fs/tests.rs`), with
+`a_junction_in_the_place_of_the_folder_is_refused_by_every_step_of_a_transfer`,
+`a_folder_swapped_for_a_junction_gets_nothing_published_or_removed_in_its_target`,
+`a_junction_under_the_parts_name_is_never_written_through`,
+`a_part_with_a_second_name_is_never_written_to_and_never_published`,
+`a_destination_held_open_by_another_program_is_not_replaced`,
+`a_file_is_committed_into_the_root_of_a_drive` and
+`a_file_is_committed_into_a_folder_spelled_by_a_short_name_or_in_another_letter_case`
+on Windows; `an_open_in_a_folder_stays_in_that_folder_whatever_its_path_leads_to`
+and `a_rename_through_a_handle_stays_in_the_folder_of_the_file` on Windows
+(`crates/exec/src/fs/anchor/tests.rs`); `a_name_that_is_a_path_is_refused`
 (`apps/console/src/service.rs`); and, on Windows only, because the wire
 accepts a path only when it is rooted on a drive,
 `a_file_is_sent_to_a_folder_and_replaced_only_on_request`,
 `a_revoke_during_a_transfer_to_a_folder_leaves_no_part_behind`
-(`crates/session/tests/e2e.rs`) and
-`a_file_is_sent_into_a_folder_verified_and_replaced_only_on_request`
+(`crates/session/tests/e2e.rs`),
+`a_file_is_sent_into_a_folder_verified_and_replaced_only_on_request` and
+`a_large_file_arrives_whole_and_a_cancelled_one_leaves_nothing`
 (`apps/console/tests/technician_files_e2e.rs`).
 
 *FT-9 — The list of drives (ST-M010-001).* The list reads facts and changes
@@ -1704,9 +1795,30 @@ guessed (REQ-N-006, REQ-N-008). Evidence:
   manages — is walked like any folder, and the cloud service may then remove
   the same files from the cloud, as it does when the folder is removed in
   Windows itself.
-- The removal verifies the opened object on Windows only. Elsewhere it removes
-  by name without following the last part of the name; a non-Windows agent is
-  a development and test tool that is never elevated on a customer computer.
+- Where a folder really lies is verified on Windows only. Elsewhere the
+  removal of a folder and a file sent to a folder work on the path they are
+  given, without following a link in the last part of a name; a non-Windows
+  agent is a development and test tool that is never elevated on a customer
+  computer.
+- A path through a link is refused, also when the link is harmless. A removal
+  or a transfer whose path leads through a junction or a symbolic link — the
+  ones Windows keeps itself, such as `C:\Documents and Settings`, included —
+  or that lies on a drive made with `subst` or on a network drive is refused
+  as `invalid_path`. The technician uses the path where the folder really
+  lies.
+- The folder is the one that lies at the path when the operation begins. The
+  agent refuses a link in the path and a folder that is swapped during a
+  removal; it cannot know which real folder the technician saw under that
+  path a moment earlier. A program that may rename a folder can put it where
+  the technician is about to act, as it could before these operations
+  existed.
+- The identity of a folder is only as good as its file system. On FAT and
+  exFAT it is the volume serial number and a file index that such a file
+  system can hand to another folder later. Those file systems have neither
+  links nor permissions that a removal could be turned against.
+- A step that runs out of its time before it could remove anything ends the
+  removal as blocked. On a very slow disk a removal can therefore end with
+  that reason although nothing stands in its way; asking again goes on.
 - The behaviour that only Windows has was not run on real hardware yet
   (MT-14), and its automated tests run on the Windows CI runner only.
 - Cleanup can fail. A staged file may survive an unclean shutdown; the
@@ -2033,9 +2145,10 @@ while cleanup is incomplete.
 - *Parts outside the staging area.* A file sent into a folder is written to a
   part beside its destination. The agent remembers each such part until the
   transfer is committed or discarded, removes the remaining ones with the
-  session's cleanup, and reports a part it could not remove in the cleanup
-  report, where the next cleanup tries again (ST-M010-001, REQ-F-019; see
-  FT-8).
+  session's cleanup — on Windows inside the opened, verified folder, never
+  through a link that took the folder's place — and reports a part it could
+  not remove in the cleanup report, where the next cleanup tries again
+  (ST-M010-001, REQ-F-019; see FT-8).
 
 **Residual risks.**
 

@@ -779,7 +779,20 @@ mod sys {
     /// every part that is spelled by its short name replaced by the long
     /// one.
     fn long_names(asked: &[u16]) -> io::Result<Vec<u16>> {
-        let prefixed = asked.len() >= PLAIN_PATH_UNITS;
+        // A short path is given to the system as it is. A long one needs the
+        // verbatim prefix to be accepted, and so does one whose long form is
+        // long: the call is then tried again that way.
+        if asked.len() < PLAIN_PATH_UNITS
+            && let Ok(long) = expand_short_names(asked, false)
+        {
+            return Ok(long);
+        }
+        expand_short_names(asked, true)
+    }
+
+    /// One call for the long names of `asked`, given to the system with or
+    /// without the verbatim prefix and returned without it.
+    fn expand_short_names(asked: &[u16], prefixed: bool) -> io::Result<Vec<u16>> {
         let mut short = Vec::with_capacity(VERBATIM.len() + asked.len() + 1);
         if prefixed {
             short.extend_from_slice(&VERBATIM);

@@ -619,13 +619,15 @@ Prepare the customer computer in an administrator PowerShell, which the
 technician terminal can also do:
 
 ```powershell
-New-Item -ItemType Directory C:\CretLinkTest\tree\sub\deeper, C:\CretLinkTest\outside | Out-Null
+New-Item -ItemType Directory C:\CretLinkTest\tree\sub\deeper, C:\CretLinkTest\outside\inner | Out-Null
 1..50 | ForEach-Object { Set-Content "C:\CretLinkTest\tree\sub\file-$_.txt" "x" }
 Set-Content C:\CretLinkTest\outside\keep.txt "keep"
+Set-Content C:\CretLinkTest\outside\inner\keep-too.txt "keep"
 Set-Content C:\CretLinkTest\tree\read-only.txt "x"; Set-ItemProperty C:\CretLinkTest\tree\read-only.txt IsReadOnly $true
 cmd /c mklink /J C:\CretLinkTest\tree\junction C:\CretLinkTest\outside
 cmd /c mklink /D C:\CretLinkTest\tree\folder-link C:\CretLinkTest\outside
 cmd /c mklink C:\CretLinkTest\tree\file-link C:\CretLinkTest\outside\keep.txt
+cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
 ```
 
 1. **Drives.** List the drives.
@@ -649,7 +651,17 @@ cmd /c mklink C:\CretLinkTest\tree\file-link C:\CretLinkTest\outside\keep.txt
      C:\CretLinkTest\tree and everything in it*, with the path, done; the
      Audit tab lists `console_remove_tree` with the path and the counts
      (REQ-F-017, REQ-S-017).
-3. **A file held open.** Run the preparation again. On the customer computer
+3. **A folder reached through a junction.** Ask to delete
+   `C:\CretLinkTest\via\inner`: the path leads through the junction `via` to
+   `C:\CretLinkTest\outside\inner`.
+   - Expected: refused as an invalid path before anything is removed, with the
+     reason that the path leads through a link.
+     `C:\CretLinkTest\outside\inner\keep-too.txt` is still there, and the
+     customer's item is failed.
+   - Expected: deleting `C:\CretLinkTest\via` itself removes the junction and
+     nothing else: `C:\CretLinkTest\outside` keeps its content. Deleting
+     `C:\CretLinkTest\outside\inner` by its own path removes it.
+4. **A file held open.** Run the preparation again. On the customer computer
    hold one file open without sharing it, then delete the folder:
 
    ```powershell
@@ -661,21 +673,36 @@ cmd /c mklink C:\CretLinkTest\tree\file-link C:\CretLinkTest\outside\keep.txt
      entries were left. Everything else in the folder is gone; the held file
      and the folders above it are still there. The customer's item is failed.
      After `$held.Close()` a second removal succeeds (REQ-N-008).
-4. **A large folder, cancelled.** Create a folder with 20 000 small files
+5. **A large folder, cancelled.** Create a folder with 20 000 small files
    (`1..20000 | ForEach-Object { Set-Content "C:\CretLinkTest\many\f$_.txt" "x" }`
    after creating the folder), start its removal and cancel it while it runs.
    - Expected: the removal stops within about a second. The result says
      *cancelled* and how many files were removed; the others are still there.
      The customer's item was in progress and ends as cancelled.
-5. **A large folder, stopped by the customer.** Start the removal of the rest
+6. **A large folder, stopped by the customer.** Start the removal of the rest
    and press **Stop now** on the customer computer while it runs.
    - Expected: the session ends at once on both sides; the technician is not
      told that the folder was removed; files remain in the folder; nothing is
      removed after the stop (REQ-S-004, REQ-F-018).
-6. **A drive is not a folder.** In a new session ask to delete `E:\` itself.
+7. **A folder swapped during a removal.** In a new session fill
+   `C:\CretLinkTest\many` up to 20 000 files again and start its removal.
+   While it runs, on the customer computer, move the folder away as soon as
+   Windows allows it and put another one in its place:
+
+   ```powershell
+   while (-not (Test-Path C:\CretLinkTest\many-moved)) { Rename-Item C:\CretLinkTest\many many-moved -ErrorAction SilentlyContinue }
+   New-Item -ItemType Directory C:\CretLinkTest\many | Out-Null; Set-Content C:\CretLinkTest\many\new.txt "new"
+   ```
+
+   - Expected: the rename fails for as long as a step of the removal holds the
+     folder and succeeds between two steps. The removal then ends as
+     **failed**: the folder is no longer there, or it is not the one the
+     removal began with. `C:\CretLinkTest\many\new.txt` is still there, and
+     so are the files that were left in `C:\CretLinkTest\many-moved`.
+8. **A drive is not a folder.** Ask to delete `E:\` itself.
    - Expected: refused as an invalid path before anything is removed; the
      content of the stick is untouched.
-7. **Send to a folder.** Send a file of some tens of megabytes to the
+9. **Send to a folder.** Send a file of some tens of megabytes to the
    customer's `Documents` folder, and watch that folder in Windows.
    - Expected: while the transfer runs the folder holds a file whose name
      starts with `.cretlink-part.` and never one with the final name. When the
@@ -686,27 +713,46 @@ cmd /c mklink C:\CretLinkTest\tree\file-link C:\CretLinkTest\outside\keep.txt
      the file. The customer's activity shows a received file from the
      technician with its path and size. The Audit tab lists `console_send`
      with the path, the length and the digest (REQ-F-017, REQ-S-017).
-8. **Another drive.** Send the same file to `E:\` and to a folder on `E:`.
-   - Expected: as in step 7, on the other drive.
-9. **A name that is taken.** Send a different file under the name of step 7
-   without asking to replace it, then again asking to replace it.
-   - Expected: the first transfer fails because the file already exists, and
-     the file of step 7 keeps its hash. The second replaces it, and the hash
-     is the new file's.
-10. **Cancel and stop during a transfer.** Start a large transfer into
+10. **Another drive.** Send the same file to `E:\` and to a folder on `E:`.
+    - Expected: as in step 9, on the other drive.
+11. **A destination folder that is a junction.** Make a junction to a folder
+    and send a small file to it, and to a folder behind it:
+
+    ```powershell
+    cmd /c mklink /J C:\CretLinkTest\link-folder C:\CretLinkTest\outside
+    New-Item -ItemType Directory C:\CretLinkTest\outside\behind | Out-Null
+    ```
+
+    Send the file to `C:\CretLinkTest\link-folder`, then to
+    `C:\CretLinkTest\link-folder\behind`.
+    - Expected: both transfers fail with an invalid path. Nothing appears in
+      `C:\CretLinkTest\outside` or in `behind`: neither the file nor a
+      `.cretlink-part.` file. The same file sent to
+      `C:\CretLinkTest\outside\behind`, the real path, arrives.
+12. **A name that is taken.** Send a different file under the name of step 9
+    without asking to replace it, then again asking to replace it. Then hold
+    the file open on the customer computer
+    (`$held = [IO.File]::Open("<the file>", "Open", "Read", "None")`) and
+    send a third file under that name, asking to replace it.
+    - Expected: the first transfer fails because the file already exists, and
+      the file of step 9 keeps its hash. The second replaces it, and the hash
+      is the new file's. The third fails with the reason that the file is in
+      use, and the file keeps its hash; after `$held.Close()` the same
+      transfer replaces it.
+13. **Cancel and stop during a transfer.** Start a large transfer into
     `Documents` and cancel it. Start it again and press **Stop now** on the
     customer computer while it runs.
     - Expected: each time no file appears under the final name, and afterwards
       no `.cretlink-part.` file is left in the folder. The end report of the
       stopped session names nothing that could not be removed (REQ-F-019).
-11. **A full drive.** Send a file that is larger than the free space of `E:`.
+14. **A full drive.** Send a file that is larger than the free space of `E:`.
     - Expected: the transfer fails and says that the storage is exhausted;
       nothing appears under the final name, and no part is left after the
       session has ended.
-12. **Afterwards.** End the session and look again.
-    - Expected: the files sent in steps 7 to 9 are still in their folders:
-      they are the customer's to keep, and the list of staged files never
-      named them. `C:\CretLinkTest` can be deleted by hand.
+15. **Afterwards.** End the session and look again.
+    - Expected: the files sent in steps 9, 10 and 12 are still in their
+      folders: they are the customer's to keep, and the list of staged files
+      never named them. `C:\CretLinkTest` can be deleted by hand.
 
 ### MT-E2E — Full attended-LAN acceptance walk-through (ST-M006-006)
 
@@ -803,4 +849,4 @@ hardware.
 | _pending_ | | | MT-11 steps 2, 4, 5 and 7 to 9 on Windows, and all of it on macOS (ST-M009-006) | not yet recorded on hardware |
 | _pending_ | | | MT-12 step 10 (files left from an earlier session and `cretlink recover`) and the Narrator pass (ST-M009-009, ST-M009-010) | not yet recorded on hardware |
 | _pending_ | | | MT-13 (a technician's computer on several networks, ST-M009-016) | not yet recorded on hardware |
-| _pending_ | | | MT-14 (the file operations of the explorer: the drives, a folder with links / a held file / cancel and stop, a file sent to a folder on two drives, ST-M010-001) | not yet recorded on hardware |
+| _pending_ | | | MT-14 (the file operations of the explorer: the drives, a folder with links / through a junction / a held file / cancel and stop / swapped while it is removed, a file sent to a folder on two drives and refused for a junction, ST-M010-001) | not yet recorded on hardware |
