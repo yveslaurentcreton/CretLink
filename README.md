@@ -23,7 +23,8 @@ works, how to get started, and what it promises about security.
 ## How a session goes
 
 1. **The technician** starts `cretlink`, chooses **Give help** and waits for
-   the customer.
+   the customer. The window names the network it waits on; a computer that is
+   on several, such as a VPN next to the local network, can choose another.
 2. **The customer** starts the same program, chooses **Get help** and answers
    the Windows administrator prompt. A copy named `CretLink-Support.exe` opens
    Get help straight away, for example from a USB stick. Nothing is installed.

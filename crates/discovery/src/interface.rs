@@ -116,7 +116,7 @@ pub(crate) fn is_advertisable_addr(addr: IpAddr) -> bool {
 /// Returns `true` for an IPv4/IPv6 link-local address (`169.254.0.0/16`,
 /// `fe80::/10`). Used to deprioritize automatically-assigned link-local
 /// addresses in favour of a routable-private one (ST-M002-010).
-fn is_link_local(addr: IpAddr) -> bool {
+pub(crate) fn is_link_local(addr: IpAddr) -> bool {
     matches!(locality(addr), Locality::LinkLocal)
 }
 

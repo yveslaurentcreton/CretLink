@@ -26,6 +26,12 @@ pub enum DiscoveryError {
     )]
     NoPrivateInterface,
 
+    /// The address a console was asked to announce is not a private LAN
+    /// address. Announcing a loopback, unspecified or public address is
+    /// refused (REQ-S-010).
+    #[error("{0} is not a private LAN address, so it is not announced")]
+    NotPrivate(std::net::IpAddr),
+
     /// The mDNS daemon reported an error while registering, browsing, or
     /// scoping interfaces. The detail describes a socket or configuration
     /// problem and contains no secret material.

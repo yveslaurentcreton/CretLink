@@ -567,6 +567,40 @@ screen (`#c-admin`, `#c-find`, `#c-sac`, `#c-consent`, `#c-live`, `#c-mini`,
     what it removed, says the computer is clean, and `$LASTEXITCODE` is 0;
     `CretLink-Support uninstall` is still refused.
 
+### MT-13 — A technician's computer on several networks (ST-M009-016)
+
+Run this on a technician computer that has, next to its local network, a VPN
+connection or a virtual network adapter (the virtual switch of a hypervisor),
+with the customer computer on the local network.
+
+1. **First choice.** With the VPN disconnected, start a session (Give help).
+   - Expected: the waiting screen names the adapter of the local network and
+     its address, not the virtual adapter's.
+2. **The list.** Choose **Wait on another network**.
+   - Expected: every other private address of the computer is listed with the
+     name of its adapter; the address in use is not offered again, and no
+     public address appears (REQ-S-010).
+3. **Change and change back.** Choose another network, then choose the local
+   network again.
+   - Expected: the screen stays the waiting screen, says *Changing the
+     network…* for a moment, and then shows the chosen adapter and address
+     and a new connection code.
+4. **Discovery follows.** On the customer computer open Get help, first while
+   the technician waits on a network the customer is not on, then while it
+   waits on the local network.
+   - Expected: in the first case the technician is not in the customer's list
+     and the connection code does not connect. In the second case the
+     technician appears once, with the address of the local network, and the
+     session connects.
+5. **A VPN that connects later.** Cancel, connect the VPN and start a session
+   again in the same run of the program.
+   - Expected: the session waits on the adapter chosen in step 3. After the
+     program is closed and started again the first choice applies; when that
+     is the VPN's address, choosing the local network once more works.
+6. **Escape.** Open the list and press Escape twice.
+   - Expected: the first Escape closes the list and the session keeps
+     waiting; the second cancels it (REQ-F-018).
+
 ### MT-E2E — Full attended-LAN acceptance walk-through (ST-M006-006)
 
 The scenarios above are targeted failure and edge slices; this one is the single
@@ -661,3 +695,4 @@ hardware.
 | _pending_ | | | MT-8 (reboot-resume: arm under UAC, survive a reboot, one attended reconnect via the `K_rr` proof, single-use consumption, expired/cloned refusal, residual removal via the recovery command — ST-M006-001/002/003) | not yet recorded on hardware |
 | _pending_ | | | MT-11 steps 2, 4, 5 and 7 to 9 on Windows, and all of it on macOS (ST-M009-006) | not yet recorded on hardware |
 | _pending_ | | | MT-12 step 10 (files left from an earlier session and `cretlink recover`) and the Narrator pass (ST-M009-009, ST-M009-010) | not yet recorded on hardware |
+| _pending_ | | | MT-13 (a technician's computer on several networks, ST-M009-016) | not yet recorded on hardware |

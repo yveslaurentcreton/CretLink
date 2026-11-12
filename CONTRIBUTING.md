@@ -187,7 +187,7 @@ Use these sample values:
 | Computers | `TECH-LAPTOP` (the technician's), `CUSTOMER-PC`, `ACME-PC-07`, `FRONTDESK-2`, `MOM-LAPTOP` |
 | People | `Sam` (the technician) and `Ann` |
 | Accounts | `sam`, `ann`, `jdoe`, `tech`, `customer`, as in `C:\Users\ann` and `/home/ann` |
-| Addresses | `127.0.0.1`, `10.0.0.42`, `192.168.1.20`, and `192.0.2.1` for a peer on the internet |
+| Addresses | `127.0.0.1`, `10.0.0.42`, `192.168.1.20`, `172.20.0.1` for a virtual adapter, and `192.0.2.1` for a peer on the internet |
 | Domains | names under `example.org`, such as `host-01.example.org` and `ann@example.org` |
 
 [`scripts/private-data-samples.json`](scripts/private-data-samples.json) lists

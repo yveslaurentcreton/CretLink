@@ -28,7 +28,9 @@ use cretlink_console::{
     ConsoleSessionService, IpcAudit, IpcServer, LiveEcho, ManualActivity, SessionAuditStart,
     open_session_log, prune_audit_dir, report_prune, spawn_audit_service, technician_display_name,
 };
-use cretlink_discovery::{Advertiser, ConnectionCode, private_interface_addrs};
+use cretlink_discovery::{
+    Advertiser, ConnectionCode, default_route_addr, first_choice, listen_candidates,
+};
 use cretlink_mcp::{IpcEndpoint, IpcListener};
 use cretlink_protocol::{PROTOCOL_V1, SessionId, TargetIdentity};
 use cretlink_session::{
@@ -338,9 +340,10 @@ fn announce_lan(handle: &HostHandle) -> Result<Option<Advertiser>, String> {
         || "CretLink Console".to_string(),
         |name| name.as_str().to_string(),
     );
+    // Only the address the listener is bound to is announced (ST-M009-016).
     let advertiser = match Advertiser::advertise(
         "cretlink-console",
-        local_addr.port(),
+        local_addr,
         PROTOCOL_V1,
         &advertised_name,
     ) {
@@ -1356,25 +1359,22 @@ fn non_empty_env(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-/// Chooses which local interface to listen on. An explicit `--bind` wins;
-/// otherwise the first private LAN address `private_interface_addrs` returns is
-/// used so another machine can reach it, falling back to loopback for a
-/// local-only run. That candidate list is preference-ordered by the discovery
-/// crate — routable-private (RFC1918 / ULA) first, automatically-assigned
-/// link-local (`169.254` / `fe80::`) dropped unless it is the only option — so
-/// a stray APIPA interface cannot shadow the real LAN address and force a
-/// manual `--bind` (ST-M002-010). The runtime independently refuses
-/// any non-private address (REQ-S-010).
+/// Chooses which local address to listen on. An explicit `--bind` wins.
+/// Otherwise it is the first choice of the discovery crate among this
+/// computer's private addresses (ST-M009-016): the address the computer uses
+/// to reach other networks, unless that is a point-to-point link, so that a
+/// VPN adapter or a virtual switch does not shadow the local network the
+/// customer is on. Link-local addresses (`169.254` / `fe80::`) are candidates
+/// only when nothing else exists (ST-M002-010). Without any private address
+/// the listener falls back to loopback, for a local-only run. The runtime
+/// independently refuses any non-private address (REQ-S-010).
 fn select_bind_ip(explicit: Option<IpAddr>) -> Result<IpAddr, String> {
     if let Some(ip) = explicit {
         return Ok(ip);
     }
-    let candidates = private_interface_addrs().unwrap_or_default();
-    if let Some(ip) = candidates.iter().find(|ip| !ip.is_loopback()).copied() {
-        return Ok(ip);
-    }
-    if let Some(ip) = candidates.first().copied() {
-        return Ok(ip);
-    }
-    Ok(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    let candidates = listen_candidates().unwrap_or_default();
+    Ok(first_choice(&candidates, default_route_addr())
+        .map_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), |chosen| {
+            chosen.addr
+        }))
 }

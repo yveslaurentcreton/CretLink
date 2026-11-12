@@ -313,7 +313,9 @@ interfaces with a manual connection-code fallback (ADR-0007), and the Noise
 - The pairing and control listener that accepts the handshake and, after
   pairing, carries the encrypted session. The architecture prefers the
   customer agent to initiate the control channel toward the technician console
-  where practical, so the long-lived listener sits on the technician side.
+  where practical, so the long-lived listener sits on the technician side. It
+  is bound to one private address of the technician's computer, never to a
+  public or wildcard address (REQ-S-010, ST-M009-016).
 - In-flight session traffic: encrypted frames carrying commands, output
   streams, and file transfers.
 - The network fabric itself: ARP, DHCP, mDNS/DNS, and switching behaviour that
@@ -347,6 +349,23 @@ section: endpoint authentication with the SAC bound to the transcript
 (REQ-S-006, REQ-F-005) means an interposed attacker produces mismatched codes,
 so ARP or mDNS spoofing can redirect packets but cannot yield an approved
 session.
+
+*A session offered on the wrong network (ST-M009-016).* A technician's
+computer is often on several private networks at once: its local network, a
+VPN, the virtual switch of a hypervisor. The listener is bound to exactly one
+of their addresses, and discovery announces that address alone, on its adapter
+alone, so a waiting session is not offered on a VPN or a virtual network that
+the technician did not choose, and the customer's list never holds an address
+that nobody listens on. The waiting screen names the adapter, and the
+technician can move the session to another network; the address asked for
+must be one this computer itself listed, so the window cannot make the
+listener bind anything else. Without a choice the application waits on the
+address the computer uses to reach other networks, unless that adapter is a
+point-to-point link. To learn that address it connects a datagram socket to
+an address reserved for documentation and reads the socket's local address:
+nothing is sent, nothing listens, and the socket is closed at once —
+*implemented (`crates/discovery/src/listen.rs`,
+`apps/app/src-tauri/src/technician/network.rs`)*.
 
 *Malicious discovery announcements.* An attacker advertises a fake console to
 the agent, or a fake agent to the console, floods the discovery view with

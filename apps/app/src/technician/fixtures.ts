@@ -7,6 +7,7 @@ import type {
   AiClientStatus,
   AppInfo,
   AuditEntryView,
+  ListenNetwork,
   SessionSummary,
 } from "../shared/contract";
 import type { ConsoleState, SessionPhase, TargetIdentity } from "./api";
@@ -65,6 +66,13 @@ export function consoleIn(
     phase,
   };
 }
+
+/** This computer on its local network, a virtual adapter and a VPN (ST-M009-016). */
+export const NETWORKS: ListenNetwork[] = [
+  { address: "10.0.0.42", adapter: "Wi-Fi", pointToPoint: false },
+  { address: "172.20.0.1", adapter: "vEthernet (Default Switch)", pointToPoint: false },
+  { address: "192.168.1.20", adapter: "VPN", pointToPoint: true },
+];
 
 export const APP_INSTALLED: AppInfo = {
   hostname: "TECH-LAPTOP",
@@ -345,6 +353,7 @@ function base(console: ConsoleState): TechnicianSnapshot {
     version: "0.22.0",
     clients: CLIENTS,
     sessions: SESSIONS.slice(0, 3),
+    networks: NETWORKS,
   };
 }
 
@@ -395,6 +404,31 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
   "wait-no-name": base(
     consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" }),
   ),
+  // The other networks of this computer, listed (ST-M009-016).
+  "wait-networks": {
+    ...base(
+      consoleIn(
+        { phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" },
+        { displayName: "Sam" },
+      ),
+    ),
+    networksOpen: true,
+  },
+  // One network only: nothing to choose.
+  "wait-one-network": {
+    ...base(consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" })),
+    networks: NETWORKS.slice(0, 1),
+  },
+  // The backend has not listed the networks: the address stands alone.
+  "wait-networks-unknown": {
+    ...base(consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" })),
+    networks: null,
+  },
+  // Between the old listener and the new one.
+  "wait-switching": {
+    ...base(consoleIn({ phase: "stopped", reason: "technician_requested" })),
+    busy: "network",
+  },
   connecting: base(consoleIn({ phase: "connecting" }, { session: true })),
   compare: base(
     consoleIn({ phase: "awaiting_approval_code", code: "482913" }, { session: true, target: true }),

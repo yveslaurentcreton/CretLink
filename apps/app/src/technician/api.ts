@@ -14,6 +14,7 @@ import type {
   AuditEntryView,
   BridgeStatus,
   ClientId,
+  ListenNetwork,
   SessionSummary,
 } from "../shared/contract";
 
@@ -132,6 +133,12 @@ export const api = {
   // returned snapshot is the pre-listen state; live progress then arrives as
   // `"console-state"` events (see `main.ts`), never as the return value here.
   startLiveSession: () => invoke<ConsoleState>("start_live_session"),
+  // The networks this computer can wait on, and the move of the waiting
+  // session to another one (ST-M009-016). The move answers with the new
+  // waiting state: another address and a new connection code.
+  listenNetworks: () => invoke<ListenNetwork[]>("get_listen_networks"),
+  switchListenNetwork: (address: string) =>
+    invoke<ConsoleState>("switch_listen_network", { address }),
   // Interactive terminal panel (ST-M008-001). All four fail closed with
   // `no_consented_session` when no session is under full control — the panel
   // never fabricates a shell. `open_terminal` streams output on the

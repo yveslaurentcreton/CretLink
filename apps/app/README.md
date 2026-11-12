@@ -124,6 +124,31 @@ The authoritative state machines live in `cretlink-console`
 (`apps/support-agent/src/state.rs`) and are covered by cross-platform tests
 there; this crate is a thin renderer and holds no session authority.
 
+## The network to wait on (ST-M009-016)
+
+A technician's computer is often on several private networks at once: its
+local network, a VPN, the virtual switch of a hypervisor. The customer can
+reach only one of them, so the session waits on exactly one address, and the
+waiting screen (`#t-wait`) names its adapter.
+
+| Command | What it does |
+| --- | --- |
+| `get_listen_networks` | this computer's private addresses that are up, each with the name of its network adapter (`ListenNetwork` in `src/shared/contract.ts`), in the order of `cretlink_discovery::listen_candidates` |
+| `start_live_session` | waits on the adapter chosen earlier in this run while it still has an address, otherwise on the first choice of `cretlink_discovery::first_choice`: the address of the default route unless that adapter is a point-to-point link |
+| `switch_listen_network` `{ address }` | only while waiting: stops the listener, waits until it is gone, and starts one on `address` with a new connection code; `address` must be one that `get_listen_networks` lists |
+
+- With more than one network the waiting screen offers the others under
+  **Wait on another network**. While the listener moves it shows no code. The
+  first Escape closes the open list; Escape then cancels as always.
+- The choice is kept for the later sessions of the same run, by adapter name
+  and in memory only (`src-tauri/src/technician/network.rs`): nothing is
+  written to disk.
+- Discovery announces the bound address alone, on its adapter alone
+  (`cretlink_discovery::Advertiser`), so the customer's list never holds an
+  address that nobody listens on.
+- Without any private address the listener binds loopback and is not
+  announced; a public or wildcard address is never bound (REQ-S-010).
+
 ## The activity feed (ST-M009-011)
 
 Both roles build the same activity item for every action on the customer

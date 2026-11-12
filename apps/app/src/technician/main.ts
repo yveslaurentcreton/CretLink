@@ -30,6 +30,8 @@ import {
   isActivityEvent,
   isAuditEntry,
   isBridgeStatus,
+  isListenNetwork,
+  listenHost,
   placeholderConsole,
   screenFor,
   sessionCounts,
@@ -154,6 +156,16 @@ function adoptConsole(next: ConsoleState): void {
     if (next.phase.phase === "listening") auditGeneration += 1;
     scheduleAuditRefresh();
   }
+  // Waiting on an address the list does not name yet: ask which networks this
+  // computer has, so the screen can name the adapter and offer the others
+  // (ST-M009-016).
+  if (next.phase.phase === "listening") {
+    const host = listenHost(next.phase.address);
+    const previous = snap.console.phase;
+    if (previous.phase !== "listening" || listenHost(previous.address) !== host) {
+      void loadNetworks();
+    }
+  }
   const wasFull = before === "full_control";
   const { snapshot, ended } = applyConsole(snap, next, Date.now());
   // A phase change is announced in words; an older notice would hide it.
@@ -226,6 +238,67 @@ async function loadBridge(): Promise<void> {
   } catch {
     // Not offered: the rail falls back to the clients seen in the feed.
   }
+}
+
+// The networks this computer can wait on (ST-M009-016). The newest answer
+// wins: adapters come and go, for example when a VPN connects.
+let networksGeneration = 0;
+
+async function loadNetworks(): Promise<void> {
+  networksGeneration += 1;
+  const generation = networksGeneration;
+  try {
+    const networks = await api.listenNetworks();
+    if (generation === networksGeneration) {
+      set({ networks: Array.isArray(networks) ? networks.filter(isListenNetwork) : null });
+    }
+  } catch {
+    // Not offered: the screen shows the address without its adapter.
+    if (generation === networksGeneration) set({ networks: null });
+  }
+}
+
+/** Moves the waiting session to another network of this computer. */
+async function switchNetwork(address: string): Promise<void> {
+  if (snap.console.phase.phase !== "listening" || snap.busy !== undefined) return;
+  const wanted = snap.networks?.find((network) => network.address === address);
+  set({ busy: "network", error: undefined, networksOpen: false });
+  try {
+    const next = await api.switchListenNetwork(address);
+    // The answer is the new waiting state, or the honest end when the address
+    // could not be used. States were pushed meanwhile; the answer is adopted
+    // unless a customer has already started to connect, which is newer.
+    snap = { ...snap, busy: undefined };
+    const now = snap.console.phase.phase;
+    if (now === "stopped" || now === "listening" || now === "idle" || now === "failed") {
+      adoptConsole(next);
+    }
+    if (snap.console.phase.phase === "listening") {
+      set({
+        notice: wanted
+          ? `Now waiting on ${wanted.adapter}. The connection code changed.`
+          : "The network changed. The connection code changed.",
+      });
+    } else {
+      set({});
+    }
+  } catch (error) {
+    set({
+      busy: undefined,
+      error: {
+        title: "The network could not be changed",
+        message: describe(error),
+        next: "Start the session again and choose a network your customer's computer is on.",
+      },
+    });
+    // The old listener may be gone already: show what the backend says now.
+    try {
+      adoptConsole(await api.getState());
+    } catch {
+      // The state stays as it was pushed.
+    }
+  }
+  void loadNetworks();
 }
 
 // Bumped when a new session starts, so an older `get_session_audit` answer
@@ -362,6 +435,14 @@ function onAction(event: ActionEvent): void {
       break;
     case "copy":
       if (arg) void copy(arg);
+      break;
+    case "networks":
+      // Adapters come and go: read them again whenever the list opens.
+      if (!snap.networksOpen) void loadNetworks();
+      set({ networksOpen: !snap.networksOpen });
+      break;
+    case "network":
+      if (arg) void switchNetwork(arg);
       break;
     case "open-audit":
       void openAudit(arg);
@@ -512,6 +593,13 @@ async function uninstall(): Promise<void> {
 
 function onKeydown(event: KeyboardEvent): void {
   if (event.key === "Escape") {
+    // An open list of networks closes first; Escape then stops as always.
+    if (snap.networksOpen) {
+      event.preventDefault();
+      set({ networksOpen: false });
+      queueMicrotask(() => document.getElementById("net-toggle")?.focus());
+      return;
+    }
     // Escape is the always-available stop in every live phase (REQ-F-018).
     if (canStop(snap.console)) {
       event.preventDefault();

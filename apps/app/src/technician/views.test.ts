@@ -238,6 +238,73 @@ describe("waiting (#t-wait)", () => {
     expect(buttonNamed(root, /Cancel/)?.dataset.action).toBe("stop");
     expect(text(root.querySelector(".pill"))).toContain("No access");
   });
+
+  it("names the adapter of the address it waits on (ST-M009-016)", () => {
+    const root = show("wait");
+    expect(text(root.querySelector(".conn-addr"))).toContain("Wi-Fi · 10.0.0.42:7000");
+  });
+
+  it("offers the other networks behind a button that says whether the list is open", () => {
+    const closed = show("wait");
+    const toggle = closed.querySelector<HTMLButtonElement>("#net-toggle");
+    expect(text(toggle)).toBe("Wait on another network");
+    expect(toggle?.dataset.action).toBe("networks");
+    expect(toggle?.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle?.getAttribute("aria-controls")).toBe("net-list");
+    expect(closed.querySelector("#net-list")).toBeNull();
+
+    const open = show("wait-networks");
+    expect(open.querySelector("#net-toggle")?.getAttribute("aria-expanded")).toBe("true");
+    const rows = Array.from(open.querySelectorAll("#net-list li"));
+    // The network it waits on is not offered again.
+    expect(rows.map((row) => text(row.querySelector(".net-name")))).toEqual([
+      "vEthernet (Default Switch) · 172.20.0.1",
+      "VPN · 192.168.1.20",
+    ]);
+    const choose = rows[0]?.querySelector("button");
+    expect(text(choose)).toBe("Wait here");
+    expect(choose?.dataset.action).toBe("network");
+    expect(choose?.dataset.arg).toBe("172.20.0.1");
+    expect(choose?.getAttribute("aria-label")).toBe(
+      "Wait on vEthernet (Default Switch), 172.20.0.1",
+    );
+    // A tunnel is named in words, and the list says what changing does.
+    expect(text(rows[1])).toContain("point-to-point link");
+    expect(text(rows[0])).not.toContain("point-to-point link");
+    expect(text(open.querySelector("#net-list"))).toContain("The connection code changes with it");
+  });
+
+  it("offers no choice with one network, and shows the address alone when none is known", () => {
+    const one = show("wait-one-network");
+    expect(one.querySelector("#net-toggle")).toBeNull();
+    expect(text(one.querySelector(".conn-addr"))).toContain("Wi-Fi · 10.0.0.42:7000");
+
+    const unknown = show("wait-networks-unknown");
+    expect(unknown.querySelector("#net-toggle")).toBeNull();
+    expect(unknown.querySelector(".net-adapter")).toBeNull();
+    expect(text(unknown.querySelector(".conn-addr"))).toContain("10.0.0.42:7000");
+  });
+
+  it("shows no code while the network changes", () => {
+    const root = show("wait-switching");
+    expect(root.querySelector(".screen.wait")).not.toBeNull();
+    expect(text(root.querySelector('[role="status"].conn-switching'))).toBe("Changing the network…");
+    expect(root.querySelector(".conn-code")).toBeNull();
+    expect(buttonNamed(root, "Copy the connection code")).toBeUndefined();
+    expect(root.querySelector("#net-toggle")).toBeNull();
+  });
+
+  it("writes an adapter name as text", () => {
+    const root = show("wait-networks", {
+      networks: [
+        { address: "10.0.0.42", adapter: XSS, pointToPoint: false },
+        { address: "172.20.0.1", adapter: XSS, pointToPoint: false },
+      ],
+    });
+    expect(root.querySelector("img")).toBeNull();
+    expect(root.querySelector("script")).toBeNull();
+    expect(text(root.querySelector(".conn-addr"))).toContain(XSS);
+  });
 });
 
 describe("compare (#t-sac)", () => {

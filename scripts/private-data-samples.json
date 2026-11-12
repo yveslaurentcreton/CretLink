@@ -22,6 +22,12 @@
       ]
     },
     {
+      "_comment": "A fixture address for a second network of one computer: a virtual adapter next to its local network.",
+      "values": [
+        "172.20.0.1"
+      ]
+    },
+    {
       "_comment": "Fixture addresses in the documentation ranges (RFC 5737), for peers on the internet.",
       "values": ["192.0.2.1", "198.51.100.9", "203.0.113.7"]
     },

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ActivityEntry } from "../shared/contract";
-import { AUDIT, FEED, NOW, SESSION_ID, TARGET, consoleIn } from "./fixtures";
+import { AUDIT, FEED, FIXTURES, NETWORKS, NOW, SESSION_ID, TARGET, consoleIn } from "./fixtures";
 import {
   applyConsole,
   auditActionWords,
@@ -13,6 +13,9 @@ import {
   isActivityEvent,
   isAuditEntry,
   isBridgeStatus,
+  isListenNetwork,
+  listenHost,
+  otherNetworks,
   screenFor,
   sessionCounts,
   stateWords,
@@ -20,6 +23,7 @@ import {
   type TechnicianSnapshot,
   trimFeed,
   upsertActivity,
+  waitingNetwork,
 } from "./model";
 
 const item = (id: string, state: "running" | "done" = "done"): ActivityEntry => ({
@@ -284,6 +288,67 @@ describe("the bridge status (ST-M009-008)", () => {
       { endpoint: "unavailable", message: 3, tools: 1, clients: [] },
     ]) {
       expect(isBridgeStatus(bad)).toBe(false);
+    }
+  });
+});
+
+describe("the network to wait on (ST-M009-016)", () => {
+  const waiting = FIXTURES.wait as TechnicianSnapshot;
+
+  it("reads the host of a listen address with or without brackets", () => {
+    expect(listenHost("10.0.0.42:7000")).toBe("10.0.0.42");
+    expect(listenHost("[fd00::1]:7000")).toBe("fd00::1");
+    expect(listenHost("fd00::1")).toBe("fd00::1");
+    expect(listenHost("10.0.0.42")).toBe("10.0.0.42");
+  });
+
+  it("names the network the session waits on and lists the others", () => {
+    expect(waitingNetwork(waiting)?.adapter).toBe("Wi-Fi");
+    expect(otherNetworks(waiting).map((network) => network.adapter)).toEqual([
+      "vEthernet (Default Switch)",
+      "VPN",
+    ]);
+  });
+
+  it("offers nothing when there is one network, none is known, or nobody waits", () => {
+    expect(otherNetworks({ ...waiting, networks: NETWORKS.slice(0, 1) })).toEqual([]);
+    expect(otherNetworks({ ...waiting, networks: null })).toEqual([]);
+    expect(waitingNetwork({ ...waiting, networks: null })).toBeUndefined();
+    const home = FIXTURES.home as TechnicianSnapshot;
+    expect(otherNetworks(home)).toEqual([]);
+    expect(waitingNetwork(home)).toBeUndefined();
+    // An address that is not in the list has no adapter to name, and every
+    // listed network is then another one.
+    const elsewhere = {
+      ...waiting,
+      console: consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.9:7000" }),
+    };
+    expect(waitingNetwork(elsewhere)).toBeUndefined();
+    expect(otherNetworks(elsewhere)).toHaveLength(NETWORKS.length);
+  });
+
+  it("stays on the waiting screen while the network changes", () => {
+    // Between the old listener and the new one the console reports a stop.
+    const between = {
+      ...waiting,
+      console: consoleIn({ phase: "stopped", reason: "technician_requested" }),
+    };
+    expect(screenFor(between)).toBe("home");
+    expect(screenFor({ ...between, busy: "network" })).toBe("wait");
+    expect(screenFor({ ...between, busy: "network", nav: "settings" })).toBe("wait");
+  });
+
+  it("takes only a ListenNetwork of the contract", () => {
+    expect(isListenNetwork(NETWORKS[0])).toBe(true);
+    for (const bad of [
+      null,
+      "10.0.0.42",
+      { address: "", adapter: "Wi-Fi", pointToPoint: false },
+      { address: "10.0.0.42", adapter: 7, pointToPoint: false },
+      { address: "10.0.0.42", adapter: "Wi-Fi" },
+      { adapter: "Wi-Fi", pointToPoint: false },
+    ]) {
+      expect(isListenNetwork(bad)).toBe(false);
     }
   });
 });

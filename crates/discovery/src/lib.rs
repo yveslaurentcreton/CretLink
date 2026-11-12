@@ -30,6 +30,11 @@
 //! default**. Its only network accommodation is multicast UDP 5353, and the
 //! manual [`ConnectionCode`] removes even that.
 //!
+//! A console waits on **one** private address ([`listen_candidates`],
+//! [`first_choice`]) and announces that address alone, on its adapter alone
+//! (ST-M009-016): a computer on several networks never announces an address
+//! that nothing listens on.
+//!
 //! # No firewall changes
 //!
 //! This crate performs no OS firewall mutation. Where a host firewall blocks
@@ -46,6 +51,7 @@
 mod code;
 mod error;
 mod interface;
+mod listen;
 
 mod advertiser;
 mod browser;
@@ -57,6 +63,7 @@ pub use code::{
 };
 pub use error::DiscoveryError;
 pub use interface::{is_private_addr, private_interface_addrs};
+pub use listen::{ListenCandidate, default_route_addr, first_choice, listen_candidates};
 
 /// The DNS-SD service type CretLink consoles advertise and agents browse for
 /// (ADR-0007).
