@@ -1599,21 +1599,23 @@ Evidence: `links_in_the_folder_are_removed_and_never_followed`,
 `a_stop_ends_a_removal_and_later_actions_fail_closed`
 (`apps/console/tests/technician_files_e2e.rs`).
 
-*FT-8 — A file sent into any folder (ST-M010-001).* The transfer engine could
-already commit a file at an absolute path; the explorer makes that an everyday
-action of the technician. Such a file is the customer's to keep: it lies
-outside the staging area, in no manifest, and no cleanup removes it. What can
-go wrong: the unfinished part of a transfer that never completes stays in the
-customer's folder; a program of an unprivileged account plants a link under
-the part's name, so that the elevated agent writes somewhere else; a file that
-was already there is replaced unasked; a torn or unverified file appears under
-the final name; a full disk is reported as something else. Mitigations:
+*FT-8 — A file sent into any folder (ST-M010-001).* The wire and the agent's
+file store could already commit a file at an absolute path, but nothing that
+is shipped asked for it: the AI's upload tool takes a staging name only. The
+technician's file actions are the first to send a file straight into a
+folder. Such a file is the customer's to keep: it lies outside the staging
+area, in no manifest, and no cleanup removes it. What can go wrong: the
+unfinished part of a transfer that never completes stays in the customer's
+folder; a program of an unprivileged account plants a link under the part's
+name, so that the elevated agent writes somewhere else; a file that was
+already there is replaced unasked; a torn or unverified file appears under the
+final name; a full disk is reported as something else. Mitigations:
 
 - *Verified before it has its name.* The bytes go to a part file beside the
-  destination — on the same drive, so the commit is one rename on any drive
-  and the file gets the permissions of its folder — and the file appears under
-  its name only after its length and SHA-256 are verified (FT-2, FT-3,
-  REQ-N-007).
+  destination — on the same drive, so the commit is one rename on any drive,
+  and created in that folder, so on Windows the file inherits the folder's
+  permissions — and the file appears under its name only after its length and
+  SHA-256 are verified (FT-2, FT-3, REQ-N-007).
 - *Replaced only on request.* Without the request to replace, a file of that
   name fails the transfer with `already_exists` and stays as it is.
 - *No write through a planted link.* The part is opened without following a
@@ -1652,9 +1654,9 @@ accepts a path only when it is rooted on a drive,
 
 *FT-9 — The list of drives (ST-M010-001).* The list reads facts and changes
 nothing, but it carries text that anyone can choose — the label of a USB
-stick — into the technician's view and the audit trail, and a careless query
-could open a system dialog on the customer's screen or wait on a file server
-while the agent serves nothing else. Mitigations: at most `MAX_DRIVES` (32)
+stick — to the technician computer, and a careless query could open a system
+dialog on the customer's screen or wait on a file server while the agent
+serves nothing else. Mitigations: at most `MAX_DRIVES` (32)
 entries, a root and a label bounded and kept on one line by the agent and
 checked again by the wire validation on both ends; a drive without a medium
 is listed with its kind and no size, and no dialog is shown for it; a drive on
