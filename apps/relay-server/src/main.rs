@@ -28,6 +28,7 @@
 //!   of the line. A change of the file takes effect within seconds, without a
 //!   restart and without touching the sessions in progress.
 //! - `keygen` — prints a new random key for such a file and exits.
+//! - `--version` — prints the release version and exits.
 //! - `--behind-proxy` or `CRETLINK_RELAY_BEHIND_PROXY=1` — serve WebSocket
 //!   **without** TLS, for a reverse proxy that ends TLS in front of the relay
 //!   (ST-M007-015). The endpoints still speak `wss` to the proxy. It excludes
@@ -97,7 +98,7 @@ struct Config {
 
 /// What the command line asks for.
 enum Invocation {
-    /// `--help` was handled and printed.
+    /// `--help` or `--version` was handled and printed.
     Help,
     /// Print a new admission key and exit.
     Keygen,
@@ -381,6 +382,10 @@ fn parse_args() -> Result<Invocation, String> {
                 print_usage();
                 return Ok(Invocation::Help);
             }
+            "--version" | "-V" => {
+                println!("cretlink-relay-server {}", cretlink_shared::RELEASE_VERSION);
+                return Ok(Invocation::Help);
+            }
             "--behind-proxy" => behind_proxy = true,
             "--keys" => {
                 keys = Some(args.next().ok_or(
@@ -524,6 +529,7 @@ fn print_usage() {
     );
     println!("                         the connection from the proxy: keep it on this host or a");
     println!("                         private network.");
+    println!("  -V, --version          Print the version and exit.");
     println!("  -h, --help             Show this help.");
 }
 

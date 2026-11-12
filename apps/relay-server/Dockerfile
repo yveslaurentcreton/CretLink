@@ -45,6 +45,16 @@ RUN node scripts/third-party-notices.mjs --package cretlink-relay-server \
 # The image: nothing but the program and its licence texts.
 FROM scratch
 
+# What the image is and where its source lives. The registry of GitHub reads
+# the source label to show the package with its repository.
+ARG CRETLINK_VERSION=0.0.0-dev
+LABEL org.opencontainers.image.title="CretLink relay server" \
+      org.opencontainers.image.description="Forwards end-to-end encrypted CretLink sessions between two computers; holds no session key." \
+      org.opencontainers.image.source="https://github.com/yveslaurentcreton/CretLink" \
+      org.opencontainers.image.documentation="https://github.com/yveslaurentcreton/CretLink/blob/main/docs/relay-server.md" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${CRETLINK_VERSION}"
+
 COPY --from=build --chmod=0555 /out/cretlink-relay-server /cretlink-relay-server
 COPY --from=build --chmod=0444 /out/LICENSE /out/THIRD-PARTY-NOTICES.txt /
 

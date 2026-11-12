@@ -463,3 +463,22 @@ fn behind_a_proxy_excludes_a_certificate_and_a_mistyped_switch() {
     let said = String::from_utf8_lossy(&output.stderr);
     assert!(said.contains("CRETLINK_RELAY_BEHIND_PROXY"), "{said}");
 }
+
+#[test]
+fn the_program_reports_its_version() {
+    for flag in ["--version", "-V"] {
+        let output = relay_server(&[flag]).output().expect("run");
+        assert!(output.status.success());
+        let said = String::from_utf8(output.stdout).expect("text");
+        let version = said
+            .strip_prefix("cretlink-relay-server ")
+            .unwrap_or_else(|| panic!("unexpected output {said:?}"))
+            .trim_end();
+        // A release stamps its version at build time; any other build is a
+        // development build. Either way it is one word that starts with a digit.
+        assert!(
+            version.starts_with(|first: char| first.is_ascii_digit()) && !version.contains(' '),
+            "{said:?}"
+        );
+    }
+}
