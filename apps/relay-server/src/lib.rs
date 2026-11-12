@@ -41,6 +41,8 @@
 //! *writes* the preamble is ST-M007-008/009; this server only ever reads it.
 //!
 
+pub mod keys;
+
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -300,12 +302,39 @@ async fn serve_connection<S, U, Fut>(
         }
     };
 
+    // Who this leg is in the log: the label of its key, with the address it
+    // came from. Never the key (REQ-S-017).
+    let who = who(&guard, &peer_label);
+
+    // A leg that would find neither its peer nor a place to park is told so,
+    // instead of admitted and then dropped (ST-M007-014). Dropping the guard
+    // records the admitted leg as ended with nothing forwarded.
+    match rendezvous.has_room_for(&preamble.ticket) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("relay: no free place to park {who}");
+            answer(
+                &mut stream,
+                RelayAnswer::Refused(RelayRefusal::Busy),
+                &config,
+            )
+            .await;
+            return;
+        }
+        Err(err) => {
+            eprintln!("relay: cannot park {who}: {err}");
+            let unavailable = RelayAnswer::Refused(RelayRefusal::Unavailable);
+            answer(&mut stream, unavailable, &config).await;
+            return;
+        }
+    }
+
     // The endpoint learns that it is admitted before the leg is parked. From
-    // here on a stream that ends without a byte from the peer means that
-    // nobody joined the rendezvous, and nothing else. If the answer cannot be
+    // here on a stream that ends without a byte from the peer was not refused:
+    // no session came about on this rendezvous. If the answer cannot be
     // written the leg is dropped: its guard records an honest unknown end.
     if !answer(&mut stream, RelayAnswer::Admitted, &config).await {
-        eprintln!("relay: dropped {peer_label}: the admission could not be answered");
+        eprintln!("relay: dropped {who}: the admission could not be answered");
         return;
     }
 
@@ -316,7 +345,7 @@ async fn serve_connection<S, U, Fut>(
     let leg = Leg {
         stream,
         guard,
-        peer: peer_label.clone(),
+        peer: who.clone(),
     };
     match rendezvous
         .join(ticket, leg, config.rendezvous_timeout)
@@ -333,8 +362,20 @@ async fn serve_connection<S, U, Fut>(
             // Timeout / AtCapacity / Poisoned: `join` dropped our leg (and its
             // guard) fail-closed, so the abandoned session is recorded as an
             // honest unknown end. Nothing was forwarded.
-            eprintln!("relay: rendezvous for {peer_label} ended: {err}");
+            eprintln!("relay: rendezvous for {who} ended: {err}");
         }
+    }
+}
+
+/// How a log line names an admitted leg: the label its key is accounted
+/// under and the address it came from, or the address alone on a relay
+/// without keys, where the address is the label.
+fn who(guard: &SessionGuard, peer_label: &str) -> String {
+    let client = guard.client().as_str();
+    if client == peer_label {
+        peer_label.to_string()
+    } else {
+        format!("{client} ({peer_label})")
     }
 }
 

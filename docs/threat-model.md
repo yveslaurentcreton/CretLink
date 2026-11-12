@@ -2002,6 +2002,16 @@ metadata rather than content.
   an anonymous abuse service, plus self-hosting documentation with verifiable
   release provenance (REQ-S-019; M007 scope covering REQ-S-017 through
   REQ-S-022).
+- *One admission key per customer.* An operator gives every customer copy and
+  technician a key of its own and withdraws one by deleting its line from the
+  relay's key file, without a restart and without touching the others
+  (ST-M007-014). A key that leaks, for example with a customer copy that was
+  passed on, lets a stranger use the forwarder under that label until it is
+  withdrawn. It reveals no session and controls none: a key is checked once,
+  when a connection arrives, and is never session authority (ADR-0016 §4). The
+  relay's log, events and metrics name the label and never the key, and a key
+  file that breaks a rule is refused as a whole, so a typing error neither
+  opens the relay nor locks everybody out.
 - *A relay code grants nothing.* It holds a random seed of 64 bits and a
   typing check, no address and no key. Someone who overhears or guesses a code
   can at most reach the rendezvous before the customer does: the approval

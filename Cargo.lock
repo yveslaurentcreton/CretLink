@@ -481,6 +481,7 @@ dependencies = [
  "cretlink-session",
  "cretlink-shared",
  "cretlink-wss",
+ "thiserror 2.0.19",
  "tokio",
 ]
 

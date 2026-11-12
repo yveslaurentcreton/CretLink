@@ -66,7 +66,10 @@ pub mod rendezvous;
 pub mod splice;
 pub mod ticket;
 
-pub use admission::{AdmissionError, AdmissionPolicy, AdmissionToken, ClientId};
+pub use admission::{
+    AdmissionError, AdmissionPolicy, AdmissionToken, ClientId, GENERATED_KEY_BYTES,
+    KeyGenerationError, generate_key,
+};
 pub use cancel::{StopHandle, StopSignal};
 pub use control::{AdmissionControl, ControlConfig, Denied, SessionGuard};
 pub use events::{EventLog, OpEvent, OpEventKind, RetentionPolicy};
