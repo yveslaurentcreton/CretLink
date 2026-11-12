@@ -70,9 +70,12 @@ pub(super) enum Kind {
 pub(super) enum Hold {
     /// For work inside the folder through its handle. Others keep every use
     /// of the folder: nothing the work does depends on its name.
-    #[allow(
-        dead_code,
-        reason = "first used by the file sent to a folder, which the next change brings"
+    #[cfg_attr(
+        not(windows),
+        allow(
+            dead_code,
+            reason = "only the Windows file store works inside an opened folder"
+        )
     )]
     Shared,
     /// For removing the folder. For as long as it is held nobody else renames
@@ -110,10 +113,6 @@ pub(super) const LEADS_ELSEWHERE: &str =
 
 pub(super) use sys::Folder;
 #[cfg(windows)]
-#[allow(
-    unused_imports,
-    reason = "some are first used by the file sent to a folder, which the next change brings"
-)]
 pub(super) use sys::{
     Disposition, delete, kind_of, link_count, open_at, open_entry, open_for_removal, place_of,
     rename_in_folder,
@@ -204,10 +203,6 @@ fn clean(asked: &[u16]) -> Option<Vec<u16>> {
 /// one plain name: it is empty, `.` or `..`, or it holds a separator, a colon
 /// (which would name a stream of a file) or a NUL.
 #[cfg(any(windows, test))]
-#[allow(
-    dead_code,
-    reason = "first used by the file sent to a folder, which the next change brings"
-)]
 fn single_name(name: &str) -> Option<Vec<u16>> {
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', ':', '\0']) {
         return None;
@@ -317,12 +312,6 @@ mod sys {
                   and ADR-0006 permit reviewed, localized unsafe in one \
                   platform adapter."
     )]
-    #![allow(
-        dead_code,
-        reason = "the open in a folder, the rename through a handle and the \
-                  count of names are first used by the file sent to a folder, \
-                  which the next change brings"
-    )]
 
     use std::ffi::{OsString, c_void};
     use std::fs::{File, OpenOptions};
@@ -387,6 +376,12 @@ mod sys {
     // Windows error codes that say another handle excludes this use.
     const ERROR_SHARING_VIOLATION: i32 = 32;
     const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    // The plain form of a rename has one setting, a byte at the start of
+    // its structure: whether a file of the new name is replaced. It shares
+    // its place with the flags of the extended form.
+    const PLAIN_KEEP: u32 = 0;
+    const PLAIN_REPLACE: u32 = 1;
 
     /// Marks an identity made of the volume serial number and the 128-bit
     /// file identifier.
@@ -631,20 +626,21 @@ mod sys {
         replace: bool,
     ) -> io::Result<()> {
         let name = single_name(name).ok_or_else(not_a_name)?;
-        // The form of Windows 10 1607 and later: the name changes at once,
-        // also when a file that is replaced is still open elsewhere in a way
-        // that allows its removal.
-        let flags = FILE_RENAME_POSIX_SEMANTICS
-            | if replace {
-                FILE_RENAME_REPLACE_IF_EXISTS
-            } else {
-                0
-            };
+        if !replace {
+            // The plain form, which every Windows and every file system has:
+            // a taken name fails the rename.
+            return rename_with(entry, &name, FileRenameInformation, PLAIN_KEEP);
+        }
+        // To replace, the form of Windows 10 1607 and later: the name changes
+        // at once, also when the file that is replaced is still open
+        // elsewhere in a way that allows its removal. It is what the standard
+        // library's own rename asks for.
+        let flags = FILE_RENAME_POSIX_SEMANTICS | FILE_RENAME_REPLACE_IF_EXISTS;
         match rename_with(entry, &name, FileRenameInformationEx, flags) {
             // An older Windows, or a file system without the extended form:
-            // the plain one, whose only setting is whether to replace.
+            // the plain one.
             Err(error) if not_offered(&error) => {
-                rename_with(entry, &name, FileRenameInformation, u32::from(replace))
+                rename_with(entry, &name, FileRenameInformation, PLAIN_REPLACE)
             }
             renamed => renamed,
         }

@@ -1870,10 +1870,29 @@ async fn unfinished_transfers_to_folders_are_bounded() {
     assert!(names_in(&folder).is_empty());
 }
 
+/// Makes `link` a symbolic link to the file `target`. `false` when this
+/// account may not create one — on Windows that takes a privilege — and the
+/// caller has nothing to test.
+#[cfg(any(unix, windows))]
+fn plant_file_link(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let planted = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let planted = std::os::windows::fs::symlink_file(target, link);
+    match planted {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("skipped: this account may not create symbolic links ({error})");
+            false
+        }
+    }
+}
+
 /// A link that someone planted under the name of a transfer's part is never
 /// written through and never published: the write and the commit are refused
-/// and the file the link points at keeps its content.
-#[cfg(unix)]
+/// and the file the link points at keeps its content. Discarding the transfer
+/// removes the link, as the link it is.
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn a_link_planted_under_the_parts_name_is_never_written_through() {
     let sb = Sandbox::new();
@@ -1883,7 +1902,9 @@ async fn a_link_planted_under_the_parts_name_is_never_written_through() {
     std::fs::write(&victim, b"untouched").expect("write the victim");
     let dest = abs(&folder, "tool.exe");
     let part = store.part_path(&dest).expect("the part of this transfer");
-    std::os::unix::fs::symlink(&victim, &part).expect("plant the link");
+    if !plant_file_link(&victim, &part) {
+        return;
+    }
 
     let refused = store
         .perform(Operation::FsWrite {
@@ -1897,7 +1918,7 @@ async fn a_link_planted_under_the_parts_name_is_never_written_through() {
 
     let refused = store
         .perform(Operation::FsCommit {
-            dest,
+            dest: dest.clone(),
             len: 9,
             algo: DigestAlgo::Sha256,
             digest: B64Bytes::new(sha256(b"untouched")),
@@ -1911,6 +1932,131 @@ async fn a_link_planted_under_the_parts_name_is_never_written_through() {
 
     assert_eq!(std::fs::read(&victim).expect("read"), b"untouched");
     assert!(!folder.join("tool.exe").exists());
+
+    store
+        .perform(Operation::FsAbort { dest })
+        .await
+        .expect("the link is discarded");
+    assert!(names_in(&folder).is_empty(), "the link itself is gone");
+    assert_eq!(std::fs::read(&victim).expect("read"), b"untouched");
+}
+
+/// A folder under the name of a transfer's part is not a part either: nothing
+/// is written, nothing is published, and the folder is not removed as a part.
+#[tokio::test]
+async fn a_folder_under_the_parts_name_is_refused() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    let dest = abs(&folder, "tool.exe");
+    let part = store.part_path(&dest).expect("the part of this transfer");
+    std::fs::create_dir(&part).expect("plant a folder");
+    std::fs::write(part.join("theirs.txt"), b"theirs").expect("write");
+
+    let refused = store
+        .perform(Operation::FsWrite {
+            dest: dest.clone(),
+            offset: 0,
+            data: B64Bytes::new(b"payload".to_vec()),
+        })
+        .await
+        .expect_err("a folder is not a part");
+    assert_eq!(refused.code, ErrorCode::WrongPathKind);
+    let refused = store
+        .perform(Operation::FsCommit {
+            dest: dest.clone(),
+            len: 0,
+            algo: DigestAlgo::Sha256,
+            digest: B64Bytes::new(sha256(b"")),
+            overwrite: true,
+            source: None,
+            cleanup: CleanupPolicy::Keep,
+        })
+        .await
+        .expect_err("a folder is never published as the file");
+    assert_eq!(refused.code, ErrorCode::WrongPathKind);
+    store
+        .perform(Operation::FsAbort { dest })
+        .await
+        .expect_err("a folder is not discarded as a part");
+
+    assert!(part.join("theirs.txt").exists(), "the folder is untouched");
+    assert!(!folder.join("tool.exe").exists());
+}
+
+/// A file without content is committed without a chunk: the commit makes its
+/// empty part itself. When such a commit is refused, the part it made is
+/// removed again and forgotten — it holds nothing to resume. Otherwise every
+/// refused commit would leave an empty part in the customer's folder and one
+/// more remembered transfer, until no transfer could begin at all.
+#[tokio::test]
+async fn a_refused_commit_of_an_empty_file_leaves_no_part_and_no_memory_of_one() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    let commit_empty = |name: String, digest: Vec<u8>| {
+        let store = store.clone();
+        let dest = abs(&folder, &name);
+        async move {
+            store
+                .perform(Operation::FsCommit {
+                    dest,
+                    len: 0,
+                    algo: DigestAlgo::Sha256,
+                    digest: B64Bytes::new(digest),
+                    overwrite: false,
+                    source: None,
+                    cleanup: CleanupPolicy::Keep,
+                })
+                .await
+        }
+    };
+
+    // More refused commits than the store remembers unfinished transfers:
+    // each declares a digest that is not that of an empty file.
+    for n in 0..super::MAX_UNFINISHED_TRANSFERS + 8 {
+        let refused = commit_empty(format!("empty-{n}.txt"), sha256(b"not empty"))
+            .await
+            .expect_err("the digest is not that of an empty file");
+        assert_eq!(refused.code, ErrorCode::IntegrityMismatch, "commit {n}");
+    }
+    assert!(
+        names_in(&folder).is_empty(),
+        "no refused commit left its part behind"
+    );
+
+    // A name that is taken refuses the commit as well, and leaves nothing.
+    std::fs::write(folder.join("taken.txt"), b"theirs").expect("write");
+    let refused = commit_empty("taken.txt".to_owned(), sha256(b""))
+        .await
+        .expect_err("the name is taken");
+    assert_eq!(refused.code, ErrorCode::AlreadyExists);
+    assert_eq!(names_in(&folder), vec!["taken.txt"]);
+    assert_eq!(
+        std::fs::read(folder.join("taken.txt")).expect("read"),
+        b"theirs"
+    );
+
+    // Nothing is remembered: a transfer can begin, and an empty file is
+    // committed.
+    let committed = commit_empty("empty.txt".to_owned(), sha256(b""))
+        .await
+        .expect("an empty file is committed without a chunk");
+    assert!(matches!(
+        committed,
+        OpResult::Committed {
+            len: 0,
+            replaced: false,
+            ..
+        }
+    ));
+    assert_eq!(std::fs::read(folder.join("empty.txt")).expect("read"), b"");
+    assert_eq!(names_in(&folder), vec!["empty.txt", "taken.txt"]);
+    assert_eq!(
+        cleanup(&store, CleanupTrigger::SessionEnd).await,
+        (0, Vec::new()),
+        "and nothing is left for the cleanup"
+    );
 }
 
 /// Beneath that check, the part is opened in a way that refuses a link in the
@@ -2024,7 +2170,377 @@ fn a_text_for_the_wire_is_kept_on_one_line_and_within_its_bound() {
     assert!(cut.len() <= 8);
 }
 
-// --- Windows only: a held destination and another drive (ST-M010-001) -------
+// --- Windows only: a file sent to a folder stays in the folder that was
+// --- opened, a held destination, a drive root and another drive
+// --- (ST-M010-001) ----------------------------------------------------------
+
+/// The request of one chunk for `dest`.
+#[cfg(windows)]
+fn chunk(dest: &RemotePath, offset: u64, bytes: &[u8]) -> Operation {
+    Operation::FsWrite {
+        dest: dest.clone(),
+        offset,
+        data: B64Bytes::new(bytes.to_vec()),
+    }
+}
+
+/// The request that commits `bytes` as the file `dest`.
+#[cfg(windows)]
+fn commit_of(dest: &RemotePath, bytes: &[u8], overwrite: bool) -> Operation {
+    Operation::FsCommit {
+        dest: dest.clone(),
+        len: bytes.len() as u64,
+        algo: DigestAlgo::Sha256,
+        digest: B64Bytes::new(sha256(bytes)),
+        overwrite,
+        source: None,
+        cleanup: CleanupPolicy::Keep,
+    }
+}
+
+/// A junction in the place of the folder a file is sent to is not that
+/// folder: the file would go where the junction leads. Every step of a
+/// transfer refuses it — the chunk, the commit and the discard — and nothing
+/// is written where it leads.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_junction_in_the_place_of_the_folder_is_refused_by_every_step_of_a_transfer() {
+    use super::testing::junction;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    let real = target.join("real");
+    std::fs::create_dir(&real).expect("create");
+    let link = target.join("link");
+    junction(&link, &real);
+    let dest = abs(&link, "tool.exe");
+
+    for step in [
+        chunk(&dest, 0, b"payload"),
+        commit_of(&dest, b"", true),
+        Operation::FsAbort { dest: dest.clone() },
+    ] {
+        let refused = store
+            .perform(step.clone())
+            .await
+            .expect_err("a link is not the folder");
+        assert_eq!(refused.code, ErrorCode::InvalidPath, "{step:?}");
+    }
+    assert!(
+        names_in(&real).is_empty(),
+        "nothing was written where the junction leads"
+    );
+    // Nothing was begun, so nothing is left for the cleanup.
+    assert_eq!(
+        cleanup(&store, CleanupTrigger::SessionEnd).await,
+        (0, Vec::new())
+    );
+
+    // A junction further up in the path is refused the same way.
+    std::fs::create_dir(real.join("inside")).expect("create");
+    let through = abs(&link.join("inside"), "tool.exe");
+    let refused = store
+        .perform(chunk(&through, 0, b"payload"))
+        .await
+        .expect_err("a path through a link is not the folder");
+    assert_eq!(refused.code, ErrorCode::InvalidPath);
+    assert!(names_in(&real.join("inside")).is_empty());
+}
+
+/// A transfer has begun in a folder. Before its next request the folder is
+/// moved away and a junction to another place takes its name — with a file
+/// under the name of the transfer's part put there, so that a transfer that
+/// resolved the path again would find everything it looks for. Nothing is
+/// written, published or removed in that place: every step refuses, and the
+/// cleanup reports the part as not removed and keeps it in mind.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_folder_swapped_for_a_junction_gets_nothing_published_or_removed_in_its_target() {
+    use super::testing::junction;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    let folder = target.join("Downloads");
+    let elsewhere = target.join("elsewhere");
+    std::fs::create_dir(&folder).expect("create");
+    std::fs::create_dir(&elsewhere).expect("create");
+    let dest = abs(&folder, "setup.exe");
+    let payload = b"installer-bytes";
+    let (first, rest) = payload.split_at(5);
+
+    store
+        .perform(chunk(&dest, 0, first))
+        .await
+        .expect("the first chunk");
+    let part = store.part_path(&dest).expect("the part of this transfer");
+    let part_name = part.file_name().expect("the part has a name").to_owned();
+
+    let moved = target.join("Downloads-moved");
+    std::fs::rename(&folder, &moved).expect("move the folder away");
+    junction(&folder, &elsewhere);
+    let planted = elsewhere.join(&part_name);
+    std::fs::rename(moved.join(&part_name), &planted).expect("put the part there");
+
+    // The next chunk, and a commit of exactly what lies there.
+    for step in [
+        chunk(&dest, 5, rest),
+        commit_of(&dest, first, true),
+        Operation::FsAbort { dest: dest.clone() },
+    ] {
+        let refused = store
+            .perform(step.clone())
+            .await
+            .expect_err("the folder is a link now");
+        assert_eq!(refused.code, ErrorCode::InvalidPath, "{step:?}");
+    }
+    assert_eq!(
+        names_in(&elsewhere),
+        vec![part_name.to_string_lossy().into_owned()],
+        "nothing was published there and the file under the part's name stays"
+    );
+    assert_eq!(std::fs::read(&planted).expect("read"), first, "unchanged");
+
+    // The cleanup does not follow the junction either: the part is reported
+    // as not removed, and what lies where the junction leads stays.
+    let (removed, failed) = cleanup(&store, CleanupTrigger::SessionEnd).await;
+    assert_eq!(removed, 0);
+    assert_eq!(failed, vec![part.to_string_lossy().into_owned()]);
+    assert!(planted.exists());
+
+    // Everything is put back. The store has kept the part in mind: the
+    // transfer goes on where it was and is committed.
+    std::fs::remove_dir(&folder).expect("remove the junction");
+    std::fs::rename(&planted, moved.join(&part_name)).expect("put the part back");
+    std::fs::rename(&moved, &folder).expect("move the folder back");
+    store
+        .perform(chunk(&dest, 5, rest))
+        .await
+        .expect("the next chunk");
+    store
+        .perform(commit_of(&dest, payload, false))
+        .await
+        .expect("the commit");
+    assert_eq!(names_in(&folder), vec!["setup.exe"]);
+    assert_eq!(
+        std::fs::read(folder.join("setup.exe")).expect("read"),
+        payload
+    );
+    assert!(names_in(&elsewhere).is_empty());
+    assert_eq!(
+        cleanup(&store, CleanupTrigger::SessionEnd).await,
+        (0, Vec::new())
+    );
+}
+
+/// A junction under the name of a transfer's part is a link, not a part:
+/// nothing is written or published through it, and discarding the transfer
+/// removes the junction itself and nothing where it leads. A junction needs
+/// no privilege, so this runs wherever Windows does.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_junction_under_the_parts_name_is_never_written_through() {
+    use super::testing::junction;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    let elsewhere = sb.root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("create");
+    std::fs::write(elsewhere.join("theirs.txt"), b"theirs").expect("write");
+    let dest = abs(&folder, "tool.exe");
+    let part = store.part_path(&dest).expect("the part of this transfer");
+    junction(&part, &elsewhere);
+
+    for step in [chunk(&dest, 0, b"payload"), commit_of(&dest, b"", true)] {
+        let refused = store
+            .perform(step.clone())
+            .await
+            .expect_err("a link is not a part");
+        assert_eq!(refused.code, ErrorCode::WrongPathKind, "{step:?}");
+    }
+    assert_eq!(names_in(&elsewhere), vec!["theirs.txt"]);
+
+    store
+        .perform(Operation::FsAbort { dest })
+        .await
+        .expect("the junction is discarded");
+    assert!(names_in(&folder).is_empty(), "the junction itself is gone");
+    assert_eq!(
+        std::fs::read(elsewhere.join("theirs.txt")).expect("read"),
+        b"theirs",
+        "and what it led to is untouched"
+    );
+}
+
+/// The part of a transfer has exactly one name. A part that was given a
+/// second name somewhere else, and a file from somewhere else that was given
+/// a second name where a part is expected, are the same file under two
+/// names: writing to one or publishing it would reach the other. Neither is
+/// written to and neither is published.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_part_with_a_second_name_is_never_written_to_and_never_published() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+
+    // The part of a running transfer is given a second name.
+    let dest = abs(&folder, "report.docx");
+    store
+        .perform(chunk(&dest, 0, b"first"))
+        .await
+        .expect("the first chunk");
+    let part = store.part_path(&dest).expect("the part of this transfer");
+    let alias = sb.root.join("alias.bin");
+    std::fs::hard_link(&part, &alias).expect("give the part a second name");
+    for step in [chunk(&dest, 5, b"more"), commit_of(&dest, b"first", false)] {
+        let refused = store
+            .perform(step.clone())
+            .await
+            .expect_err("a part with two names");
+        assert_eq!(refused.code, ErrorCode::WrongPathKind, "{step:?}");
+    }
+    assert_eq!(std::fs::read(&alias).expect("read"), b"first", "unchanged");
+    assert!(!folder.join("report.docx").exists());
+    // With the second name gone the part is the transfer's own again.
+    std::fs::remove_file(&alias).expect("remove the second name");
+    store
+        .perform(chunk(&dest, 5, b"more"))
+        .await
+        .expect("the next chunk");
+    store
+        .perform(commit_of(&dest, b"firstmore", false))
+        .await
+        .expect("the commit");
+    assert_eq!(
+        std::fs::read(folder.join("report.docx")).expect("read"),
+        b"firstmore"
+    );
+
+    // A file from elsewhere is given a second name where a part is expected.
+    let victim = sb.root.join("victim.txt");
+    std::fs::write(&victim, b"untouched").expect("write the victim");
+    let dest = abs(&folder, "tool.exe");
+    let part = store.part_path(&dest).expect("the part of this transfer");
+    std::fs::hard_link(&victim, &part).expect("plant the second name");
+    // The offset and the digest are those of the victim, so that nothing but
+    // the second name stands in the way.
+    for step in [
+        chunk(&dest, 9, b"appended"),
+        commit_of(&dest, b"untouched", true),
+    ] {
+        let refused = store
+            .perform(step.clone())
+            .await
+            .expect_err("a file with two names is not a part");
+        assert_eq!(refused.code, ErrorCode::WrongPathKind, "{step:?}");
+    }
+    assert_eq!(std::fs::read(&victim).expect("read"), b"untouched");
+    assert!(!folder.join("tool.exe").exists());
+}
+
+/// A file is committed into the root of a drive: the root is a folder like
+/// any other, opened and verified as one. The test needs the right to write
+/// there; an account without it has nothing to test.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_file_is_committed_into_the_root_of_a_drive() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let root = PathBuf::from(&sb.root.to_string_lossy()[..3]);
+    let name = format!("cretlink-fs-test-{}-root.bin", std::process::id());
+    let probe = root.join(format!("{name}.probe"));
+    if std::fs::write(&probe, b"").is_err() {
+        eprintln!("skipped: this account may not write to the root of the drive");
+        return;
+    }
+    let _ = std::fs::remove_file(&probe);
+
+    let committed = transfer(
+        &store,
+        abs(&root, &name),
+        b"in the root",
+        4,
+        false,
+        None,
+        CleanupPolicy::Keep,
+    )
+    .await;
+    let on_disk = std::fs::read(root.join(&name));
+    let parts_left = names_in(&root)
+        .into_iter()
+        .filter(|entry| entry.starts_with(".cretlink-part."))
+        .count();
+    let _ = std::fs::remove_file(root.join(&name));
+
+    match committed {
+        Ok(OpResult::Committed {
+            canonical_path,
+            len: 11,
+            ..
+        }) => assert!(
+            canonical_path.eq_ignore_ascii_case(&root.join(&name).to_string_lossy()),
+            "{canonical_path}"
+        ),
+        other => panic!("expected Committed, got {other:?}"),
+    }
+    assert_eq!(on_disk.expect("read the committed file"), b"in the root");
+    assert_eq!(parts_left, 0, "no part is left beside it");
+}
+
+/// The folder may be spelled in another letter case or by its short name: it
+/// is still the place where the folder lies, and the file is committed there.
+/// The answer names the file by where it really lies.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_file_is_committed_into_a_folder_spelled_by_a_short_name_or_in_another_letter_case() {
+    use super::testing::{reported, short_name};
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target().join("Long Folder Name");
+    std::fs::create_dir(&folder).expect("create");
+    let real = reported(&folder);
+    let text = folder.to_string_lossy().into_owned();
+
+    let mut spellings = vec![text.to_uppercase(), text.to_lowercase()];
+    match short_name(&folder) {
+        Some(short) => spellings.push(short),
+        None => eprintln!("skipped the short name: this volume keeps none"),
+    }
+    for (n, spelled) in spellings.iter().enumerate() {
+        let name = format!("file-{n}.txt");
+        let committed = transfer(
+            &store,
+            abs(Path::new(spelled), &name),
+            b"content",
+            3,
+            false,
+            None,
+            CleanupPolicy::Keep,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{spelled} is refused: {error:?}"));
+        match committed {
+            OpResult::Committed { canonical_path, .. } => {
+                assert_eq!(canonical_path, format!("{real}\\{name}"), "{spelled}");
+            }
+            other => panic!("expected Committed, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(folder.join(&name)).expect("read"),
+            b"content",
+            "{spelled}"
+        );
+    }
+    assert_eq!(
+        names_in(&folder).len(),
+        spellings.len(),
+        "the files and no part"
+    );
+}
 
 /// An existing file that another program holds open is not replaced, even on
 /// request: the commit says that the file is in use, the file keeps its

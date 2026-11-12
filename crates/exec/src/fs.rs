@@ -41,15 +41,30 @@
 //! cleanup removes it. What the session does clean up is the **unfinished
 //! part** of such a transfer: the store remembers the parts it began and has
 //! neither committed nor discarded, and removes them with the staging area.
-//! A part is opened without following a link, so a link planted under a part's
-//! name is never written through.
+//!
+//! That folder may belong to an account that is not elevated, and a program
+//! of that account can swap it for a junction between two requests. On
+//! Windows every request of such a transfer — each chunk, the commit, the
+//! discard and the cleanup — therefore **opens the folder once, verifies it,
+//! and does everything inside that opened folder** (see the `anchor` and
+//! `to_folder` modules): the folder must be a real folder that lies where the
+//! request says, the part is opened by its one name relative to the folder's
+//! handle and must be a regular file with a single name, its length and
+//! digest are read through that handle, and it is published by a rename
+//! inside the directory it lies in. A link in the place of the folder, under
+//! the part's name or as a second name of the part is refused: nothing is
+//! written through it and nothing is published.
+//!
+//! Off Windows these requests work on paths, with the part opened without
+//! following a link in the last part of its name: a non-Windows agent is a
+//! development and test tool that is never elevated on a customer computer.
 //!
 //! # Drives and folder removal (ST-M010-001)
 //!
 //! [`Operation::FsDrives`] lists the drives (see the `drives` module), and
 //! [`Operation::RemoveTree`] removes a folder with everything in it, one
 //! bounded step at a time, without ever leaving the folder (see the `tree`
-//! module).
+//! module). It takes up its folder as a verified folder too.
 //!
 //! # Honest failures (REQ-N-008, REQ-N-015)
 //!
@@ -62,6 +77,8 @@
 mod anchor;
 mod drives;
 mod manifest;
+#[cfg(windows)]
+mod to_folder;
 mod tree;
 
 #[cfg(test)]
@@ -577,6 +594,12 @@ impl FileStore {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<OpResult, FsError> {
+        // A file sent to a folder: inside the opened, verified folder.
+        #[cfg(windows)]
+        if let Some(place) = self.place_in_folder(dest)? {
+            let store = self.clone();
+            return blocking(move || to_folder::write(&store, &place, offset, &data)).await;
+        }
         let part = self.part_path(dest)?;
         let to_folder = matches!(dest, RemotePath::Absolute { .. });
         if !to_folder {
@@ -637,31 +660,45 @@ impl FileStore {
         } = args;
         // Only SHA-256 exists today; reject anything else rather than assume.
         let DigestAlgo::Sha256 = algo;
-        let is_staging = matches!(dest, RemotePath::Staging { .. });
-        // A staging commit must record where the artifact came from (REQ-S-017).
-        let source = if is_staging {
-            match source {
-                Some(s) => s,
-                None => {
-                    return Err(FsError::new(
-                        ErrorCode::Unsupported,
-                        "a staging commit requires a source label",
-                    ));
-                }
+        // A staging commit must record where the artifact came from
+        // (REQ-S-017), and it is recorded in the manifest with its policy.
+        let staged = match (&dest, source) {
+            (RemotePath::Staging { .. }, Some(source)) => Some((source, cleanup)),
+            (RemotePath::Staging { .. }, None) => {
+                return Err(FsError::new(
+                    ErrorCode::Unsupported,
+                    "a staging commit requires a source label",
+                ));
             }
-        } else {
-            source.unwrap_or_default()
+            (RemotePath::Absolute { .. }, _) => None,
         };
+
+        // A file sent to a folder: inside the opened, verified folder.
+        #[cfg(windows)]
+        if let Some(place) = self.place_in_folder(&dest)? {
+            let store = self.clone();
+            let digest = digest.into_inner();
+            // If nobody waits for the commit any more — the session task is
+            // gone — it is told so and publishes nothing.
+            let abandoned = Arc::new(AtomicBool::new(false));
+            let _abandon_when_dropped = StopOnDrop(Arc::clone(&abandoned));
+            return blocking(move || {
+                to_folder::commit(&store, &place, len, &digest, overwrite, &|| {
+                    abandoned.load(Ordering::SeqCst)
+                })
+            })
+            .await;
+        }
 
         let final_path = self.resolve(&dest)?;
         let part = self.part_path(&dest)?;
-        if is_staging {
+        if staged.is_some() {
             self.ensure_staging_dirs().await?;
         }
 
         // Materialise a zero-length part if the caller committed without writing.
-        let part_len = match tokio::fs::symlink_metadata(&part).await {
-            Ok(meta) if meta.file_type().is_file() => meta.len(),
+        let (part_len, created) = match tokio::fs::symlink_metadata(&part).await {
+            Ok(meta) if meta.file_type().is_file() => (meta.len(), false),
             // Never publish what is not a regular file this store wrote.
             Ok(_) => {
                 return Err(FsError::wrong_kind(
@@ -674,17 +711,65 @@ impl FileStore {
                         "no staged bytes for the declared length",
                     ));
                 }
-                if !is_staging {
+                if staged.is_none() {
                     self.remember_unfinished(&part)?;
                 }
-                tokio::fs::File::create(&part)
-                    .await
-                    .map_err(|e| FsError::from_io("failed to create the part file", &e))?;
-                0
+                if let Err(error) = create_empty_part(&part).await {
+                    // A part that was never created is nothing to clean up.
+                    if staged.is_none() && tokio::fs::symlink_metadata(&part).await.is_err() {
+                        self.forget_unfinished(&part);
+                    }
+                    return Err(error);
+                }
+                (0, true)
             }
             Err(e) => return Err(FsError::from_io("failed to stat the part file", &e)),
         };
 
+        let to_folder = staged.is_none();
+        let published = self
+            .publish_by_path(PathCommit {
+                final_path: &final_path,
+                part: &part,
+                part_len,
+                len,
+                digest: &digest,
+                overwrite,
+                staged,
+            })
+            .await;
+        if to_folder {
+            match &published {
+                // The part is the file now: nothing is left for a cleanup.
+                Ok(_) => self.forget_unfinished(&part),
+                // A part of bytes that were sent stays for a repeated commit.
+                // An empty one that this commit made holds nothing to resume:
+                // it is removed again, so that a refused commit leaves neither
+                // a file nor a part to remember.
+                Err(_) if created => {
+                    if tokio::fs::remove_file(&part).await.is_ok() {
+                        self.forget_unfinished(&part);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        published
+    }
+
+    /// Verifies the part at a path against the declared length and digest and
+    /// renames it into place: the commit of a staged file, and off Windows of
+    /// a file sent to a folder.
+    async fn publish_by_path(&self, commit: PathCommit<'_>) -> Result<OpResult, FsError> {
+        let PathCommit {
+            final_path,
+            part,
+            part_len,
+            len,
+            digest,
+            overwrite,
+            staged,
+        } = commit;
         // Verify length, then digest, before anything is published.
         if part_len != len {
             return Err(FsError::integrity("the staged length does not match"));
@@ -692,7 +777,7 @@ impl FileStore {
         if digest.as_bytes().len() != limits::DIGEST_LEN {
             return Err(FsError::integrity("the declared digest is malformed"));
         }
-        let (computed, hashed) = sha256_file(&part, None)
+        let (computed, hashed) = sha256_file(part, None)
             .await
             .map_err(|e| FsError::from_io("failed to read the part file", &e))?;
         if hashed != len || computed.as_slice() != digest.as_bytes() {
@@ -705,7 +790,7 @@ impl FileStore {
         {
             let file = tokio::fs::OpenOptions::new()
                 .write(true)
-                .open(&part)
+                .open(part)
                 .await
                 .map_err(|e| FsError::from_io("failed to open the part file", &e))?;
             file.sync_all()
@@ -714,7 +799,7 @@ impl FileStore {
         }
 
         // Resolve the overwrite decision against the final path.
-        let replaced = match tokio::fs::symlink_metadata(&final_path).await {
+        let replaced = match tokio::fs::symlink_metadata(final_path).await {
             Ok(meta) => {
                 if !overwrite {
                     return Err(FsError::new(
@@ -733,7 +818,7 @@ impl FileStore {
 
         let canonical_path = final_path.to_string_lossy().into_owned();
 
-        if is_staging {
+        if let Some((source, cleanup)) = staged {
             // Record the artifact before publishing it, so a crash can leave a
             // recorded-but-absent entry (harmless: cleanup treats it as gone)
             // but never a published-but-untracked one.
@@ -758,7 +843,7 @@ impl FileStore {
             });
             self.store_manifest(&manifest).await?;
 
-            if let Err(e) = tokio::fs::rename(&part, &final_path).await {
+            if let Err(e) = tokio::fs::rename(part, final_path).await {
                 // Publishing failed; retract the record we just wrote.
                 let mut manifest = self.load_manifest().await.unwrap_or_default();
                 if manifest.remove(&canonical_path) {
@@ -767,11 +852,9 @@ impl FileStore {
                 return Err(FsError::from_io("failed to publish the file", &e));
             }
         } else {
-            tokio::fs::rename(&part, &final_path)
+            tokio::fs::rename(part, final_path)
                 .await
                 .map_err(|e| FsError::from_io("failed to publish the file", &e))?;
-            // The part is the file now: nothing is left for a cleanup.
-            self.forget_unfinished(&part);
         }
 
         Ok(OpResult::Committed {
@@ -784,6 +867,12 @@ impl FileStore {
     }
 
     async fn abort(&self, dest: &RemotePath) -> Result<OpResult, FsError> {
+        // A file sent to a folder: inside the opened, verified folder.
+        #[cfg(windows)]
+        if let Some(place) = self.place_in_folder(dest)? {
+            let store = self.clone();
+            return blocking(move || to_folder::discard(&store, &place)).await;
+        }
         let part = self.part_path(dest)?;
         match tokio::fs::remove_file(&part).await {
             Ok(()) => {}
@@ -994,14 +1083,14 @@ impl FileStore {
         let parts: Vec<PathBuf> = self.unfinished().iter().cloned().collect();
         let mut removed: u32 = 0;
         for part in parts {
-            match tokio::fs::remove_file(&part).await {
-                Ok(()) => removed = removed.saturating_add(1),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
+            match remove_unfinished_part(&part).await {
+                Ok(true) => removed = removed.saturating_add(1),
+                Ok(false) => {}
+                Err(reason) => {
                     if failed.len() < limits::MAX_DIR_PAGE {
                         failed.push(CleanupFailure {
                             canonical_path: part.to_string_lossy().into_owned(),
-                            reason: cleanup_reason(&e).to_string(),
+                            reason: reason.to_string(),
                         });
                     }
                     continue;
@@ -1310,6 +1399,31 @@ impl FileStore {
         }
     }
 
+    /// Where a file with the destination `dest` goes when it is sent to a
+    /// folder, or `None` for a destination in the staging area.
+    #[cfg(windows)]
+    fn place_in_folder(&self, dest: &RemotePath) -> Result<Option<to_folder::Place>, FsError> {
+        if matches!(dest, RemotePath::Staging { .. }) {
+            return Ok(None);
+        }
+        let asked = self.resolve(dest)?;
+        let (Some(folder), Some(name)) =
+            (asked.parent(), asked.file_name().and_then(|n| n.to_str()))
+        else {
+            return Err(FsError::wrong_kind(
+                "the destination has no parent directory",
+            ));
+        };
+        let part_name = self.part_name_for(&asked);
+        Ok(Some(to_folder::Place {
+            folder: folder.to_path_buf(),
+            name: name.to_owned(),
+            part: folder.join(&part_name),
+            part_name,
+            asked: asked.to_string_lossy().into_owned(),
+        }))
+    }
+
     fn part_name_for(&self, final_path: &Path) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.session.to_string().as_bytes());
@@ -1434,8 +1548,76 @@ struct CommitArgs {
     cleanup: cretlink_protocol::CleanupPolicy,
 }
 
-/// Tells a running folder-removal step to stop when it is dropped, which
-/// happens when the future that waits for the step is dropped.
+/// What a commit that works on paths publishes, and how.
+struct PathCommit<'a> {
+    /// The path the file gets.
+    final_path: &'a Path,
+    /// The part that becomes the file.
+    part: &'a Path,
+    /// The length the part was found to have.
+    part_len: u64,
+    /// The declared length.
+    len: u64,
+    /// The declared digest.
+    digest: &'a B64Bytes,
+    /// Whether a file at the final path is replaced.
+    overwrite: bool,
+    /// For a staged file: its source label and cleanup policy, recorded in
+    /// the manifest. `None` for a file sent to a folder.
+    staged: Option<(String, cretlink_protocol::CleanupPolicy)>,
+}
+
+/// Runs blocking file work off the async runtime.
+#[cfg(windows)]
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, FsError> + Send + 'static,
+) -> Result<T, FsError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| FsError::internal())?
+}
+
+/// Removes the part of an unfinished transfer to a folder for the cleanup.
+/// `Ok(true)` when it was removed, `Ok(false)` when it was already gone, and
+/// the short reason when it is still there.
+///
+/// On Windows the part is removed inside its opened, verified folder: a
+/// folder that was swapped for a link since is not followed, the part there
+/// is reported as not removed, and it stays remembered.
+async fn remove_unfinished_part(part: &Path) -> Result<bool, &'static str> {
+    #[cfg(windows)]
+    {
+        let part = part.to_path_buf();
+        match blocking(move || to_folder::remove_part(&part)).await {
+            Ok(to_folder::Removal::Removed) => Ok(true),
+            Ok(to_folder::Removal::Absent) => Ok(false),
+            Err(error) => Err(reason_for(error.code)),
+        }
+    }
+    #[cfg(not(windows))]
+    match tokio::fs::remove_file(part).await {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(cleanup_reason(&e)),
+    }
+}
+
+/// Creates the empty part of a file that is committed without a chunk. The
+/// name must be free: nothing that lies under it is opened, and a link there
+/// is not followed.
+async fn create_empty_part(part: &Path) -> Result<(), FsError> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(part)
+        .await
+        .map(drop)
+        .map_err(|e| FsError::from_io("failed to create the part file", &e))
+}
+
+/// Tells blocking work — a folder-removal step, a commit to a folder — to
+/// stop when it is dropped, which happens when the future that waits for the
+/// work is dropped.
 struct StopOnDrop(Arc<AtomicBool>);
 
 impl Drop for StopOnDrop {
@@ -1623,12 +1805,20 @@ fn drive_letter(path: &Path) -> Option<char> {
 
 /// A short, secret-free reason for a cleanup failure, drawn from the error kind.
 fn cleanup_reason(err: &std::io::Error) -> &'static str {
-    match io_error_code(err) {
+    reason_for(io_error_code(err))
+}
+
+/// A short, secret-free reason for a cleanup failure of the category `code`.
+fn reason_for(code: ErrorCode) -> &'static str {
+    match code {
         ErrorCode::AccessDenied => "access denied",
         ErrorCode::FileInUse => "in use",
         ErrorCode::PathNotFound => "not found",
         ErrorCode::WrongPathKind => "wrong kind",
         ErrorCode::DirNotEmpty => "not empty",
+        // The folder of a part was swapped for a link, or is reached through
+        // one: the part is not removed where that path leads now.
+        ErrorCode::InvalidPath => "its folder is a link or no longer in its place",
         _ => "i/o error",
     }
 }

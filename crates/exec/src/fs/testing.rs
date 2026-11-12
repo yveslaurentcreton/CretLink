@@ -47,3 +47,25 @@ pub(super) fn junction(link: &Path, target: &Path) {
 pub(super) fn verbatim(path: &Path) -> std::path::PathBuf {
     std::fs::canonicalize(path).expect("the folder exists")
 }
+
+/// The existing folder `path` spelled with its short (8.3) names, or `None`
+/// when its volume keeps no short names, in which case the system answers
+/// with the long ones.
+#[cfg(windows)]
+pub(super) fn short_name(path: &Path) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+
+    // `%~sI` is the short form of the path the `for` variable holds. The
+    // command line is given as it is: `cmd` has its own rules for quotes.
+    let asked = std::process::Command::new("cmd")
+        .raw_arg(format!(
+            "/C for %I in (\"{}\") do @echo %~sI",
+            path.display()
+        ))
+        .output()
+        .expect("run cmd");
+    assert!(asked.status.success(), "cmd failed");
+    let short = String::from_utf8_lossy(&asked.stdout).trim().to_owned();
+    let long = path.display().to_string();
+    (!short.is_empty() && !short.eq_ignore_ascii_case(&long)).then_some(short)
+}
