@@ -31,6 +31,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 
 use thiserror::Error;
 
@@ -133,7 +134,9 @@ struct State {
 /// on drop.
 #[derive(Debug)]
 struct Inner {
-    policy: AdmissionPolicy,
+    /// Who may use the forwarder. Behind a lock of its own, so that an
+    /// operator can replace it while sessions run ([`AdmissionControl::replace_policy`]).
+    policy: RwLock<AdmissionPolicy>,
     splice_limits: SpliceLimits,
     state: Mutex<State>,
     metrics: RelayMetrics,
@@ -188,7 +191,7 @@ impl AdmissionControl {
         };
         Self {
             inner: Arc::new(Inner {
-                policy,
+                policy: RwLock::new(policy),
                 splice_limits: config.splice_limits,
                 state: Mutex::new(state),
                 metrics: RelayMetrics::new(),
@@ -211,8 +214,17 @@ impl AdmissionControl {
         peer: &str,
         now_ms: u64,
     ) -> Result<SessionGuard, Denied> {
-        // 1. Authenticate use of the forwarder (no session authority).
-        let client = match self.inner.policy.admit(token, peer) {
+        // 1. Authenticate use of the forwarder (no session authority). The
+        //    policy is read under its own lock and released before anything
+        //    else happens; a poisoned lock admits nobody.
+        let decision = match self.inner.policy.read() {
+            Ok(policy) => policy.admit(token, peer),
+            Err(_) => {
+                self.inner.metrics.record_denied_unavailable();
+                return Err(Denied::Unavailable);
+            }
+        };
+        let client = match decision {
             Ok(client) => client,
             Err(err) => {
                 self.inner.metrics.record_denied_auth();
@@ -268,6 +280,28 @@ impl AdmissionControl {
             admitted_ms: now_ms,
             finished: false,
         })
+    }
+
+    /// Replaces the admission policy for every connection that arrives from
+    /// now on (ST-M007-014): an operator withdraws or adds a key without
+    /// restarting the relay.
+    ///
+    /// Sessions in progress are not touched. Admission decides once, when a
+    /// leg connects, whether it may use the forwarder; a session that already
+    /// runs holds its place until it ends, and never depended on the key for
+    /// anything else (ADR-0016 §4).
+    ///
+    /// Returns `false`, and keeps the policy as it was, if the internal lock
+    /// is poisoned; the gate then admits nobody (fail-closed).
+    #[must_use]
+    pub fn replace_policy(&self, policy: AdmissionPolicy) -> bool {
+        match self.inner.policy.write() {
+            Ok(mut current) => {
+                *current = policy;
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// A point-in-time snapshot of the operational metrics (metadata only).
@@ -524,5 +558,85 @@ mod tests {
         let wrong = AdmissionToken::from_text("wrong");
         let _ = ctrl.admit(Some(&wrong), "peer", 0);
         assert_eq!(ctrl.metrics().sessions_active, 0);
+    }
+
+    fn keys(entries: &[(&str, &str)]) -> AdmissionPolicy {
+        AdmissionPolicy::Allowlist(
+            entries
+                .iter()
+                .map(|(label, key)| (AdmissionToken::from_text(key), ClientId::new(*label)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_replaced_policy_decides_for_new_legs_and_leaves_running_sessions_alone() {
+        let ctrl = AdmissionControl::new(
+            keys(&[("acme", "key-of-acme"), ("frontdesk", "key-of-frontdesk")]),
+            ControlConfig::default(),
+        );
+        let acme = AdmissionToken::from_text("key-of-acme");
+        let frontdesk = AdmissionToken::from_text("key-of-frontdesk");
+        let newcomer = AdmissionToken::from_text("key-of-newcomer");
+
+        // A session of each customer runs.
+        let running = ctrl.admit(Some(&frontdesk), "198.51.100.9", 1).unwrap();
+        assert_eq!(running.client(), &ClientId::new("frontdesk"));
+        assert!(ctrl.admit(Some(&newcomer), "203.0.113.7", 2).is_err());
+
+        // The operator withdraws one key and adds another.
+        assert!(ctrl.replace_policy(keys(&[
+            ("acme", "key-of-acme"),
+            ("newcomer", "key-of-newcomer"),
+        ])));
+
+        // New legs are decided by the new list.
+        assert_eq!(
+            ctrl.admit(Some(&frontdesk), "198.51.100.9", 3).unwrap_err(),
+            Denied::Auth(AdmissionError::CredentialRejected)
+        );
+        let admitted = ctrl.admit(Some(&newcomer), "203.0.113.7", 4).unwrap();
+        assert_eq!(admitted.client(), &ClientId::new("newcomer"));
+        assert!(ctrl.admit(Some(&acme), "192.0.2.1", 5).is_ok());
+
+        // The session that ran before the change still holds its place and
+        // ends in order, with its own label.
+        assert_eq!(ctrl.metrics().sessions_active, 2);
+        running.finish(6, &report(10, 1, SpliceOutcome::Closed(Direction::AtoB)));
+        let ended = ctrl
+            .recent_events()
+            .into_iter()
+            .rev()
+            .find(|event| matches!(event.kind, OpEventKind::SessionEnded { .. }))
+            .unwrap();
+        assert_eq!(ended.client, Some(ClientId::new("frontdesk")));
+    }
+
+    #[test]
+    fn events_name_the_label_and_never_the_key() {
+        let ctrl =
+            AdmissionControl::new(keys(&[("acme", "key-of-acme")]), ControlConfig::default());
+        let guard = ctrl
+            .admit(
+                Some(&AdmissionToken::from_text("key-of-acme")),
+                "192.0.2.1",
+                1,
+            )
+            .unwrap();
+        let _ = ctrl.admit(
+            Some(&AdmissionToken::from_text("not-a-key")),
+            "192.0.2.1",
+            2,
+        );
+        drop(guard);
+
+        let events = ctrl.recent_events();
+        assert!(events.iter().any(|event| {
+            event.kind == OpEventKind::Admitted && event.client == Some(ClientId::new("acme"))
+        }));
+        let rendered = format!("{events:?} {:?}", ctrl.metrics());
+        assert!(rendered.contains("acme"), "{rendered}");
+        assert!(!rendered.contains("key-of-acme"), "{rendered}");
+        assert!(!rendered.contains("not-a-key"), "{rendered}");
     }
 }

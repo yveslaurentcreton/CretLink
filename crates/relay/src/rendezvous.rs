@@ -116,6 +116,23 @@ impl<S> Rendezvous<S> {
         Ok(map.len())
     }
 
+    /// Whether an arrival on `ticket` would find a peer or a place to park
+    /// right now. A relay asks this before it tells an endpoint that it is
+    /// admitted, so that a full table is answered as "no free place" instead
+    /// of admitted and then dropped (ST-M007-014).
+    ///
+    /// The answer is a snapshot: another arrival can take the last place
+    /// before [`join`](Self::join) is called, and `join` then still refuses
+    /// with [`RendezvousError::AtCapacity`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RendezvousError::Poisoned`] if the lock was poisoned.
+    pub fn has_room_for(&self, ticket: &RendezvousTicket) -> Result<bool, RendezvousError> {
+        let map = self.pending.lock().map_err(|_| RendezvousError::Poisoned)?;
+        Ok(map.contains_key(ticket) || map.len() < self.max_pending)
+    }
+
     /// Joins the rendezvous named by `ticket` with connection `conn`.
     ///
     /// If a peer is already parked on `ticket`, returns [`Matched::Pair`]
@@ -323,5 +340,44 @@ mod tests {
         assert!(matches!(err, RendezvousError::AtCapacity));
 
         parked.abort();
+    }
+
+    // A relay can ask beforehand whether an arrival would find a peer or a
+    // place, so that it does not admit a leg it must then drop.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_table_has_room_only_for_the_peer_of_a_parked_leg() {
+        let rv: Arc<Rendezvous<Conn>> = Arc::new(Rendezvous::with_capacity(1));
+        assert!(
+            rv.has_room_for(&ticket(1)).unwrap(),
+            "an empty table has room"
+        );
+
+        let parked = {
+            let rv = Arc::clone(&rv);
+            tokio::spawn(async move { rv.join(ticket(1), 1, Duration::from_secs(60)).await })
+        };
+        while rv.pending_len().unwrap() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        // The table is full: another ticket finds no place, the peer of the
+        // parked leg needs none.
+        assert!(!rv.has_room_for(&ticket(2)).unwrap());
+        assert!(rv.has_room_for(&ticket(1)).unwrap());
+
+        // The peer arrives and takes the parked leg; the table has room again.
+        let matched = rv
+            .join(ticket(1), 2, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(matches!(
+            matched,
+            Matched::Pair {
+                first: 1,
+                second: 2
+            }
+        ));
+        assert!(rv.has_room_for(&ticket(2)).unwrap());
+        assert!(matches!(parked.await.unwrap(), Ok(Matched::Parked)));
     }
 }
