@@ -2465,6 +2465,42 @@ async fn a_part_with_a_second_name_is_never_written_to_and_never_published() {
     assert!(!folder.join("tool.exe").exists());
 }
 
+/// A commit of a large file takes a while, and the session can end in the
+/// meantime. A commit that nobody waits for any more is told so and publishes
+/// nothing: what happens after a session has ended is not the session's
+/// doing. The part stays as it is.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_commit_that_nobody_waits_for_any_more_publishes_nothing() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    let dest = abs(&folder, "big.iso");
+    store
+        .perform(chunk(&dest, 0, b"content"))
+        .await
+        .expect("the chunk");
+    let place = store
+        .place_in_folder(&dest)
+        .expect("the destination resolves")
+        .expect("it lies in a folder");
+
+    let nobody_waits = || true;
+    let abandoned =
+        super::to_folder::commit(&store, &place, 7, &sha256(b"content"), false, &nobody_waits)
+            .expect_err("an abandoned commit does not go through");
+    assert_eq!(abandoned.code, ErrorCode::Internal);
+    assert!(!folder.join("big.iso").exists(), "nothing was published");
+    assert_eq!(names_in(&folder).len(), 1, "the part is still there");
+
+    // Asked for again by a session that waits, the commit goes through.
+    store
+        .perform(commit_of(&dest, b"content", false))
+        .await
+        .expect("the commit");
+    assert_eq!(names_in(&folder), vec!["big.iso"]);
+}
+
 /// A file is committed into the root of a drive: the root is a folder like
 /// any other, opened and verified as one. The test needs the right to write
 /// there; an account without it has nothing to test.
