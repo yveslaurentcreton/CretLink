@@ -201,18 +201,77 @@ ST-M006-007).**
    - no CretLink service and no auto-start entry (`sc query`, `Get-Service`,
      the `Run`/`RunOnce` registry keys, and the Startup folder);
    - the session's staging tree under
-     `%ProgramData%\CretLink\staging\<session-id>` is gone (its `on_session_end`
-     artifact removed).
+     `C:\Program Files\CretLink Data\staging\<session-id>` is gone (its
+     `on_session_end` artifact removed). Look from an administrator
+     PowerShell: the folder is closed to every other account. A session that
+     ran without administrator rights keeps its staging tree under
+     `%LOCALAPPDATA%\CretLink\staging` instead.
    - Expected: no active access path remains; any residual is reported by the
      agent, not left silently (REQ-F-001, REQ-F-019, REQ-S-012).
+
+**MT-4b — CretLink's own folders are closed to other accounts (ST-M006-020).**
+It needs two PowerShell windows on the customer computer: one opened as
+administrator, and one that is not elevated (of an account without
+administrator rights, or of the same account). *The recovery command* below
+is the one the program shows, without `--remove` unless a step says so:
+`& '<folder>\cretlink-cli.exe' recover`, or
+`& '<folder>\CretLink-Support.exe' recover | Out-Host`.
+
+1. In the administrator PowerShell, create a folder `C:\cretlink-test` and a
+   text file `important.txt` in it. In the PowerShell that is not elevated,
+   plant what a release up to 0.24.0 could have been made to read: create the
+   folder
+   `C:\ProgramData\CretLink\staging\11111111-2222-4333-8444-555555555555` and
+   in it a file `manifest.json` with this content:
+   `{"version":1,"staged":[{"canonical_path":"C:\\cretlink-test\\important.txt","source":"x","len":0,"algo":"sha256","digest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","cleanup":"on_session_end","created_ms":0}]}`
+2. Start **Get help** and accept the UAC prompt.
+   - Expected: `C:\cretlink-test\important.txt` is still there, the folder
+     `C:\ProgramData\CretLink` is gone, and *Who is helping you?* shows no
+     notice about an earlier session.
+3. In the administrator PowerShell run
+   `icacls "C:\Program Files\CretLink Data"`,
+   `icacls "C:\Program Files\CretLink Data\staging"` and
+   `(Get-Acl "C:\Program Files\CretLink Data").Owner`.
+   - Expected: each folder lists `NT AUTHORITY\SYSTEM:(OI)(CI)(F)` and
+     `BUILTIN\Administrators:(OI)(CI)(F)` and nobody else, and the owner is
+     `BUILTIN\Administrators`.
+4. In the PowerShell that is not elevated run
+   `New-Item "C:\Program Files\CretLink Data\staging\x.txt"` and
+   `Get-ChildItem "C:\Program Files\CretLink Data"`.
+   - Expected: both are refused.
+5. Let the technician upload a file into staging that is kept
+   (`remote_upload` with `keep`), end the session and close CretLink. Run the
+   recovery command in the PowerShell that is not elevated.
+   - Expected: it does not call the computer clean. It says that what
+     CretLink kept with administrator rights can only be read and removed by
+     this command run as an administrator.
+6. Run the recovery command in the administrator PowerShell, then again with
+   `--remove`.
+   - Expected: the first lists the kept file; the second removes it and ends
+     with *this machine is clean*, and both say that the folders of the
+     accounts are not covered. `C:\Program Files\CretLink Data` no longer
+     exists, and the command of step 5 now calls the computer clean.
+7. Copy `C:\Windows\System32\cmd.exe` into the folder of the downloaded
+   CretLink program under the name `powershell.exe`. Start **Get help** from
+   that folder, accept the UAC prompt, and let the technician run
+   `$PSVersionTable.PSVersion.Major` in PowerShell and open a PowerShell
+   terminal. Remove the copy afterwards.
+   - Expected: the command prints `5`, and the terminal shows a PowerShell
+     prompt, not the banner of Command Prompt: the planted program was not
+     started.
+8. Start **Get help**, decline the UAC prompt and go on without administrator
+   rights; let the technician upload a file into staging.
+   - Expected: the upload works, and its staging tree lies under
+     `%LOCALAPPDATA%\CretLink\staging`.
 
 ### MT-5 — Locked-file cleanup failure and retry
 
 1. In an active session, `remote_upload` an artifact with `on_session_end`.
 2. On the customer machine, hold the staged file open **without share-delete**
    so its removal is refused — for example open it in a program that keeps an
-   exclusive handle, or run
-   `powershell -Command "$f=[IO.File]::Open('C:\\ProgramData\\CretLink\\staging\\<session-id>\\<name>','Open','Read','None'); Read-Host 'holding'"`.
+   exclusive handle, or run, in an administrator PowerShell (the staging
+   folder is closed to every other account),
+   `powershell -Command "$f=[IO.File]::Open('C:\\Program Files\\CretLink Data\\staging\\<session-id>\\<name>','Open','Read','None'); Read-Host 'holding'"`.
 3. End the session while the handle is held.
    - Expected: the agent's cleanup reports the artifact as a **failed** removal
      with an honest reason (in use), never as success; the console shows the
@@ -554,7 +613,9 @@ screen (`#c-admin`, `#c-find`, `#c-sac`, `#c-consent`, `#c-live`, `#c-mini`,
    exits at once.
 10. **Left from an earlier session (ST-M009-010).** End a session during a
     file upload by killing the customer's `cretlink.exe` in Task Manager, and
-    hold one file of `%ProgramData%\CretLink\staging` open in another program.
+    hold one file of `C:\Program Files\CretLink Data\staging` open in another
+    program that runs as administrator (the folder is closed to every other
+    account).
     Start Get help again. Expect *Who is helping you?* to say that a file
     from an earlier CretLink session could not be removed, with the command
     to run in an administrator Windows PowerShell and the full path of the

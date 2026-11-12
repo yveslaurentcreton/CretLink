@@ -70,7 +70,9 @@ mod conpty;
 mod desktop;
 mod error;
 mod fs;
+mod own;
 mod platform;
+mod system;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -83,8 +85,13 @@ pub use desktop::{
 };
 pub use error::ExecError;
 pub use fs::{
-    FileStore, FsError, SessionStaging, StagingCensus, StartupSweepReport, default_staging_base,
+    FileStore, FsError, OUTSIDE_STAGING_REASON, SessionStaging, StagingCensus, StartupSweepReport,
 };
+pub use own::{
+    OwnFolder, Standing, administrators_folder, earlier_release_folder, earlier_release_in_use,
+    remove_whole,
+};
+pub use system::windows_folder;
 
 // Reuse the wire vocabulary so the session layer forwards broker output without
 // lossy conversions.

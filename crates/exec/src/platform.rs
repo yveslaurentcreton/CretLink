@@ -248,6 +248,7 @@ mod win {
 
     use super::cmd_raw_tail;
     use crate::error::ExecError;
+    use crate::system::shell_program;
     use crate::{JobSpec, Shell};
 
     /// A kill-on-close Job Object that contains one piped job's whole process tree.
@@ -286,24 +287,27 @@ mod win {
     /// The shell process that runs `command`, before its stdio and containment
     /// are set up.
     ///
+    /// The shell is started by its full path in the system folder, never
+    /// looked for by its name: a program of that name next to a downloaded
+    /// copy of CretLink would otherwise be started in its place (ST-M006-020;
+    /// see [`crate::system`]).
+    ///
     /// PowerShell takes the command as one argument, quoted by the C runtime
     /// rules that `powershell.exe` reads. `cmd.exe` does not read those rules,
     /// so a Command Prompt command is appended to the command line raw, as
     /// `/S /C "<command>"`, and reaches `cmd.exe` exactly as written
     /// (ST-M003-001; see [`cmd_raw_tail`]).
-    fn shell_command(shell: Shell, command: &str) -> Command {
+    fn shell_command(shell: Shell, command: &str) -> Result<Command, ExecError> {
+        let mut process = Command::new(shell_program(shell).map_err(ExecError::Spawn)?);
         match shell {
             Shell::PowerShell => {
-                let mut process = Command::new("powershell");
                 process.args(["-NoProfile", "-NonInteractive", "-Command", command]);
-                process
             }
             Shell::Cmd => {
-                let mut process = Command::new("cmd");
                 process.raw_arg(cmd_raw_tail(command));
-                process
             }
         }
+        Ok(process)
     }
 
     /// Spawns `spec` as a piped-stdio child contained in a kill-on-close Job
@@ -314,7 +318,7 @@ mod win {
     /// escapes the job (REQ-S-014), matching the ConPTY path. Once contained, its
     /// initial thread is resumed.
     pub(crate) fn spawn(spec: &JobSpec) -> Result<(Child, Job), ExecError> {
-        let mut command = shell_command(spec.shell, &spec.command);
+        let mut command = shell_command(spec.shell, &spec.command)?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

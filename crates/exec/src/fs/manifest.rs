@@ -21,6 +21,13 @@ use serde::{Deserialize, Serialize};
 /// The manifest file name, kept inside the session staging root.
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
 
+/// The largest manifest that is read. A manifest holds at most
+/// [`cretlink_protocol::limits::MAX_DIR_PAGE`] records of bounded size, far
+/// below this; a larger file is not one this program wrote, and reading it
+/// whole would let whoever put it there use up the program's memory
+/// (REQ-N-006, ST-M006-020).
+const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
+
 /// The on-disk manifest document. The `version` field lets a future agent
 /// recognise and migrate an older layout rather than silently misread it.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -42,16 +49,33 @@ impl Manifest {
     /// Reads the manifest at `path`, returning an empty manifest when the file
     /// is absent. A corrupt manifest is surfaced as an error so the caller can
     /// fail closed rather than silently lose the record of what was staged.
+    ///
+    /// At most [`MAX_MANIFEST_BYTES`] are read; a larger file is an error.
     pub(crate) async fn load(path: &Path) -> std::io::Result<Self> {
-        match tokio::fs::read(path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
-                version: 1,
-                staged: Vec::new(),
-            }),
-            Err(e) => Err(e),
+        use tokio::io::AsyncReadExt;
+
+        let file = match tokio::fs::File::open(path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    version: 1,
+                    staged: Vec::new(),
+                });
+            }
+            Err(e) => return Err(e),
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the manifest is larger than a manifest can be",
+            ));
         }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     /// Writes the manifest to `path` durably: the bytes are written to a
@@ -64,7 +88,23 @@ impl Manifest {
         let tmp = tmp_sibling(path);
         {
             use tokio::io::AsyncWriteExt;
-            let mut file = tokio::fs::File::create(&tmp).await?;
+            // Whatever stands under the temporary name is removed as what it
+            // is, and the file is then made new: nothing is ever written
+            // through a link or into a file that someone else put there
+            // (ST-M006-020).
+            let stale = tmp.clone();
+            let cleared = tokio::task::spawn_blocking(move || crate::own::remove_whole(&stale))
+                .await
+                .map_err(std::io::Error::other)?;
+            match cleared {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .await?;
             file.write_all(&bytes).await?;
             file.sync_all().await?;
         }

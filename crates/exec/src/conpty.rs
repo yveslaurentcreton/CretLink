@@ -460,6 +460,14 @@ fn spawn_child(spec: &JobSpec, hpc: HPCON, job: HANDLE) -> Result<PROCESS_INFORM
     startup.StartupInfo.hStdError = HANDLE::default();
     startup.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 
+    // The shell is named by its full path in the system folder, so that
+    // nothing is looked for by name: not in the folder of this program, not
+    // in its working directory (ST-M006-020; see `crate::system`).
+    let program = to_utf16(
+        crate::system::shell_program(spec.shell)
+            .map_err(ExecError::Spawn)?
+            .as_os_str(),
+    );
     let mut command = command_line_utf16(spec);
     let cwd = spec
         .working_dir
@@ -468,12 +476,13 @@ fn spawn_child(spec: &JobSpec, hpc: HPCON, job: HANDLE) -> Result<PROCESS_INFORM
     let env = env_block(spec);
 
     let mut info = PROCESS_INFORMATION::default();
-    // SAFETY: `command` is a writable, null-terminated UTF-16 buffer; the startup
-    // info and its attribute list are valid; `cwd`/`env` outlive the call; the
+    // SAFETY: `program` is a null-terminated UTF-16 string and `command` a
+    // writable, null-terminated UTF-16 buffer; the startup info and its
+    // attribute list are valid; `program`/`cwd`/`env` outlive the call; the
     // out-param `info` is writable.
     let created = unsafe {
         CreateProcessW(
-            PCWSTR::null(),
+            PCWSTR(program.as_ptr()),
             Some(PWSTR(command.as_mut_ptr())),
             None,
             None,
@@ -554,6 +563,10 @@ fn command_line_utf16(spec: &JobSpec) -> Vec<u16> {
 
 /// The command line of a shell invocation, mirroring the piped backend's
 /// mapping for a non-empty command.
+///
+/// Its first word names the shell for the shell itself. Which program is
+/// started is not decided here: the child is created from the shell's full
+/// path (see `spawn_child`).
 ///
 /// An **empty** command opens the shell's own interactive REPL under the
 /// pseudo-console — the human-terminal case (an interactive `TermOpen` carries

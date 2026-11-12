@@ -23,10 +23,33 @@
 //! The functions take an explicit staging base and [`TicketStore`] so the whole
 //! surface is exercised in-process on every host; [`scan`] and [`recover`] are
 //! the production wrappers over the platform defaults.
+//!
+//! # What is not read (ST-M006-020)
+//!
+//! - What lies in the staging area under the name of a session and is not
+//!   what CretLink makes there — a link, a file, a session folder with a link
+//!   in the place of its records — is residue too
+//!   ([`ResourceKind::NotCretLinks`]). It is named, never read, and the
+//!   recovery removes it whole.
+//! - The folder in which releases up to 0.24.0 kept these files, where every
+//!   account could write, is named ([`ResourceKind::EarlierRelease`]), never
+//!   read, and the recovery removes it whole.
+//!
+//! # Two keepers
+//!
+//! A program with administrator rights keeps its files where only
+//! administrators can write, a program without them in the folder of its
+//! account, and neither works in the place of the other. So a scan and a
+//! recovery cover the place of the kind of program that runs them. A program
+//! without administrator rights cannot read the other place; where that place
+//! exists, the scan says that there is something it cannot see, and never
+//! calls the machine clean.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use cretlink_exec::{FileStore, StagingCensus, StartupSweepReport, default_staging_base};
+use cretlink_exec::{
+    FileStore, OUTSIDE_STAGING_REASON, OwnFolder, StagingCensus, StartupSweepReport,
+};
 use cretlink_protocol::{CleanupTrigger, SessionId};
 
 use crate::reboot_resume::TicketStore;
@@ -44,6 +67,15 @@ pub enum ResourceKind {
     /// Sealed, single-use reboot-resume continuity tickets at rest — created
     /// today by arming (ST-M006-001) and machine-scoped.
     RebootResumeTicket,
+    /// Something in the staging area, under the name of a session, that is
+    /// not what CretLink makes there: a link, a file, or a session folder
+    /// with a link in the place of its records (ST-M006-020). It is named by
+    /// its path and never read.
+    NotCretLinks,
+    /// The folder in which releases up to 0.24.0 kept the staging area and the
+    /// reboot tickets, where every account could write (ST-M006-020). It is
+    /// named by its path and never read.
+    EarlierRelease,
     /// The OS auto-start entry that would relaunch the agent after a reboot for
     /// reboot-resume. Nothing in this codebase registers it yet, so it is
     /// asserted absent.
@@ -63,9 +95,11 @@ pub enum ResourceKind {
 impl ResourceKind {
     /// Every kind, in inventory order. Iterated so a scan visits all of them and
     /// none is forgotten.
-    pub const ALL: [ResourceKind; 7] = [
+    pub const ALL: [ResourceKind; 9] = [
         ResourceKind::StagedFiles,
         ResourceKind::RebootResumeTicket,
+        ResourceKind::NotCretLinks,
+        ResourceKind::EarlierRelease,
         ResourceKind::OsAutoStartEntry,
         ResourceKind::TemporaryService,
         ResourceKind::ScheduledTask,
@@ -79,6 +113,8 @@ impl ResourceKind {
         match self {
             ResourceKind::StagedFiles => "staged files",
             ResourceKind::RebootResumeTicket => "reboot-resume ticket",
+            ResourceKind::NotCretLinks => "entry that CretLink did not make",
+            ResourceKind::EarlierRelease => "folder of an earlier release",
             ResourceKind::OsAutoStartEntry => "reboot-resume OS auto-start entry",
             ResourceKind::TemporaryService => "temporary service",
             ResourceKind::ScheduledTask => "scheduled task",
@@ -87,7 +123,8 @@ impl ResourceKind {
         }
     }
 
-    /// Whether any feature in this build can create residue of this kind. The
+    /// Whether a scan of this build looks for residue of this kind: any
+    /// feature can create it, or it can be found in CretLink's own folders. The
     /// kinds that return `false` are always asserted empty — the inventory never
     /// runs a real scanner for them, so it cannot false-positive on an unrelated
     /// system service or task that merely resembles one.
@@ -95,7 +132,10 @@ impl ResourceKind {
     fn is_creatable(self) -> bool {
         matches!(
             self,
-            ResourceKind::StagedFiles | ResourceKind::RebootResumeTicket
+            ResourceKind::StagedFiles
+                | ResourceKind::RebootResumeTicket
+                | ResourceKind::NotCretLinks
+                | ResourceKind::EarlierRelease
         )
     }
 }
@@ -181,14 +221,67 @@ impl RecoveryReport {
     }
 }
 
+/// Where a scan or a recovery looks.
+#[derive(Debug, Clone)]
+struct Places {
+    /// The staging area of this process.
+    staging: OwnFolder,
+    /// The folder in which releases up to 0.24.0 kept their files, where
+    /// there can be one.
+    earlier_release: Option<PathBuf>,
+    /// The folder of a program with administrator rights, when this process
+    /// has none and so cannot read it.
+    out_of_reach: Option<PathBuf>,
+}
+
+impl Places {
+    /// A staging area alone: a sandbox.
+    fn only(staging: OwnFolder) -> Self {
+        Self {
+            staging,
+            earlier_release: None,
+            out_of_reach: None,
+        }
+    }
+
+    /// The places of this process.
+    fn of_this_process() -> Self {
+        let staging = OwnFolder::staging_for_this_process();
+        let out_of_reach = if staging.is_private() {
+            None
+        } else {
+            cretlink_exec::administrators_folder()
+        };
+        Self {
+            staging,
+            earlier_release: cretlink_exec::earlier_release_folder(),
+            out_of_reach,
+        }
+    }
+}
+
+/// Whether something stands at `path`. What cannot be looked at counts as
+/// being there: only "not found" says that nothing is.
+async fn stands(path: &Path) -> bool {
+    !matches!(
+        tokio::fs::symlink_metadata(path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Scans the CretLink residue under `staging_base` and `tickets`, removing
 /// nothing. Every [`ResourceKind`] is visited: kinds a feature can create are
 /// enumerated, the rest are asserted empty.
-pub async fn scan_at(staging_base: &Path, tickets: &TicketStore) -> Inventory {
+pub async fn scan_at(staging_base: impl Into<OwnFolder>, tickets: &TicketStore) -> Inventory {
+    scan_in(&Places::only(staging_base.into()), tickets).await
+}
+
+/// [`scan_at`] over every place a scan looks.
+async fn scan_in(places: &Places, tickets: &TicketStore) -> Inventory {
     let mut inventory = Inventory::default();
 
     // 1. Staged files — session-scoped residue enumerated read-only.
-    let census: StagingCensus = FileStore::census_all_sessions(staging_base.to_path_buf()).await;
+    let census: StagingCensus = FileStore::census_all_sessions(&places.staging).await;
     for session in &census.sessions {
         for entry in &session.staged {
             inventory.found.push(OwnedResource {
@@ -205,11 +298,57 @@ pub async fn scan_at(staging_base: &Path, tickets: &TicketStore) -> Inventory {
             });
         }
     }
-    if census.is_empty() {
+    // Where CretLink's records could not be read, what is staged is unknown:
+    // never asserted empty (REQ-N-008).
+    for path in &census.unread {
+        inventory.unreadable.push(UnreadableKind {
+            kind: ResourceKind::StagedFiles,
+            reason: format!("the staging records in {path} could not be read"),
+        });
+    }
+    // What a program with administrator rights kept cannot be seen without
+    // those rights: where its folder exists, this scan does not know.
+    let mut out_of_reach = false;
+    if let Some(folder) = &places.out_of_reach
+        && stands(folder).await
+    {
+        out_of_reach = true;
+        inventory.unreadable.push(UnreadableKind {
+            kind: ResourceKind::StagedFiles,
+            reason: format!(
+                "what CretLink kept with administrator rights, in {}, can only be read and \
+                 removed by this command run as an administrator",
+                folder.display()
+            ),
+        });
+    }
+    if census.sessions.is_empty() && census.unread.is_empty() && !out_of_reach {
         inventory.asserted_empty.push(ResourceKind::StagedFiles);
     }
+    // What CretLink did not make is named by its path, and nothing in it is
+    // read (ST-M006-020).
+    for path in &census.foreign {
+        inventory.found.push(OwnedResource {
+            kind: ResourceKind::NotCretLinks,
+            description: path.clone(),
+            session: None,
+        });
+    }
+    if census.foreign.is_empty() {
+        inventory.asserted_empty.push(ResourceKind::NotCretLinks);
+    }
 
-    // 2. Reboot-resume tickets — machine-scoped; a malformed store is surfaced
+    // 2. The folder of an earlier release — named, never read (ST-M006-020).
+    match &places.earlier_release {
+        Some(folder) if stands(folder).await => inventory.found.push(OwnedResource {
+            kind: ResourceKind::EarlierRelease,
+            description: folder.to_string_lossy().into_owned(),
+            session: None,
+        }),
+        _ => inventory.asserted_empty.push(ResourceKind::EarlierRelease),
+    }
+
+    // 3. Reboot-resume tickets — machine-scoped; a malformed store is surfaced
     //    as unreadable rather than assumed empty.
     match tickets.load() {
         Ok(list) if list.is_empty() => {
@@ -235,7 +374,7 @@ pub async fn scan_at(staging_base: &Path, tickets: &TicketStore) -> Inventory {
         }),
     }
 
-    // 3. Kinds no feature creates yet: asserted empty, honestly, so a later
+    // 4. Kinds no feature creates yet: asserted empty, honestly, so a later
     //    milestone that starts creating one cannot escape the inventory.
     for kind in ResourceKind::ALL {
         if !kind.is_creatable() {
@@ -251,102 +390,221 @@ pub async fn scan_at(staging_base: &Path, tickets: &TicketStore) -> Inventory {
 /// [`CleanupTrigger::All`] sweep (recovery clears everything, including
 /// keep-until-shutdown artifacts); the sealed reboot-resume ticket store is
 /// deleted. Evidence is recorded before anything is touched.
-pub async fn recover_at(staging_base: &Path, tickets: &TicketStore) -> RecoveryReport {
+pub async fn recover_at(
+    staging_base: impl Into<OwnFolder>,
+    tickets: &TicketStore,
+) -> RecoveryReport {
+    recover_in(&Places::only(staging_base.into()), tickets).await
+}
+
+/// [`recover_at`] over every place a recovery looks. It also removes, whole
+/// and without reading it, the folder of an earlier release; and when it left
+/// nothing, it removes CretLink's own folders too, as far as they are empty.
+async fn recover_in(places: &Places, tickets: &TicketStore) -> RecoveryReport {
+    let staging_base = &places.staging;
     let mut report = RecoveryReport::default();
 
     // Evidence first: record everything present before removing anything so the
-    // report can never hide what was here (ST-M006-003 AC3). Unreadable kinds are
-    // carried through *except* the reboot-resume ticket store, whose outcome the
-    // removal step below decides precisely: a malformed-but-removable store is
-    // resolved (not a failure), while a store that cannot be removed becomes a
-    // kept failure. Any other unreadable kind (none exist yet) recovery does not
-    // act on, so it stays unknown and keeps `ok()` false.
-    let before = scan_at(staging_base, tickets).await;
+    // report can never hide what was here (ST-M006-003 AC3).
+    let before = scan_in(places, tickets).await;
     report.found = before.found.clone();
-    report.unreadable = before
-        .unreadable
-        .iter()
-        .filter(|kind| kind.kind != ResourceKind::RebootResumeTicket)
-        .cloned()
-        .collect();
 
     // 1. Staged trees — the sweep removes and reports per-file failures, which
-    //    it keeps for the next startup sweep to retry.
+    //    it keeps for the next startup sweep to retry. It also removes, whole
+    //    and without reading it, what CretLink did not make.
     let sweep: StartupSweepReport =
-        FileStore::sweep_all_sessions(staging_base.to_path_buf(), CleanupTrigger::All).await;
-    let failed_paths: std::collections::BTreeSet<&str> = sweep
-        .failed
-        .iter()
-        .map(|failure| failure.canonical_path.as_str())
-        .collect();
-    for resource in before
-        .found
-        .iter()
-        .filter(|resource| resource.kind == ResourceKind::StagedFiles)
-    {
-        if !failed_paths.contains(resource.description.as_str()) {
-            report.removed.push(resource.clone());
-        }
-    }
+        FileStore::sweep_all_sessions(staging_base, CleanupTrigger::All).await;
     for failure in &sweep.failed {
+        let kind = before
+            .found
+            .iter()
+            .find(|resource| resource.description == failure.canonical_path)
+            .map_or(ResourceKind::StagedFiles, |resource| resource.kind);
+        // A manifest entry that named a path outside the staging area was
+        // dropped and its path left alone: it is not CretLink's to remove.
+        let remediation = if failure.reason.starts_with(OUTSIDE_STAGING_REASON) {
+            "none: the path is not CretLink's and was not touched".to_string()
+        } else {
+            format!(
+                "delete it manually, as an administrator: {}",
+                failure.canonical_path
+            )
+        };
         report.failed.push(RecoveryFailure {
-            kind: ResourceKind::StagedFiles,
+            kind,
             description: failure.canonical_path.clone(),
             reason: failure.reason.clone(),
-            remediation: format!("delete the file manually: {}", failure.canonical_path),
+            remediation,
         });
     }
 
-    // 2. Reboot-resume ticket store — one removal clears both readable tickets
+    // 2. The folder of an earlier release — removed whole, without reading it
+    //    and without following a link (ST-M006-020).
+    if let Some(folder) = &places.earlier_release
+        && before
+            .found
+            .iter()
+            .any(|resource| resource.kind == ResourceKind::EarlierRelease)
+        && let Some(reason) = remove_earlier_release(folder).await
+    {
+        report.failed.push(RecoveryFailure {
+            kind: ResourceKind::EarlierRelease,
+            description: folder.to_string_lossy().into_owned(),
+            reason,
+            remediation: format!(
+                "close every CretLink window, then run this command again as an administrator, \
+                 or delete the folder manually: {}",
+                folder.display()
+            ),
+        });
+    }
+
+    // 3. Reboot-resume ticket store — one removal clears both readable tickets
     //    and an unreadable (malformed) store; a failure keeps the residue and
     //    names the exact file to delete by hand.
-    let ticket_residue: Vec<OwnedResource> = before
+    let ticket_residue: Vec<&OwnedResource> = before
         .found
         .iter()
         .filter(|resource| resource.kind == ResourceKind::RebootResumeTicket)
-        .cloned()
         .collect();
     let store_unreadable = before
         .unreadable
         .iter()
         .any(|kind| kind.kind == ResourceKind::RebootResumeTicket);
-    if !ticket_residue.is_empty() || store_unreadable {
+    if (!ticket_residue.is_empty() || store_unreadable)
+        && let Err(err) = tickets.remove()
+    {
         let remediation = format!(
             "delete the sealed reboot-resume ticket store manually: {}",
             tickets.path().display()
         );
-        match tickets.remove() {
-            Ok(_) => report.removed.extend(ticket_residue),
-            Err(err) if ticket_residue.is_empty() => report.failed.push(RecoveryFailure {
+        if ticket_residue.is_empty() {
+            report.failed.push(RecoveryFailure {
                 kind: ResourceKind::RebootResumeTicket,
                 description: format!("unreadable ticket store {}", tickets.path().display()),
                 reason: err.to_string(),
                 remediation,
-            }),
-            Err(err) => {
-                for resource in ticket_residue {
-                    report.failed.push(RecoveryFailure {
-                        kind: ResourceKind::RebootResumeTicket,
-                        description: resource.description,
-                        reason: err.to_string(),
-                        remediation: remediation.clone(),
-                    });
-                }
+            });
+        } else {
+            for resource in ticket_residue {
+                report.failed.push(RecoveryFailure {
+                    kind: ResourceKind::RebootResumeTicket,
+                    description: resource.description.clone(),
+                    reason: err.to_string(),
+                    remediation: remediation.clone(),
+                });
             }
         }
+    }
+
+    // 4. What the recovery removed is what is no longer there and what no
+    //    step named as kept: a second look decides, not what a step said of
+    //    itself. Something that is still there and that no step named is said
+    //    to be still there (REQ-N-008).
+    let after = scan_in(places, tickets).await;
+    let still_there = |resource: &OwnedResource| {
+        after
+            .found
+            .iter()
+            .any(|left| left.kind == resource.kind && left.description == resource.description)
+    };
+    for resource in &before.found {
+        let named_as_kept = report
+            .failed
+            .iter()
+            .any(|failure| failure.description == resource.description);
+        if named_as_kept {
+            continue;
+        }
+        if !still_there(resource) {
+            report.removed.push(resource.clone());
+        } else if !report
+            .failed
+            .iter()
+            .any(|failure| failure.kind == resource.kind)
+        {
+            report.failed.push(RecoveryFailure {
+                kind: resource.kind,
+                description: resource.description.clone(),
+                reason: "still there after the recovery".to_string(),
+                remediation: format!(
+                    "delete it manually, as an administrator: {}",
+                    resource.description
+                ),
+            });
+        }
+    }
+    // What still cannot be read is unknown, unless a failure of that kind
+    // already says what was kept.
+    report.unreadable = after
+        .unreadable
+        .into_iter()
+        .filter(|unknown| {
+            !report
+                .failed
+                .iter()
+                .any(|failure| failure.kind == unknown.kind)
+        })
+        .collect();
+
+    // 5. A recovery that left nothing in this process's own folders leaves
+    //    no empty folder of CretLink behind either.
+    if report.failed.is_empty() && after.found.is_empty() {
+        remove_empty_folders(staging_base, tickets).await;
     }
 
     report
 }
 
+/// Removes the folder of an earlier release whole. Returns why it is still
+/// there, when it is.
+async fn remove_earlier_release(folder: &Path) -> Option<String> {
+    let target = folder.to_path_buf();
+    let removed = tokio::task::spawn_blocking(move || cretlink_exec::remove_whole(&target)).await;
+    match removed {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Some("removing it needs administrator rights".to_string())
+        }
+        Ok(Err(error)) => Some(format!("could not be removed ({})", error.kind())),
+        Err(_) => Some("could not be removed".to_string()),
+    }
+}
+
+/// Removes the lock of the staging area, unless a CretLink program holds it,
+/// and then the staging area, the folder of the ticket store and the folder
+/// above them, as far as they are empty.
+async fn remove_empty_folders(staging: &OwnFolder, tickets: &TicketStore) {
+    let staging = staging.clone();
+    let tickets = tickets.folder().cloned();
+    let _ = tokio::task::spawn_blocking(move || {
+        let lock = staging.path().join(crate::recovery::IN_USE_LOCK);
+        if cretlink_exec::Standing::of_file(&lock) == cretlink_exec::Standing::Ours
+            && let Ok(file) = std::fs::File::open(&lock)
+        {
+            // A program that runs holds a share of the lock: its folders stay.
+            if file.try_lock().is_err() {
+                return;
+            }
+            let _ = std::fs::remove_file(&lock);
+        }
+        if let Some(tickets) = tickets {
+            tickets.remove_if_empty();
+        }
+        staging.remove_if_empty();
+    })
+    .await;
+}
+
 /// Scans the platform-default CretLink residue (the production entry point).
 pub async fn scan(tickets: &TicketStore) -> Inventory {
-    scan_at(&default_staging_base(), tickets).await
+    scan_in(&Places::of_this_process(), tickets).await
 }
 
 /// Recovers the platform-default CretLink residue (the production entry point).
 pub async fn recover(tickets: &TicketStore) -> RecoveryReport {
-    recover_at(&default_staging_base(), tickets).await
+    recover_in(&Places::of_this_process(), tickets).await
 }
 
 #[cfg(test)]

@@ -51,8 +51,7 @@ use cretlink_session::{
     SessionJoiner, WssRelayDial,
 };
 use cretlink_support_agent::{
-    EffectiveIdentity, TicketStore, current_identity, default_ticket_store_path,
-    reboot_resume_arming_disclosure, sysinfo,
+    EffectiveIdentity, TicketStore, current_identity, reboot_resume_arming_disclosure, sysinfo,
 };
 use tokio::sync::mpsc;
 
@@ -559,14 +558,9 @@ fn build_reboot_resume() -> (Arc<dyn RebootResumeArmer>, Vec<String>, bool) {
     #[cfg(windows)]
     {
         use cretlink_protocol::CAP_REBOOT_RESUME_V1;
-        use cretlink_support_agent::{
-            DpapiSealer, TicketStore, VaultArmer, default_ticket_store_path,
-        };
+        use cretlink_support_agent::{DpapiSealer, TicketStore, VaultArmer};
 
-        let armer = VaultArmer::new(
-            DpapiSealer::new(),
-            TicketStore::new(default_ticket_store_path()),
-        );
+        let armer = VaultArmer::new(DpapiSealer::new(), TicketStore::for_this_process());
         capabilities.push(CAP_REBOOT_RESUME_V1.to_string());
         (Arc::new(armer), capabilities, true)
     }
@@ -600,7 +594,7 @@ async fn sweep_stale_staging() -> Option<cretlink_support_agent::recovery::Stagi
 /// a clean result exits non-zero, so a script never mistakes kept residue for
 /// success. It grants no control and needs no session (REQ-F-019, REQ-N-008).
 async fn run_recover(remove: bool) -> ExitCode {
-    let store = TicketStore::new(default_ticket_store_path());
+    let store = TicketStore::for_this_process();
     let run = cretlink_support_agent::run_recover(PROGRAM, remove, &store).await;
     print!("{}", run.text);
     if run.success {

@@ -40,6 +40,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use cretlink_exec::{OwnFolder, Standing, remove_whole};
 use cretlink_protocol::{
     ArmedTicket, AtRestSealer, REBOOT_RESUME_NONCE_LEN, REBOOT_RESUME_TICKET_ID_LEN,
     RebootResumeVault, TargetBinding, TargetIdentity, TicketId, derive_reboot_resume_key,
@@ -81,6 +82,14 @@ type FillRandom = Arc<dyn Fn(&mut [u8]) -> Result<(), RebootResumeArmError> + Se
 /// (ADR-0014 §6).
 const STORE_FORMAT_VERSION: u32 = 1;
 
+/// The file of the ticket store inside its folder.
+const STORE_FILE: &str = "tickets.json";
+
+/// The largest ticket store that is read. A store holds a handful of sealed
+/// tickets; a larger file is not one this program wrote, and reading it whole
+/// would let whoever put it there use up the program's memory (REQ-N-006).
+const MAX_STORE_BYTES: u64 = 1024 * 1024;
+
 /// The persisted set of armed reboot-resume tickets, written atomically to a
 /// well-known file on the customer machine (ADR-0014 §6, ST-M006-001).
 ///
@@ -103,6 +112,11 @@ pub enum StoreError {
     Io(std::io::Error),
     /// The store file exists but is not valid inventory JSON.
     Format(serde_json::Error),
+    /// What stands under the name of the store is not a file — a link, or a
+    /// folder — or a link stands in the place of a folder that must be
+    /// private. Nothing is read or removed through it (ST-M006-020,
+    /// REQ-S-024).
+    NotOurs,
 }
 
 impl fmt::Display for StoreError {
@@ -110,6 +124,9 @@ impl fmt::Display for StoreError {
         match self {
             Self::Io(err) => write!(f, "reboot-resume ticket store I/O failed: {err}"),
             Self::Format(err) => write!(f, "reboot-resume ticket store is malformed: {err}"),
+            Self::NotOurs => f.write_str(
+                "reboot-resume ticket store is not a file of its own, or lies behind a link",
+            ),
         }
     }
 }
@@ -119,6 +136,7 @@ impl std::error::Error for StoreError {
         match self {
             Self::Io(err) => Some(err),
             Self::Format(err) => Some(err),
+            Self::NotOurs => None,
         }
     }
 }
@@ -129,16 +147,40 @@ impl std::error::Error for StoreError {
 /// in ST-M006-003, folded into the general owned-resource inventory and its
 /// recovery CLI verb. Writes go through a temp file and an atomic rename so a
 /// crash mid-write never leaves a half-written inventory (REQ-F-019).
+///
+/// The store of an elevated program lies in a folder that administrators
+/// made, private from the moment it existed
+/// ([`TicketStore::for_this_process`]); the folder is prepared before
+/// anything is written (ST-M006-020, REQ-S-024).
 #[derive(Debug, Clone)]
 pub struct TicketStore {
     path: PathBuf,
+    /// The folder the store lies in, when it is one of CretLink's own.
+    folder: Option<OwnFolder>,
 }
 
 impl TicketStore {
-    /// Binds a store to an explicit inventory file path.
+    /// Binds a store to an explicit inventory file path, in a folder of the
+    /// account that runs this process.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, folder: None }
+    }
+
+    /// The store of this process: in the private folder of an elevated
+    /// program on Windows; in a folder of the account otherwise.
+    #[must_use]
+    pub fn for_this_process() -> Self {
+        Self::in_folder(OwnFolder::tickets_for_this_process())
+    }
+
+    /// The store in `folder`, which says whether it must be private.
+    #[must_use]
+    pub fn in_folder(folder: OwnFolder) -> Self {
+        Self {
+            path: folder.path().join(STORE_FILE),
+            folder: Some(folder),
+        }
     }
 
     /// The inventory file path this store owns.
@@ -147,23 +189,59 @@ impl TicketStore {
         &self.path
     }
 
+    /// The folder the store lies in, when it is one of CretLink's own.
+    #[must_use]
+    pub fn folder(&self) -> Option<&OwnFolder> {
+        self.folder.as_ref()
+    }
+
+    /// Whether a link, or something else that is not a folder, stands in the
+    /// place of a folder that must be private. The path of the store would
+    /// then lead somewhere else, so nothing is read or removed by it.
+    fn behind_a_link(&self) -> bool {
+        self.folder
+            .as_ref()
+            .is_some_and(|folder| folder.is_private() && folder.standing() == Standing::Foreign)
+    }
+
     /// Loads the persisted tickets, treating a missing file as an empty
     /// inventory (nothing was ever armed, or it was fully cleaned up).
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`] if the file exists but cannot be read, or
-    /// [`StoreError::Format`] if its contents are not valid inventory JSON.
+    /// [`StoreError::Io`] if the file exists but cannot be read,
+    /// [`StoreError::Format`] if its contents are not valid inventory JSON, or
+    /// [`StoreError::NotOurs`] if a link or a folder stands under the name of
+    /// the store; nothing is read then.
     pub fn load(&self) -> Result<Vec<ArmedTicket>, StoreError> {
-        match fs::read(&self.path) {
-            Ok(bytes) => {
-                let doc: StoredTickets =
-                    serde_json::from_slice(&bytes).map_err(StoreError::Format)?;
-                Ok(doc.tickets)
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(err) => Err(StoreError::Io(err)),
+        use std::io::Read as _;
+
+        if self.behind_a_link() {
+            return Err(StoreError::NotOurs);
         }
+        match Standing::of_file(&self.path) {
+            Standing::Absent => return Ok(Vec::new()),
+            Standing::Foreign => return Err(StoreError::NotOurs),
+            Standing::Ours => {}
+        }
+        let file = match fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(StoreError::Io(err)),
+        };
+        // At most `MAX_STORE_BYTES` are read.
+        let mut bytes = Vec::new();
+        file.take(MAX_STORE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(StoreError::Io)?;
+        if bytes.len() as u64 > MAX_STORE_BYTES {
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the ticket store is larger than a ticket store can be",
+            )));
+        }
+        let doc: StoredTickets = serde_json::from_slice(&bytes).map_err(StoreError::Format)?;
+        Ok(doc.tickets)
     }
 
     /// Writes the given tickets, replacing any prior inventory atomically.
@@ -173,8 +251,17 @@ impl TicketStore {
     /// [`StoreError::Io`] if the parent directory, temp file, or rename fails,
     /// or [`StoreError::Format`] if serialization fails.
     pub fn save(&self, tickets: &[ArmedTicket]) -> Result<(), StoreError> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(StoreError::Io)?;
+        use std::io::Write as _;
+
+        match &self.folder {
+            // A folder that must be private is made so, with the folders
+            // above it, before anything is written into it.
+            Some(folder) => folder.prepare().map_err(StoreError::Io)?,
+            None => {
+                if let Some(parent) = self.path.parent() {
+                    fs::create_dir_all(parent).map_err(StoreError::Io)?;
+                }
+            }
         }
         let doc = StoredTickets {
             version: STORE_FORMAT_VERSION,
@@ -183,9 +270,27 @@ impl TicketStore {
         let bytes = serde_json::to_vec_pretty(&doc).map_err(StoreError::Format)?;
         // Write to a sibling temp file then rename over the target. `std::fs`
         // maps this to a replacing move on Windows and a POSIX rename elsewhere,
-        // so a reader never sees a partially-written inventory.
+        // so a reader never sees a partially-written inventory. Whatever
+        // stands under the temporary name is removed as what it is and the
+        // file is made new, and a link or a folder under the store's own name
+        // is removed first: nothing is written through a link.
         let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, &bytes).map_err(StoreError::Io)?;
+        match remove_whole(&tmp) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                return Err(StoreError::Io(err));
+            }
+            _ => {}
+        }
+        if Standing::of_file(&self.path) == Standing::Foreign {
+            remove_whole(&self.path).map_err(StoreError::Io)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(StoreError::Io)?;
+        file.write_all(&bytes).map_err(StoreError::Io)?;
+        drop(file);
         fs::rename(&tmp, &self.path).map_err(StoreError::Io)?;
         Ok(())
     }
@@ -193,16 +298,22 @@ impl TicketStore {
     /// Removes the ticket store file entirely, so the recovery verb can clear the
     /// reboot-resume residue without hiding evidence (ST-M006-003 AC3): the
     /// caller reads the tickets first, then this deletes the sealed inventory.
+    /// A link under the store's name is removed as a link: what it points at
+    /// is never touched.
     ///
     /// Idempotent — an already-absent store is `Ok(false)` (nothing to remove),
     /// a store that was present and is now gone is `Ok(true)`.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`] if the file exists but cannot be removed; the caller
+    /// [`StoreError::Io`] if the file exists but cannot be removed, or
+    /// [`StoreError::NotOurs`] if the store lies behind a link; the caller
     /// keeps the residue in its report and names safe manual remediation rather
     /// than claiming a clean removal (REQ-N-008).
     pub fn remove(&self) -> Result<bool, StoreError> {
+        if self.behind_a_link() {
+            return Err(StoreError::NotOurs);
+        }
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(true),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -211,20 +322,17 @@ impl TicketStore {
     }
 }
 
-/// The default well-known reboot-resume ticket store path on the customer
-/// machine: `%ProgramData%\CretLink\reboot-resume\tickets.json` on Windows (a
-/// machine-wide, reboot-surviving location mirroring the exec staging base), or
-/// a `cretlink/reboot-resume` folder under the system temp directory elsewhere.
+/// The path of the reboot-resume ticket store of this process
+/// ([`TicketStore::for_this_process`]): on Windows
+/// `reboot-resume\tickets.json` in the private folder of an elevated program
+/// (machine-wide, surviving a reboot, beside the staging area), and in
+/// `CretLink` under the account's local application data otherwise; elsewhere
+/// a `cretlink/reboot-resume` folder under the system temp directory.
 #[must_use]
 pub fn default_ticket_store_path() -> PathBuf {
-    let dir = if let Some(program_data) = std::env::var_os("ProgramData") {
-        PathBuf::from(program_data)
-            .join("CretLink")
-            .join("reboot-resume")
-    } else {
-        std::env::temp_dir().join("cretlink").join("reboot-resume")
-    };
-    dir.join("tickets.json")
+    OwnFolder::tickets_for_this_process()
+        .path()
+        .join(STORE_FILE)
 }
 
 /// A concrete [`RebootResumeArmer`] backed by a [`RebootResumeVault`] and a
