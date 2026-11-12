@@ -81,4 +81,7 @@ pub use rendezvous::{Matched, Rendezvous, RendezvousError};
 pub use splice::{
     Direction, MAX_RELAY_FRAME_BYTES, SpliceLimits, SpliceOutcome, SpliceReport, splice,
 };
-pub use ticket::{RENDEZVOUS_TICKET_LEN, RendezvousTicket, TicketError};
+pub use ticket::{
+    MAX_RELAY_HOST_LEN, RENDEZVOUS_SEED_LEN, RENDEZVOUS_TICKET_LEN, RendezvousTicket, TicketError,
+    canonical_relay_host,
+};
