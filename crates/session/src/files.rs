@@ -26,6 +26,14 @@
 //! cancellation, which is this engine no longer asking (REQ-S-004,
 //! REQ-N-006).
 //!
+//! # Bounded
+//!
+//! Each step is bounded by the agent, and the number of steps is bounded
+//! here: after [`MAX_TREE_REMOVAL_STEPS`] steps that each left more to do the
+//! removal ends as failed, with the reason, and the agent is told that it
+//! ended. A folder that a program on the target keeps refilling can therefore
+//! not keep a removal running for ever (REQ-N-006).
+//!
 //! # Honest outcomes (REQ-N-008)
 //!
 //! The report is [`JobOutcome::Completed`] only when the folder is gone. A
@@ -43,6 +51,16 @@ use cretlink_protocol::{B64Bytes, DriveEntry, ErrorCode, OpResult, Operation, Re
 use cretlink_protocol::{TreeFailure, TreeState};
 
 use crate::{Attribution, CancelToken, HostHandle, JobOutcome, Origin, SessionError};
+
+/// The most steps one folder removal asks the agent for.
+///
+/// Every step that says more remains has removed something, so a removal of a
+/// folder that nobody adds to ends by itself. One that never ends is a folder
+/// that something keeps filling while it is being removed; the engine then
+/// gives up and says so, instead of asking for as long as the session lasts.
+/// A million steps are far more than any real folder takes: a step settles up
+/// to [`cretlink_protocol::limits::MAX_TREE_STEP_ENTRIES`] entries.
+pub const MAX_TREE_REMOVAL_STEPS: u64 = 1_000_000;
 
 /// A progress snapshot delivered to a folder removal's `on_progress` callback
 /// after each step the agent answered.
@@ -160,8 +178,10 @@ impl HostHandle {
     /// `Err` only when the session could not carry the removal (not active,
     /// revoked, disconnected), the path is invalid, or the agent's answer
     /// contradicts itself. A step the agent refused — the folder does not
-    /// exist, the agent does not serve the operation — is a `Failed`
-    /// [`TreeRemovalReport`] with the refusal in `error`.
+    /// exist, it is no longer the folder the removal began with, the agent
+    /// does not serve the operation — is a `Failed` [`TreeRemovalReport`]
+    /// with the refusal in `error`, and so is a removal that did not end
+    /// within [`MAX_TREE_REMOVAL_STEPS`] steps.
     pub async fn remove_tree(
         &self,
         path: RemotePath,
@@ -201,7 +221,8 @@ impl HostHandle {
 /// agent and returns its answer.
 ///
 /// Every step names the folder by the identity the step before it answered
-/// with, so the removal stays with the folder it began with.
+/// with, so the removal stays with the folder it began with. The removal
+/// asks for at most [`MAX_TREE_REMOVAL_STEPS`] steps.
 async fn run_removal<Ask, Answer>(
     mut ask: Ask,
     path: RemotePath,
@@ -217,6 +238,7 @@ where
     // "more": the agent then shows the removal as in progress, and must be
     // told if it ends here.
     let mut folder: Option<B64Bytes> = None;
+    let mut steps: u64 = 0;
     loop {
         if cancel.is_cancelled() {
             if folder.is_some() {
@@ -224,6 +246,20 @@ where
             }
             return Ok(report.ended(JobOutcome::Cancelled));
         }
+        if steps >= MAX_TREE_REMOVAL_STEPS {
+            // Every step left more to do, and something keeps it that way.
+            // The agent shows the removal as in progress: it is told that it
+            // ended. Never a success: the folder is still there.
+            end_removal(&mut ask, &path).await;
+            report.error = Some(TreeRemovalError {
+                code: ErrorCode::LimitExceeded,
+                message: format!(
+                    "the folder was not removed within {MAX_TREE_REMOVAL_STEPS} steps"
+                ),
+            });
+            return Ok(report.ended(JobOutcome::Failed));
+        }
+        steps += 1;
         let step = ask(Operation::RemoveTree {
             path: path.clone(),
             stop: false,

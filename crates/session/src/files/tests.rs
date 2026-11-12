@@ -10,7 +10,7 @@ use std::future::{Ready, ready};
 
 use cretlink_protocol::{B64Bytes, ErrorCode, OpResult, Operation, RemotePath, TreeState};
 
-use super::{TreeRemovalProgress, run_removal};
+use super::{MAX_TREE_REMOVAL_STEPS, TreeRemovalProgress, run_removal};
 use crate::{CancelToken, JobOutcome, SessionError};
 
 /// The folder every test removes.
@@ -193,4 +193,51 @@ async fn an_answer_that_says_more_without_progress_or_without_a_folder_is_not_a_
             "and nothing more is asked"
         );
     }
+}
+
+/// A removal ends, whatever the agent answers. An agent that says "more"
+/// after every step — its folder is refilled as fast as it is emptied — is
+/// asked a bounded number of times; then the removal ends as failed with the
+/// reason, with what it had removed, and the agent is told that it ended.
+#[tokio::test]
+async fn a_removal_that_never_ends_is_given_up_after_a_bounded_number_of_steps() {
+    use std::cell::Cell;
+
+    let steps = Cell::new(0u64);
+    let told_that_it_ended = Cell::new(false);
+    // An agent that always removes one file and always says that more remain.
+    let endless = |request: Operation| {
+        let Operation::RemoveTree { stop, .. } = request else {
+            panic!("a removal asks nothing but removal steps");
+        };
+        if stop {
+            assert!(!told_that_it_ended.replace(true), "told once");
+            return ready(answer(TreeState::Stopped, 0, None));
+        }
+        assert!(
+            !told_that_it_ended.get(),
+            "no step is asked for after the removal was ended"
+        );
+        steps.set(steps.get() + 1);
+        ready(answer(TreeState::More, 1, Some(b"folder-a")))
+    };
+
+    let report = run_removal(endless, folder(), &CancelToken::new(), |_| {})
+        .await
+        .expect("a removal that is given up is a report");
+
+    assert_eq!(steps.get(), MAX_TREE_REMOVAL_STEPS, "and not one more");
+    assert_eq!(report.outcome, JobOutcome::Failed, "never a success");
+    assert_eq!(report.removed_files, MAX_TREE_REMOVAL_STEPS);
+    let error = report.error.expect("the removal says why it ended");
+    assert_eq!(error.code, ErrorCode::LimitExceeded);
+    assert!(
+        error.message.contains(&MAX_TREE_REMOVAL_STEPS.to_string()),
+        "{}",
+        error.message
+    );
+    assert!(
+        told_that_it_ended.get(),
+        "the agent is told, so the customer does not see the removal as still running"
+    );
 }

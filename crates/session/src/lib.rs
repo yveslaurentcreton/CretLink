@@ -75,7 +75,7 @@ pub use dial::{
     RELAY_ANSWER_TIMEOUT, RELAY_CONNECT_TIMEOUT, RelayDial, RelayFailure, RelayLeg,
     RendezvousLapsed, WaitingDial, WssRelayDial, rendezvous_lapsed,
 };
-pub use files::{TreeRemovalError, TreeRemovalProgress, TreeRemovalReport};
+pub use files::{MAX_TREE_REMOVAL_STEPS, TreeRemovalError, TreeRemovalProgress, TreeRemovalReport};
 // The wss trust material a retrying endpoint builds once and clones per attempt
 // (see `WssRelayDial::connector`). Re-exported so a caller can name the connector
 // it holds across a reconnect loop without a direct `cretlink-wss` dependency.
