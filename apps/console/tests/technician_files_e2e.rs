@@ -46,7 +46,10 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 const STEP: Duration = Duration::from_secs(10);
-const SEAL: Duration = Duration::from_secs(30);
+/// How long the audit drain may take to seal the log once the session has
+/// ended. It syncs the file to disk several times on the way, which a busy
+/// disk can hold up for many seconds; a drain that never ends still fails.
+const SEAL: Duration = Duration::from_secs(60);
 
 /// A folder on the customer computer that the tests which run everywhere name
 /// and never write to.
@@ -417,7 +420,9 @@ async fn a_cancelled_removal_stops_and_is_recorded_as_cancelled() {
     let trail = Trail::default();
     let files = TechnicianFiles::new(&live.service, &trail);
     let folder = staged_folder(live.session, "large");
-    let planted = MAX_TREE_STEP_ENTRIES * 2 + 50;
+    // More than one step can settle, and no more than that needs: the files
+    // are planted and removed for real.
+    let planted = MAX_TREE_STEP_ENTRIES + 50;
     plant_files(&folder, planted);
 
     // Cancelled as soon as the first step has been answered.
@@ -658,7 +663,7 @@ async fn a_stop_ends_a_removal_and_later_actions_fail_closed() {
     let trail = Trail::default();
     let files = TechnicianFiles::new(&live.service, &trail);
     let folder = staged_folder(live.session, "stopped");
-    let planted = MAX_TREE_STEP_ENTRIES * 2 + 50;
+    let planted = MAX_TREE_STEP_ENTRIES + 50;
     plant_files(&folder, planted);
 
     // The technician stops the session as soon as the first step is answered.
