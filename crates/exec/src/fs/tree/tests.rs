@@ -246,7 +246,7 @@ fn a_drive_is_not_a_folder() {
 
 // --- bounds ---------------------------------------------------------------
 
-/// A step settles no more entries than its bound and says that more remain;
+/// A step meets no more entries than its bound and says that more remain;
 /// the following steps get further, and the counts of the steps add up to the
 /// whole folder.
 #[test]
@@ -269,10 +269,12 @@ fn a_step_stops_at_its_entry_bound_and_the_next_one_gets_further() {
     let (last, before) = reports.split_last().expect("at least one step");
     for report in before {
         assert_eq!(report.state, TreeState::More);
-        assert_eq!(
-            report.removed_files + report.removed_dirs,
-            bounds.entries,
-            "a step settles its bound and no more: {report:?}"
+        // Every entry a step meets is removed, except a folder it has
+        // entered and not finished when its bound is reached: `sub`, here.
+        let removed = report.removed_files + report.removed_dirs;
+        assert!(
+            removed == bounds.entries || removed == bounds.entries - 1,
+            "a step meets its bound and no more: {report:?}"
         );
     }
     assert_eq!(last.state, TreeState::Removed);
@@ -284,8 +286,104 @@ fn a_step_stops_at_its_entry_bound_and_the_next_one_gets_further() {
     assert!(!root.exists());
 }
 
-/// Once a step has removed something it answers when its time is up, however
-/// much is left; with no time at all that is after one entry.
+/// A step counts every entry it meets, and a folder it enters is one. A chain
+/// of folders as long as the bound uses the step up before it reaches
+/// anything it could remove: the step ends all the same, removes nothing, and
+/// names the folder it stood in with the reason. With room for one more entry
+/// it gets to the file and the removal gets on.
+#[test]
+fn a_step_counts_every_entry_it_meets_and_ends_at_its_bound() {
+    let sb = Sandbox::new();
+    let root = sb.dir("deep");
+    let bottom = sb.file("deep/1/2/3/bottom.txt");
+    let stood_in = super::super::testing::reported(&sb.path("deep/1/2/3"));
+
+    let three = StepBounds {
+        entries: 3,
+        ..roomy()
+    };
+    let report = remove_step(&root, None, three, &never).expect("a step");
+    assert_on_the_wire(&report);
+    assert_eq!(report.state, TreeState::Blocked, "{report:?}");
+    assert_eq!((report.removed_files, report.removed_dirs), (0, 0));
+    assert_eq!(failed_paths(&report), vec![stood_in]);
+    assert_eq!(report.failed[0].code, ErrorCode::LimitExceeded);
+    assert_eq!(report.failed_more, 0);
+    assert!(bottom.exists(), "nothing was removed");
+
+    let four = StepBounds {
+        entries: 4,
+        ..roomy()
+    };
+    let reports = remove_in_steps(&root, four);
+    assert_eq!(reports[0].state, TreeState::More);
+    assert_eq!(
+        (reports[0].removed_files, reports[0].removed_dirs),
+        (1, 0),
+        "three folders entered and the file removed"
+    );
+    assert_eq!(reports[1].state, TreeState::Removed);
+    assert_eq!(
+        (reports[1].removed_files, reports[1].removed_dirs),
+        (0, 4),
+        "a folder counts when it is entered, not again when it is removed"
+    );
+    assert!(!root.exists());
+}
+
+/// An entry that is gone by the time the walk reaches for it is not a failure
+/// and is not counted as removed — but it is an entry the step met. A program
+/// that removes the entries of the folder behind the walk does not keep the
+/// step going: it ends at its bound like any other.
+#[test]
+fn entries_that_are_gone_when_the_walk_reaches_them_count_toward_the_bound() {
+    let sb = Sandbox::new();
+    let root = sb.dir("busy");
+    for n in 0..10 {
+        sb.file(&format!("busy/{n}.txt"));
+    }
+    let asked = Cell::new(0u32);
+    // The step asks before every entry whether to stop. When it asks the
+    // second time it has removed one entry, and the listing it reads from
+    // has the others in hand: they are removed behind it now.
+    let empty_the_folder_behind_the_walk = || {
+        asked.set(asked.get() + 1);
+        if asked.get() == 2 {
+            for entry in std::fs::read_dir(&root).expect("list").flatten() {
+                std::fs::remove_file(entry.path()).expect("remove behind the walk");
+            }
+        }
+        false
+    };
+    let five = StepBounds {
+        entries: 5,
+        ..roomy()
+    };
+
+    let report = remove_step(&root, None, five, &empty_the_folder_behind_the_walk).expect("a step");
+    assert_on_the_wire(&report);
+
+    assert_eq!(
+        report.state,
+        TreeState::More,
+        "the step ended at its bound, on entries that were gone: {report:?}"
+    );
+    assert_eq!(
+        (report.removed_files, report.removed_dirs),
+        (1, 0),
+        "what others removed is not counted as removed by the step"
+    );
+    assert!(report.failed.is_empty(), "and is not a failure");
+    assert!(root.exists(), "the folder is left for the next step");
+    assert_eq!(count_entries(&root), 0);
+
+    let last = remove_step(&root, report.folder_id.as_deref(), five, &never).expect("a step");
+    assert_eq!(last.state, TreeState::Removed);
+    assert_eq!((last.removed_files, last.removed_dirs), (0, 1));
+}
+
+/// Once a step has met an entry it answers when its time is up, however much
+/// is left; with no time at all that is after one entry.
 #[test]
 fn a_step_answers_when_its_time_is_up() {
     let sb = Sandbox::new();
@@ -310,6 +408,35 @@ fn a_step_answers_when_its_time_is_up() {
         "one step for each file left and for the folder"
     );
     assert!(!root.exists());
+}
+
+/// The time bound holds for a step that has removed nothing, too: a step
+/// answers when its time is up whatever it achieved. It says that it is
+/// blocked, and names the folder it stood in when nothing else explains it.
+#[test]
+fn a_step_ends_at_its_time_bound_although_it_removed_nothing() {
+    let sb = Sandbox::new();
+    let root = sb.dir("slow");
+    let inner = sb.file("slow/sub/inner.txt");
+    let stood_in = super::super::testing::reported(&sb.path("slow/sub"));
+    let no_time = StepBounds {
+        time: Duration::ZERO,
+        ..roomy()
+    };
+
+    // The one entry the step meets before its time is up is the folder it
+    // enters: nothing is removed yet.
+    let report = remove_step(&root, None, no_time, &never).expect("a step");
+    assert_on_the_wire(&report);
+
+    assert_eq!(report.state, TreeState::Blocked, "{report:?}");
+    assert_eq!((report.removed_files, report.removed_dirs), (0, 0));
+    assert_eq!(failed_paths(&report), vec![stood_in]);
+    assert_eq!(report.failed[0].code, ErrorCode::LimitExceeded);
+    assert!(inner.exists());
+
+    // With time to work, the same folder is removed.
+    assert_eq!(remove(&root).state, TreeState::Removed);
 }
 
 /// A folder nested deeper than the walk goes is named and left, with
@@ -690,7 +817,7 @@ fn failures_beyond_the_ones_named_are_counted() {
 
 /// A step that reaches its bound without having removed anything says that it
 /// is blocked, not that more remains: another step would meet the same
-/// entries again.
+/// entries again. It names the entries it could not remove.
 #[cfg(unix)]
 #[test]
 fn a_step_that_can_remove_nothing_is_blocked() {
@@ -712,7 +839,14 @@ fn a_step_that_can_remove_nothing_is_blocked() {
 
     assert_eq!(report.state, TreeState::Blocked);
     assert_eq!((report.removed_files, report.removed_dirs), (0, 0));
-    assert_eq!(report.failed.len() as u64 + report.failed_more, 4);
+    assert_eq!(
+        report.failed.len() as u64 + report.failed_more,
+        3,
+        "four entries met: the folder it entered and three files it could not remove"
+    );
+    for failure in &report.failed {
+        assert_eq!(failure.code, ErrorCode::AccessDenied);
+    }
     assert_eq!(count_entries(&root), 7, "sealed and its six files");
 }
 

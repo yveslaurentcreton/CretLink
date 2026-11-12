@@ -290,16 +290,24 @@ pub struct DriveEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TreeState {
-    /// The folder and everything in it are gone.
+    /// The folder and everything in it are gone: this step removed the
+    /// folder itself. A folder that is gone for another reason — renamed away
+    /// or removed by someone else — is never reported this way.
     Removed,
     /// The step reached its bound after removing something: the folder is
-    /// still there and the next step gets further.
+    /// still there and the next step gets further. The answer names the
+    /// folder for that next step (`folder_id`).
     More,
     /// The whole folder was walked and the entries the step names could not be
-    /// removed, so the folder remains with them in it.
+    /// removed, so the folder remains with them in it. The answer names at
+    /// least one entry; when the folder itself is no longer at its path, it
+    /// names the folder as not found.
     Incomplete,
-    /// The step reached its bound without removing anything: the entries it
-    /// met could not be removed, and what lies beyond them was not tried.
+    /// The step reached its bound without removing anything, and what lies
+    /// beyond was not tried. The answer names at least one entry: those the
+    /// step could not remove, or — when it met only entries that were gone by
+    /// the time it reached for them, or folders it entered — the folder it
+    /// stood in, with [`ErrorCode::LimitExceeded`].
     Blocked,
     /// The removal was stopped before the folder was gone, on the caller's
     /// request (`stop`): nothing more was removed.
@@ -610,9 +618,10 @@ pub enum Operation {
     /// Remove a folder and everything in it, **one bounded step at a time**,
     /// answered [`OpResult::TreeRemoval`] (ST-M010-001).
     ///
-    /// One step settles at most [`limits::MAX_TREE_STEP_ENTRIES`] entries and
-    /// answers after about [`limits::MAX_TREE_STEP_MS`] milliseconds; while
-    /// the answer is [`TreeState::More`] the caller sends the request again,
+    /// One step meets at most [`limits::MAX_TREE_STEP_ENTRIES`] entries and
+    /// answers after about [`limits::MAX_TREE_STEP_MS`] milliseconds, whatever
+    /// it finds and whether or not it removes anything; while the answer is
+    /// [`TreeState::More`] the caller sends the request again,
     /// with the `folder_id` of that answer. The agent keeps nothing between
     /// two steps, so it stays free to serve a stop, a revocation or any other
     /// request in between, and a caller that wants to cancel simply stops
@@ -2011,7 +2020,7 @@ fn validate_result(result: &OpResult) -> Result<(), ProtocolError> {
                 }
                 (_, None) => {}
             }
-            // One step settles at most `MAX_TREE_STEP_ENTRIES` entries, so no
+            // One step meets at most `MAX_TREE_STEP_ENTRIES` entries, so no
             // count of one step can be larger.
             check_limit(
                 "tree_removal removed_files",

@@ -80,9 +80,12 @@ pub struct TreeRemovalReport {
     pub failed: Vec<TreeFailure>,
     /// How many more entries could not be removed, beyond `failed`.
     pub failed_more: u64,
-    /// Whether the removal gave up before it had tried every entry: the agent
-    /// met only entries it could not remove ([`TreeState::Blocked`]), so
-    /// `failed` and `failed_more` do not cover what lies beyond them.
+    /// Whether the removal gave up before it had tried every entry: a step
+    /// of the agent reached its bound without removing anything
+    /// ([`TreeState::Blocked`]), so `failed` and `failed_more` do not cover
+    /// what lies beyond. `failed` then names the entries that step could not
+    /// remove, or the folder it stood in with [`ErrorCode::LimitExceeded`]
+    /// when it met none it could name.
     pub blocked: bool,
     /// The error of a step the agent refused, for a `Failed` removal that
     /// ended that way (the folder does not exist, it is a file, the agent

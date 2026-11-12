@@ -62,12 +62,25 @@
 //!
 //! # Bounded
 //!
-//! One step settles — removes, or finds it cannot remove — at most
-//! [`StepBounds::entries`] entries, and once it has removed something it
-//! answers after [`StepBounds::time`]. A folder nested deeper than
-//! [`StepBounds::depth`] is reported and left. The answer names the first
-//! [`limits::MAX_TREE_FAILURES`] entries that could not be removed and counts
-//! the rest, so it has a fixed largest size.
+//! The agent serves one request at a time, so a step that did not end would
+//! keep everything else waiting, a stop by the customer included. Every step
+//! therefore ends, **whatever it finds and whatever it achieves**: it meets at
+//! most [`StepBounds::entries`] entries, and once it has met one it answers
+//! after [`StepBounds::time`]. An entry counts when the walk meets it: one it
+//! removes, one it cannot remove, one that is gone by the time the walk
+//! reaches for it, and a folder it enters. Nothing that a program does in the
+//! folder meanwhile — creating and deleting entries in a loop — keeps a step
+//! going beyond that.
+//!
+//! A step that ends at a bound says [`TreeState::More`] when it removed
+//! something, so that the next step gets further. One that removed nothing
+//! says [`TreeState::Blocked`] and names why: the entries it could not
+//! remove, or, when it met nothing but entries that were gone and folders it
+//! entered, the folder it stood in, with [`ErrorCode::LimitExceeded`].
+//!
+//! A folder nested deeper than [`StepBounds::depth`] is reported and left.
+//! The answer names the first [`limits::MAX_TREE_FAILURES`] entries that
+//! could not be removed and counts the rest, so it has a fixed largest size.
 //!
 //! # Honest (REQ-N-008)
 //!
@@ -90,11 +103,20 @@ use super::{FsError, io_error_code, one_line};
 /// The bounds of one step.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct StepBounds {
-    /// The most entries the step settles: removes, or finds it cannot remove.
+    /// The most entries the step meets: every entry a listing shows it, be it
+    /// removed, not removable or gone by then, and every folder it enters. A
+    /// folder counts once, when the walk meets it, and not again when it is
+    /// removed after its content.
+    ///
+    /// It must be larger than [`Self::depth`]: the walk enters at most that
+    /// many folders on its way down, and the entry after them is the one it
+    /// removes. So a step in a folder where nothing is in its way always
+    /// removes something before it runs out of entries.
     pub(super) entries: u64,
-    /// How long the step works before it answers, once it has removed
-    /// something. A step that has removed nothing yet goes on until
-    /// [`Self::entries`], so that a slow disk alone never ends a removal.
+    /// How long the step works before it answers, once it has met an entry,
+    /// whether or not it has removed anything. Without that, a folder whose
+    /// entries keep vanishing and reappearing would hold the step for as long
+    /// as its owner likes.
     pub(super) time: Duration,
     /// The deepest level below the folder that the step walks.
     pub(super) depth: usize,
@@ -179,6 +201,9 @@ enum Refusal {
     Changed,
     /// The folder is nested deeper than the walk goes.
     TooDeep,
+    /// The step reached its bound in this folder before it could remove
+    /// anything.
+    OutOfBounds,
 }
 
 impl Refusal {
@@ -193,7 +218,7 @@ impl Refusal {
             Self::Io(error) => io_error_code(error),
             Self::Outside => ErrorCode::InvalidPath,
             Self::Changed => ErrorCode::WrongPathKind,
-            Self::TooDeep => ErrorCode::LimitExceeded,
+            Self::TooDeep | Self::OutOfBounds => ErrorCode::LimitExceeded,
         }
     }
 }
@@ -223,6 +248,8 @@ struct Walk<'a> {
     bounds: StepBounds,
     stop: &'a dyn Fn() -> bool,
     started: Instant,
+    /// Entries the step has met: see [`StepBounds::entries`].
+    met: u64,
     removed_files: u64,
     removed_dirs: u64,
     failed: Vec<TreeFailure>,
@@ -305,6 +332,7 @@ pub(super) fn remove_step(
                 bounds,
                 stop,
                 started: Instant::now(),
+                met: 0,
                 removed_files: 0,
                 removed_dirs: 0,
                 failed: Vec::new(),
@@ -366,23 +394,30 @@ impl Walk<'_> {
             if (self.stop)() {
                 return TreeState::Stopped;
             }
-            if self.out_of_bounds() {
-                // The folder is not done. A step that removed something made
-                // room for the next one; a step that removed nothing met only
-                // what cannot be removed, and another step would meet it again.
-                return if self.removed() > 0 {
-                    TreeState::More
-                } else {
-                    TreeState::Blocked
-                };
-            }
             let depth = levels.len();
             let Some(level) = levels.last_mut() else {
                 // Unreachable: the loop returns when the last level is popped.
                 return TreeState::Incomplete;
             };
+            if self.out_of_bounds() {
+                // The folder is not done. A step that removed something made
+                // room for the next one.
+                if self.removed() > 0 {
+                    return TreeState::More;
+                }
+                // A step that removed nothing would meet the same again. It
+                // names what stood in its way; when that was nothing it could
+                // name — entries that were gone, folders it only entered — it
+                // names the folder it stood in.
+                if self.failed_total == 0 {
+                    let stood_in = level.path.clone();
+                    self.fail(&stood_in, &Refusal::OutOfBounds);
+                }
+                return TreeState::Blocked;
+            }
             match level.entries.next() {
                 Some(Ok(entry)) => {
+                    self.met += 1;
                     let path = entry.path();
                     // The listing's own word on what the entry is saves a
                     // look at every file. It decides nothing: a folder is
@@ -426,6 +461,7 @@ impl Walk<'_> {
                 // The listing broke off: what it had not shown yet is unknown,
                 // so the folder is kept and reported with the reason.
                 Some(Err(error)) => {
+                    self.met += 1;
                     let refusal = Refusal::Io(error);
                     let path = level.path.clone();
                     self.fail(&path, &refusal);
@@ -541,10 +577,12 @@ impl Walk<'_> {
         self.removed_files + self.removed_dirs
     }
 
-    /// Whether the step has reached one of its bounds.
+    /// Whether the step has reached one of its bounds. Both are about what
+    /// the step has met, not about what it has achieved: a step that removes
+    /// nothing ends all the same.
     fn out_of_bounds(&self) -> bool {
-        self.removed() + self.failed_total >= self.bounds.entries
-            || (self.removed() > 0 && self.started.elapsed() >= self.bounds.time)
+        self.met >= self.bounds.entries
+            || (self.met > 0 && self.started.elapsed() >= self.bounds.time)
     }
 
     /// Records that `path` could not be removed: the first ones by name and

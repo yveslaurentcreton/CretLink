@@ -158,23 +158,32 @@ pub const MAX_DRIVE_ROOT_BYTES: usize = 256;
 /// UTF-8 bytes.
 pub const MAX_DRIVE_LABEL_BYTES: usize = 128;
 
-/// The most entries one [`crate::Operation::RemoveTree`] step settles: removes
-/// or finds it cannot remove. A step that reaches this bound answers and the
-/// caller asks for the next one, so one request never holds the agent for the
-/// whole of a large folder: between two steps the agent serves a stop from the
-/// customer, a revocation and every other request (REQ-S-004, REQ-N-006).
+/// The most entries one [`crate::Operation::RemoveTree`] step meets: every
+/// entry it removes, every one it cannot remove, every one that is gone by
+/// the time it reaches for it, and every folder it enters. A step that
+/// reaches this bound answers and the caller asks for the next one, so one
+/// request never holds the agent for the whole of a large folder: between two
+/// steps the agent serves a stop from the customer, a revocation and every
+/// other request (REQ-S-004, REQ-N-006).
 pub const MAX_TREE_STEP_ENTRIES: u64 = 4096;
 
 /// How long one [`crate::Operation::RemoveTree`] step works before it answers,
-/// in milliseconds, once it has removed something. With
-/// [`MAX_TREE_STEP_ENTRIES`] this bounds how long a folder removal can delay a
-/// stop or a cancellation.
+/// in milliseconds, once it has met an entry — whether or not it has removed
+/// anything. With [`MAX_TREE_STEP_ENTRIES`] this bounds how long a folder
+/// removal can delay a stop or a cancellation, whatever a program does in the
+/// folder meanwhile.
 pub const MAX_TREE_STEP_MS: u64 = 1000;
 
 /// The deepest level below the folder being removed that
 /// [`crate::Operation::RemoveTree`] walks. A folder nested deeper is reported
 /// as not removed, never walked without bound.
 pub const MAX_TREE_DEPTH: usize = 256;
+
+// A step enters at most `MAX_TREE_DEPTH` folders on its way down, and each of
+// them counts as an entry it met. With room for more entries than that, a step
+// in a folder where nothing is in its way always removes something before its
+// entries run out, so a removal that is not hindered always gets further.
+const _: () = assert!(MAX_TREE_STEP_ENTRIES > MAX_TREE_DEPTH as u64);
 
 /// Maximum number of entries one [`crate::OpResult::TreeRemoval`] names as not
 /// removed: the first ones, each with its reason. The rest are counted in
