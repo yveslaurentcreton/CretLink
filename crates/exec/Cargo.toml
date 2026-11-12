@@ -42,10 +42,21 @@ png = "0.18"
 # set); its platform wrappers are gated internally, so this stays portable.
 process-wrap = { version = "9.1", features = ["tokio1"] }
 
+# Off Windows the file store asks the system two things the standard library
+# does not offer: the size and free space of the root file system (`statvfs`,
+# for the drive list) and the flag that refuses to open through a symbolic link
+# (`O_NOFOLLOW`, for the part of a transfer). Both come from nix's safe `fs`
+# API, so the crate needs no unsafe block of its own for them (ST-M010-001).
+# nix is MIT (deny.toml allow set) and already in the graph with this feature
+# through process-wrap, so no package enters the lockfile. Non-Windows agents
+# are for development and tests only.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+
 # Windows-only bindings, confined to `cfg(windows)` so the workspace test matrix
 # (windows, macos, ubuntu) still builds everywhere. windows-rs is MIT OR
 # Apache-2.0 (deny.toml allow set); pinned to the 0.62 line already in the
-# lockfile (see apps/support-agent). Two localized adapters use them:
+# lockfile (see apps/support-agent). Three localized adapters use them:
 #   - ConPTY interactive execution (ADR-0006 Mode B, ST-M003-008): the
 #     pseudo-console, the Job Object that contains the tree (REQ-S-014), the
 #     anonymous pipes bridged to tokio, and CreateProcessW with the
@@ -53,12 +64,19 @@ process-wrap = { version = "9.1", features = ["tokio1"] }
 #   - Piped-mode kill-on-close containment (ST-M006-007): its own Job Object
 #     assigned while the child is suspended, then resumed via the Toolhelp thread
 #     snapshot — so a hard `TerminateProcess` of the agent still reaps the tree.
+#   - The drive list and the removal of a folder with its content
+#     (ST-M010-001): the volume queries behind `FsDrives`, with the thread's
+#     error mode set so that an empty card reader shows no system dialog
+#     (`Win32_System_Diagnostics_Debug`), and the two handle calls that keep
+#     `RemoveTree` inside its folder: the final path of an opened entry and its
+#     removal through that same handle (`Win32_Storage_FileSystem`).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
+  "Win32_System_Diagnostics_Debug",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_JobObjects",
   "Win32_System_Pipes",

@@ -1369,3 +1369,738 @@ async fn per_session_census_matches_a_single_tree() {
     assert_eq!(staging.staged.len(), 1);
     assert_eq!(staging.orphaned_parts, 0);
 }
+
+// --- drives, folder removal and a file sent to a folder (ST-M010-001) -------
+
+/// A result as the session would send it: within the wire bounds.
+#[track_caller]
+fn assert_on_the_wire(result: &OpResult) {
+    use cretlink_protocol::{Message, RequestId};
+    Message::Response {
+        id: RequestId(1),
+        session: SessionId::new(),
+        result: result.clone(),
+    }
+    .encode()
+    .expect("the result is within the wire bounds");
+}
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("list the folder")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Runs a cleanup and returns how many files it removed and what it could not.
+async fn cleanup(store: &FileStore, trigger: CleanupTrigger) -> (u32, Vec<String>) {
+    match store.cleanup(trigger).await.expect("cleanup runs") {
+        OpResult::CleanupReport { removed, failed } => (
+            removed,
+            failed.into_iter().map(|f| f.canonical_path).collect(),
+        ),
+        other => panic!("expected CleanupReport, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_drives_of_this_computer_are_listed() {
+    let sb = Sandbox::new();
+    let result = sb
+        .store()
+        .perform(Operation::FsDrives {})
+        .await
+        .expect("the drives are listed");
+    assert_on_the_wire(&result);
+    match result {
+        OpResult::Drives { drives } => {
+            assert!(!drives.is_empty(), "a computer has at least one drive");
+        }
+        other => panic!("expected Drives, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_folder_with_its_content_is_removed_in_one_operation() {
+    use cretlink_protocol::TreeState;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    let old = target.join("old");
+    std::fs::create_dir_all(old.join("sub")).expect("create the folder");
+    std::fs::write(old.join("a.txt"), b"a").expect("write");
+    std::fs::write(old.join("sub").join("b.txt"), b"b").expect("write");
+    std::fs::write(target.join("beside.txt"), b"keep").expect("write");
+
+    let result = store
+        .perform(Operation::RemoveTree {
+            path: abs(&target, "old"),
+            stop: false,
+        })
+        .await
+        .expect("the folder is removed");
+    assert_on_the_wire(&result);
+    match result {
+        OpResult::TreeRemoval {
+            state,
+            removed_files,
+            removed_dirs,
+            failed,
+            failed_more,
+        } => {
+            assert_eq!(state, TreeState::Removed);
+            assert_eq!((removed_files, removed_dirs), (2, 2));
+            assert!(failed.is_empty());
+            assert_eq!(failed_more, 0);
+        }
+        other => panic!("expected TreeRemoval, got {other:?}"),
+    }
+    assert!(!old.exists());
+    assert_eq!(names_in(&target), vec!["beside.txt"]);
+}
+
+/// A folder in the staging area is named by its staging name and removed
+/// with its content like any other.
+#[tokio::test]
+async fn a_folder_in_the_staging_area_is_removed_by_its_name() {
+    use cretlink_protocol::TreeState;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    store
+        .perform(Operation::CreateDir {
+            path: staging("unpacked"),
+        })
+        .await
+        .expect("create the staged folder");
+    let unpacked = store.staging_root().join("unpacked");
+    std::fs::create_dir(unpacked.join("inner")).expect("create");
+    std::fs::write(unpacked.join("inner").join("tool.txt"), b"tool").expect("write");
+
+    let result = store
+        .perform(Operation::RemoveTree {
+            path: staging("unpacked"),
+            stop: false,
+        })
+        .await
+        .expect("the staged folder is removed");
+    assert!(matches!(
+        result,
+        OpResult::TreeRemoval {
+            state: TreeState::Removed,
+            removed_files: 1,
+            removed_dirs: 2,
+            ..
+        }
+    ));
+    assert!(!unpacked.exists());
+    assert!(
+        store.staging_root().exists(),
+        "the staging area itself stays"
+    );
+}
+
+/// A request that only ends a removal touches nothing, whatever the path.
+#[tokio::test]
+async fn a_stop_request_ends_a_removal_and_touches_nothing() {
+    use cretlink_protocol::TreeState;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    let old = target.join("old");
+    std::fs::create_dir(&old).expect("create");
+    std::fs::write(old.join("a.txt"), b"a").expect("write");
+
+    for name in ["old", "not-there"] {
+        let result = store
+            .perform(Operation::RemoveTree {
+                path: abs(&target, name),
+                stop: true,
+            })
+            .await
+            .expect("a stop is always answered");
+        assert_on_the_wire(&result);
+        assert_eq!(
+            result,
+            OpResult::TreeRemoval {
+                state: TreeState::Stopped,
+                removed_files: 0,
+                removed_dirs: 0,
+                failed: Vec::new(),
+                failed_more: 0,
+            }
+        );
+    }
+    assert!(old.join("a.txt").exists(), "nothing was removed");
+}
+
+/// The step of the wire operation is bounded by the protocol's own limits:
+/// a folder with more entries than one step settles takes more than one
+/// request, and the requests together remove all of it.
+#[tokio::test]
+async fn a_large_folder_takes_several_requests() {
+    use cretlink_protocol::{TreeState, limits};
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    let big = target.join("big");
+    std::fs::create_dir(&big).expect("create");
+    let files = limits::MAX_TREE_STEP_ENTRIES + 100;
+    for n in 0..files {
+        std::fs::write(big.join(format!("{n}.txt")), b"").expect("write");
+    }
+
+    let (mut removed, mut requests) = (0, 0);
+    loop {
+        requests += 1;
+        let result = store
+            .perform(Operation::RemoveTree {
+                path: abs(&target, "big"),
+                stop: false,
+            })
+            .await
+            .expect("a step");
+        assert_on_the_wire(&result);
+        let OpResult::TreeRemoval {
+            state,
+            removed_files,
+            removed_dirs,
+            ..
+        } = result
+        else {
+            panic!("expected TreeRemoval");
+        };
+        assert!(removed_files + removed_dirs <= limits::MAX_TREE_STEP_ENTRIES);
+        removed += removed_files + removed_dirs;
+        match state {
+            TreeState::More => assert!(big.exists()),
+            TreeState::Removed => break,
+            other => panic!("unexpected state {other:?}"),
+        }
+        assert!(requests < 1000, "the removal must end");
+    }
+    assert!(requests >= 2, "more entries than one step settles");
+    assert_eq!(removed, files + 1, "every file and the folder itself");
+    assert!(!big.exists());
+}
+
+/// A file sent to a folder is the customer's to keep: the staging manifest
+/// does not record it and no cleanup removes it. The staging area stays the
+/// one place for what the session cleans up.
+#[tokio::test]
+async fn a_file_sent_to_a_folder_is_kept_and_not_staged() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let documents = sb.target().join("Documents").join("Invoices");
+    std::fs::create_dir_all(&documents).expect("create the folder");
+
+    let committed = transfer(
+        &store,
+        abs(&documents, "invoice.pdf"),
+        b"%PDF-sample",
+        4,
+        false,
+        None,
+        CleanupPolicy::OnSessionEnd,
+    )
+    .await
+    .expect("the file is committed into the folder");
+    assert!(matches!(
+        committed,
+        OpResult::Committed {
+            len: 11,
+            replaced: false,
+            ..
+        }
+    ));
+    assert_eq!(names_in(&documents), vec!["invoice.pdf"]);
+
+    match store.perform(Operation::ListStaged {}).await.expect("list") {
+        OpResult::StagedList { entries } => {
+            assert!(entries.is_empty(), "a file in a folder is not staged");
+        }
+        other => panic!("expected StagedList, got {other:?}"),
+    }
+    // Not even the purge of everything staged removes it.
+    for trigger in [
+        CleanupTrigger::SessionEnd,
+        CleanupTrigger::Shutdown,
+        CleanupTrigger::All,
+    ] {
+        assert_eq!(cleanup(&store, trigger).await, (0, Vec::new()));
+    }
+    assert_eq!(
+        std::fs::read(documents.join("invoice.pdf")).expect("read"),
+        b"%PDF-sample"
+    );
+}
+
+/// While a transfer to a folder is under way its bytes lie in one part beside
+/// the destination, under a name of CretLink's own; the file's name appears
+/// only with the verified commit, and the part is gone then.
+#[tokio::test]
+async fn the_part_lies_beside_the_destination_until_the_verified_commit() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    let dest = abs(&folder, "setup.exe");
+    let payload = b"installer-bytes";
+
+    store
+        .perform(Operation::FsWrite {
+            dest: dest.clone(),
+            offset: 0,
+            data: B64Bytes::new(payload.to_vec()),
+        })
+        .await
+        .expect("write");
+    let during = names_in(&folder);
+    assert_eq!(
+        during.len(),
+        1,
+        "one part and nothing under the file's name"
+    );
+    assert!(during[0].starts_with(".cretlink-part."), "{during:?}");
+
+    store
+        .perform(Operation::FsCommit {
+            dest,
+            len: payload.len() as u64,
+            algo: DigestAlgo::Sha256,
+            digest: B64Bytes::new(sha256(payload)),
+            overwrite: false,
+            source: None,
+            cleanup: CleanupPolicy::Keep,
+        })
+        .await
+        .expect("commit");
+    assert_eq!(names_in(&folder), vec!["setup.exe"]);
+}
+
+/// A transfer to a folder that never finishes leaves its part beside the
+/// destination. The session's cleanup removes that part, with every trigger,
+/// and has nothing more to remove afterwards.
+#[tokio::test]
+async fn the_part_of_an_unfinished_transfer_to_a_folder_is_removed_by_the_cleanup() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    std::fs::write(folder.join("theirs.txt"), b"theirs").expect("write");
+    store
+        .perform(Operation::FsWrite {
+            dest: abs(&folder, "half.bin"),
+            offset: 0,
+            data: B64Bytes::new(b"half of it".to_vec()),
+        })
+        .await
+        .expect("write");
+    assert_eq!(names_in(&folder).len(), 2);
+
+    assert_eq!(
+        cleanup(&store, CleanupTrigger::SessionEnd).await,
+        (1, Vec::new())
+    );
+    assert_eq!(
+        names_in(&folder),
+        vec!["theirs.txt"],
+        "the part is gone and nothing else in the folder was touched"
+    );
+    assert_eq!(
+        cleanup(&store, CleanupTrigger::SessionEnd).await,
+        (0, Vec::new())
+    );
+}
+
+/// A transfer that was committed or discarded leaves nothing for the cleanup.
+#[tokio::test]
+async fn a_finished_or_discarded_transfer_leaves_nothing_for_the_cleanup() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+
+    transfer(
+        &store,
+        abs(&folder, "done.bin"),
+        b"done",
+        2,
+        false,
+        None,
+        CleanupPolicy::Keep,
+    )
+    .await
+    .expect("commit");
+    store
+        .perform(Operation::FsWrite {
+            dest: abs(&folder, "dropped.bin"),
+            offset: 0,
+            data: B64Bytes::new(b"dropped".to_vec()),
+        })
+        .await
+        .expect("write");
+    store
+        .perform(Operation::FsAbort {
+            dest: abs(&folder, "dropped.bin"),
+        })
+        .await
+        .expect("abort");
+
+    assert_eq!(cleanup(&store, CleanupTrigger::All).await, (0, Vec::new()));
+    assert_eq!(names_in(&folder), vec!["done.bin"]);
+}
+
+/// A part the cleanup cannot remove is reported with its path, never passed
+/// over, and the next cleanup tries again (REQ-F-019, REQ-N-008).
+#[tokio::test]
+async fn a_part_the_cleanup_cannot_remove_is_reported_and_tried_again() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    let dest = abs(&folder, "stuck.bin");
+    store
+        .perform(Operation::FsWrite {
+            dest: dest.clone(),
+            offset: 0,
+            data: B64Bytes::new(b"stuck".to_vec()),
+        })
+        .await
+        .expect("write");
+    let part = store.part_path(&dest).expect("the part of this transfer");
+    let block = block_removal(&part);
+
+    let (removed, failed) = cleanup(&store, CleanupTrigger::SessionEnd).await;
+    assert_eq!(removed, 0);
+    assert_eq!(failed, vec![part.to_string_lossy().into_owned()]);
+
+    release_block(block, &part);
+    assert_eq!(
+        cleanup(&store, CleanupTrigger::SessionEnd).await,
+        (1, Vec::new())
+    );
+    assert!(names_in(&folder).is_empty());
+}
+
+/// The store remembers a bounded number of unfinished transfers to folders: a
+/// transfer beyond it is refused before anything is written, never begun
+/// untracked, and one that finishes makes room again.
+#[tokio::test]
+async fn unfinished_transfers_to_folders_are_bounded() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    let write = |name: String| {
+        let store = store.clone();
+        let dest = abs(&folder, &name);
+        async move {
+            store
+                .perform(Operation::FsWrite {
+                    dest,
+                    offset: 0,
+                    data: B64Bytes::new(b"x".to_vec()),
+                })
+                .await
+        }
+    };
+    for n in 0..super::MAX_UNFINISHED_TRANSFERS {
+        write(format!("{n}.bin")).await.expect("within the bound");
+    }
+
+    let refused = write("one-too-many.bin".to_owned())
+        .await
+        .expect_err("beyond the bound");
+    assert_eq!(refused.code, ErrorCode::StorageExhausted);
+    assert_eq!(
+        names_in(&folder).len(),
+        super::MAX_UNFINISHED_TRANSFERS,
+        "nothing was written for the refused transfer"
+    );
+
+    // An unfinished transfer the store already knows can go on.
+    store
+        .perform(Operation::FsWrite {
+            dest: abs(&folder, "0.bin"),
+            offset: 1,
+            data: B64Bytes::new(b"y".to_vec()),
+        })
+        .await
+        .expect("a known transfer continues");
+    // Discarding one makes room for a new one.
+    store
+        .perform(Operation::FsAbort {
+            dest: abs(&folder, "1.bin"),
+        })
+        .await
+        .expect("abort");
+    write("now-it-fits.bin".to_owned())
+        .await
+        .expect("room again");
+
+    let (removed, failed) = cleanup(&store, CleanupTrigger::SessionEnd).await;
+    assert_eq!(removed as usize, super::MAX_UNFINISHED_TRANSFERS);
+    assert!(failed.is_empty());
+    assert!(names_in(&folder).is_empty());
+}
+
+/// A link that someone planted under the name of a transfer's part is never
+/// written through and never published: the write and the commit are refused
+/// and the file the link points at keeps its content.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_planted_under_the_parts_name_is_never_written_through() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    let victim = sb.root.join("victim.txt");
+    std::fs::write(&victim, b"untouched").expect("write the victim");
+    let dest = abs(&folder, "tool.exe");
+    let part = store.part_path(&dest).expect("the part of this transfer");
+    std::os::unix::fs::symlink(&victim, &part).expect("plant the link");
+
+    let refused = store
+        .perform(Operation::FsWrite {
+            dest: dest.clone(),
+            offset: 0,
+            data: B64Bytes::new(b"payload".to_vec()),
+        })
+        .await
+        .expect_err("a link is not a part");
+    assert_eq!(refused.code, ErrorCode::WrongPathKind);
+
+    let refused = store
+        .perform(Operation::FsCommit {
+            dest,
+            len: 9,
+            algo: DigestAlgo::Sha256,
+            digest: B64Bytes::new(sha256(b"untouched")),
+            overwrite: true,
+            source: None,
+            cleanup: CleanupPolicy::Keep,
+        })
+        .await
+        .expect_err("a link is never published as the file");
+    assert_eq!(refused.code, ErrorCode::WrongPathKind);
+
+    assert_eq!(std::fs::read(&victim).expect("read"), b"untouched");
+    assert!(!folder.join("tool.exe").exists());
+}
+
+/// Beneath that check, the part is opened in a way that refuses a link in the
+/// last part of its name, so a link swapped in after the check is not written
+/// through either.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_part_is_opened_without_following_a_link() {
+    let sb = Sandbox::new();
+    let folder = sb.target();
+    let victim = folder.join("victim.txt");
+    std::fs::write(&victim, b"untouched").expect("write the victim");
+    let link = folder.join("part");
+    std::os::unix::fs::symlink(&victim, &link).expect("plant the link");
+
+    super::append_to_part(&link, b"payload")
+        .await
+        .expect_err("the link is not opened");
+    assert_eq!(std::fs::read(&victim).expect("read"), b"untouched");
+
+    // A link to nothing is not followed into creating its target either.
+    let dangling = folder.join("dangling");
+    std::os::unix::fs::symlink(folder.join("created.txt"), &dangling).expect("plant");
+    super::append_to_part(&dangling, b"payload")
+        .await
+        .expect_err("the link is not opened");
+    assert!(!folder.join("created.txt").exists());
+}
+
+/// A disk that is full refuses the bytes of a part, and the transfer is told
+/// so in the storage category instead of a nameless failure. Linux only: the
+/// part is `/dev/full`, the device whose every write fails with "no space
+/// left", so no disk has to be filled.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_full_disk_is_reported_as_exhausted_storage() {
+    for data in [vec![7u8; 1], vec![7u8; 256 * 1024]] {
+        let refused = super::append_to_part(Path::new("/dev/full"), &data)
+            .await
+            .expect_err("a full disk takes no bytes");
+        assert_eq!(refused.code, ErrorCode::StorageExhausted, "{refused:?}");
+    }
+}
+
+/// The operating system's reasons are told apart in the wire vocabulary on
+/// every platform, from the kind of the error rather than from a number that
+/// means something else on another system.
+#[test]
+fn io_errors_are_classified_by_their_kind() {
+    use std::io::{Error, ErrorKind};
+
+    for (kind, code) in [
+        (ErrorKind::NotFound, ErrorCode::PathNotFound),
+        (ErrorKind::PermissionDenied, ErrorCode::AccessDenied),
+        (ErrorKind::AlreadyExists, ErrorCode::AlreadyExists),
+        (ErrorKind::DirectoryNotEmpty, ErrorCode::DirNotEmpty),
+        (ErrorKind::NotADirectory, ErrorCode::WrongPathKind),
+        (ErrorKind::IsADirectory, ErrorCode::WrongPathKind),
+        (ErrorKind::CrossesDevices, ErrorCode::Unsupported),
+        (ErrorKind::StorageFull, ErrorCode::StorageExhausted),
+        (ErrorKind::QuotaExceeded, ErrorCode::StorageExhausted),
+        (ErrorKind::ResourceBusy, ErrorCode::FileInUse),
+        (ErrorKind::ExecutableFileBusy, ErrorCode::FileInUse),
+        (ErrorKind::Other, ErrorCode::Internal),
+    ] {
+        assert_eq!(super::io_error_code(&Error::from(kind)), code, "{kind:?}");
+    }
+}
+
+/// Creating a folder that is already there is "already exists" on every
+/// platform (off Windows the system's number for it is the one Windows uses
+/// for "not the same device").
+#[tokio::test]
+async fn creating_a_folder_that_exists_is_already_exists() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    store
+        .perform(Operation::CreateDir {
+            path: abs(&target, "twice"),
+        })
+        .await
+        .expect("first");
+    let error = store
+        .perform(Operation::CreateDir {
+            path: abs(&target, "twice"),
+        })
+        .await
+        .expect_err("second");
+    assert_eq!(error.code, ErrorCode::AlreadyExists);
+}
+
+#[test]
+fn a_text_for_the_wire_is_kept_on_one_line_and_within_its_bound() {
+    use super::one_line;
+
+    assert_eq!(one_line("C:\\Temp\\report.txt", 64), "C:\\Temp\\report.txt");
+    // A line break, a tab and a line separator are each replaced.
+    assert_eq!(
+        one_line("a\nb\tc\u{2028}d", 64),
+        "a\u{FFFD}b\u{FFFD}c\u{FFFD}d"
+    );
+    // Exactly at the bound is whole; beyond it is cut and marked.
+    assert_eq!(one_line("abcdefgh", 8), "abcdefgh");
+    let cut = one_line("abcdefghi", 8);
+    assert_eq!(cut, "abcde…");
+    assert!(cut.len() <= 8);
+    // The cut never splits a character.
+    let cut = one_line(&"é".repeat(10), 8);
+    assert_eq!(cut, "éé…");
+    assert!(cut.len() <= 8);
+}
+
+// --- Windows only: a held destination and another drive (ST-M010-001) -------
+
+/// An existing file that another program holds open is not replaced, even on
+/// request: the commit says that the file is in use, the file keeps its
+/// content, and the verified part stays so the commit can be repeated once the
+/// file is released.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_destination_held_open_by_another_program_is_not_replaced() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    let existing = folder.join("report.docx");
+    std::fs::write(&existing, b"the old one").expect("write");
+    let dest = abs(&folder, "report.docx");
+    let payload = b"the new one";
+    let commit = || Operation::FsCommit {
+        dest: dest.clone(),
+        len: payload.len() as u64,
+        algo: DigestAlgo::Sha256,
+        digest: B64Bytes::new(sha256(payload)),
+        overwrite: true,
+        source: None,
+        cleanup: CleanupPolicy::Keep,
+    };
+    store
+        .perform(Operation::FsWrite {
+            dest: dest.clone(),
+            offset: 0,
+            data: B64Bytes::new(payload.to_vec()),
+        })
+        .await
+        .expect("write");
+
+    let block = block_removal(&existing);
+    let refused = store
+        .perform(commit())
+        .await
+        .expect_err("a held file is not replaced");
+    assert_eq!(refused.code, ErrorCode::FileInUse);
+    assert_eq!(std::fs::read(&existing).expect("read"), b"the old one");
+
+    release_block(block, &existing);
+    let committed = store.perform(commit()).await.expect("the commit repeats");
+    assert!(matches!(
+        committed,
+        OpResult::Committed { replaced: true, .. }
+    ));
+    assert_eq!(std::fs::read(&existing).expect("read"), b"the new one");
+    assert_eq!(names_in(&folder), vec!["report.docx"]);
+}
+
+/// A file is committed into a folder on another drive than the one that
+/// holds the staging area: the part lies beside the destination, so the
+/// verified rename never leaves that drive. The test needs a second fixed
+/// drive it may write to; a computer without one has nothing to test.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_file_is_committed_into_a_folder_on_another_drive() {
+    use cretlink_protocol::DriveKind;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let here = sb.root.to_string_lossy()[..3].to_ascii_uppercase();
+    let folder = super::drives::list()
+        .into_iter()
+        .filter(|drive| drive.kind == DriveKind::Fixed && drive.root != here)
+        .find_map(|drive| {
+            let folder =
+                PathBuf::from(&drive.root).join(format!("cretlink-fs-test-{}", std::process::id()));
+            std::fs::create_dir_all(&folder).ok().map(|()| folder)
+        });
+    let Some(folder) = folder else {
+        eprintln!("skipped: no second fixed drive that this account may write to");
+        return;
+    };
+
+    let committed = transfer(
+        &store,
+        abs(&folder, "driver.inf"),
+        b"[Version]",
+        4,
+        false,
+        None,
+        CleanupPolicy::Keep,
+    )
+    .await;
+    let on_disk = std::fs::read(folder.join("driver.inf"));
+    let left = names_in(&folder);
+    let _ = std::fs::remove_dir_all(&folder);
+
+    assert!(
+        matches!(committed, Ok(OpResult::Committed { len: 9, .. })),
+        "{committed:?}"
+    );
+    assert_eq!(on_disk.expect("read the committed file"), b"[Version]");
+    assert_eq!(left, vec!["driver.inf"], "no part is left beside it");
+}
