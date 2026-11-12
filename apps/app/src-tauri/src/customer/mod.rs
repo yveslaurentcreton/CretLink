@@ -50,7 +50,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use cretlink_discovery::{Browser, DiscoveredConsole, DiscoveryError, parse_manual_entry};
+use cretlink_discovery::{
+    Browser, DiscoveredConsole, DiscoveryError, ManualEntry, parse_entry, parse_manual_entry,
+};
 use cretlink_protocol::{
     CAP_FS_V1, CAP_FS_V2, PROTOCOL_V1, RevokeReason, SessionId, TargetIdentity,
 };
@@ -807,9 +809,27 @@ fn start_live_session(
     // Parse the technician's connection code into a dialable address *before*
     // mutating any state, so a typo leaves the window untouched. This grants no
     // authority; trust is established later by the Session Approval Code.
-    let target = parse_manual_entry(code.trim()).map_err(|e| CommandError::new("connect", e))?;
+    let target = typed_target(&code)?;
 
-    Ok(begin_live_dial(app, &state, target.addr()))
+    Ok(begin_live_dial(app, &state, target))
+}
+
+/// What a relay code gets in a copy that is not set up for a relay
+/// (ST-M007-012). The code is well formed, so calling it wrong would send the
+/// customer back to type it again; the copy is what does not fit.
+const RELAY_CODE_WITHOUT_RELAY: &str = "This is a relay code, for a technician who is not on \
+    your network. This copy of CretLink is not set up for a relay, so it connects only on the \
+    same network.";
+
+/// Resolves what the customer typed into the code field to the address to
+/// dial (REQ-F-004, ST-M007-012): a LAN connection code or a raw address. A
+/// relay code is told apart from a mistyped code and answered in plain words;
+/// its stage is `relay`, so the window can say what to do next.
+fn typed_target(code: &str) -> Result<SocketAddr, CommandError> {
+    match parse_entry(code.trim()).map_err(|e| CommandError::new("connect", e))? {
+        ManualEntry::Lan(target) => Ok(target.addr()),
+        ManualEntry::Relay(_) => Err(CommandError::new("relay", RELAY_CODE_WITHOUT_RELAY)),
+    }
 }
 
 /// Browses the LAN for listening consoles and returns the capped candidate list
@@ -1307,17 +1327,43 @@ mod tests {
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 50), 7000);
 
         // `start_live_session` receives a typed connection code; `connect_console`
-        // receives the discovered "ip:port" string. Both are validated by the
-        // *same* `parse_manual_entry` that `begin_live_dial` then consumes, so a
-        // discovered console is dialed by exactly the code path — no shortcut.
-        let from_code = parse_manual_entry(&ConnectionCode::encode(addr))
-            .expect("a freshly encoded code parses")
-            .addr();
+        // receives the discovered "ip:port" string. Both end in the same parser
+        // of the discovery crate and the same `begin_live_dial`, so a discovered
+        // console is dialed by exactly the code path — no shortcut.
+        let from_code =
+            typed_target(&ConnectionCode::encode(addr)).expect("a freshly encoded code parses");
         let from_pick = parse_manual_entry(&SocketAddr::V4(addr).to_string())
             .expect("a discovered ip:port parses")
             .addr();
 
         assert_eq!(from_code, SocketAddr::V4(addr));
         assert_eq!(from_code, from_pick);
+        // The field also takes a raw address, typed loosely.
+        let typed = format!("  {} ", SocketAddr::V4(addr));
+        assert_eq!(
+            typed_target(&typed).expect("a raw address parses"),
+            SocketAddr::V4(addr)
+        );
+    }
+
+    #[test]
+    fn a_relay_code_in_a_copy_without_a_relay_is_answered_in_plain_words() {
+        // A well-formed relay code (ST-M007-012), typed loosely.
+        let error = typed_target("53st a71d jkkv 0vgh").expect_err("this copy has no relay");
+        assert_eq!(error.stage, "relay");
+        assert!(error.message.contains("relay code"), "{}", error.message);
+        assert!(
+            error.message.contains("not set up for a relay"),
+            "{}",
+            error.message
+        );
+        // The message is whole sentences without the gaps of a wrapped literal.
+        assert!(!error.message.contains("  "), "{:?}", error.message);
+
+        // A relay code with a typing error is a mistyped code, not a relay
+        // matter: the customer checks it with the technician.
+        let error = typed_target("53ST-A71D-JKKV-0VGJ").expect_err("a typing error");
+        assert_eq!(error.stage, "connect");
+        assert!(error.message.contains("checksum"), "{}", error.message);
     }
 }

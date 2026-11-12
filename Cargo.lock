@@ -406,6 +406,7 @@ dependencies = [
  "cretlink-protocol",
  "if-addrs",
  "mdns-sd",
+ "rand 0.9.5",
  "thiserror 2.0.19",
 ]
 
@@ -463,7 +464,9 @@ version = "0.0.0"
 dependencies = [
  "cretlink-protocol",
  "cretlink-transport",
+ "hkdf",
  "rand 0.9.5",
+ "sha2 0.10.9",
  "subtle",
  "thiserror 2.0.19",
  "tokio",
@@ -474,11 +477,13 @@ dependencies = [
 name = "cretlink-relay-server"
 version = "0.0.0"
 dependencies = [
+ "cretlink-discovery",
  "cretlink-protocol",
  "cretlink-relay",
  "cretlink-session",
  "cretlink-shared",
  "cretlink-wss",
+ "thiserror 2.0.19",
  "tokio",
 ]
 

@@ -44,18 +44,19 @@ use std::time::Duration;
 
 use cretlink_protocol::{Origin, PROTOCOL_V1, TargetIdentity};
 use cretlink_relay::{
-    AdmissionControl, AdmissionPolicy, ControlConfig, MetricsSnapshot, Preamble,
-    RENDEZVOUS_TICKET_LEN, Rendezvous, RendezvousTicket, StopSignal, write_preamble,
+    AdmissionControl, AdmissionPolicy, AdmissionToken, ClientId, ControlConfig, MetricsSnapshot,
+    Preamble, RENDEZVOUS_TICKET_LEN, RelayRefusal, Rendezvous, RendezvousTicket, StopSignal,
+    write_preamble,
 };
 use cretlink_relay_server::{Leg, ServeConfig, serve_wss};
 use cretlink_session::{
     ConsoleHints, Dial, ExecRequest, HostHandle, JobId, JobOutcome, JoinHandle, NoAudit,
-    NoRebootResume, RevokeReason, SessionError, SessionEvent, SessionHost, SessionJoiner, Shell,
-    WssRelayDial,
+    NoRebootResume, RelayFailure, RevokeReason, SessionError, SessionEvent, SessionHost,
+    SessionJoiner, Shell, WaitingDial, WssRelayDial,
 };
 use cretlink_wss::testcert::self_signed;
 use cretlink_wss::{CertificateDer, PrivateKeyDer, WssConnector, WssServerStream};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
@@ -504,7 +505,7 @@ async fn an_untrusted_relay_certificate_fails_the_wss_dial_closed() {
         .await
         .expect("the untrusted handshake resolves promptly");
     assert!(
-        matches!(result, Err(SessionError::Io(_))),
+        matches!(result, Err(SessionError::Relay(RelayFailure::Untrusted(_)))),
         "an untrusted relay certificate must fail the dial closed with no stream"
     );
 }
@@ -528,7 +529,7 @@ async fn a_hostname_mismatch_fails_the_wss_dial_closed() {
         .await
         .expect("the mismatched handshake resolves promptly");
     assert!(
-        matches!(result, Err(SessionError::Io(_))),
+        matches!(result, Err(SessionError::Relay(RelayFailure::Untrusted(_)))),
         "a hostname mismatch must fail the dial closed with no stream"
     );
 }
@@ -574,4 +575,94 @@ async fn a_plaintext_dial_to_the_wss_relay_is_refused() {
     );
     assert_eq!(m.sessions_active, 0, "no slot was reserved");
     assert_eq!(m.bytes_forwarded, 0, "nothing was forwarded");
+}
+
+/// ST-M007-012 — the relay's answer travels inside the wss envelope like
+/// everything else: a wrong key is refused with the relay's reason, and the
+/// dial returns no stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wrong_key_is_refused_over_wss_with_the_relays_reason() {
+    let (cert, key) = self_signed(RELAY_DNS).expect("mint the relay leaf");
+    let trusted = pinned_connector(cert.clone());
+    let policy = AdmissionPolicy::SharedToken {
+        token: AdmissionToken::from_text("relay-secret"),
+        client: ClientId::new("shared"),
+    };
+    let (relay_addr, control, _signal, _serve) =
+        start_relay_wss(policy, ServeConfig::default(), cert, key).await;
+
+    let ticket = RendezvousTicket::from_bytes([0x53; RENDEZVOUS_TICKET_LEN]);
+    let dialer = WssRelayDial::new(
+        relay_addr,
+        RELAY_DNS,
+        trusted,
+        ticket,
+        Some(AdmissionToken::from_text("not-the-secret")),
+    );
+    let error = timeout(STEP_TIMEOUT, dialer.dial())
+        .await
+        .expect("the refusal resolves promptly")
+        .expect_err("a wrong key is refused");
+    assert!(
+        matches!(
+            error,
+            SessionError::Relay(RelayFailure::Refused(RelayRefusal::CredentialRejected))
+        ),
+        "{error:?}"
+    );
+    let m = wait_until_metrics(&control, |m| m.denied_auth == 1).await;
+    assert_eq!(m.sessions_admitted, 0, "a refused leg reserves no place");
+}
+
+/// ST-M007-012 — over wss a relay drops a parked leg without a TLS farewell.
+/// The waiting side reads that as a rendezvous that lapsed, dials again, and
+/// meets a peer that arrives later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_waiting_side_outlives_lapsed_rendezvous_over_wss() {
+    let (cert, key) = self_signed(RELAY_DNS).expect("mint the relay leaf");
+    let trusted = pinned_connector(cert.clone());
+    let config = ServeConfig {
+        rendezvous_timeout: Duration::from_millis(150),
+        ..ServeConfig::default()
+    };
+    let (relay_addr, control, _signal, _serve) =
+        start_relay_wss(AdmissionPolicy::Open, config, cert, key).await;
+    let ticket = || RendezvousTicket::from_bytes([0x54; RENDEZVOUS_TICKET_LEN]);
+
+    let waiting = WaitingDial::with_pause(
+        WssRelayDial::new(relay_addr, RELAY_DNS, trusted.clone(), ticket(), None),
+        Duration::from_millis(20),
+    );
+    let waiting = tokio::spawn(async move { waiting.dial().await });
+
+    let m = wait_until_metrics(&control, |m| m.sessions_ended >= 3).await;
+    assert!(m.sessions_ended >= 3, "several rendezvous lapsed");
+    assert!(!waiting.is_finished(), "the waiting side is still waiting");
+
+    // The peer arrives and speaks first, as the customer's copy does.
+    let mut peer = timeout(
+        STEP_TIMEOUT,
+        WssRelayDial::new(relay_addr, RELAY_DNS, trusted, ticket(), None).dial(),
+    )
+    .await
+    .expect("the peer's dial resolves")
+    .expect("the peer is admitted");
+    // The relay forwards whole frames: a length prefix and an opaque body.
+    let body = b"first words";
+    let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(body);
+    peer.write_all(&frame).await.expect("write");
+    peer.flush().await.expect("flush");
+
+    let mut leg = timeout(STEP_TIMEOUT, waiting)
+        .await
+        .expect("the waiting side meets its peer")
+        .expect("the waiting task ends in order")
+        .expect("the waiting side is admitted");
+    let mut heard = vec![0u8; frame.len()];
+    timeout(STEP_TIMEOUT, leg.read_exact(&mut heard))
+        .await
+        .expect("the peer's bytes arrive")
+        .expect("read");
+    assert_eq!(heard, frame, "nothing of the peer's stream is lost");
 }

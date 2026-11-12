@@ -293,4 +293,25 @@ describe("customer controller", () => {
     expect(alert).toContain("That code did not work");
     expect(alert).toContain("unrecognised connection code");
   });
+
+  it("does not ask to retype a relay code that this copy cannot use", async () => {
+    await boot({
+      start_live_session: () => {
+        throw {
+          stage: "relay",
+          message: "This is a relay code, for a technician who is not on your network.",
+        };
+      },
+    });
+    const input = app().querySelector<HTMLInputElement>("#code");
+    if (input) input.value = "53ST-A71D-JKKV-0VGH";
+    click('[data-action="connect-code"]');
+    await flush();
+    expect(called("start_live_session")).toEqual([{ code: "53ST-A71D-JKKV-0VGH" }]);
+    const alert = app().querySelector('[role="alert"]')?.textContent ?? "";
+    expect(alert).toContain("This copy cannot use a relay code");
+    expect(alert).toContain("This is a relay code");
+    expect(alert).toContain("set up for their relay");
+    expect(alert).not.toContain("type it again");
+  });
 });

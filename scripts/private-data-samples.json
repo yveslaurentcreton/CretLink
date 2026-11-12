@@ -34,6 +34,10 @@
     {
       "_comment": "Not an address: the assembly version in apps/support-agent/cretlink-support.manifest.",
       "values": ["1.0.0.0"]
+    },
+    {
+      "_comment": "Not an address: a spelling with leading zeros that the check of a relay's host name must refuse (crates/relay/src/ticket.rs).",
+      "values": ["192.168.001.001"]
     }
   ],
   "accounts": [

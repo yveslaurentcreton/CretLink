@@ -1163,6 +1163,29 @@ struct EarlyFailure {
     outcome: Outcome,
 }
 
+/// How a failed pairing is reported. Over a relay, a stream that ends before
+/// the peer was heard is no failed handshake: nobody joined the rendezvous
+/// ([`crate::dial::rendezvous_lapsed`], ST-M007-012). It gets a stage of its
+/// own, so that a front end says "nobody is waiting on this code" instead of a
+/// pairing failure of unknown cause (REQ-N-015).
+fn pairing_failure(error: &cretlink_transport::PairingError) -> EarlyFailure {
+    if crate::dial::rendezvous_lapsed(error) {
+        EarlyFailure {
+            stage: "rendezvous",
+            message: "nobody joined the rendezvous on the relay",
+            action: "error",
+            outcome: Outcome::Timeout,
+        }
+    } else {
+        EarlyFailure {
+            stage: "pairing",
+            message: "secure pairing failed",
+            action: "error",
+            outcome: Outcome::Failed,
+        }
+    }
+}
+
 /// Locally revokes the session: sends the `Revoke`, then keeps the connection
 /// open and drains until the peer reads it and closes, so the peer reports the
 /// honest revoke reason rather than a bare disconnect (a reset would otherwise
@@ -1581,18 +1604,13 @@ pub(crate) async fn host_task_over_stream<S>(
             shared.set_approval_code(paired.approval_code);
             paired.channel
         }
-        Ok(Err(_)) => {
+        Ok(Err(error)) => {
             return fail_before_channel(
                 &shared,
                 &tx,
                 audit,
                 Actor::Console,
-                EarlyFailure {
-                    stage: "pairing",
-                    message: "secure pairing failed",
-                    action: "error",
-                    outcome: Outcome::Failed,
-                },
+                pairing_failure(&error),
             );
         }
         Err(_elapsed) => {
@@ -2218,19 +2236,8 @@ pub(crate) async fn join_task<S>(
             }
             (paired.channel, paired.handshake_hash)
         }
-        Ok(Err(_)) => {
-            return fail_before_channel(
-                &shared,
-                &tx,
-                audit,
-                Actor::Agent,
-                EarlyFailure {
-                    stage: "pairing",
-                    message: "secure pairing failed",
-                    action: "error",
-                    outcome: Outcome::Failed,
-                },
-            );
+        Ok(Err(error)) => {
+            return fail_before_channel(&shared, &tx, audit, Actor::Agent, pairing_failure(&error));
         }
         Err(_elapsed) => {
             return fail_before_channel(

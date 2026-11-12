@@ -2286,11 +2286,13 @@ fn session_to_target(err: HostSessionError) -> TargetError {
         | HostSessionError::RevokedLocally
         | HostSessionError::RevokedByPeer
         | HostSessionError::ConsentDenied => TargetError::NoConsentedSession,
-        // `Io` is the connection's (binding, dialing). An error on the
-        // technician's own file never arrives here: the transfer engine reports
-        // it as a failed transfer in the stage `local` (ST-M003-005).
+        // `Io` and `Relay` are the connection's (binding, dialing, the relay).
+        // An error on the technician's own file never arrives here: the
+        // transfer engine reports it as a failed transfer in the stage `local`
+        // (ST-M003-005).
         HostSessionError::Disconnected
         | HostSessionError::Io(_)
+        | HostSessionError::Relay(_)
         | HostSessionError::Channel(_)
         | HostSessionError::Pairing(_)
         | HostSessionError::Timeout => TargetError::Disconnected,

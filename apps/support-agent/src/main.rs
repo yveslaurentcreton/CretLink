@@ -47,8 +47,8 @@ use cretlink_discovery::{Browser, parse_manual_entry};
 use cretlink_protocol::{PROTOCOL_V1, TargetIdentity};
 use cretlink_session::{
     ActionOutcome, ActivityKind, AdmissionToken, DesktopAccess, Dial, JoinHandle, NoAudit, Origin,
-    RebootResumeArmer, RelayDial, RendezvousTicket, RevokeReason, SessionError, SessionEvent,
-    SessionJoiner, WssRelayDial,
+    RebootResumeArmer, RelayDial, RelayFailure, RendezvousTicket, RevokeReason, SessionError,
+    SessionEvent, SessionJoiner, WssRelayDial,
 };
 use cretlink_support_agent::{
     EffectiveIdentity, TicketStore, current_identity, default_ticket_store_path,
@@ -970,7 +970,7 @@ async fn connect_relay_with_retries(
     let wss = match &tls {
         Some(tls) => {
             let connector = WssRelayDial::connector(tls.ca_pem.as_deref()).map_err(|error| {
-                format!("could not establish the relay TLS trust store: {error}")
+                format!("could not use the relay settings: {}", with_causes(&error))
             })?;
             println!(
                 "  Wrapping the relay leg in wss/TLS (validating the certificate for {}).",
@@ -1006,10 +1006,9 @@ async fn connect_relay_with_retries(
                 println!("Connected to the console through the relay.");
                 return Ok(Some(handle));
             }
-            // The relay is unreachable, or no peer arrived before the relay's
-            // rendezvous window closed: keep waiting rather than giving up.
+            // The relay is unreachable: keep waiting rather than giving up.
             RelayAttempt::Retry => {
-                println!("  Relay or peer not ready yet — retrying...");
+                println!("  Relay not reachable yet — retrying...");
             }
             // A reached-but-failed handshake is a real problem, not a wait.
             RelayAttempt::Fatal(message) => return Err(message),
@@ -1028,8 +1027,7 @@ async fn connect_relay_with_retries(
 enum RelayAttempt {
     /// The end-to-end session was established.
     Connected(JoinHandle),
-    /// A transport fault (relay unreachable, or no peer before the rendezvous
-    /// window closed): wait and try again.
+    /// The relay cannot be reached yet: wait and try again.
     Retry,
     /// A reached-but-failed handshake: fatal, do not retry.
     Fatal(String),
@@ -1056,9 +1054,31 @@ async fn join_relay_attempt<D: Dial>(
     .await
     {
         Ok(handle) => RelayAttempt::Connected(handle),
-        Err(SessionError::Io(_)) => RelayAttempt::Retry,
-        Err(other) => RelayAttempt::Fatal(format!("could not establish the session: {other}")),
+        // The relay is not there yet: wait and try again.
+        Err(SessionError::Io(_) | SessionError::Relay(RelayFailure::Unreachable(_))) => {
+            RelayAttempt::Retry
+        }
+        // The relay answered and refused, is not trusted, or is no relay of
+        // this version: trying again changes nothing, so say why and stop.
+        Err(other) => RelayAttempt::Fatal(format!(
+            "could not establish the session: {}",
+            with_causes(&other)
+        )),
     }
+}
+
+/// An error with the causes behind it, on one line. A failed relay dial says
+/// in its cause what went wrong: unreachable, not trusted, no answer, or the
+/// reason of the relay's refusal (ST-M007-012).
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(inner) = cause {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    text
 }
 
 /// One mDNS browse round. Returns the first console advertising a usable

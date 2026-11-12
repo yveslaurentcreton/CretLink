@@ -10,7 +10,10 @@
 //!    rejecting a malformed or oversized preamble *before* any forwarding;
 //! 2. [`AdmissionControl::admit`] it — authentication (abuse control only, never
 //!    session authority) → rate limit → concurrency quota — sourcing its posture
-//!    from [`ControlConfig::public_default`](cretlink_relay::ControlConfig::public_default);
+//!    from [`ControlConfig::public_default`](cretlink_relay::ControlConfig::public_default)
+//!    — and **answer** the endpoint once ([`RelayAnswer`], ST-M007-012):
+//!    admitted, or refused with the reason, so that an endpoint can tell a
+//!    refusal from a rendezvous that nobody joined;
 //! 3. [`Rendezvous::join`] on the single-use ticket, parking the first leg until
 //!    its peer arrives;
 //! 4. [`splice`](cretlink_relay::splice()) the matched pair under the admitted
@@ -38,6 +41,8 @@
 //! *writes* the preamble is ST-M007-008/009; this server only ever reads it.
 //!
 
+pub mod keys;
+
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -46,11 +51,11 @@ use std::time::{Duration, Instant};
 
 use cretlink_relay::preamble::{MAX_PREAMBLE_TOKEN_BYTES, read_preamble};
 use cretlink_relay::{
-    AdmissionControl, Matched, Rendezvous, SessionGuard, SpliceOutcome, SpliceReport, StopHandle,
-    splice,
+    AdmissionControl, Matched, PREAMBLE_VERSION, PreambleError, RelayAnswer, RelayRefusal,
+    Rendezvous, SessionGuard, SpliceOutcome, SpliceReport, StopHandle, splice, write_answer,
 };
 use cretlink_wss::{WssAcceptor, WssServerStream};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
 /// How long a fresh connection has to deliver a complete rendezvous preamble
@@ -265,6 +270,17 @@ async fn serve_connection<S, U, Fut>(
         Ok(Ok(preamble)) => preamble,
         Ok(Err(err)) => {
             eprintln!("relay: rejected {peer_label}: {err}");
+            // An endpoint of another preamble version is told so: that status
+            // keeps its meaning in every version. Anything else that is not a
+            // well-formed preamble gets no answer.
+            if matches!(err, PreambleError::UnsupportedVersion { .. }) {
+                let refusal = RelayRefusal::UnsupportedVersion {
+                    relay: PREAMBLE_VERSION,
+                };
+                if answer(&mut stream, RelayAnswer::Refused(refusal), &config).await {
+                    discard_rest(&mut stream).await;
+                }
+            }
             return;
         }
         Err(_elapsed) => {
@@ -274,15 +290,53 @@ async fn serve_connection<S, U, Fut>(
     };
 
     // 2. Admit: authentication → rate limit → concurrency quota. A denial forwards
-    //    zero bytes; the gate has already recorded the metadata-only reason.
+    //    zero bytes; the gate has already recorded the metadata-only reason. The
+    //    endpoint is told the reason, which names no credential and no session.
     let now_ms = ms_since(clock);
     let guard = match control.admit(preamble.token.as_ref(), &peer_label, now_ms) {
         Ok(guard) => guard,
         Err(denied) => {
             eprintln!("relay: denied {peer_label}: {denied}");
+            answer(&mut stream, RelayAnswer::Refused(denied.into()), &config).await;
             return;
         }
     };
+
+    // Who this leg is in the log: the label of its key, with the address it
+    // came from. Never the key (REQ-S-017).
+    let who = who(&guard, &peer_label);
+
+    // A leg that would find neither its peer nor a place to park is told so,
+    // instead of admitted and then dropped (ST-M007-014). Dropping the guard
+    // records the admitted leg as ended with nothing forwarded.
+    match rendezvous.has_room_for(&preamble.ticket) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("relay: no free place to park {who}");
+            answer(
+                &mut stream,
+                RelayAnswer::Refused(RelayRefusal::Busy),
+                &config,
+            )
+            .await;
+            return;
+        }
+        Err(err) => {
+            eprintln!("relay: cannot park {who}: {err}");
+            let unavailable = RelayAnswer::Refused(RelayRefusal::Unavailable);
+            answer(&mut stream, unavailable, &config).await;
+            return;
+        }
+    }
+
+    // The endpoint learns that it is admitted before the leg is parked. From
+    // here on a stream that ends without a byte from the peer was not refused:
+    // no session came about on this rendezvous. If the answer cannot be
+    // written the leg is dropped: its guard records an honest unknown end.
+    if !answer(&mut stream, RelayAnswer::Admitted, &config).await {
+        eprintln!("relay: dropped {who}: the admission could not be answered");
+        return;
+    }
 
     // 3. Join the single-use rendezvous. The token is dropped here — it has done
     //    its only job (admission) and must not travel further.
@@ -291,7 +345,7 @@ async fn serve_connection<S, U, Fut>(
     let leg = Leg {
         stream,
         guard,
-        peer: peer_label.clone(),
+        peer: who.clone(),
     };
     match rendezvous
         .join(ticket, leg, config.rendezvous_timeout)
@@ -308,9 +362,64 @@ async fn serve_connection<S, U, Fut>(
             // Timeout / AtCapacity / Poisoned: `join` dropped our leg (and its
             // guard) fail-closed, so the abandoned session is recorded as an
             // honest unknown end. Nothing was forwarded.
-            eprintln!("relay: rendezvous for {peer_label} ended: {err}");
+            eprintln!("relay: rendezvous for {who} ended: {err}");
         }
     }
+}
+
+/// How a log line names an admitted leg: the label its key is accounted
+/// under and the address it came from, or the address alone on a relay
+/// without keys, where the address is the label.
+fn who(guard: &SessionGuard, peer_label: &str) -> String {
+    let client = guard.client().as_str();
+    if client == peer_label {
+        peer_label.to_string()
+    } else {
+        format!("{client} ({peer_label})")
+    }
+}
+
+/// Writes the relay's one answer to an endpoint, under the preamble deadline so
+/// that an endpoint which does not read cannot hold the connection open.
+/// Returns whether the answer was written.
+async fn answer<S>(stream: &mut S, answer: RelayAnswer, config: &ServeConfig) -> bool
+where
+    S: AsyncWrite + Unpin,
+{
+    matches!(
+        tokio::time::timeout(config.preamble_timeout, write_answer(stream, answer)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// How long the relay keeps reading after it refused a preamble of another
+/// version, so that its answer arrives.
+const DISCARD_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Reads and discards the rest of a preamble that the relay refused after its
+/// first bytes, bounded in bytes and in time.
+///
+/// The relay stops reading a preamble at the version byte when it does not
+/// speak that version; the rest is still on its way. Closing a connection with
+/// unread data makes the operating system reset it, and a reset can discard
+/// the answer before the endpoint has read it. Reading what one preamble can
+/// hold lets the connection close in order. Nothing that is read is used.
+async fn discard_rest<S>(stream: &mut S)
+where
+    S: AsyncRead + Unpin,
+{
+    let mut left = MAX_PREAMBLE_TOKEN_BYTES + 64;
+    let mut scratch = [0u8; 256];
+    let discard = async {
+        while left > 0 {
+            let want = left.min(scratch.len());
+            match stream.read(&mut scratch[..want]).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => left -= read,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(DISCARD_TIMEOUT, discard).await;
 }
 
 /// Splices a matched pair under the admitted limits and finishes both guards.

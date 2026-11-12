@@ -21,6 +21,13 @@
 //! - `--client-label <label>` — the non-secret accountability label all holders
 //!   of the shared secret are logged under (default [`DEFAULT_CLIENT_LABEL`]);
 //!   ignored under the open policy.
+//! - `--keys <file>` or `CRETLINK_RELAY_KEYS` — one admission key per customer
+//!   copy and technician, one `label:key` per line (ST-M007-014, see
+//!   [`cretlink_relay_server::keys`]). It replaces `--token`: giving both is
+//!   refused. A file that breaks a rule is refused at startup with the number
+//!   of the line. A change of the file takes effect within seconds, without a
+//!   restart and without touching the sessions in progress.
+//! - `keygen` — prints a new random key for such a file and exits.
 //! - `--tls-cert <path>` / `--tls-key <path>` (or `CRETLINK_RELAY_TLS_CERT` /
 //!   `CRETLINK_RELAY_TLS_KEY`) — the operator's PEM certificate chain and private
 //!   key. When **both** are supplied the relay serves `wss://` (WebSocket over
@@ -36,13 +43,15 @@
 //! fail-closed (REQ-N-008), and prints a final metadata-only metrics snapshot.
 //!
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use cretlink_relay::{
     AdmissionControl, AdmissionPolicy, AdmissionToken, ClientId, ControlConfig, MetricsSnapshot,
-    Rendezvous, StopSignal,
+    Rendezvous, StopSignal, generate_key,
 };
+use cretlink_relay_server::keys::{DEFAULT_KEYS_POLL, load_keys, watch_keys};
 use cretlink_relay_server::{Leg, ServeConfig, serve, serve_wss};
 use cretlink_wss::{WssAcceptor, WssServerStream};
 use tokio::net::{TcpListener, TcpStream};
@@ -75,6 +84,18 @@ struct Config {
     tls_cert: Option<String>,
     /// Path to the operator's PEM private key, if serving `wss://`.
     tls_key: Option<String>,
+    /// Path to the file with one admission key per label (ST-M007-014).
+    keys: Option<String>,
+}
+
+/// What the command line asks for.
+enum Invocation {
+    /// `--help` was handled and printed.
+    Help,
+    /// Print a new admission key and exit.
+    Keygen,
+    /// Run the relay.
+    Serve(Config),
 }
 
 /// The resolved transport: raw TCP (ADR-0016 §5 interim) or `wss://` (ADR-0016 §3
@@ -128,9 +149,16 @@ fn resolve_transport(config: &Config) -> Result<Transport, String> {
 
 async fn run() -> Result<(), String> {
     let config = match parse_args()? {
-        Some(config) => config,
+        Invocation::Serve(config) => config,
         // `--help` was handled and printed; exit cleanly.
-        None => return Ok(()),
+        Invocation::Help => return Ok(()),
+        // The key goes to standard output and nowhere else, so that an
+        // operator can redirect it into a file.
+        Invocation::Keygen => {
+            let key = generate_key().map_err(|err| err.to_string())?;
+            println!("{key}");
+            return Ok(());
+        }
     };
 
     // Resolve the transport BEFORE binding (and before `config` is consumed): a
@@ -146,20 +174,33 @@ async fn run() -> Result<(), String> {
         }
     };
 
-    // The admission posture: a shared secret when one is configured, otherwise
-    // an open relay. Either way the rate limiter and concurrency quotas from the
-    // public default still bound abuse (ADR-0016 §4–§5).
-    let policy = match config.token {
-        Some(token) => AdmissionPolicy::SharedToken {
+    // The admission posture: one key per label from a file, a shared secret,
+    // or an open relay. Either way the rate limiter and concurrency quotas from
+    // the public default still bound abuse (ADR-0016 §4–§5). A key file that
+    // breaks a rule is refused here, before the listener opens (REQ-N-015).
+    let keys_path = config.keys.map(PathBuf::from);
+    let policy = match (&keys_path, config.token) {
+        (Some(path), None) => {
+            AdmissionPolicy::Allowlist(load_keys(path).map_err(|err| err.to_string())?)
+        }
+        (None, Some(token)) => AdmissionPolicy::SharedToken {
             token,
             client: ClientId::new(config.client_label),
         },
-        None => AdmissionPolicy::Open,
+        (None, None) => AdmissionPolicy::Open,
+        // `parse_args` refuses the combination; never fall back to one of the
+        // two silently.
+        (Some(_), Some(_)) => return Err(KEYS_AND_TOKEN.to_string()),
     };
     let policy_label = match &policy {
-        AdmissionPolicy::Open => "open (no credential required)",
-        AdmissionPolicy::SharedToken { .. } => "shared-token",
-        AdmissionPolicy::Allowlist(_) => "allowlist",
+        AdmissionPolicy::Open => "open (no credential required)".to_string(),
+        AdmissionPolicy::SharedToken { .. } => "shared-token".to_string(),
+        AdmissionPolicy::Allowlist(keys) => {
+            format!(
+                "one key per label ({} keys, reread when the file changes)",
+                keys.len()
+            )
+        }
     };
 
     let control = AdmissionControl::new(policy, ControlConfig::public_default());
@@ -189,6 +230,15 @@ async fn run() -> Result<(), String> {
     // down fail-closed rather than abandoned (REQ-N-008). Each transport builds
     // its own typed rendezvous over the same core `serve`/`serve_wss` pipeline.
     let (signal, stop) = StopSignal::new();
+    // A changed key file is applied while the relay runs (ST-M007-014).
+    if let Some(path) = keys_path {
+        tokio::spawn(watch_keys(
+            path,
+            control.clone(),
+            DEFAULT_KEYS_POLL,
+            stop.clone(),
+        ));
+    }
     let serve_task = match transport {
         Transport::Wss(acceptor) => {
             let rendezvous: Arc<Rendezvous<Leg<WssServerStream<TcpStream>>>> =
@@ -233,22 +283,39 @@ async fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// Parses the command line and folds in environment defaults. Returns `Ok(None)`
-/// when `--help` was requested (already printed), or an actionable error string
-/// for a malformed invocation.
-fn parse_args() -> Result<Option<Config>, String> {
+/// The refusal of a key file together with a shared secret.
+const KEYS_AND_TOKEN: &str = "both a key file and a shared admission secret were given (--keys or \
+     CRETLINK_RELAY_KEYS, and --token or CRETLINK_RELAY_TOKEN); use one of the two";
+
+/// Parses the command line and folds in environment defaults, or returns an
+/// actionable error string for a malformed invocation.
+fn parse_args() -> Result<Invocation, String> {
     let mut bind = std::env::var("CRETLINK_RELAY_BIND").ok();
     let mut token_text = std::env::var("CRETLINK_RELAY_TOKEN").ok();
     let mut client_label: Option<String> = None;
     let mut tls_cert = std::env::var("CRETLINK_RELAY_TLS_CERT").ok();
     let mut tls_key = std::env::var("CRETLINK_RELAY_TLS_KEY").ok();
+    let mut keys = std::env::var("CRETLINK_RELAY_KEYS").ok();
 
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+    // `keygen` is the one subcommand; it takes nothing else.
+    if args.peek().map(String::as_str) == Some("keygen") {
+        args.next();
+        return match args.next() {
+            None => Ok(Invocation::Keygen),
+            Some(extra) => Err(format!("keygen takes no argument, but got '{extra}'")),
+        };
+    }
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
                 print_usage();
-                return Ok(None);
+                return Ok(Invocation::Help);
+            }
+            "--keys" => {
+                keys = Some(args.next().ok_or(
+                    "--keys requires the path of a file with one label:key per line, e.g. --keys relay.keys",
+                )?);
             }
             "--bind" => {
                 bind = Some(
@@ -297,21 +364,34 @@ fn parse_args() -> Result<Option<Config>, String> {
         None => None,
     };
 
-    Ok(Some(Config {
+    // An empty path is a configuration mistake, like an empty secret.
+    if keys.as_deref() == Some("") {
+        return Err(
+            "the key file path is empty; unset CRETLINK_RELAY_KEYS or name a file".to_string(),
+        );
+    }
+    if keys.is_some() && token.is_some() {
+        return Err(KEYS_AND_TOKEN.to_string());
+    }
+
+    Ok(Invocation::Serve(Config {
         bind: bind.unwrap_or_else(|| DEFAULT_BIND.to_string()),
         token,
         client_label: client_label.unwrap_or_else(|| DEFAULT_CLIENT_LABEL.to_string()),
         tls_cert,
         tls_key,
+        keys,
     }))
 }
 
 fn print_usage() {
     println!("CretLink internet relay server (ST-M007-007, wss ST-M007-009)\n");
-    println!(
-        "Usage: cretlink-relay-server [--bind <addr>] [--token <secret>] [--client-label <label>]"
-    );
-    println!("                            [--tls-cert <path> --tls-key <path>]\n");
+    println!("Usage: cretlink-relay-server [--bind <addr>] [--keys <file> | --token <secret>]");
+    println!("                            [--client-label <label>]");
+    println!("                            [--tls-cert <path> --tls-key <path>]");
+    println!("       cretlink-relay-server keygen\n");
+    println!("Commands:");
+    println!("  keygen                 Print a new random admission key and exit.\n");
     println!("Options:");
     println!(
         "  --bind <addr>          Listen address (env CRETLINK_RELAY_BIND; default {DEFAULT_BIND})."
@@ -326,6 +406,10 @@ fn print_usage() {
     println!(
         "  --client-label <label> Accountability label for shared-token clients (default {DEFAULT_CLIENT_LABEL})."
     );
+    println!("  --keys <file>          One admission key per customer copy and technician, one");
+    println!("                         label:key per line (env CRETLINK_RELAY_KEYS). Not together");
+    println!("                         with --token. A change of the file takes effect within");
+    println!("                         seconds; sessions in progress continue.");
     println!(
         "  --tls-cert <path>      PEM certificate chain the relay presents (env CRETLINK_RELAY_TLS_CERT)."
     );
