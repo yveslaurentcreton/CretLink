@@ -52,9 +52,9 @@ use cretlink_relay::{
 };
 use cretlink_relay_server::{Leg, ServeConfig, serve};
 use cretlink_session::{
-    ConsoleHints, Dial, ExecRequest, HostHandle, JobId, JobOutcome, JoinHandle, NoAudit,
-    NoRebootResume, RelayDial, RelayFailure, RevokeReason, SessionError, SessionEvent, SessionHost,
-    SessionJoiner, Shell, WaitingDial, rendezvous_lapsed,
+    ConsoleHints, Dial, ExecRequest, HostHandle, JobId, JobOutcome, JoinHandle, JoiningDial,
+    NoAudit, NoRebootResume, RelayDial, RelayFailure, RevokeReason, SessionError, SessionEvent,
+    SessionHost, SessionJoiner, Shell, WaitingDial, rendezvous_lapsed,
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, copy_bidirectional};
@@ -916,21 +916,22 @@ async fn a_typed_relay_code_pairs_after_the_waiting_side_outlived_lapsed_rendezv
     assert!(observed.stdout_has_marker);
 }
 
-/// ST-M007-012 — a code that nobody waits on: the relay admits the leg, lets
-/// the rendezvous lapse, and the joining side reports exactly that instead of a
-/// pairing failure of unknown cause.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_code_that_nobody_waits_on_is_reported_as_a_lapsed_rendezvous() {
-    let config = ServeConfig {
-        rendezvous_timeout: Duration::from_millis(150),
-        ..ServeConfig::default()
-    };
-    let (relay_addr, _control, _signal, _serve) = start_relay(AdmissionPolicy::Open, config).await;
-
-    let code = RelayCode::from_seed([0x5a; 8]);
+/// Joins with a relay code that nobody waits on and returns the stage and the
+/// message of the failure that the customer's copy reports.
+async fn join_a_code_nobody_waits_on(
+    relay_addr: SocketAddr,
+    seed: u8,
+    limit: Option<Duration>,
+) -> (String, String) {
+    let code = RelayCode::from_seed([seed; 8]);
     let ticket = RendezvousTicket::derive(code.seed(), RELAY_HOST).expect("derive");
+    let dial = RelayDial::new(relay_addr, ticket, None);
+    let dialer = match limit {
+        Some(limit) => JoiningDial::with_limit(dial, limit),
+        None => JoiningDial::new(dial),
+    };
     let mut joiner = SessionJoiner::join_with_reboot_resume_over(
-        RelayDial::new(relay_addr, ticket, None),
+        dialer,
         agent_identity(),
         PROTOCOL_V1,
         caps(),
@@ -940,14 +941,99 @@ async fn a_code_that_nobody_waits_on_is_reported_as_a_lapsed_rendezvous() {
     )
     .await
     .expect("the relay admits the leg");
-
     match next_event!(joiner) {
-        SessionEvent::Failed { stage, message } => {
-            assert_eq!(stage, "rendezvous", "{message}");
-            assert!(message.contains("nobody joined"), "{message}");
-        }
-        other => panic!("expected a lapsed rendezvous, got {other:?}"),
+        SessionEvent::Failed { stage, message } => (stage, message),
+        other => panic!("expected a failed session, got {other:?}"),
     }
+}
+
+/// ST-M007-012 — a code that nobody waits on, against a relay as it runs: the
+/// relay admits the leg and parks it for half a minute, longer than pairing is
+/// given. The joining side does not wait that out and does not report a pairing
+/// that timed out: it gives the peer a limit to be heard and then says that
+/// nobody joined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_code_that_nobody_waits_on_is_reported_as_a_lapsed_rendezvous() {
+    let (relay_addr, _control, _signal, _serve) =
+        start_relay(AdmissionPolicy::Open, ServeConfig::default()).await;
+
+    let (stage, message) =
+        join_a_code_nobody_waits_on(relay_addr, 0x5a, Some(Duration::from_millis(200))).await;
+    assert_eq!(stage, "rendezvous", "{message}");
+    assert!(message.contains("nobody joined"), "{message}");
+}
+
+/// ST-M007-012 — the same when the relay ends the parked leg first. Whether
+/// the joining side notices on its first write or on the read that follows
+/// depends on timing; both are reported as the lapsed rendezvous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leg_that_the_relay_drops_first_is_reported_as_a_lapsed_rendezvous() {
+    let config = ServeConfig {
+        rendezvous_timeout: Duration::from_millis(50),
+        ..ServeConfig::default()
+    };
+    let (relay_addr, _control, _signal, _serve) = start_relay(AdmissionPolicy::Open, config).await;
+
+    for seed in 0x60..0x68 {
+        let (stage, message) = join_a_code_nobody_waits_on(relay_addr, seed, None).await;
+        assert_eq!(stage, "rendezvous", "{message}");
+    }
+}
+
+/// ST-M007-012 — the waiting side does not rely on the relay to end a parked
+/// leg. A leg on which nothing is heard within the park limit is given up and
+/// dialled again: here a server admits every leg and then stays silent, as a
+/// relay does whose close never arrives or which matched the leg with a silent
+/// peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_waiting_side_gives_up_a_leg_that_stays_silent() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    let listener = TcpListener::bind(loopback()).await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let legs = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&legs);
+    let server = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (mut stream, _peer) = listener.accept().await.expect("accept");
+            let mut preamble = [0u8; 4 + 1 + 2 + RENDEZVOUS_TICKET_LEN];
+            stream.read_exact(&mut preamble).await.expect("preamble");
+            cretlink_relay::write_answer(&mut stream, RelayAnswer::Admitted)
+                .await
+                .expect("answer");
+            // The third leg meets a peer that speaks; the others hear nothing
+            // and are never closed.
+            if seen.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                stream.write_all(b"peer").await.expect("write");
+            }
+            held.push(stream);
+        }
+    });
+
+    let waiting = WaitingDial::with_timing(
+        RelayDial::new(
+            addr,
+            RendezvousTicket::from_bytes([0x73; RENDEZVOUS_TICKET_LEN]),
+            None,
+        ),
+        Duration::from_millis(10),
+        Duration::from_millis(100),
+    );
+    let mut leg = timeout(STEP_TIMEOUT, waiting.dial())
+        .await
+        .expect("the waiting side does not wait on a silent leg for ever")
+        .expect("the third leg hears its peer");
+    assert_eq!(
+        legs.load(Ordering::SeqCst),
+        3,
+        "two silent legs were given up"
+    );
+    let mut heard = [0u8; 4];
+    leg.read_exact(&mut heard).await.expect("read");
+    assert_eq!(&heard, b"peer");
+    server.abort();
 }
 
 /// ST-M007-012 — only "nobody joined yet" is waited out. A refusal ends the

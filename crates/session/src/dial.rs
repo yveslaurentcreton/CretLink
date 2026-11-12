@@ -84,6 +84,20 @@ async fn within<T, E>(
 /// (its rate limit would then refuse, and that refusal ends the wait).
 pub const DEFAULT_REDIAL_PAUSE: Duration = Duration::from_secs(1);
 
+/// How long [`WaitingDial`] trusts one parked leg before it dials again of
+/// its own accord. A relay closes a parked leg after half a minute, and the
+/// waiting side then dials again; this limit covers the cases in which that
+/// close never arrives or never comes: the network changed or the computer
+/// slept, or the relay matched the leg with a peer that stays silent.
+pub const DEFAULT_PARK_LIMIT: Duration = Duration::from_secs(45);
+
+/// How long the joining side waits to hear the peer before it reports that
+/// nobody waits on the code ([`JoiningDial`]). It is shorter than the time
+/// limit of pairing, so that the honest reason is reported and not a pairing
+/// that timed out; and long enough for a waiting side that is dialling again
+/// at that moment.
+pub const DEFAULT_JOIN_LIMIT: Duration = Duration::from_secs(10);
+
 /// Why a session could not be set up through a relay (ST-M007-012,
 /// ST-M007-013). Every reason is secret-free and is one a person can act on;
 /// the application words them for the technician and the customer.
@@ -151,9 +165,10 @@ pub fn rendezvous_lapsed(error: &(dyn StdError + 'static)) -> bool {
 /// It passes every byte through unchanged in both directions; the relay and
 /// this type see the end-to-end session only as opaque bytes. Its one
 /// addition: if the stream ends, or the connection is cut, before a single
-/// byte of the peer arrived, the read fails with an error for which
+/// byte of the peer arrived, reading and writing fail with an error for which
 /// [`rendezvous_lapsed`] is true, instead of an end of stream that looks like
-/// a peer who hung up.
+/// a peer who hung up. With a limit ([`RelayLeg::hear_peer_within`]) the same
+/// holds when the peer is not heard in time.
 #[derive(Debug)]
 pub struct RelayLeg<S> {
     inner: S,
@@ -161,6 +176,8 @@ pub struct RelayLeg<S> {
     first: Option<u8>,
     /// Whether a byte of the peer has arrived.
     heard: bool,
+    /// When set: the moment by which the peer must have been heard.
+    hear_by: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<S> RelayLeg<S> {
@@ -169,6 +186,27 @@ impl<S> RelayLeg<S> {
             inner,
             first: None,
             heard: false,
+            hear_by: None,
+        }
+    }
+
+    /// Gives the peer `limit` from now to be heard. After that, a read that
+    /// still waits for the first byte of the peer fails with the lapse error.
+    /// Once the peer was heard the limit means nothing any more.
+    #[must_use]
+    pub fn hear_peer_within(mut self, limit: Duration) -> Self {
+        self.hear_by = Some(Box::pin(tokio::time::sleep(limit)));
+        self
+    }
+
+    /// Reports a cut of the connection before the peer was heard as a lapsed
+    /// rendezvous, on whichever half it shows first: a relay that drops a
+    /// parked leg while this side is still writing its first message is seen
+    /// as a failed write, not as a failed read.
+    fn unless_lapsed<T>(&self, result: io::Result<T>) -> io::Result<T> {
+        match result {
+            Err(error) if !self.heard && is_cut(&error) => Err(lapsed()),
+            other => other,
         }
     }
 }
@@ -231,13 +269,23 @@ impl<S: AsyncRead + Unpin> AsyncRead for RelayLeg<S> {
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) if buf.filled().len() > before => {
                 this.heard = true;
+                this.hear_by = None;
                 Poll::Ready(Ok(()))
             }
             // The stream ended. Before the peer was heard, that is the relay
             // letting the rendezvous lapse.
             Poll::Ready(Ok(())) if !this.heard => Poll::Ready(Err(lapsed())),
-            Poll::Ready(Err(error)) if !this.heard && is_cut(&error) => Poll::Ready(Err(lapsed())),
-            other => other,
+            Poll::Ready(result) => Poll::Ready(this.unless_lapsed(result)),
+            // Nothing yet. With a limit, the wait for the peer ends there.
+            Poll::Pending => {
+                if !this.heard
+                    && let Some(hear_by) = this.hear_by.as_mut()
+                    && hear_by.as_mut().poll(cx).is_ready()
+                {
+                    return Poll::Ready(Err(lapsed()));
+                }
+                Poll::Pending
+            }
         }
     }
 }
@@ -248,15 +296,24 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for RelayLeg<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        let this = self.get_mut();
+        Pin::new(&mut this.inner)
+            .poll_write(cx, buf)
+            .map(|result| this.unless_lapsed(result))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        Pin::new(&mut this.inner)
+            .poll_flush(cx)
+            .map(|result| this.unless_lapsed(result))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        Pin::new(&mut this.inner)
+            .poll_shutdown(cx)
+            .map(|result| this.unless_lapsed(result))
     }
 }
 
@@ -582,30 +639,49 @@ impl Dial for WssRelayDial {
 /// refusal, an unreachable relay or any other [`RelayFailure`] ends the wait
 /// at once with its reason: only "nobody joined yet" is waited out.
 ///
-/// It waits for as long as its future is polled. The caller ends the wait by
-/// dropping the future, which closes the connection; the relay then forgets
-/// the parked leg, and the code no longer finds anybody.
+/// It does not rely on the relay to end a parked leg. A leg on which the
+/// peer is not heard within the park limit is given up and dialled again:
+/// the close of the relay may never arrive (the network changed, the computer
+/// slept), and a relay may have matched the leg with a peer that stays silent,
+/// such as a second copy that waits on the same code.
 ///
-/// Use it on the side that waits, the technician's. The side that joins dials
-/// once: a lapsed rendezvous there means that nobody waits on that code.
+/// It waits for as long as its future is polled. The caller ends the wait by
+/// dropping the future, which closes the connection; the code then no longer
+/// leads to a session.
+///
+/// Use it on the side that waits, the technician's. The side that joins uses
+/// [`JoiningDial`]: a lapsed rendezvous there means that nobody waits on that
+/// code.
 #[derive(Debug)]
 pub struct WaitingDial<D> {
     inner: D,
     pause: Duration,
+    park_limit: Duration,
 }
 
 impl<D> WaitingDial<D> {
     /// Keeps the rendezvous of `inner` open, with [`DEFAULT_REDIAL_PAUSE`]
-    /// between two dials.
+    /// between two dials and [`DEFAULT_PARK_LIMIT`] for one parked leg.
     #[must_use]
     pub fn new(inner: D) -> Self {
-        Self::with_pause(inner, DEFAULT_REDIAL_PAUSE)
+        Self::with_timing(inner, DEFAULT_REDIAL_PAUSE, DEFAULT_PARK_LIMIT)
     }
 
     /// Like [`WaitingDial::new`], with another pause between two dials.
     #[must_use]
     pub fn with_pause(inner: D, pause: Duration) -> Self {
-        Self { inner, pause }
+        Self::with_timing(inner, pause, DEFAULT_PARK_LIMIT)
+    }
+
+    /// Like [`WaitingDial::new`], with another pause between two dials and
+    /// another limit for one parked leg.
+    #[must_use]
+    pub fn with_timing(inner: D, pause: Duration, park_limit: Duration) -> Self {
+        Self {
+            inner,
+            pause,
+            park_limit,
+        }
     }
 }
 
@@ -619,17 +695,61 @@ where
     async fn dial(&self) -> Result<Self::Stream, SessionError> {
         loop {
             let mut leg = self.inner.dial().await?;
-            match leg.wait_for_peer().await {
-                Ok(()) => return Ok(leg),
+            match tokio::time::timeout(self.park_limit, leg.wait_for_peer()).await {
+                Ok(Ok(())) => return Ok(leg),
                 // Nobody joined before the relay let the rendezvous lapse:
                 // not a failure, the peer is simply not there yet.
-                Err(error) if rendezvous_lapsed(&error) => {
-                    drop(leg);
-                    tokio::time::sleep(self.pause).await;
-                }
-                Err(error) => return Err(RelayFailure::Unreachable(error).into()),
+                Ok(Err(error)) if rendezvous_lapsed(&error) => {}
+                Ok(Err(error)) => return Err(RelayFailure::Unreachable(error).into()),
+                // The leg stayed silent beyond the park limit: give it up and
+                // park a fresh one.
+                Err(_elapsed) => {}
             }
+            drop(leg);
+            tokio::time::sleep(self.pause).await;
         }
+    }
+}
+
+/// A relay dial for the side that joins a rendezvous, the customer's
+/// (ST-M007-012).
+///
+/// The joining side speaks first and then waits for the peer. If nobody waits
+/// on the code, nothing ever answers: the relay parks the leg for half a
+/// minute, longer than pairing is given. This dialer gives the peer a limit
+/// to be heard ([`DEFAULT_JOIN_LIMIT`]); when it passes, reading fails with
+/// the lapse error, and the session ends at the stage `rendezvous` with the
+/// honest reason: nobody waits on that code.
+#[derive(Debug)]
+pub struct JoiningDial<D> {
+    inner: D,
+    limit: Duration,
+}
+
+impl<D> JoiningDial<D> {
+    /// Joins through `inner` and gives the peer [`DEFAULT_JOIN_LIMIT`] to be
+    /// heard.
+    #[must_use]
+    pub fn new(inner: D) -> Self {
+        Self::with_limit(inner, DEFAULT_JOIN_LIMIT)
+    }
+
+    /// Like [`JoiningDial::new`], with another limit.
+    #[must_use]
+    pub fn with_limit(inner: D, limit: Duration) -> Self {
+        Self { inner, limit }
+    }
+}
+
+impl<D, S> Dial for JoiningDial<D>
+where
+    D: Dial<Stream = RelayLeg<S>> + Sync,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    type Stream = RelayLeg<S>;
+
+    async fn dial(&self) -> Result<Self::Stream, SessionError> {
+        Ok(self.inner.dial().await?.hear_peer_within(self.limit))
     }
 }
 
@@ -713,6 +833,38 @@ mod tests {
         Err(io::Error::new(kind, "the connection was cut"))
     }
 
+    /// A stream that reads from a script and fails every write, as a
+    /// connection does that the other end already dropped.
+    struct WriteFails(Scripted, io::ErrorKind);
+
+    impl AsyncRead for WriteFails {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for WriteFails {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(self.1, "the write failed")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(self.1, "the flush failed")))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
     async fn bytes_pass_through_unchanged_and_the_first_one_is_not_lost() {
         let (near, mut far) = tokio::io::duplex(64);
@@ -789,6 +941,66 @@ mod tests {
         let error = leg.read(&mut [0u8; 8]).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(!rendezvous_lapsed(&error));
+    }
+
+    #[tokio::test]
+    async fn a_cut_while_writing_before_the_peer_was_heard_is_a_lapse_too() {
+        // The joining side speaks first. A relay that drops the parked leg
+        // while that first message is on its way shows as a failed write.
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::ConnectionReset] {
+            let mut leg = RelayLeg::new(WriteFails(Scripted::new([]), kind));
+            let error = leg.write_all(b"first message").await.unwrap_err();
+            assert!(rendezvous_lapsed(&error), "write, {kind:?}");
+            let error = leg.flush().await.unwrap_err();
+            assert!(rendezvous_lapsed(&error), "flush, {kind:?}");
+
+            // After the peer was heard a failed write is a lost connection.
+            let mut leg = RelayLeg::new(WriteFails(Scripted::new([Ok(vec![7])]), kind));
+            assert_eq!(leg.read(&mut [0u8; 4]).await.unwrap(), 1);
+            let error = leg.write_all(b"later message").await.unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert!(!rendezvous_lapsed(&error), "{kind:?}");
+        }
+
+        // A write that fails for another reason is reported as it is.
+        let mut leg = RelayLeg::new(WriteFails(
+            Scripted::new([]),
+            io::ErrorKind::PermissionDenied,
+        ));
+        let error = leg.write_all(b"x").await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_is_not_heard_in_time_is_a_lapse() {
+        // The far end stays open and silent, as a relay does while it parks.
+        let (near, _far) = tokio::io::duplex(64);
+        let mut leg = RelayLeg::new(near).hear_peer_within(Duration::from_millis(40));
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(5), leg.read(&mut [0u8; 8]))
+            .await
+            .expect("the limit ends the read")
+            .unwrap_err();
+        assert!(rendezvous_lapsed(&error), "{error:?}");
+        assert!(started.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_was_heard_is_never_cut_off_by_the_limit() {
+        let (near, mut far) = tokio::io::duplex(64);
+        let mut leg = RelayLeg::new(near).hear_peer_within(Duration::from_millis(40));
+        far.write_all(b"a").await.unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(leg.read(&mut buf).await.unwrap(), 1);
+
+        // Long after the limit the stream is an ordinary stream: a read that
+        // finds nothing simply waits, and what comes later is read.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let waiting = tokio::time::timeout(Duration::from_millis(60), leg.read(&mut buf)).await;
+        assert!(waiting.is_err(), "the read waits and reports no lapse");
+        far.write_all(b"b").await.unwrap();
+        assert_eq!(leg.read(&mut buf).await.unwrap(), 1);
+        assert_eq!(buf[0], b'b');
     }
 
     #[tokio::test]

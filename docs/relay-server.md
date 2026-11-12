@@ -286,18 +286,28 @@ status     1 byte    see the table
 
 After any status but `0` the relay closes the connection. Status `6` keeps its
 meaning in every preamble version, and an endpoint reads an answer with
-another version byte as status `6` whatever its status says, so two versions
-can always tell each other that they differ. A status that an endpoint does
-not know is never taken for an admission. Something that sends no preamble at
-all, such as a port scan, gets no answer.
+another version byte as status `6` whatever its status says, so from version 2
+on two versions can tell each other that they differ. A relay server of
+version 1 sends no answer at all; an endpoint reports that as a relay that did
+not answer. A status that an endpoint does not know is never taken for an
+admission. Something that sends no preamble at all, such as a port scan, gets
+no answer.
 
 The answer exists so that an endpoint can say what went wrong. Without it a
 refusal, a full relay and a rendezvous that nobody joined all looked the same:
 a closed connection. With it, a connection that ends **after** status `0` and
-before a single byte of the peer arrived means that nobody joined the
-rendezvous before the relay let it lapse, and nothing else. The waiting
-endpoint then simply dials again with the same ticket; the joining endpoint
-reports that nobody waits on that code.
+before a single byte of the peer arrived was not refused. No session came
+about on that rendezvous: nobody joined before the relay let it lapse, or the
+relay had no room left to park the leg, or the peer it was matched with had
+already gone.
+
+- The **waiting** endpoint then dials again with the same ticket, for as long
+  as its person waits. It also gives up a leg on which it hears nothing for
+  longer than a relay parks one (45 seconds), and dials again: the relay's
+  close may never arrive after a change of network, and a leg may have been
+  matched with a peer that stays silent.
+- The **joining** endpoint gives the peer ten seconds to be heard, less than
+  pairing is given, and then reports that nobody waits on that code.
 
 The answer is the relay's own addressing metadata: fixed in size, written
 once, with nothing of a session in it. Its reasons are those of admission,
@@ -308,7 +318,9 @@ session.
 
 Two people do not exchange a 16-byte ticket. The technician reads a **relay
 code** aloud, sixteen characters in four groups such as `53ST-A71D-JKKV-0VGH`,
-and both programs derive the ticket from it (ST-M007-012):
+and both ends derive the ticket from it (ST-M007-012). This is how the
+application names a rendezvous once it offers the relay; the development tools
+of section 3 take the ticket itself.
 
 ```text
 relay code  16 Crockford Base32 characters = 80 bits
@@ -325,7 +337,8 @@ The code carries no address: each program takes the relay from its own
 settings. The host name is part of the derivation, so two programs that name
 different relays never meet. The canonical form is the host name in lower case
 without a trailing dot, or an IP address in its standard text form; the port
-is not part of it. The alphabet has no `I`, `L`, `O` or `U`; input in any case
+is not part of it. An address in another spelling, such as one with leading
+zeros, is refused instead of taken for a name. The alphabet has no `I`, `L`, `O` or `U`; input in any case
 is accepted, `I` and `L` read as `1`, `O` as `0`, and hyphens and spaces are
 ignored. The checksum rejects every mistyped character and every swap of two
 neighbours before anything is dialled. It is a typing check and no secret.

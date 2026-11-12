@@ -2007,8 +2007,10 @@ metadata rather than content.
   can at most reach the rendezvous before the customer does: the approval
   codes then differ on the two screens and the session ends before consent
   (REQ-S-006, REQ-S-009). The relay's rate limit bounds guessing, a ticket
-  works once, and the technician's program mints a new code for every
-  session. Because the relay's host name enters the derivation, a code read
+  works once, and a code is minted for one session. Someone who holds the
+  code and joins without speaking can hold up one parked leg; the waiting
+  side gives up a silent leg after 45 seconds and parks a new one. Because
+  the relay's host name enters the derivation, a code read
   aloud names nothing on any other relay. The code is named and drawn
   differently from the approval code, which alone establishes trust.
 - *The relay's answer says only what admission decided.* The reasons it can

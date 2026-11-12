@@ -69,8 +69,9 @@ pub use activity::{
     CustomerActivity,
 };
 pub use dial::{
-    DEFAULT_REDIAL_PAUSE, Dial, DirectDial, RELAY_ANSWER_TIMEOUT, RELAY_CONNECT_TIMEOUT, RelayDial,
-    RelayFailure, RelayLeg, RendezvousLapsed, WaitingDial, WssRelayDial, rendezvous_lapsed,
+    DEFAULT_JOIN_LIMIT, DEFAULT_PARK_LIMIT, DEFAULT_REDIAL_PAUSE, Dial, DirectDial, JoiningDial,
+    RELAY_ANSWER_TIMEOUT, RELAY_CONNECT_TIMEOUT, RelayDial, RelayFailure, RelayLeg,
+    RendezvousLapsed, WaitingDial, WssRelayDial, rendezvous_lapsed,
 };
 // The wss trust material a retrying endpoint builds once and clones per attempt
 // (see `WssRelayDial::connector`). Re-exported so a caller can name the connector

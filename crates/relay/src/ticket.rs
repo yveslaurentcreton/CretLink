@@ -196,11 +196,16 @@ impl fmt::Debug for RendezvousTicket {
 /// whatever the spelling in their relay profile (ST-M007-012).
 ///
 /// - An IP address, with or without the square brackets of an IPv6 literal,
-///   becomes its standard text form.
+///   becomes its standard text form. An IPv4 address written as an IPv6
+///   address (`::ffff:192.0.2.1`) is that IPv4 address.
 /// - A host name loses surrounding whitespace and one trailing dot and is
 ///   lowercased. It may hold ASCII letters, digits, hyphens, underscores and
 ///   dots, in labels that are not empty, up to [`MAX_RELAY_HOST_LEN`] bytes.
 ///   An internationalised name is written in its ASCII (`xn--`) form.
+/// - A name whose last label is a number is refused: no domain ends in one,
+///   so it is an IPv4 address in a spelling that is not the standard one
+///   (`192.168.001.001`, `10.1`, `0x0a.0.0.1`). Two copies could spell the
+///   same relay in two such ways, derive two tickets and never meet.
 ///
 /// The port is not part of it: a relay is named by its host.
 ///
@@ -214,7 +219,7 @@ pub fn canonical_relay_host(host: &str) -> Result<String, TicketError> {
         .and_then(|rest| rest.strip_suffix(']'))
         .unwrap_or(trimmed);
     if let Ok(address) = literal.parse::<IpAddr>() {
-        return Ok(address.to_string());
+        return Ok(address.to_canonical().to_string());
     }
 
     let name = trimmed.strip_suffix('.').unwrap_or(trimmed);
@@ -225,11 +230,23 @@ pub fn canonical_relay_host(host: &str) -> Result<String, TicketError> {
                 && label
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-        });
+        })
+        && !name.rsplit('.').next().is_some_and(is_number);
     if well_formed {
         Ok(name.to_ascii_lowercase())
     } else {
         Err(TicketError::BadHost)
+    }
+}
+
+/// Whether a label reads as a number: decimal digits only, or hexadecimal
+/// digits after `0x`. The last label of an address in a spelling other than
+/// the standard one is such a number; the last label of a domain never is.
+fn is_number(label: &str) -> bool {
+    let lower = label.to_ascii_lowercase();
+    match lower.strip_prefix("0x") {
+        Some(hex) => hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        None => lower.bytes().all(|byte| byte.is_ascii_digit()),
     }
 }
 
@@ -363,6 +380,41 @@ mod tests {
                 v6,
                 "{spelling:?}"
             );
+        }
+        // An IPv4 address written as an IPv6 address is that IPv4 address.
+        let v4 = RendezvousTicket::derive(&SEED, "192.0.2.1").unwrap();
+        for spelling in ["::ffff:192.0.2.1", "[::ffff:c000:201]"] {
+            assert_eq!(
+                RendezvousTicket::derive(&SEED, spelling).unwrap(),
+                v4,
+                "{spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_address_in_another_spelling_is_refused_instead_of_taken_as_a_name() {
+        // Each of these could be meant as the address of the relay, and none
+        // is the standard spelling. Taken as host names they would give
+        // tickets that no copy with the standard spelling derives.
+        for host in [
+            "192.168.001.001",
+            "10.1",
+            "0x0a.0.0.1",
+            "0X0A.0.0.1",
+            "2130706433",
+            "999.999.999.999",
+            "192.0.2.1.",
+            "relay.example.123",
+        ] {
+            assert!(
+                matches!(canonical_relay_host(host), Err(TicketError::BadHost)),
+                "{host:?}"
+            );
+        }
+        // A number elsewhere in a name is fine.
+        for host in ["relay1.example.net", "123.example.net", "0x1.example.net"] {
+            assert!(canonical_relay_host(host).is_ok(), "{host:?}");
         }
     }
 
