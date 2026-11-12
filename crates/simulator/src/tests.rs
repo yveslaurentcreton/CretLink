@@ -964,10 +964,6 @@ async fn simulator_refuses_to_overwrite_a_committed_artifact() {
     }
 }
 
-// --- Interactive terminal grammar (ADR-0013, ST-M003-009) ---
-
-/// A `Request` carrying a terminal `op`, stamped with the technician-terminal
-/// origin the console uses for these operations.
 // --- simulated drives and folder removal (ST-M010-001, ADR-0012) -----------
 
 /// Sends `op` on `framed` and returns the code of the error it is answered
@@ -1142,6 +1138,10 @@ async fn simulator_stops_a_removal_and_refuses_a_file() {
     assert_eq!(code, ErrorCode::WrongPathKind);
 }
 
+// --- Interactive terminal grammar (ADR-0013, ST-M003-009) ---
+
+/// A `Request` carrying a terminal `op`, stamped with the technician-terminal
+/// origin the console uses for these operations.
 fn term_request(id: u64, session: SessionId, op: Operation) -> Message {
     Message::Request {
         id: RequestId(id),
