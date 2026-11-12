@@ -6,6 +6,7 @@ description: What you do and what your customer does during a CretLink session o
 import { Aside } from '@astrojs/starlight/components';
 import Shot from '../../components/Shot.astro';
 import wait from '../../assets/screens/technician-wait.png';
+import networks from '../../assets/screens/technician-wait-networks.png';
 
 <p class="lede">You are with your customer, or on the phone with them, and both computers are on the same network. This is the whole visit.</p>
 
@@ -41,8 +42,19 @@ Your waiting screen shows a connection code. Read it to your customer; they type
 <Shot
   src={wait}
   kind="wide"
-  alt="The technician's waiting screen with the connection code and the address of this computer."
+  alt="The technician's waiting screen with the connection code and, under it, the network and the address this computer waits on."
   caption="The connection code only says where your computer is. It gives nobody access."
+/>
+
+### When your computer is on more than one network
+
+A VPN or a virtual machine gives your computer networks that your customer cannot reach. Under the code, the waiting screen names the network it waits on. When that is not the network your customer is on, choose **Wait on another network** and pick theirs. The connection code changes with it.
+
+<Shot
+  src={networks}
+  kind="wide"
+  alt="The waiting screen with the other networks of this computer listed under the code, each with a Wait here button."
+  caption="Your choice holds until you close CretLink."
 />
 
 ## Put your AI agent to work
