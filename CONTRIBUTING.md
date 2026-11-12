@@ -35,8 +35,8 @@ crates/
   wss/              TLS/WebSocket transport envelope for the relay
 docs/               Threat model, release policy, artifact verification, relay
                     operation, MCP clients, manual tests, release sign-off
-scripts/            Release artifact generation, Windows signing helpers and
-                    the private-data check
+scripts/            Release artifact generation, Windows signing helpers, the
+                    third-party notices and the private-data check
 website/            The documentation site (Astro with Starlight), published
                     through GitHub Pages
 ```
@@ -75,6 +75,25 @@ comes to the application (M007).
 All routine tests run without administrator rights against the simulated
 target (`crates/simulator`). Privileged Windows tests are opt-in and never run
 automatically for untrusted contributions.
+
+### The relay server image
+
+The relay server is also released as a container image, built from
+`apps/relay-server/Dockerfile` with the root of the repository as its context
+(`.dockerignore` says what is sent to the builder). Its tests need Docker and
+a built image, so an ordinary test run skips them; CI builds the image on
+amd64 and arm64 and runs them:
+
+```sh
+docker build --file apps/relay-server/Dockerfile --tag cretlink-relay-server:test .
+CRETLINK_RELAY_IMAGE=cretlink-relay-server:test \
+  cargo test -p cretlink-relay-server --test relay_image -- --ignored
+```
+
+The image holds the notices of the packages the program is built from, written
+by `scripts/third-party-notices.mjs` from the locked dependencies. When the
+toolchain of the project moves, move the builder image in the Dockerfile with
+it: the tag and its digest.
 
 ### The application (Tauri)
 

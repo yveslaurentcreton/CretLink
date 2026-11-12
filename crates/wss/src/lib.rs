@@ -19,6 +19,8 @@
 //!   [`AsyncWrite`] view of the connection, so the
 //!   existing preamble reader, `cretlink_relay::Rendezvous`, and the session
 //!   runtime operate over it exactly as over a bare `TcpStream`.
+//! - [`accept_plain`] is the same without TLS, for a relay behind a reverse
+//!   proxy that ends TLS (ST-M007-015).
 //!
 //! # Cryptographic backend
 //!
@@ -251,6 +253,48 @@ where
 {
     let tls = acceptor.accept(tcp).await.map_err(WssError::Io)?;
     let ws = tokio_tungstenite::accept_async(tls)
+        .await
+        .map_err(|e| WssError::Handshake(Box::new(e)))?;
+    Ok(WsByteStream::new(ws))
+}
+
+/// Completes the server side of a WebSocket **without TLS** over an accepted
+/// transport `tcp`, yielding a byte stream (ST-M007-015).
+///
+/// This is for a relay behind a reverse proxy that ends TLS: the endpoints
+/// still speak `wss` to the proxy, and the proxy passes the WebSocket on to the
+/// relay over a connection that the relay does not encrypt. That hop must be
+/// one the operator trusts (the same host or a private network): the
+/// rendezvous preamble with the admission key crosses it in the clear. The
+/// session inside stays end-to-end encrypted either way.
+///
+/// # Errors
+///
+/// Returns [`WssError::Handshake`] if the WebSocket upgrade fails.
+pub async fn accept_plain<S>(tcp: S) -> Result<WsByteStream<S>, WssError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let ws = tokio_tungstenite::accept_async(tcp)
+        .await
+        .map_err(|e| WssError::Handshake(Box::new(e)))?;
+    Ok(WsByteStream::new(ws))
+}
+
+/// Completes the client side of a WebSocket **without TLS** over a connected
+/// transport `tcp`: what a reverse proxy does towards a relay behind it
+/// ([`accept_plain`]). The endpoints of a session never use this; they speak
+/// `wss` ([`connect`]).
+///
+/// # Errors
+///
+/// Returns [`WssError::Handshake`] if the WebSocket upgrade fails.
+pub async fn connect_plain<S>(host: &str, tcp: S) -> Result<WsByteStream<S>, WssError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = format!("ws://{host}/");
+    let (ws, _response) = tokio_tungstenite::client_async(request, tcp)
         .await
         .map_err(|e| WssError::Handshake(Box::new(e)))?;
     Ok(WsByteStream::new(ws))

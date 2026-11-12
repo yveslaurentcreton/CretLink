@@ -84,6 +84,16 @@ into the GitHub release by `@semantic-release/github`:
 - `cretlink-relay-server-<target>[.exe]` — operator-hosted public
   infrastructure on neither endpoint (see [`docs/relay-server.md`](relay-server.md)),
   attached on its own and not in the archives;
+- the relay server as a container image (ST-M007-015, REQ-N-023), not as a
+  release file but in the registry:
+  `ghcr.io/yveslaurentcreton/cretlink-relay-server:<version>` and `:latest`,
+  for `linux/amd64` and `linux/arm64`. The `image` jobs build it from
+  `apps/relay-server/Dockerfile` on a runner of each architecture and run it
+  (`apps/relay-server/tests/relay_image.rs`) before the release is made; the
+  release waits for them. `publish-image` then pushes exactly those images,
+  with a provenance attestation that names the commit and a bill of materials
+  per architecture. It is the only job that may write packages, and no pull
+  request reaches it;
 - `CHECKSUMS-<target>.txt` — SHA-256 over every binary for that target;
 - `dependency-inventory-<target>.txt` — the resolved normal-dependency graph and
   pinned versions of the shipped packages (`cretlink`, `cretlink-cli`,

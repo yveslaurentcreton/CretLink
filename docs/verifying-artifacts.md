@@ -124,3 +124,26 @@ files list the exact pinned dependencies the release was built from, so you can
 compare against the locked workspace at the release tag. They describe
 provenance; they are not a substitute for the checksum and signature checks
 above.
+
+## 4. Verify the relay server image
+
+The container image of the relay server is not a release file: it lives in
+the registry, as `ghcr.io/yveslaurentcreton/cretlink-relay-server:<version>`.
+Every published version carries a signed provenance attestation that names
+the repository, the workflow and the commit it was built from. Verify it with
+the GitHub CLI before you run a version:
+
+```sh
+gh attestation verify oci://ghcr.io/yveslaurentcreton/cretlink-relay-server:<version> \
+  --repo yveslaurentcreton/CretLink
+```
+
+The command fails when the image was not built by this repository's release
+workflow. Its output names the commit; compare it with the tag `v<version>`.
+To see the bill of materials of an architecture, add
+`--predicate-type https://cyclonedx.org/bom`.
+
+Run the image by its digest when you want to be sure that what you verified
+is what runs: `docker pull` prints the digest, and
+`ghcr.io/yveslaurentcreton/cretlink-relay-server@sha256:<digest>` names
+exactly that image.

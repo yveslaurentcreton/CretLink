@@ -293,6 +293,7 @@ fn relay_server(args: &[&str]) -> Command {
         "CRETLINK_RELAY_KEYS",
         "CRETLINK_RELAY_TLS_CERT",
         "CRETLINK_RELAY_TLS_KEY",
+        "CRETLINK_RELAY_BEHIND_PROXY",
     ] {
         command.env_remove(name);
     }
@@ -416,6 +417,68 @@ fn a_key_file_that_breaks_a_rule_is_refused_at_startup_with_its_line() {
         assert!(
             !printed.contains("listening"),
             "the listener never opened: {printed:?}"
+        );
+    }
+}
+
+#[test]
+fn behind_a_proxy_excludes_a_certificate_and_a_mistyped_switch() {
+    // The proxy holds the certificate: asking the relay for both is refused,
+    // on the command line and through the environment.
+    let attempts = [
+        relay_server(&[
+            "--behind-proxy",
+            "--tls-cert",
+            "relay.crt",
+            "--tls-key",
+            "relay.key",
+        ])
+        .output()
+        .expect("run"),
+        relay_server(&["--tls-cert", "relay.crt", "--tls-key", "relay.key"])
+            .env("CRETLINK_RELAY_BEHIND_PROXY", "1")
+            .output()
+            .expect("run"),
+        relay_server(&["--behind-proxy"])
+            .env("CRETLINK_RELAY_TLS_CERT", "relay.crt")
+            .output()
+            .expect("run"),
+    ];
+    for output in attempts {
+        assert!(!output.status.success(), "the relay does not start");
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            said.contains("cannot be combined with --tls-cert"),
+            "{said}"
+        );
+    }
+
+    // A switch that is neither on nor off is refused, not read as off: a relay
+    // meant to run behind a proxy must not start as something else.
+    let output = relay_server(&["--bind", "127.0.0.1:0"])
+        .env("CRETLINK_RELAY_BEHIND_PROXY", "maybe")
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("CRETLINK_RELAY_BEHIND_PROXY"), "{said}");
+}
+
+#[test]
+fn the_program_reports_its_version() {
+    for flag in ["--version", "-V"] {
+        let output = relay_server(&[flag]).output().expect("run");
+        assert!(output.status.success());
+        let said = String::from_utf8(output.stdout).expect("text");
+        let version = said
+            .strip_prefix("cretlink-relay-server ")
+            .unwrap_or_else(|| panic!("unexpected output {said:?}"))
+            .trim_end();
+        // A release stamps its version at build time; any other build is a
+        // development build. Either way it is one word that starts with a digit.
+        assert!(
+            version.starts_with(|first: char| first.is_ascii_digit()) && !version.contains(' '),
+            "{said:?}"
         );
     }
 }

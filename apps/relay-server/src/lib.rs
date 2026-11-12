@@ -30,6 +30,9 @@
 //! outcome: any fault — a bad preamble, a denied admission, a lone arrival, a
 //! quota, an I/O error — fails closed and is recorded honestly (REQ-N-008).
 //!
+//! [`serve_ws`] is `serve_wss` without the TLS: for a relay behind a reverse
+//! proxy that ends TLS (ST-M007-015).
+//!
 //! [`serve`] and [`serve_wss`] are the two transports over the **same** core:
 //! [`serve`] forwards raw TCP — the ADR-0016 §5 documented interim, safe because
 //! the relay is opaque end to end — and [`serve_wss`] wraps each hop in
@@ -54,7 +57,7 @@ use cretlink_relay::{
     AdmissionControl, Matched, PREAMBLE_VERSION, PreambleError, RelayAnswer, RelayRefusal,
     Rendezvous, SessionGuard, SpliceOutcome, SpliceReport, StopHandle, splice, write_answer,
 };
-use cretlink_wss::{WssAcceptor, WssServerStream};
+use cretlink_wss::{WsByteStream, WssAcceptor, WssServerStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -164,6 +167,43 @@ pub async fn serve_wss(
                 .map_err(|err| io::Error::other(err.to_string()))
         }
     })
+    .await;
+}
+
+/// Serves relay connections over **WebSocket without TLS**, for a relay behind
+/// a reverse proxy that ends TLS in front of it (ST-M007-015). The endpoints
+/// speak `wss` to the proxy as always; the proxy passes each WebSocket on to
+/// this listener, and the **identical** preamble → admit → rendezvous → splice
+/// pipeline runs over it.
+///
+/// The relay does not encrypt this hop. It must be one the operator trusts —
+/// the same host or a private network — because the rendezvous preamble with
+/// the admission key crosses it in the clear. What the endpoints say to each
+/// other stays end-to-end encrypted and opaque to the proxy and the relay
+/// alike (REQ-F-022, REQ-S-005).
+///
+/// Every connection comes from the proxy, so an open relay accounts all of
+/// them under the proxy's address; with a key file each customer is accounted
+/// under its label.
+pub async fn serve_ws(
+    listener: TcpListener,
+    control: AdmissionControl,
+    rendezvous: Arc<Rendezvous<Leg<WsByteStream<TcpStream>>>>,
+    config: ServeConfig,
+    stop: StopHandle,
+) {
+    serve_loop(
+        listener,
+        control,
+        rendezvous,
+        config,
+        stop,
+        |tcp| async move {
+            cretlink_wss::accept_plain(tcp)
+                .await
+                .map_err(|err| io::Error::other(err.to_string()))
+        },
+    )
     .await;
 }
 

@@ -255,13 +255,49 @@ jobs:
       - run: node --test "scripts/*.test.mjs"
       - run: npm run check
 
+  # The relay server as a container image (ST-M007-015, REQ-N-023), on both
+  # architectures it is published for, each on a runner of that architecture.
+  # The image is built from apps/relay-server/Dockerfile exactly as a release
+  # builds it and then run: one program on an empty base, a user without
+  # rights, a read-only root file system, and a rendezvous over wss with a
+  # mounted certificate and key file (apps/relay-server/tests/relay_image.rs).
+  # Nothing is pushed anywhere: only the release workflow publishes.
+  image:
+    name: Relay server image (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.code != 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the image
+        run: docker build --file apps/relay-server/Dockerfile --tag cretlink-relay-server:test .
+      - name: Run the image
+        env:
+          CRETLINK_RELAY_IMAGE: cretlink-relay-server:test
+        run: cargo test --locked -p cretlink-relay-server --test relay_image -- --ignored
+
   # The one check the ruleset on main requires from this workflow. It runs
   # whatever happened before it: a failed or cancelled job fails it, a skipped
   # job does not.
   result:
     name: CI result
     if: always()
-    needs: [changes, lint, test, app, msrv, deny, website]
+    needs: [changes, lint, test, app, msrv, deny, website, image]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

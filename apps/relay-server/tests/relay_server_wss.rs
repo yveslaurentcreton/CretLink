@@ -45,17 +45,17 @@ use std::time::Duration;
 use cretlink_protocol::{Origin, PROTOCOL_V1, TargetIdentity};
 use cretlink_relay::{
     AdmissionControl, AdmissionPolicy, AdmissionToken, ClientId, ControlConfig, MetricsSnapshot,
-    Preamble, RENDEZVOUS_TICKET_LEN, RelayRefusal, Rendezvous, RendezvousTicket, StopSignal,
-    write_preamble,
+    Preamble, RENDEZVOUS_TICKET_LEN, RelayAnswer, RelayRefusal, Rendezvous, RendezvousTicket,
+    StopSignal, read_answer, write_preamble,
 };
-use cretlink_relay_server::{Leg, ServeConfig, serve_wss};
+use cretlink_relay_server::{Leg, ServeConfig, serve_ws, serve_wss};
 use cretlink_session::{
     ConsoleHints, Dial, ExecRequest, HostHandle, JobId, JobOutcome, JoinHandle, NoAudit,
     NoRebootResume, RelayFailure, RevokeReason, SessionError, SessionEvent, SessionHost,
     SessionJoiner, Shell, WaitingDial, WssRelayDial,
 };
 use cretlink_wss::testcert::self_signed;
-use cretlink_wss::{CertificateDer, PrivateKeyDer, WssConnector, WssServerStream};
+use cretlink_wss::{CertificateDer, PrivateKeyDer, WsByteStream, WssConnector, WssServerStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -665,4 +665,103 @@ async fn the_waiting_side_outlives_lapsed_rendezvous_over_wss() {
         .expect("the peer's bytes arrive")
         .expect("read");
     assert_eq!(heard, frame, "nothing of the peer's stream is lost");
+}
+
+/// ST-M007-015 — a relay behind a reverse proxy that ends TLS serves WebSocket
+/// without TLS. The proxy's side of that hop is a plain WebSocket client; the
+/// preamble, the relay's answer and the forwarding are the same as over wss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_behind_a_proxy_forwards_over_websocket_without_tls() {
+    let policy = AdmissionPolicy::SharedToken {
+        token: AdmissionToken::from_text("relay-secret"),
+        client: ClientId::new("shared"),
+    };
+    let control = AdmissionControl::new(policy, ControlConfig::public_default());
+    let rendezvous: Arc<Rendezvous<Leg<WsByteStream<TcpStream>>>> = Arc::new(Rendezvous::new());
+    let listener = TcpListener::bind(loopback()).await.expect("bind relay");
+    let relay_addr = listener.local_addr().expect("relay addr");
+    let (_signal, stop) = StopSignal::new();
+    tokio::spawn(serve_ws(
+        listener,
+        control.clone(),
+        rendezvous,
+        ServeConfig::default(),
+        stop,
+    ));
+
+    // What the proxy does for one endpoint: a WebSocket to the relay, through
+    // which the endpoint's bytes pass unchanged.
+    async fn leg(
+        relay_addr: SocketAddr,
+        token: &str,
+        ticket: u8,
+    ) -> (WsByteStream<TcpStream>, RelayAnswer) {
+        let tcp = TcpStream::connect(relay_addr).await.expect("dial relay");
+        let mut stream = cretlink_wss::connect_plain("relay.test", tcp)
+            .await
+            .expect("the relay speaks WebSocket without TLS");
+        let preamble = Preamble::new(
+            Some(AdmissionToken::from_text(token)),
+            RendezvousTicket::from_bytes([ticket; RENDEZVOUS_TICKET_LEN]),
+        );
+        write_preamble(&mut stream, &preamble)
+            .await
+            .expect("write preamble");
+        let answer = timeout(STEP_TIMEOUT, read_answer(&mut stream))
+            .await
+            .expect("the relay answers promptly")
+            .expect("a well-formed answer");
+        (stream, answer)
+    }
+
+    let (_refused, answer) = leg(relay_addr, "not-the-secret", 0x61).await;
+    assert_eq!(
+        answer,
+        RelayAnswer::Refused(RelayRefusal::CredentialRejected)
+    );
+
+    let (mut first, answer) = leg(relay_addr, "relay-secret", 0x62).await;
+    assert_eq!(answer, RelayAnswer::Admitted);
+    let (mut second, answer) = leg(relay_addr, "relay-secret", 0x62).await;
+    assert_eq!(answer, RelayAnswer::Admitted);
+
+    // One frame in each direction: a length prefix and an opaque body.
+    async fn forward(
+        from: &mut WsByteStream<TcpStream>,
+        to: &mut WsByteStream<TcpStream>,
+        body: &[u8],
+    ) {
+        let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(body);
+        from.write_all(&frame).await.expect("write");
+        from.flush().await.expect("flush");
+        let mut received = vec![0u8; frame.len()];
+        timeout(STEP_TIMEOUT, to.read_exact(&mut received))
+            .await
+            .expect("the frame is forwarded promptly")
+            .expect("read");
+        assert_eq!(received, frame);
+    }
+    forward(&mut first, &mut second, b"through the proxy").await;
+    forward(&mut second, &mut first, b"and back").await;
+
+    // Something that speaks no WebSocket gets nothing.
+    let mut plain = TcpStream::connect(relay_addr).await.expect("dial relay");
+    write_preamble(
+        &mut plain,
+        &Preamble::new(
+            None,
+            RendezvousTicket::from_bytes([0x63; RENDEZVOUS_TICKET_LEN]),
+        ),
+    )
+    .await
+    .expect("write");
+    let mut rest = [0u8; 8];
+    let read = timeout(STEP_TIMEOUT, plain.read(&mut rest))
+        .await
+        .expect("the relay closes a connection that is no WebSocket");
+    // Whatever the WebSocket layer answers to a request that is none, it is
+    // not the relay's admission: no preamble was read from this connection.
+    assert!(!matches!(read, Ok(6)) || rest[..4] != *b"CRLR");
+    assert_eq!(control.metrics().sessions_admitted, 2);
 }
