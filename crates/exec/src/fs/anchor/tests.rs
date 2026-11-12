@@ -304,7 +304,7 @@ mod windows {
     use cretlink_protocol::ErrorCode;
 
     use super::super::super::io_error_code;
-    use super::super::super::testing::{junction, reported};
+    use super::super::super::testing::{junction, reported, short_name};
     use super::super::{
         Disposition, Folder, Hold, Kind, Refusal, link_count, open_at, plain, rename_in_folder,
     };
@@ -360,22 +360,27 @@ mod windows {
         assert_eq!(plain(opened.path()), reported(&sb.root) + r"\link");
     }
 
-    /// The path may be spelled in another letter case, with `/`, or with a
-    /// separator at its end: it still names the place the folder lies in.
-    /// The verified location is the one the disk has.
+    /// The path may be spelled in another letter case, with `/`, with a
+    /// separator at its end, or by its short names: it still names the place
+    /// the folder lies in. The verified location is the one the disk has.
     #[test]
     fn another_spelling_of_the_real_location_is_accepted() {
         let sb = Sandbox::new();
-        let folder = sb.dir("Mixed Case");
+        let folder = sb.dir("Mixed Case Folder");
         let real = reported(&folder);
         let text = folder.display().to_string();
 
-        for spelled in [
+        let mut spellings = vec![
             text.to_uppercase(),
             text.to_lowercase(),
             text.replace('\\', "/"),
             format!("{text}\\"),
-        ] {
+        ];
+        match short_name(&folder) {
+            Some(short) => spellings.push(short),
+            None => eprintln!("skipped the short names: this volume keeps none"),
+        }
+        for spelled in spellings {
             let opened = Folder::open(Path::new(&spelled), Hold::Shared)
                 .unwrap_or_else(|refusal| panic!("{spelled} is refused: {refusal:?}"));
             assert_eq!(plain(opened.path()), real, "{spelled}");
