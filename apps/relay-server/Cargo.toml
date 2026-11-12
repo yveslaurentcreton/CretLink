@@ -30,6 +30,8 @@ cretlink-relay.workspace = true
 # cretlink-wss enables by default goes unused here; it is deny-clean, so there
 # is nothing server-specific to disable.
 cretlink-wss.workspace = true
+# Typed, secret-free errors of the key file (ST-M007-014).
+thiserror.workspace = true
 # `net` (the real TCP listener and its per-connection streams) is added to the
 # workspace tokio feature set; rt-multi-thread/io-util/time/sync/macros/signal
 # come from the workspace definition. Feature unification keeps a single build.

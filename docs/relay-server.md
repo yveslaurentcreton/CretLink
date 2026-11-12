@@ -64,8 +64,10 @@ official release agree byte-for-byte on metadata.
 ## 2. Run the relay
 
 ```text
-Usage: cretlink-relay-server [--bind <addr>] [--token <secret>] [--client-label <label>]
+Usage: cretlink-relay-server [--bind <addr>] [--keys <file> | --token <secret>]
+                            [--client-label <label>]
                             [--tls-cert <path> --tls-key <path>]
+       cretlink-relay-server keygen
 ```
 
 | Option | Env | Default | Meaning |
@@ -73,6 +75,7 @@ Usage: cretlink-relay-server [--bind <addr>] [--token <secret>] [--client-label 
 | `--bind <addr>` | `CRETLINK_RELAY_BIND` | `0.0.0.0:9970` | Listen address. A relay is meant to be publicly reachable, so it binds all interfaces by default; narrow it to one interface with this flag. |
 | `--token <secret>` | `CRETLINK_RELAY_TOKEN` | *(unset → open relay)* | When set, admission requires this shared secret. **Prefer the environment variable** so the secret never appears in a process listing. An empty value is refused, not treated as open. |
 | `--client-label <label>` | — | `shared` | Non-secret accountability label that all holders of the shared token are logged under. Ignored for an open relay. |
+| `--keys <file>` | `CRETLINK_RELAY_KEYS` | *(unset)* | One admission key per customer copy and technician, see "One key per customer" below. Not together with `--token`: giving both is refused at startup. |
 | `--tls-cert <path>` | `CRETLINK_RELAY_TLS_CERT` | *(unset)* | PEM certificate chain the relay presents. Supply **with** `--tls-key` to serve `wss://` (the shipped default transport). |
 | `--tls-key <path>` | `CRETLINK_RELAY_TLS_KEY` | *(unset)* | PEM private key for that certificate. Supply **both** cert and key for `wss`; supply **neither** for the raw-TCP interim. Only one of the pair, or a missing/unreadable/malformed file, is refused **at startup** — the relay never opens a listener it cannot protect. |
 
@@ -83,6 +86,47 @@ forward fail-closed, and prints a **metadata-only** metrics snapshot (session
 counts, forwarded byte/frame totals, and denial counters — never a credential,
 ticket, or byte of session content; REQ-S-017).
 
+### One key per customer
+
+With one shared secret, withdrawing it from one customer means changing it for
+everybody. A key file gives every customer copy and every technician a key of
+its own (ST-M007-014):
+
+```text
+# relay.keys: one label:key per line
+sam-laptop:5f2c9d0e…
+acme:9a41c7b3…
+frontdesk:0c6e12fa…
+```
+
+```sh
+cretlink-relay-server keygen          # prints a new random key (256 bits)
+cretlink-relay-server --keys relay.keys --tls-cert relay.crt --tls-key relay.key
+```
+
+- A **label** says who a key belongs to: letters, digits, `.`, `_` and `-`,
+  at most 64 characters. The relay's log, its events and its metrics name the
+  label. They never hold a key.
+- A **key** is 16 to 512 characters of plain text without a blank. Use
+  `keygen`; do not make keys up.
+- Blank lines and lines that start with `#` are ignored. Every label and
+  every key is listed once.
+- **To withdraw a key, delete its line.** The relay looks at the file every
+  five seconds and applies a change by itself: no restart. A new connection
+  with the withdrawn key is refused; a session that already runs continues
+  until it ends, because a key is checked once, when a connection arrives.
+- A file that breaks a rule is refused as a whole, with the number of the
+  line. At startup the relay then does not start. After a change it keeps the
+  keys it had and says so in its log, so a typing error never opens the relay
+  and never locks everybody out.
+- Keep the file readable only by the relay's account. It holds every key.
+
+A key lets a program use the relay and decides nothing else. It gives no
+control over a session and cannot stand in for the approval code and the
+customer's consent, which alone establish a session (ADR-0016 §4). The relay
+holds keys only so that strangers cannot use it as an anonymous forwarding
+service.
+
 The admission token is **abuse control only, never session authority**
 (ADR-0016 §5). Even an open relay bounds abuse with the public defaults:
 
@@ -92,6 +136,8 @@ The admission token is **abuse control only, never session authority**
 - **Preamble read timeout:** 10 s — a peer that stalls mid-preamble is dropped.
 - **Rendezvous match timeout:** 30 s — a parked leg whose peer never arrives is
   dropped, never a fabricated pairing.
+- **Waiting legs:** at most 1024 at a time. A connection that would find
+  neither its peer nor a place to wait is refused as "no free place".
 
 ### Run as an unprivileged service (Linux, systemd)
 
@@ -116,7 +162,10 @@ Environment=CRETLINK_RELAY_BIND=0.0.0.0:9970
 # this account.
 # Environment=CRETLINK_RELAY_TLS_CERT=/etc/cretlink/relay.crt
 # Environment=CRETLINK_RELAY_TLS_KEY=/etc/cretlink/relay.key
-# Optional shared-secret admission — keep the secret out of the unit file in
+# One admission key per customer (recommended): a file with one label:key per
+# line, readable only by this account. The relay rereads it when it changes.
+# Environment=CRETLINK_RELAY_KEYS=/etc/cretlink/relay.keys
+# Or one shared secret for everybody — keep the secret out of the unit file in
 # production; load it from a systemd credential or an EnvironmentFile 0600 file.
 # Environment=CRETLINK_RELAY_TOKEN=...
 ExecStart=/usr/local/bin/cretlink-relay-server
@@ -222,6 +271,11 @@ state exists.
   who may open sessions and bounds abuse; the rate limit and quota above bound a
   single client's share. Nothing about the relay port grants any authority over
   either endpoint.
+- **Keys.** With a key file every customer copy and technician has a key of
+  its own, and the quota and the rate limit count per label. A key that leaks
+  lets a stranger use the forwarder under that label until its line is
+  deleted; it shows no session and controls none. The key file is the one
+  secret the relay keeps: protect it like the certificate's private key.
 - **Transport TLS (built-in).** Serving `wss` over TLS is built into the relay
   (ST-M007-009): supply `--tls-cert`/`--tls-key` and point both endpoints at it
   with `--relay-tls <server-name>`. The TLS stack is `rustls` with the
@@ -360,5 +414,5 @@ any such tampering, permanently poisoning the channel (REQ-S-008, REQ-S-009).
 posture), REQ-N-016 through REQ-N-019 (provenance, honest failure, versioned
 artifacts). Stories: ST-M007-005 (deployment), ST-M007-007 (server binary),
 ST-M007-009 (built-in wss/TLS transport), ST-M007-012 (the relay's answer and
-the relay code). Architecture: ADR-0016 §2 (rendezvous is addressing), §3
+the relay code), ST-M007-014 (one key per customer). Architecture: ADR-0016 §2 (rendezvous is addressing), §3
 (shipped wss transport), §5 (opaque rendezvous forwarder).*
