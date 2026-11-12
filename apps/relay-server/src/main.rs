@@ -28,6 +28,12 @@
 //!   of the line. A change of the file takes effect within seconds, without a
 //!   restart and without touching the sessions in progress.
 //! - `keygen` — prints a new random key for such a file and exits.
+//! - `--version` — prints the release version and exits.
+//! - `--behind-proxy` or `CRETLINK_RELAY_BEHIND_PROXY=1` — serve WebSocket
+//!   **without** TLS, for a reverse proxy that ends TLS in front of the relay
+//!   (ST-M007-015). The endpoints still speak `wss` to the proxy. It excludes
+//!   `--tls-cert`/`--tls-key`. The relay does not encrypt the hop from the
+//!   proxy, so that hop must be the same host or a private network.
 //! - `--tls-cert <path>` / `--tls-key <path>` (or `CRETLINK_RELAY_TLS_CERT` /
 //!   `CRETLINK_RELAY_TLS_KEY`) — the operator's PEM certificate chain and private
 //!   key. When **both** are supplied the relay serves `wss://` (WebSocket over
@@ -52,8 +58,8 @@ use cretlink_relay::{
     Rendezvous, StopSignal, generate_key,
 };
 use cretlink_relay_server::keys::{DEFAULT_KEYS_POLL, load_keys, watch_keys};
-use cretlink_relay_server::{Leg, ServeConfig, serve, serve_wss};
-use cretlink_wss::{WssAcceptor, WssServerStream};
+use cretlink_relay_server::{Leg, ServeConfig, serve, serve_ws, serve_wss};
+use cretlink_wss::{WsByteStream, WssAcceptor, WssServerStream};
 use tokio::net::{TcpListener, TcpStream};
 
 /// The default listen address: every interface, on the CretLink relay port. A
@@ -86,11 +92,13 @@ struct Config {
     tls_key: Option<String>,
     /// Path to the file with one admission key per label (ST-M007-014).
     keys: Option<String>,
+    /// Serve WebSocket without TLS, behind a proxy that ends TLS (ST-M007-015).
+    behind_proxy: bool,
 }
 
 /// What the command line asks for.
 enum Invocation {
-    /// `--help` was handled and printed.
+    /// `--help` or `--version` was handled and printed.
     Help,
     /// Print a new admission key and exit.
     Keygen,
@@ -105,6 +113,8 @@ enum Transport {
     RawTcp,
     /// Serve WebSocket-over-TLS with the operator's certificate.
     Wss(WssAcceptor),
+    /// Serve WebSocket without TLS, behind a reverse proxy that ends TLS.
+    BehindProxy,
 }
 
 /// Resolves the transport from the cert/key paths, **failing closed at startup**:
@@ -114,6 +124,20 @@ enum Transport {
 /// No branch ever falls back to an unprotected listener (REQ-S-019, REQ-S-020,
 /// REQ-N-015).
 fn resolve_transport(config: &Config) -> Result<Transport, String> {
+    // Behind a proxy the proxy holds the certificate. Asking for both is a
+    // mistake that is refused, never resolved in favour of one of them.
+    if config.behind_proxy {
+        return if config.tls_cert.is_some() || config.tls_key.is_some() {
+            Err(
+                "--behind-proxy serves WebSocket without TLS, for a reverse proxy that holds \
+                 the certificate; it cannot be combined with --tls-cert or --tls-key (or \
+                 CRETLINK_RELAY_TLS_CERT and CRETLINK_RELAY_TLS_KEY)"
+                    .to_string(),
+            )
+        } else {
+            Ok(Transport::BehindProxy)
+        };
+    }
     match (&config.tls_cert, &config.tls_key) {
         (Some(cert_path), Some(key_path)) => {
             let cert_pem = std::fs::read(cert_path).map_err(|err| {
@@ -168,6 +192,11 @@ async fn run() -> Result<(), String> {
     let transport = resolve_transport(&config)?;
     let transport_label = match &transport {
         Transport::Wss(_) => "wss:// (WebSocket over TLS; the relay authenticates itself)",
+        Transport::BehindProxy => {
+            "WebSocket without TLS, for a reverse proxy that ends TLS in front of this relay \
+             (the relay does not encrypt the connection from the proxy: keep it on this host \
+             or a private network; sessions stay end-to-end encrypted regardless)"
+        }
         Transport::RawTcp => {
             "raw TCP (ADR-0016 §5 interim — no transport encryption; sessions stay end-to-end \
              encrypted regardless)"
@@ -252,6 +281,17 @@ async fn run() -> Result<(), String> {
                 stop,
             ))
         }
+        Transport::BehindProxy => {
+            let rendezvous: Arc<Rendezvous<Leg<WsByteStream<TcpStream>>>> =
+                Arc::new(Rendezvous::new());
+            tokio::spawn(serve_ws(
+                listener,
+                control.clone(),
+                rendezvous,
+                ServeConfig::default(),
+                stop,
+            ))
+        }
         Transport::RawTcp => {
             let rendezvous: Arc<Rendezvous<Leg<TcpStream>>> = Arc::new(Rendezvous::new());
             tokio::spawn(serve(
@@ -264,11 +304,9 @@ async fn run() -> Result<(), String> {
         }
     };
 
-    // Wait for the operator's stop. A failure to install the Ctrl+C handler is
-    // itself fatal — better to refuse to run than to run un-stoppable.
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|err| format!("could not listen for Ctrl+C: {err}"))?;
+    // Wait for the operator's stop. A failure to install the handler is itself
+    // fatal — better to refuse to run than to run un-stoppable.
+    stop_requested().await?;
 
     println!("\nStopping — refusing new connections and tearing down in-flight forwards.");
     signal.stop();
@@ -281,6 +319,34 @@ async fn run() -> Result<(), String> {
 
     print_metrics(&control.metrics());
     Ok(())
+}
+
+/// Waits for the operator's stop: Ctrl+C, or the termination signal that a
+/// service manager or a container runtime sends (ST-M007-015). In a container
+/// the relay is the first process, for which a signal without a handler does
+/// nothing: without this, stopping the container would end in a kill after a
+/// wait, with every forward cut instead of torn down in order.
+async fn stop_requested() -> Result<(), String> {
+    let interrupted = || async {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|err| format!("could not listen for Ctrl+C: {err}"))
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate())
+            .map_err(|err| format!("could not listen for the termination signal: {err}"))?;
+        tokio::select! {
+            result = interrupted() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        interrupted().await
+    }
 }
 
 /// The refusal of a key file together with a shared secret.
@@ -296,6 +362,10 @@ fn parse_args() -> Result<Invocation, String> {
     let mut tls_cert = std::env::var("CRETLINK_RELAY_TLS_CERT").ok();
     let mut tls_key = std::env::var("CRETLINK_RELAY_TLS_KEY").ok();
     let mut keys = std::env::var("CRETLINK_RELAY_KEYS").ok();
+    let mut behind_proxy = match std::env::var("CRETLINK_RELAY_BEHIND_PROXY") {
+        Ok(value) => parse_switch("CRETLINK_RELAY_BEHIND_PROXY", &value)?,
+        Err(_) => false,
+    };
 
     let mut args = std::env::args().skip(1).peekable();
     // `keygen` is the one subcommand; it takes nothing else.
@@ -312,6 +382,11 @@ fn parse_args() -> Result<Invocation, String> {
                 print_usage();
                 return Ok(Invocation::Help);
             }
+            "--version" | "-V" => {
+                println!("cretlink-relay-server {}", cretlink_shared::RELEASE_VERSION);
+                return Ok(Invocation::Help);
+            }
+            "--behind-proxy" => behind_proxy = true,
             "--keys" => {
                 keys = Some(args.next().ok_or(
                     "--keys requires the path of a file with one label:key per line, e.g. --keys relay.keys",
@@ -381,14 +456,28 @@ fn parse_args() -> Result<Invocation, String> {
         tls_cert,
         tls_key,
         keys,
+        behind_proxy,
     }))
+}
+
+/// Reads an on/off environment variable. An unknown value is refused rather
+/// than read as off: a relay that was meant to run behind a proxy must not
+/// start as something else because of a typing error.
+fn parse_switch(name: &str, value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "{name} is \"{other}\"; use 1 or 0 (or true/false, yes/no, on/off)"
+        )),
+    }
 }
 
 fn print_usage() {
     println!("CretLink internet relay server (ST-M007-007, wss ST-M007-009)\n");
     println!("Usage: cretlink-relay-server [--bind <addr>] [--keys <file> | --token <secret>]");
     println!("                            [--client-label <label>]");
-    println!("                            [--tls-cert <path> --tls-key <path>]");
+    println!("                            [--tls-cert <path> --tls-key <path> | --behind-proxy]");
     println!("       cretlink-relay-server keygen\n");
     println!("Commands:");
     println!("  keygen                 Print a new random admission key and exit.\n");
@@ -429,6 +518,18 @@ fn print_usage() {
         "                         is refused at startup. Rotate a certificate by draining and"
     );
     println!("                         restarting with the new pair.");
+    println!(
+        "  --behind-proxy         Serve WebSocket without TLS, for a reverse proxy that ends TLS"
+    );
+    println!(
+        "                         in front of the relay (env CRETLINK_RELAY_BEHIND_PROXY=1). Not"
+    );
+    println!(
+        "                         together with --tls-cert/--tls-key. The relay does not encrypt"
+    );
+    println!("                         the connection from the proxy: keep it on this host or a");
+    println!("                         private network.");
+    println!("  -V, --version          Print the version and exit.");
     println!("  -h, --help             Show this help.");
 }
 

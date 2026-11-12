@@ -31,7 +31,8 @@ the adversarial suite in `crates/relay/tests/malicious_relay.rs` (ST-M007-006).
 > confidentiality and integrity never depended on the transport — the payload is
 > already end-to-end encrypted — so **plain TCP** remains available (supply no
 > cert/key) as the ADR-0016 §5-sanctioned interim for a hop that is already
-> private (a VPN, an SSH tunnel, or a TLS-terminating reverse proxy in front). The
+> private (a VPN or an SSH tunnel), for the development tools. Behind a reverse
+> proxy that ends TLS, start the relay with `--behind-proxy` (ST-M007-015). The
 > relay never falls back silently: a half-supplied or malformed cert/key is
 > refused at startup (see [§2](#2-run-the-relay) and [§6](#6-security)).
 
@@ -61,6 +62,41 @@ The single portable artifact producer `scripts/gen-artifacts.sh` builds this
 binary into `dist/` with its checksum exactly as CI does, so a local run and the
 official release agree byte-for-byte on metadata.
 
+### Or run the container image
+
+From the release that publishes it (ST-M007-015), the relay server is also a
+container image, for `linux/amd64` and `linux/arm64`:
+
+```text
+ghcr.io/yveslaurentcreton/cretlink-relay-server:<version>
+ghcr.io/yveslaurentcreton/cretlink-relay-server:latest
+```
+
+The image holds one statically linked program, its licence and the notices of
+the packages it is built from (`/LICENSE`, `/THIRD-PARTY-NOTICES.txt`), on an
+empty base. There is no shell, no package manager and no other program in it,
+so there is nothing else to keep up to date and nothing else to attack. It
+runs as a fixed user without rights (`65532:65532`), writes nothing, and is
+smaller than 15 MB.
+
+Every published image carries a provenance attestation that names the commit
+it was built from, and a bill of materials. Check them before you run a new
+version:
+
+```sh
+gh attestation verify oci://ghcr.io/yveslaurentcreton/cretlink-relay-server:<version> \
+  --repo yveslaurentcreton/CretLink
+```
+
+To build the same image yourself from a checked-out, tagged commit:
+
+```sh
+docker build --file apps/relay-server/Dockerfile \
+  --build-arg CRETLINK_VERSION=<version> --tag cretlink-relay-server .
+```
+
+[§2](#run-it-as-a-container) shows how to run it.
+
 ## 2. Run the relay
 
 ```text
@@ -78,6 +114,8 @@ Usage: cretlink-relay-server [--bind <addr>] [--keys <file> | --token <secret>]
 | `--keys <file>` | `CRETLINK_RELAY_KEYS` | *(unset)* | One admission key per customer copy and technician, see "One key per customer" below. Not together with `--token`: giving both is refused at startup. |
 | `--tls-cert <path>` | `CRETLINK_RELAY_TLS_CERT` | *(unset)* | PEM certificate chain the relay presents. Supply **with** `--tls-key` to serve `wss://` (the shipped default transport). |
 | `--tls-key <path>` | `CRETLINK_RELAY_TLS_KEY` | *(unset)* | PEM private key for that certificate. Supply **both** cert and key for `wss`; supply **neither** for the raw-TCP interim. Only one of the pair, or a missing/unreadable/malformed file, is refused **at startup** — the relay never opens a listener it cannot protect. |
+| `--behind-proxy` | `CRETLINK_RELAY_BEHIND_PROXY=1` | *(off)* | Serve WebSocket **without** TLS, for a reverse proxy that holds the certificate and ends TLS in front of the relay. Not together with `--tls-cert`/`--tls-key`. See "Behind a reverse proxy" below. |
+| `--version` | — | — | Print the version and exit. |
 
 A command-line flag overrides the environment. On start the relay prints its
 bound address, **the selected transport** (`wss://` or raw TCP), admission
@@ -138,6 +176,75 @@ The admission token is **abuse control only, never session authority**
   dropped, never a fabricated pairing.
 - **Waiting legs:** at most 1024 at a time. A connection that would find
   neither its peer nor a place to wait is refused as "no free place".
+
+### Run it as a container
+
+The image is configured with the same environment variables, and with files
+that you mount. With a certificate and one key per customer:
+
+```sh
+docker run --detach --name cretlink-relay --restart unless-stopped \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --publish 443:9970 \
+  --volume /etc/cretlink:/config:ro \
+  --env CRETLINK_RELAY_TLS_CERT=/config/relay.crt \
+  --env CRETLINK_RELAY_TLS_KEY=/config/relay.key \
+  --env CRETLINK_RELAY_KEYS=/config/relay.keys \
+  ghcr.io/yveslaurentcreton/cretlink-relay-server:<version>
+```
+
+- The three files must be readable by the user of the container (`65532`),
+  and by nobody who should not read them: for example owned by that user with
+  mode `0400`, in a folder that only that user and root can enter.
+- `--read-only`, `--cap-drop ALL` and `no-new-privileges` cost nothing: the
+  relay writes no file and needs no right. It listens on port 9970 inside the
+  container; publish it on the port your certificate's address uses.
+- `docker stop` ends it in order: it refuses new connections, tears down the
+  forwards in progress and prints its counters. `docker logs` shows the same
+  lines as a terminal would.
+- A new key file is picked up within seconds, without a restart. A new
+  certificate needs a restart.
+- To make a key: `docker run --rm ghcr.io/yveslaurentcreton/cretlink-relay-server:<version> keygen`.
+
+### Behind a reverse proxy
+
+If a reverse proxy (Caddy, nginx, Traefik, a load balancer) already holds your
+certificates, let it end TLS and start the relay with `--behind-proxy`. The
+relay then serves WebSocket without TLS, and the proxy passes each connection
+on to it. The programs of the technician and the customer notice no
+difference: they speak `wss` to the proxy.
+
+```sh
+docker run --detach --name cretlink-relay --restart unless-stopped \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --publish 127.0.0.1:9970:9970 \
+  --volume /etc/cretlink:/config:ro \
+  --env CRETLINK_RELAY_BEHIND_PROXY=1 \
+  --env CRETLINK_RELAY_KEYS=/config/relay.keys \
+  ghcr.io/yveslaurentcreton/cretlink-relay-server:<version>
+```
+
+```text
+# Caddyfile
+relay.example.org {
+    reverse_proxy 127.0.0.1:9970
+}
+```
+
+Three things to know:
+
+- **The hop from the proxy to the relay is not encrypted by the relay.** Keep
+  it on the same host or a private network, as above, where the relay's port
+  is published on `127.0.0.1` only. What crosses that hop in the clear is the
+  rendezvous preamble with the admission key. The session itself stays
+  end-to-end encrypted: the proxy sees what the relay sees, ciphertext and
+  its size and timing.
+- **Use a key file.** Every connection reaches the relay from the proxy's
+  address, so a relay without keys would count all customers as one for its
+  rate limit and its quota. With keys it counts per label.
+- **The proxy must pass WebSocket connections on and keep them open** for as
+  long as a session lasts. Caddy does that by itself; with nginx set the
+  `Upgrade` and `Connection` headers and a long `proxy_read_timeout`.
 
 ### Run as an unprivileged service (Linux, systemd)
 
@@ -225,10 +332,18 @@ with an actionable error and never a fabricated session (REQ-N-015).
 The relay is **stateless**, so upgrades are a drain-and-swap with no migration:
 
 1. Deploy the new verified binary alongside the old one.
-2. Send the running relay `Ctrl+C` (or `systemctl stop`). It stops accepting new
-   connections and tears down in-flight forwards fail-closed — active sessions
-   drop cleanly rather than hang.
+2. Send the running relay `Ctrl+C` (or `systemctl stop`, or `docker stop`). It
+   stops accepting new connections and tears down in-flight forwards
+   fail-closed — active sessions drop cleanly rather than hang.
 3. Swap the binary and start again.
+
+With the container image: verify the attestation of the new version, then
+`docker pull` it and start a new container with the same options.
+
+The relay server and the programs that use it must speak the same version of
+the rendezvous preamble. When they do not, a program says so: "the relay
+speaks another version". Update the relay server together with the release
+that your copies of CretLink come from.
 
 Run two relay instances behind a load balancer if you need zero-downtime
 upgrades; because each session is fully contained in one spliced connection,
@@ -246,7 +361,8 @@ configuration:
   `--client-label` settings;
 - the admission secret, if you use one — store it in your secret manager, not in
   the unit file, and rotate it by restarting the relay with a new value (holders
-  of the old token simply stop being admitted).
+  of the old token simply stop being admitted);
+- the key file, if you use one, and the certificate with its private key.
 
 Back those up the way you back up any service configuration and secret. No
 CretLink-specific backup procedure exists because no CretLink-specific durable
@@ -280,12 +396,21 @@ state exists.
   (ST-M007-009): supply `--tls-cert`/`--tls-key` and point both endpoints at it
   with `--relay-tls <server-name>`. The TLS stack is `rustls` with the
   `aws-lc-rs` crypto provider (ADR-0017) — audited libraries and no home-grown
-  channel. A TLS-terminating reverse proxy (nginx, Caddy, HAProxy) in
-  front of a raw-TCP relay remains a valid alternative when you must reuse
+  channel. A reverse proxy that ends TLS (nginx, Caddy, HAProxy) in front of a
+  relay started with `--behind-proxy` is the alternative when you must reuse
   existing edge termination; the proxy then sees the same
   ciphertext-plus-metadata the relay does and gains no session authority. Either
   way, TLS hides the residual metadata above from a *network* observer but not
   from whoever operates the relay or its proxy.
+- **The hop behind a proxy.** With `--behind-proxy` the relay does not encrypt
+  the connection from the proxy, and the rendezvous preamble with the
+  admission key crosses it in the clear. Keep that hop on one host or on a
+  private network, and never publish the relay's own port to the internet in
+  that mode.
+- **The container image.** It holds the program and its licence texts and
+  nothing else, and runs as a user without rights. Verify the attestation of
+  a version before you run it ([§1](#or-run-the-container-image)); an image
+  with the same name from anywhere else is not this project's.
 
 ## 7. Interoperability
 
@@ -412,7 +537,9 @@ any such tampering, permanently poisoning the channel (REQ-S-008, REQ-S-009).
 
 *Requirements: REQ-F-022 (internet relay), REQ-S-019/REQ-S-020 (relay operator
 posture), REQ-N-016 through REQ-N-019 (provenance, honest failure, versioned
-artifacts). Stories: ST-M007-005 (deployment), ST-M007-007 (server binary),
-ST-M007-009 (built-in wss/TLS transport), ST-M007-012 (the relay's answer and
-the relay code), ST-M007-014 (one key per customer). Architecture: ADR-0016 §2 (rendezvous is addressing), §3
+artifacts), REQ-N-023 (the container image). Stories: ST-M007-005
+(deployment), ST-M007-007 (server binary), ST-M007-009 (built-in wss/TLS
+transport), ST-M007-012 (the relay's answer and the relay code), ST-M007-014
+(one key per customer), ST-M007-015 (the container image and the relay behind
+a proxy). Architecture: ADR-0016 §2 (rendezvous is addressing), §3
 (shipped wss transport), §5 (opaque rendezvous forwarder).*

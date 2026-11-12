@@ -2202,6 +2202,18 @@ metadata rather than content.
   an anonymous abuse service, plus self-hosting documentation with verifiable
   release provenance (REQ-S-019; M007 scope covering REQ-S-017 through
   REQ-S-022).
+- *A relay behind a proxy, and the relay as an image.* A relay started with
+  `--behind-proxy` serves WebSocket without TLS, for a reverse proxy that ends
+  TLS in front of it (ST-M007-015). The proxy then sees what the relay sees,
+  ciphertext with its size and timing, and the rendezvous preamble with the
+  admission key crosses the hop between them in the clear: that hop must be
+  one host or a private network, and the relay says so when it starts. The
+  mode excludes a certificate of the relay's own, and a switch that is neither
+  on nor off is refused instead of read as off, so a relay never ends up
+  without TLS by a typing error. The container image holds the one program
+  and its licence texts on an empty base and runs as a user without rights;
+  it is published only by the release workflow, with a provenance attestation
+  that names the commit, which an operator verifies before running a version.
 - *One admission key per customer.* An operator gives every customer copy and
   technician a key of its own and withdraws one by deleting its line from the
   relay's key file, without a restart and without touching the others
