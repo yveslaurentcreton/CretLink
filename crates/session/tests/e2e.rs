@@ -3983,6 +3983,24 @@ fn entries_in(folder: &Path) -> u64 {
     std::fs::read_dir(folder).map_or(0, |entries| entries.count() as u64)
 }
 
+/// The text under which the agent names the existing entry `path` in the
+/// answer of a removal. On Windows that is where the entry really lies — the
+/// long name of every part, in the letter case the disk has, without the
+/// prefix of a verbatim path — whatever spelling the request used. Elsewhere
+/// it is the path as it was asked.
+fn reported_location(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let real = std::fs::canonicalize(path).expect("the entry exists");
+        let real = real.display().to_string();
+        real.strip_prefix(r"\\?\").unwrap_or(&real).to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
+}
+
 /// The words the agent describes the removal of the staged folder `name` in.
 fn removal_of(name: &str) -> String {
     format!("delete the folder {name} (CretLink staging folder) and everything in it")
@@ -4310,6 +4328,88 @@ async fn a_cancelled_removal_stops_between_steps_and_says_so_on_both_sides() {
     let _ = std::fs::remove_dir_all(&folder);
 }
 
+/// One removal is about one folder. A folder that is swapped for another one
+/// between two steps — moved away, with a new folder under its name — is not
+/// removed in its place: the agent refuses the step that would continue,
+/// nothing is removed from the new folder, and the removal ends as failed on
+/// both sides with what it had removed until then (REQ-N-008).
+#[tokio::test]
+async fn a_folder_swapped_between_two_steps_is_not_removed_in_its_place() {
+    use cretlink_protocol::limits::MAX_TREE_STEP_ENTRIES;
+    use cretlink_session::ActionOutcome;
+
+    let audit = Arc::new(OutcomeAudit::default());
+    let (mut host, mut joiner) = connected_pair_explorer(audit.clone()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let folder = staged_folder(&host, "swapped");
+    let files = MAX_TREE_STEP_ENTRIES + 300;
+    plant_files(&folder, files);
+    let moved = folder.with_file_name("swapped-moved");
+
+    // As soon as the first step has been answered, the folder is moved away
+    // and another one takes over its name.
+    let mut swapped = false;
+    let report = host
+        .remove_tree(staged("swapped"), &CancelToken::new(), |_| {
+            if !swapped {
+                swapped = true;
+                std::fs::rename(&folder, &moved).expect("move the folder away");
+                std::fs::create_dir(&folder).expect("another folder of that name");
+                plant_files(&folder, 3);
+            }
+        })
+        .await
+        .expect("a refused step is a report");
+
+    assert!(swapped, "the folder was swapped after the first step");
+    assert_eq!(report.outcome, JobOutcome::Failed, "never a success");
+    assert_eq!(
+        report.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::InvalidPath),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.removed_files, MAX_TREE_STEP_ENTRIES,
+        "what the first step removed, and nothing after it"
+    );
+    assert_eq!(entries_in(&folder), 3, "the other folder keeps everything");
+    assert_eq!(
+        entries_in(&moved),
+        files - MAX_TREE_STEP_ENTRIES,
+        "and so does the rest of the folder that was moved away"
+    );
+
+    // The customer sees one action: in progress, then failed with the reason.
+    let first_id = match next_handled(&mut joiner).await {
+        SessionEvent::RequestHandled { id, outcome, .. } => {
+            assert_eq!(outcome, ActionOutcome::InProgress);
+            id
+        }
+        other => panic!("expected RequestHandled, got {other:?}"),
+    };
+    match next_handled(&mut joiner).await {
+        SessionEvent::RequestHandled { id, outcome, .. } => {
+            assert_eq!(id, first_id, "the same action, now ended");
+            assert_eq!(
+                outcome,
+                ActionOutcome::Failed {
+                    code: ErrorCode::InvalidPath
+                }
+            );
+        }
+        other => panic!("expected RequestHandled, got {other:?}"),
+    }
+
+    assert_the_session_still_runs_a_command(&mut host).await;
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+    assert_eq!(audit.of("fs_remove_tree_start"), vec![Outcome::Ok]);
+    assert_eq!(audit.of("fs_remove_tree"), vec![Outcome::Failed]);
+    let _ = std::fs::remove_dir_all(&folder);
+    let _ = std::fs::remove_dir_all(&moved);
+}
+
 /// Something that keeps an entry of `folder` from being removed, for as long
 /// as it lives, and the reason the agent gives for it.
 struct Held {
@@ -4395,7 +4495,7 @@ async fn a_removal_that_leaves_something_behind_is_a_failure_with_its_reasons() 
         "the folders that hold the entry stay"
     );
     assert_eq!(report.failed.len(), 1);
-    assert_eq!(report.failed[0].path, kept.display().to_string());
+    assert_eq!(report.failed[0].path, reported_location(&kept));
     assert_eq!(report.failed[0].code, reason);
     assert_eq!(report.failed_more, 0);
     assert!(!report.blocked && report.error.is_none());
@@ -4513,6 +4613,7 @@ async fn a_removal_bound_to_another_session_removes_nothing() {
             Operation::RemoveTree {
                 path: staged("theirs"),
                 stop: false,
+                folder_id: None,
             },
         )
         .await

@@ -8,6 +8,14 @@
 //! [`TreeState::More`], adds the counts up, and turns the last answer into one
 //! honest [`TreeRemovalReport`].
 //!
+//! # One folder
+//!
+//! An answer that says more remains names the folder the agent is removing
+//! (`folder_id`). The engine gives that name back with the next request, so
+//! the agent goes on with the folder it began with and refuses any other that
+//! lies at the path by then: between two steps the agent holds nothing, and a
+//! program on the target could swap the folder for another one.
+//!
 //! # Why steps
 //!
 //! The agent serves one request at a time. A removal that ran to its end
@@ -29,7 +37,9 @@
 //! and removed nothing, a folder that is gone and yet has failures — is a
 //! [`SessionError::Unexpected`], never a result.
 
-use cretlink_protocol::{DriveEntry, ErrorCode, OpResult, Operation, RemotePath};
+use std::future::Future;
+
+use cretlink_protocol::{B64Bytes, DriveEntry, ErrorCode, OpResult, Operation, RemotePath};
 use cretlink_protocol::{TreeFailure, TreeState};
 
 use crate::{Attribution, CancelToken, HostHandle, JobOutcome, Origin, SessionError};
@@ -171,102 +181,133 @@ impl HostHandle {
         path: RemotePath,
         attribution: impl Into<Attribution>,
         cancel: &CancelToken,
-        mut on_progress: impl FnMut(TreeRemovalProgress),
+        on_progress: impl FnMut(TreeRemovalProgress),
     ) -> Result<TreeRemovalReport, SessionError> {
         let by = attribution.into();
-        let mut report = TreeRemovalReport::started();
-        // Whether the agent has answered a step with "more": it then shows the
-        // removal as in progress, and must be told if it ends here.
-        let mut begun = false;
-        loop {
-            if cancel.is_cancelled() {
-                if begun {
-                    self.end_removal(&path, &by).await;
-                }
-                return Ok(report.ended(JobOutcome::Cancelled));
+        run_removal(
+            |step| self.file_op_as(step, by.clone()),
+            path,
+            cancel,
+            on_progress,
+        )
+        .await
+    }
+}
+
+/// Runs one folder removal against `ask`, which sends one request to the
+/// agent and returns its answer.
+///
+/// Every step names the folder by the identity the step before it answered
+/// with, so the removal stays with the folder it began with.
+async fn run_removal<Ask, Answer>(
+    mut ask: Ask,
+    path: RemotePath,
+    cancel: &CancelToken,
+    mut on_progress: impl FnMut(TreeRemovalProgress),
+) -> Result<TreeRemovalReport, SessionError>
+where
+    Ask: FnMut(Operation) -> Answer,
+    Answer: Future<Output = Result<OpResult, SessionError>>,
+{
+    let mut report = TreeRemovalReport::started();
+    // The folder the agent said it is removing, once a step has answered with
+    // "more": the agent then shows the removal as in progress, and must be
+    // told if it ends here.
+    let mut folder: Option<B64Bytes> = None;
+    loop {
+        if cancel.is_cancelled() {
+            if folder.is_some() {
+                end_removal(&mut ask, &path).await;
             }
-            let step = self
-                .file_op_as(
-                    Operation::RemoveTree {
-                        path: path.clone(),
-                        stop: false,
-                    },
-                    by.clone(),
-                )
-                .await;
-            let (state, failed, failed_more) = match step {
-                Ok(OpResult::TreeRemoval {
-                    state,
-                    removed_files,
-                    removed_dirs,
-                    failed,
-                    failed_more,
-                }) => {
+            return Ok(report.ended(JobOutcome::Cancelled));
+        }
+        let step = ask(Operation::RemoveTree {
+            path: path.clone(),
+            stop: false,
+            folder_id: folder.clone(),
+        })
+        .await;
+        let (state, failed, failed_more) = match step {
+            Ok(OpResult::TreeRemoval {
+                state,
+                removed_files,
+                removed_dirs,
+                failed,
+                failed_more,
+                folder_id,
+            }) => {
+                if state == TreeState::More {
                     // A step that says more remains must have removed
-                    // something: that is what makes the removal end.
-                    if state == TreeState::More && removed_files + removed_dirs == 0 {
+                    // something — that is what makes the removal end — and
+                    // must name the folder the next step goes on with.
+                    if removed_files + removed_dirs == 0 || folder_id.is_none() {
                         return Err(SessionError::Unexpected {
                             context: "folder removal progress",
                         });
                     }
-                    report.removed_files = report.removed_files.saturating_add(removed_files);
-                    report.removed_dirs = report.removed_dirs.saturating_add(removed_dirs);
-                    on_progress(TreeRemovalProgress {
-                        removed_files: report.removed_files,
-                        removed_dirs: report.removed_dirs,
-                    });
-                    (state, failed, failed_more)
+                    folder = folder_id;
                 }
-                Ok(_) => {
-                    return Err(SessionError::Unexpected {
-                        context: "folder removal",
-                    });
-                }
-                Err(SessionError::Remote { code, message }) => {
-                    report.error = Some(TreeRemovalError { code, message });
-                    return Ok(report.ended(JobOutcome::Failed));
-                }
-                Err(other) => return Err(other),
-            };
-            let nothing_failed = failed.is_empty() && failed_more == 0;
-            match state {
-                TreeState::More => begun = true,
-                TreeState::Removed if nothing_failed => {
-                    return Ok(report.ended(JobOutcome::Completed));
-                }
-                TreeState::Incomplete | TreeState::Blocked if !failed.is_empty() => {
-                    report.failed = failed;
-                    report.failed_more = failed_more;
-                    report.blocked = state == TreeState::Blocked;
-                    return Ok(report.ended(JobOutcome::Failed));
-                }
-                // A folder that is gone and yet has failures, one that
-                // remains without a reason, or a step that stopped unasked.
-                TreeState::Removed
-                | TreeState::Incomplete
-                | TreeState::Blocked
-                | TreeState::Stopped => {
-                    return Err(SessionError::Unexpected {
-                        context: "folder removal result",
-                    });
-                }
+                report.removed_files = report.removed_files.saturating_add(removed_files);
+                report.removed_dirs = report.removed_dirs.saturating_add(removed_dirs);
+                on_progress(TreeRemovalProgress {
+                    removed_files: report.removed_files,
+                    removed_dirs: report.removed_dirs,
+                });
+                (state, failed, failed_more)
+            }
+            Ok(_) => {
+                return Err(SessionError::Unexpected {
+                    context: "folder removal",
+                });
+            }
+            Err(SessionError::Remote { code, message }) => {
+                report.error = Some(TreeRemovalError { code, message });
+                return Ok(report.ended(JobOutcome::Failed));
+            }
+            Err(other) => return Err(other),
+        };
+        let nothing_failed = failed.is_empty() && failed_more == 0;
+        match state {
+            TreeState::More => {}
+            TreeState::Removed if nothing_failed => {
+                return Ok(report.ended(JobOutcome::Completed));
+            }
+            TreeState::Incomplete | TreeState::Blocked if !failed.is_empty() => {
+                report.failed = failed;
+                report.failed_more = failed_more;
+                report.blocked = state == TreeState::Blocked;
+                return Ok(report.ended(JobOutcome::Failed));
+            }
+            // A folder that is gone and yet has failures, one that
+            // remains without a reason, or a step that stopped unasked.
+            TreeState::Removed
+            | TreeState::Incomplete
+            | TreeState::Blocked
+            | TreeState::Stopped => {
+                return Err(SessionError::Unexpected {
+                    context: "folder removal result",
+                });
             }
         }
     }
-
-    /// Tells the agent that a removal it shows as in progress ended here, on
-    /// the caller's cancellation. Best effort: the removal is cancelled
-    /// whether or not the agent can still be told — a session that ended in
-    /// the meantime ends the agent's view of it too.
-    async fn end_removal(&self, path: &RemotePath, by: &Attribution) {
-        let _ = self
-            .file_op_as(
-                Operation::RemoveTree {
-                    path: path.clone(),
-                    stop: true,
-                },
-                by.clone(),
-            )
-            .await;
-    }
 }
+
+/// Tells the agent that a removal it shows as in progress ended here, on the
+/// caller's side. Best effort: the removal ends whether or not the agent can
+/// still be told — a session that ended in the meantime ends the agent's view
+/// of it too.
+async fn end_removal<Ask, Answer>(ask: &mut Ask, path: &RemotePath)
+where
+    Ask: FnMut(Operation) -> Answer,
+    Answer: Future<Output = Result<OpResult, SessionError>>,
+{
+    let _ = ask(Operation::RemoveTree {
+        path: path.clone(),
+        stop: true,
+        folder_id: None,
+    })
+    .await;
+}
+
+#[cfg(test)]
+mod tests;

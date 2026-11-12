@@ -6,37 +6,59 @@
 //! bounds; the caller asks again while the answer is
 //! [`TreeState::More`]. Nothing is kept between two steps: a step that follows
 //! another walks the folder again from its top, where what the earlier step
-//! removed is simply no longer there.
+//! removed is simply no longer there. What ties the steps of one removal
+//! together is the identity of the folder, which the answer carries and the
+//! next request gives back.
 //!
 //! # Never out of the folder
 //!
 //! The agent that runs this is elevated, and the folder may belong to someone
 //! who is not. A program of that person could try to turn the removal against
-//! the rest of the computer: plant a link in the folder, or swap a folder for a
-//! link while the walk is on its way to it, so that "remove what is in here"
-//! reaches a place that was never meant.
+//! the rest of the computer: make a folder on the way to it a link, plant a
+//! link in the folder, or swap a folder for a link while the walk is on its
+//! way to it, so that "remove what is in here" reaches a place that was never
+//! meant.
 //!
-//! Two rules keep the walk in its folder:
+//! Three rules keep the removal in its folder:
 //!
+//! - **The folder is the one that lies at the path, and stays the same.**
+//!   The step opens the folder once, as a verified folder (see the `anchor`
+//!   module): what it opened must lie where the path says, so a path that
+//!   leads through a link is refused ([`ErrorCode::InvalidPath`]) and nothing
+//!   is removed. The step then **holds** the folder: nobody renames or
+//!   removes it while the step runs. A step that continues a removal is given
+//!   the identity of the folder the removal began with, and refuses a folder
+//!   with another identity before it removes anything: between two steps the
+//!   folder is not held, and a folder that was swapped for another in that
+//!   time is not the one the technician asked to remove.
 //! - **A link is removed as a link.** A symbolic link, a junction, a volume
 //!   mount point or any other entry that stands for another place is removed
-//!   itself and never walked. What it points at is not looked at.
+//!   itself and never walked. What it points at is not looked at. That holds
+//!   for a link in the place of the folder too, in the first step of a
+//!   removal; a removal that began with a folder does not go on with a link.
 //! - **Nothing is removed by its name alone.** On Windows every removal opens
 //!   the entry without following a link, reads **from the opened handle** what
 //!   the entry is and where it really lies, and removes it **through that same
 //!   handle**. An entry whose real place is not inside the folder is refused
 //!   ([`ErrorCode::InvalidPath`]), whatever the name said and whatever was
 //!   swapped in the meantime: the check and the removal are about one object,
-//!   so there is no moment between them to exploit.
+//!   so there is no moment between them to exploit. The folder itself is
+//!   removed through the handle the step holds.
+//!
+//! The paths of the entries are built from the folder's verified location in
+//! the verbatim form, which Win32 does not rewrite: a name that ends in a dot
+//! or a space and the name of a device (`nul`) are plain names, and the entry
+//! of that name is the one that is opened.
 //!
 //! A folder that is a reparse point without standing for another place — a
 //! folder of a cloud drive such as OneDrive — holds its own content and is
-//! walked like any folder, under the same second rule.
+//! walked like any folder, under the same rules.
 //!
 //! Off Windows the walk never follows the last part of a name either (it
-//! removes with `unlink` and `rmdir`), but it does not verify the opened
-//! object: a non-Windows agent is a development and test tool that is never
-//! elevated on a customer computer.
+//! removes with `unlink` and `rmdir`), but it verifies neither the folder's
+//! location nor the opened object, and it holds nothing: a non-Windows agent
+//! is a development and test tool that is never elevated on a customer
+//! computer.
 //!
 //! # Bounded
 //!
@@ -49,16 +71,20 @@
 //!
 //! # Honest (REQ-N-008)
 //!
-//! Only a folder that is gone is [`TreeState::Removed`]. An entry that could
-//! not be removed keeps every folder above it, and the answer says which
-//! entry and why. An entry that someone else removed in the meantime is not a
-//! failure and is not counted as removed by this step.
+//! Only a folder that **this step removed** is [`TreeState::Removed`]. A
+//! folder that is gone for another reason — it was renamed away or removed by
+//! someone else while the step ran — is reported as not found, never as
+//! removed: its content may live on elsewhere. An entry that could not be
+//! removed keeps every folder above it, and the answer says which entry and
+//! why. An entry inside the folder that someone else removed in the meantime
+//! is not a failure and is not counted as removed by this step.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use cretlink_protocol::{ErrorCode, OpResult, TreeFailure, TreeState, limits};
+use cretlink_protocol::{B64Bytes, ErrorCode, OpResult, TreeFailure, TreeState, limits};
 
+use super::anchor::{self, Folder, Hold, Kind};
 use super::{FsError, io_error_code, one_line};
 
 /// The bounds of one step.
@@ -98,17 +124,27 @@ pub(super) struct StepReport {
     pub(super) failed: Vec<TreeFailure>,
     /// How many more it could not remove.
     pub(super) failed_more: u64,
+    /// What identifies the folder, for the step that follows: present exactly
+    /// when the state is [`TreeState::More`].
+    pub(super) folder_id: Option<Vec<u8>>,
 }
 
 impl StepReport {
     /// The answer to a request that only ends a removal: nothing was touched.
     pub(super) fn stopped() -> Self {
+        Self::ended(TreeState::Stopped)
+    }
+
+    /// A report in `state` of a step that removed nothing and failed at
+    /// nothing, to be filled in.
+    fn ended(state: TreeState) -> Self {
         Self {
-            state: TreeState::Stopped,
+            state,
             removed_files: 0,
             removed_dirs: 0,
             failed: Vec::new(),
             failed_more: 0,
+            folder_id: None,
         }
     }
 
@@ -120,20 +156,9 @@ impl StepReport {
             removed_dirs: self.removed_dirs,
             failed: self.failed,
             failed_more: self.failed_more,
+            folder_id: self.folder_id.map(B64Bytes::new),
         }
     }
-}
-
-/// What an entry is, read without following a link.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    /// A folder that holds its own content.
-    Dir,
-    /// An entry that stands for another place: a symbolic link, a junction,
-    /// a volume mount point.
-    Link,
-    /// Anything else: a file, or a device, pipe or socket.
-    File,
 }
 
 /// Why an entry was not removed.
@@ -151,13 +176,6 @@ enum Refusal {
     )]
     Outside,
     /// The entry is no longer what it was when the walk met it.
-    #[cfg_attr(
-        not(windows),
-        allow(
-            dead_code,
-            reason = "only the Windows walk reads the kind from the opened entry"
-        )
-    )]
     Changed,
     /// The folder is nested deeper than the walk goes.
     TooDeep,
@@ -199,6 +217,8 @@ struct Level {
 
 /// The state of one step.
 struct Walk<'a> {
+    /// The folder being removed, held until the step removes it or ends.
+    root: Option<Folder>,
     guard: sys::Guard,
     bounds: StepBounds,
     stop: &'a dyn Fn() -> bool,
@@ -211,6 +231,11 @@ struct Walk<'a> {
 
 /// Removes as much of the folder at `root` as one step may.
 ///
+/// `began` is absent in the first step of a removal, which takes the folder
+/// that lies at `root`. A step that continues a removal gives the identity
+/// the removal began with — the `folder_id` of the answer before — and
+/// removes nothing from a folder with another one.
+///
 /// `stop` is asked before every entry: once it answers `true` the step ends
 /// where it is and reports [`TreeState::Stopped`] with what it had removed
 /// until then. Blocking: it works on the file system, so the caller runs it
@@ -220,47 +245,73 @@ struct Walk<'a> {
 ///
 /// When the folder itself cannot be taken up: it does not exist
 /// ([`ErrorCode::PathNotFound`]), it is a file ([`ErrorCode::WrongPathKind`]),
-/// it is a drive ([`ErrorCode::InvalidPath`]), or it cannot be opened. Nothing
-/// was removed then.
+/// it is a drive, its path leads through a link, or it is not the folder the
+/// removal began with ([`ErrorCode::InvalidPath`]), its file system does not
+/// tell its folders apart ([`ErrorCode::Unsupported`]), or it cannot be
+/// opened. Nothing was removed then.
 pub(super) fn remove_step(
     root: &Path,
+    began: Option<&[u8]>,
     bounds: StepBounds,
     stop: &dyn Fn() -> bool,
 ) -> Result<StepReport, FsError> {
+    // Refused from the path alone, before anything on the disk is touched.
     if is_drive(root) {
-        return Err(FsError::new(
-            ErrorCode::InvalidPath,
-            "a drive cannot be removed as a folder",
-        ));
+        return Err(a_drive());
     }
-    let (guard, kind) = sys::Guard::open(root)
-        .map_err(|refusal| root_error(&refusal, "failed to open the folder"))?;
-    let mut walk = Walk {
-        guard,
-        bounds,
-        stop,
-        started: Instant::now(),
-        removed_files: 0,
-        removed_dirs: 0,
-        failed: Vec::new(),
-        failed_total: 0,
-    };
-    match kind {
-        Kind::File => Err(FsError::wrong_kind("the path is not a folder")),
+    let folder = Folder::open(root, Hold::ForRemoval).map_err(|refusal| match refusal {
+        anchor::Refusal::Elsewhere => FsError::new(ErrorCode::InvalidPath, anchor::LEADS_ELSEWHERE),
+        anchor::Refusal::Io(error) => root_error(&error, "failed to open the folder"),
+    })?;
+    // And again from where the opened folder really lies.
+    if folder.is_drive() {
+        return Err(a_drive());
+    }
+    match (folder.kind(), began) {
+        (Kind::File, None) => Err(FsError::wrong_kind("the path is not a folder")),
         // A link in the place of the folder is removed as a link: what it
         // points at is not walked.
-        Kind::Link => {
-            walk.guard
-                .remove(root, false)
-                .map_err(|refusal| root_error(&refusal, "failed to remove the link"))?;
-            walk.removed_files = 1;
-            Ok(walk.report(TreeState::Removed))
+        (Kind::Link, None) => {
+            folder
+                .remove()
+                .map_err(|error| root_error(&error, "failed to remove the link"))?;
+            Ok(StepReport {
+                removed_files: 1,
+                ..StepReport::ended(TreeState::Removed)
+            })
         }
-        Kind::Dir => {
-            let top = open_level(root)
-                .map_err(|refusal| root_error(&refusal, "failed to list the folder"))?;
+        // A removal that began with a folder goes on with that folder only.
+        // What lies at the path now is something else, whatever it is.
+        (Kind::File | Kind::Link, Some(_)) => Err(another_folder()),
+        (Kind::Dir, began) => {
+            // The identity is read before anything is removed: a step that
+            // leaves more to do must be able to name its folder.
+            let Some(identity) = folder.identity() else {
+                return Err(FsError::new(
+                    ErrorCode::Unsupported,
+                    "the file system does not tell its folders apart",
+                ));
+            };
+            if began.is_some_and(|began| began != identity) {
+                return Err(another_folder());
+            }
+            let guard = sys::Guard::of(&folder)
+                .map_err(|error| root_error(&error, "failed to open the folder"))?;
+            let top = open_level(folder.path())
+                .map_err(|error| root_error(&error, "failed to list the folder"))?;
+            let mut walk = Walk {
+                root: Some(folder),
+                guard,
+                bounds,
+                stop,
+                started: Instant::now(),
+                removed_files: 0,
+                removed_dirs: 0,
+                failed: Vec::new(),
+                failed_total: 0,
+            };
             let state = walk.run(top);
-            Ok(walk.report(state))
+            Ok(walk.report(state, identity))
         }
     }
 }
@@ -272,16 +323,33 @@ fn is_drive(path: &Path) -> bool {
     path.parent().is_none()
 }
 
+/// The refusal of a drive.
+fn a_drive() -> FsError {
+    FsError::new(
+        ErrorCode::InvalidPath,
+        "a drive cannot be removed as a folder",
+    )
+}
+
+/// The refusal of a step that would continue a removal in another folder
+/// than the one it began with.
+fn another_folder() -> FsError {
+    FsError::new(
+        ErrorCode::InvalidPath,
+        "the folder is not the one this removal began with",
+    )
+}
+
 /// The error for a folder that cannot be taken up at all.
-fn root_error(refusal: &Refusal, context: &'static str) -> FsError {
-    match refusal.code() {
+fn root_error(error: &std::io::Error, context: &'static str) -> FsError {
+    match io_error_code(error) {
         ErrorCode::PathNotFound => FsError::path_not_found(),
         code => FsError::new(code, context),
     }
 }
 
 /// Starts listing the folder at `path`.
-fn open_level(path: &Path) -> Result<Level, Refusal> {
+fn open_level(path: &Path) -> std::io::Result<Level> {
     Ok(Level {
         path: path.to_path_buf(),
         entries: std::fs::read_dir(path)?,
@@ -399,7 +467,7 @@ impl Walk<'_> {
         if depth > self.bounds.depth {
             return Err(Refusal::TooDeep);
         }
-        match open_level(path) {
+        match open_level(path).map_err(Refusal::Io) {
             Ok(level) => Ok(Some(level)),
             Err(refusal) if refusal.is_gone() => Ok(None),
             Err(refusal) => Err(refusal),
@@ -418,16 +486,25 @@ impl Walk<'_> {
         // The listing holds the folder open; it is closed before the folder
         // is removed, so that the folder is gone for the one above it too.
         drop(entries);
+        let is_root = levels.is_empty();
         let gone = if kept {
             false
         } else {
-            match self.guard.remove(&path, true) {
+            let removed = if is_root {
+                self.remove_root()
+            } else {
+                self.guard.remove(&path, true)
+            };
+            match removed {
                 Ok(()) => {
                     self.removed_dirs += 1;
                     true
                 }
-                // Someone else removed it: it is gone, though not by this step.
-                Err(refusal) if refusal.is_gone() => true,
+                // Someone else removed a folder inside: it is gone, though
+                // not by this step. The folder being removed itself is a
+                // different matter: "removed" is said only of what this step
+                // removed, so a folder that vanished is reported as such.
+                Err(refusal) if !is_root && refusal.is_gone() => true,
                 Err(refusal) => {
                     self.fail(&path, &refusal);
                     false
@@ -449,6 +526,16 @@ impl Walk<'_> {
         }
     }
 
+    /// Removes the folder being removed itself, now that it is empty, through
+    /// the hold the step has on it.
+    fn remove_root(&mut self) -> Result<(), Refusal> {
+        match self.root.take() {
+            Some(folder) => folder.remove().map_err(Refusal::Io),
+            // Unreachable: the folder is given up only here, once.
+            None => Err(Refusal::Changed),
+        }
+    }
+
     /// Entries this step removed.
     fn removed(&self) -> u64 {
         self.removed_files + self.removed_dirs
@@ -466,14 +553,15 @@ impl Walk<'_> {
         self.failed_total += 1;
         if self.failed.len() < limits::MAX_TREE_FAILURES {
             self.failed.push(TreeFailure {
-                path: one_line(&path.to_string_lossy(), limits::MAX_TREE_FAILURE_PATH_BYTES),
+                path: one_line(&anchor::plain(path), limits::MAX_TREE_FAILURE_PATH_BYTES),
                 code: refusal.code(),
             });
         }
     }
 
-    /// The report of this step, ending in `state`.
-    fn report(&mut self, state: TreeState) -> StepReport {
+    /// The report of this step, ending in `state`, of the folder with the
+    /// identity `folder`.
+    fn report(&mut self, state: TreeState, folder: Vec<u8>) -> StepReport {
         let failed = std::mem::take(&mut self.failed);
         StepReport {
             state,
@@ -481,6 +569,8 @@ impl Walk<'_> {
             removed_dirs: self.removed_dirs,
             failed_more: self.failed_total - failed.len() as u64,
             failed,
+            // Only a step that leaves more to do has a next step to bind.
+            folder_id: (state == TreeState::More).then_some(folder),
         }
     }
 }
@@ -489,17 +579,16 @@ impl Walk<'_> {
 mod sys {
     use std::path::Path;
 
-    use super::{Kind, Refusal};
+    use super::{Folder, Kind, Refusal};
 
     /// The walk's access to the file system. Off Windows it holds nothing:
     /// see the module documentation.
     pub(super) struct Guard;
 
     impl Guard {
-        /// Takes up the folder at `root` and says what it is.
-        pub(super) fn open(root: &Path) -> Result<(Self, Kind), Refusal> {
-            let kind = Self.kind(root)?;
-            Ok((Self, kind))
+        /// The access to what lies in `folder`.
+        pub(super) fn of(_folder: &Folder) -> std::io::Result<Self> {
+            Ok(Self)
         }
 
         /// What the entry at `path` is, without following a link.
@@ -530,72 +619,46 @@ mod sys {
 
 #[cfg(windows)]
 mod sys {
-    #![allow(
-        unsafe_code,
-        reason = "Localized Win32 handle calls that keep a folder removal \
-                  inside its folder (ST-M010-001): the final path of an opened \
-                  entry and its removal through that handle. ADR-0001 and \
-                  ADR-0006 permit reviewed, localized unsafe in one platform \
-                  adapter."
-    )]
-
-    use std::ffi::c_void;
-    use std::fs::{File, OpenOptions};
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::fs::File;
     use std::path::Path;
 
-    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
-        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
-        FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileDispositionInfo, FileDispositionInfoEx,
-        GETFINALPATHNAMEBYHANDLE_FLAGS, GetFinalPathNameByHandleW, SetFileInformationByHandle,
-        VOLUME_NAME_NT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    use super::{Kind, Refusal};
+    use super::super::anchor;
+    use super::{Folder, Kind, Refusal};
 
     /// The path separator in a final path.
     const SEPARATOR: u16 = b'\\' as u16;
 
-    /// The longest final path the walk reads, in UTF-16 units. A path on
-    /// Windows has at most 32767 of them; the device prefix adds a few.
-    const MAX_FINAL_PATH_UNITS: usize = 33_000;
+    /// Every other use of an entry by others stays allowed while the walk
+    /// has it open.
+    const SHARED: u32 = FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0;
 
-    // Windows error codes that say the extended form of a removal is not
-    // offered here: by an older Windows, or by a file system such as FAT.
-    const ERROR_INVALID_FUNCTION: i32 = 1;
-    const ERROR_NOT_SUPPORTED: i32 = 50;
-    const ERROR_INVALID_PARAMETER: i32 = 87;
-
-    /// The walk's hold on the folder being removed: where the folder really
-    /// lies, read from its opened handle. Every entry is measured against it.
+    /// The walk's measure for every entry: where the folder being removed
+    /// really lies, read from its opened handle.
     pub(super) struct Guard {
         /// The final path of the folder, without a separator at its end.
         root: Vec<u16>,
     }
 
     impl Guard {
-        /// Takes up the folder at `root`: reads what it is and where it lies.
-        pub(super) fn open(root: &Path) -> Result<(Self, Kind), Refusal> {
-            let entry = open(root, FILE_READ_ATTRIBUTES.0)?;
-            let kind = kind_of(&entry)?;
-            let mut place = final_path(&entry)?;
+        /// Reads where the opened `folder` lies.
+        pub(super) fn of(folder: &Folder) -> std::io::Result<Self> {
+            let mut place = folder.place()?;
             while place.last() == Some(&SEPARATOR) {
                 place.pop();
             }
-            Ok((Self { root: place }, kind))
+            Ok(Self { root: place })
         }
 
         /// What the entry at `path` is, read from the opened entry without
         /// following a link. A folder is about to be listed, so it must also
         /// lie in the folder being removed.
         pub(super) fn kind(&self, path: &Path) -> Result<Kind, Refusal> {
-            let entry = open(path, FILE_READ_ATTRIBUTES.0)?;
-            let kind = kind_of(&entry)?;
+            let entry = anchor::open_entry(path, FILE_READ_ATTRIBUTES.0, SHARED)?;
+            let kind = anchor::kind_of(&entry)?;
             if kind == Kind::Dir {
                 self.require_inside(&entry)?;
             }
@@ -610,18 +673,18 @@ mod sys {
         /// handle. So the entry that is removed is the entry that was checked,
         /// whatever its name pointed at a moment earlier or later.
         pub(super) fn remove(&self, path: &Path, dir: bool) -> Result<(), Refusal> {
-            let entry = open_for_removal(path)?;
-            if (kind_of(&entry)? == Kind::Dir) != dir {
+            let entry = anchor::open_for_removal(path, SHARED)?;
+            if (anchor::kind_of(&entry)? == Kind::Dir) != dir {
                 return Err(Refusal::Changed);
             }
             self.require_inside(&entry)?;
-            delete(&entry)
+            Ok(anchor::delete(&entry)?)
         }
 
         /// Refuses an opened entry that is neither the folder being removed
         /// nor inside it.
         fn require_inside(&self, entry: &File) -> Result<(), Refusal> {
-            let place = final_path(entry)?;
+            let place = anchor::place_of(entry)?;
             let root = self.root.as_slice();
             let inside = place.len() >= root.len()
                 && place[..root.len()] == *root
@@ -631,155 +694,6 @@ mod sys {
             } else {
                 Err(Refusal::Outside)
             }
-        }
-    }
-
-    /// Opens the entry at `path` itself — never what a link there points at —
-    /// with the given access, leaving every other use of it by others allowed.
-    fn open(path: &Path, access: u32) -> Result<File, Refusal> {
-        OpenOptions::new()
-            .access_mode(access)
-            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
-            // `BACKUP_SEMANTICS` lets a folder be opened; `OPEN_REPARSE_POINT`
-            // opens a link instead of following it.
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
-            .open(path)
-            .map_err(Refusal::Io)
-    }
-
-    /// Opens the entry at `path` for removal. The right to change attributes
-    /// is asked for as well, so that a read-only entry can be made removable
-    /// where the file system needs that; an entry that does not grant it is
-    /// opened with the right to delete alone.
-    fn open_for_removal(path: &Path) -> Result<File, Refusal> {
-        let wanted = DELETE.0 | FILE_READ_ATTRIBUTES.0;
-        match open(path, wanted | FILE_WRITE_ATTRIBUTES.0) {
-            Err(Refusal::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                open(path, wanted)
-            }
-            opened => opened,
-        }
-    }
-
-    /// What an opened entry is. The standard library reads it from the handle
-    /// and calls a reparse point a symbolic link exactly when its tag marks it
-    /// as standing for another place (a symbolic link, a junction, a volume
-    /// mount point); a folder with any other reparse tag is a folder.
-    fn kind_of(entry: &File) -> Result<Kind, Refusal> {
-        let kind = entry.metadata()?.file_type();
-        Ok(if kind.is_symlink() {
-            Kind::Link
-        } else if kind.is_dir() {
-            Kind::Dir
-        } else {
-            Kind::File
-        })
-    }
-
-    /// Where an opened entry really lies: its final path, with every link on
-    /// the way resolved, in the device form that every volume has.
-    fn final_path(entry: &File) -> Result<Vec<u16>, Refusal> {
-        let handle = HANDLE(entry.as_raw_handle());
-        let flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_NT.0);
-        let mut place = vec![0u16; 512];
-        loop {
-            // SAFETY: the handle is open for as long as `entry` is borrowed,
-            // and `place` is a writable buffer whose length the wrapper
-            // passes with it.
-            let len = unsafe { GetFinalPathNameByHandleW(handle, &mut place, flags) } as usize;
-            if len == 0 {
-                return Err(Refusal::Io(std::io::Error::last_os_error()));
-            }
-            // A length below the buffer's is the path, without its
-            // terminator; anything else is the size the buffer must have.
-            if len < place.len() {
-                place.truncate(len);
-                return Ok(place);
-            }
-            if len > MAX_FINAL_PATH_UNITS {
-                return Err(Refusal::Io(std::io::Error::from(
-                    std::io::ErrorKind::InvalidInput,
-                )));
-            }
-            place.resize(len + 1, 0);
-        }
-    }
-
-    /// Removes an opened entry through its handle.
-    fn delete(entry: &File) -> Result<(), Refusal> {
-        let handle = HANDLE(entry.as_raw_handle());
-        // The form of Windows 10 1809 and later: the name is gone at once,
-        // even while others still hold the entry open, and a read-only entry
-        // is removed like any other.
-        let extended = FILE_DISPOSITION_INFO_EX {
-            Flags: FILE_DISPOSITION_INFO_EX_FLAGS(
-                FILE_DISPOSITION_FLAG_DELETE.0
-                    | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS.0
-                    | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE.0,
-            ),
-        };
-        // SAFETY: the handle is open for as long as `entry` is borrowed, and
-        // the pointer is to an initialized value of the structure this class
-        // takes, with its size, read only during the call.
-        let removed = unsafe {
-            SetFileInformationByHandle(
-                handle,
-                FileDispositionInfoEx,
-                std::ptr::from_ref(&extended).cast::<c_void>(),
-                size_of_u32::<FILE_DISPOSITION_INFO_EX>(),
-            )
-        };
-        let error = match removed {
-            Ok(()) => return Ok(()),
-            Err(error) => os_error(&error),
-        };
-        if !matches!(
-            error.raw_os_error(),
-            Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER)
-        ) {
-            return Err(Refusal::Io(error));
-        }
-        // An older Windows, or a file system without the extended form (FAT,
-        // exFAT): a read-only entry is made removable first, then the entry
-        // is marked for removal the plain way.
-        let facts = entry.metadata()?;
-        let mut permissions = facts.permissions();
-        if permissions.readonly() {
-            #[allow(
-                clippy::permissions_set_readonly_false,
-                reason = "Windows only: this clears the read-only attribute of an entry that is being removed"
-            )]
-            permissions.set_readonly(false);
-            entry.set_permissions(permissions)?;
-        }
-        let plain = FILE_DISPOSITION_INFO { DeleteFile: true };
-        // SAFETY: as above, for the plain class and its structure.
-        unsafe {
-            SetFileInformationByHandle(
-                handle,
-                FileDispositionInfo,
-                std::ptr::from_ref(&plain).cast::<c_void>(),
-                size_of_u32::<FILE_DISPOSITION_INFO>(),
-            )
-        }
-        .map_err(|error| Refusal::Io(os_error(&error)))
-    }
-
-    /// The size of `T` as the `u32` the Win32 calls take.
-    fn size_of_u32<T>() -> u32 {
-        u32::try_from(size_of::<T>()).unwrap_or(0)
-    }
-
-    /// The I/O error for a failed Win32 call, carrying the Windows error code
-    /// so that it is classified like any other. The `windows` crate reports
-    /// such a failure as an `HRESULT` that holds the code in its low half.
-    fn os_error(error: &windows::core::Error) -> std::io::Error {
-        const WIN32_FACILITY: u32 = 0x8007_0000;
-        let hresult = error.code().0.cast_unsigned();
-        if hresult & 0xFFFF_0000 == WIN32_FACILITY {
-            std::io::Error::from_raw_os_error((hresult & 0xFFFF).cast_signed())
-        } else {
-            std::io::Error::other("the removal failed")
         }
     }
 }

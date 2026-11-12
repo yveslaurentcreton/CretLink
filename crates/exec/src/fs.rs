@@ -59,10 +59,13 @@
 //! A folder removal names the entries it could not remove: those paths are its
 //! result, bounded in number and length.
 
+mod anchor;
 mod drives;
 mod manifest;
 mod tree;
 
+#[cfg(test)]
+mod testing;
 #[cfg(test)]
 mod tests;
 
@@ -411,7 +414,14 @@ impl FileStore {
             Operation::ListStaged {} => self.list_staged().await,
             Operation::StagingCleanup { trigger } => self.cleanup(trigger).await,
             Operation::FsDrives {} => self.drives().await,
-            Operation::RemoveTree { path, stop } => self.remove_tree(&path, stop).await,
+            Operation::RemoveTree {
+                path,
+                stop,
+                folder_id,
+            } => {
+                let began = folder_id.map(B64Bytes::into_inner);
+                self.remove_tree(&path, stop, began).await
+            }
             // Not file operations: the session layer routes these to the broker
             // and never here. Answering fail-closed keeps a misroute honest.
             Operation::SystemInfo {}
@@ -882,12 +892,19 @@ impl FileStore {
 
     /// One step of removing a folder with everything in it (ST-M010-001), or,
     /// with `stop`, the end of a removal the caller will not continue.
-    async fn remove_tree(&self, path: &RemotePath, stop: bool) -> Result<OpResult, FsError> {
+    /// `began` is the identity of the folder a removal began with, which a
+    /// step that continues it gives back.
+    async fn remove_tree(
+        &self,
+        path: &RemotePath,
+        stop: bool,
+        began: Option<Vec<u8>>,
+    ) -> Result<OpResult, FsError> {
         if stop {
             // Nothing is touched: the request only says that the removal ended.
             return Ok(tree::StepReport::stopped().into_result());
         }
-        self.remove_tree_step(path, tree::StepBounds::protocol())
+        self.remove_tree_step(path, began, tree::StepBounds::protocol())
             .await
             .map(tree::StepReport::into_result)
     }
@@ -900,13 +917,16 @@ impl FileStore {
     async fn remove_tree_step(
         &self,
         path: &RemotePath,
+        began: Option<Vec<u8>>,
         bounds: tree::StepBounds,
     ) -> Result<tree::StepReport, FsError> {
         let root = self.resolve(path)?;
         let stop = Arc::new(AtomicBool::new(false));
         let _stop_when_dropped = StopOnDrop(Arc::clone(&stop));
         tokio::task::spawn_blocking(move || {
-            tree::remove_step(&root, bounds, &|| stop.load(Ordering::SeqCst))
+            tree::remove_step(&root, began.as_deref(), bounds, &|| {
+                stop.load(Ordering::SeqCst)
+            })
         })
         .await
         .map_err(|_| FsError::internal())?

@@ -133,10 +133,14 @@ pub fn describe_operation(op: &Operation) -> String {
         Operation::FsDelete { path } => format!("delete the file {}", path_text(path)),
         Operation::RemoveDir { path } => format!("remove the folder {}", path_text(path)),
         Operation::FsDrives {} => "list the drives".to_owned(),
-        Operation::RemoveTree { path, stop: false } => {
+        Operation::RemoveTree {
+            path, stop: false, ..
+        } => {
             format!("delete the folder {} and everything in it", path_text(path))
         }
-        Operation::RemoveTree { path, stop: true } => {
+        Operation::RemoveTree {
+            path, stop: true, ..
+        } => {
             format!("stop deleting the folder {}", path_text(path))
         }
         Operation::ListStaged {} => "list the files CretLink staged".to_owned(),
@@ -287,6 +291,7 @@ mod tests {
             describe_operation(&Operation::RemoveTree {
                 path: folder.clone(),
                 stop: false,
+                folder_id: None,
             }),
             "delete the folder C:\\Users\\ann\\Downloads\\old-setup and everything in it"
         );
@@ -294,6 +299,7 @@ mod tests {
             describe_operation(&Operation::RemoveTree {
                 path: folder,
                 stop: true,
+                folder_id: None,
             }),
             "stop deleting the folder C:\\Users\\ann\\Downloads\\old-setup"
         );
@@ -303,6 +309,7 @@ mod tests {
                     name: "unpacked".to_owned(),
                 },
                 stop: false,
+                folder_id: None,
             }),
             "delete the folder unpacked (CretLink staging folder) and everything in it"
         );
@@ -313,6 +320,7 @@ mod tests {
                 name: "unpacked".to_owned(),
             },
             stop: false,
+            folder_id: None,
         }));
     }
 

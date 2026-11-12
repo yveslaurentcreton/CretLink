@@ -287,6 +287,7 @@ fn every_operation_has_its_kind() {
             Operation::RemoveTree {
                 path: abs("C:\\d"),
                 stop: false,
+                folder_id: None,
             },
             ActivityKind::FileOperation,
         ),
@@ -294,6 +295,7 @@ fn every_operation_has_its_kind() {
             Operation::RemoveTree {
                 path: abs("C:\\d"),
                 stop: true,
+                folder_id: None,
             },
             ActivityKind::FileOperation,
         ),
@@ -405,6 +407,7 @@ fn path_and_bytes_come_from_the_request() {
         let removal = Operation::RemoveTree {
             path: abs("C:\\Users\\ann\\Downloads\\old-setup"),
             stop,
+            folder_id: None,
         };
         assert_eq!(
             path_of(&removal).as_deref(),

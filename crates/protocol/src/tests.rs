@@ -2758,6 +2758,8 @@ fn drive(root: &str) -> DriveEntry {
     }
 }
 
+/// A removal answer in `state`. One that says more remains names its folder,
+/// as every such answer must; no other does.
 fn tree_removal(state: TreeState, failed: Vec<TreeFailure>, failed_more: u64) -> OpResult {
     OpResult::TreeRemoval {
         state,
@@ -2765,7 +2767,14 @@ fn tree_removal(state: TreeState, failed: Vec<TreeFailure>, failed_more: u64) ->
         removed_dirs: 3,
         failed,
         failed_more,
+        folder_id: (state == TreeState::More).then(folder_id),
     }
+}
+
+/// What an agent on Windows gives as the identity of a folder: a marker, the
+/// serial number of the volume and the file identifier (25 bytes).
+fn folder_id() -> B64Bytes {
+    B64Bytes::new((1..=25).collect())
 }
 
 fn tree_failure(path: &str, code: ErrorCode) -> TreeFailure {
@@ -2788,13 +2797,21 @@ fn round_trip_request_fs_drives() {
 
 #[test]
 fn round_trip_request_remove_tree() {
+    // The first step of a removal, a step that continues one, and its end.
     round_trip(request(Operation::RemoveTree {
         path: abs("C:\\Users\\ann\\Downloads\\old-setup"),
         stop: false,
+        folder_id: None,
+    }));
+    round_trip(request(Operation::RemoveTree {
+        path: abs("C:\\Users\\ann\\Downloads\\old-setup"),
+        stop: false,
+        folder_id: Some(folder_id()),
     }));
     round_trip(request(Operation::RemoveTree {
         path: staging("unpacked"),
         stop: true,
+        folder_id: None,
     }));
 }
 
@@ -2866,6 +2883,7 @@ fn round_trip_response_tree_removal_in_every_state() {
         removed_dirs: 0,
         failed: Vec::new(),
         failed_more: 0,
+        folder_id: None,
     }));
 }
 
@@ -2874,19 +2892,36 @@ fn drives_and_remove_tree_wire_format_is_stable() {
     let value = serde_json::to_value(Operation::FsDrives {}).unwrap();
     assert_eq!(value, json!({ "op": "fs_drives" }));
 
-    // A removal step that does not stop carries no `stop` at all.
+    // The first step of a removal carries neither `stop` nor `folder_id`.
     let value = serde_json::to_value(Operation::RemoveTree {
         path: abs("C:\\Temp\\old"),
         stop: false,
+        folder_id: None,
     })
     .unwrap();
     assert_eq!(
         value,
         json!({ "op": "remove_tree", "path": { "kind": "absolute", "path": "C:\\Temp\\old" } })
     );
+    // A step that continues a removal names the folder it began with.
+    let value = serde_json::to_value(Operation::RemoveTree {
+        path: abs("C:\\Temp\\old"),
+        stop: false,
+        folder_id: Some(B64Bytes::new(vec![1, 2, 3])),
+    })
+    .unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "op": "remove_tree",
+            "path": { "kind": "absolute", "path": "C:\\Temp\\old" },
+            "folder_id": "AQID",
+        })
+    );
     let value = serde_json::to_value(Operation::RemoveTree {
         path: staging("unpacked"),
         stop: true,
+        folder_id: None,
     })
     .unwrap();
     assert_eq!(
@@ -2974,6 +3009,26 @@ fn tree_removal_result_wire_format_is_stable() {
             "failed_more": 2,
         })
     );
+    // A step that leaves more to do names the folder for the next one.
+    let value = serde_json::to_value(OpResult::TreeRemoval {
+        state: TreeState::More,
+        removed_files: 4096,
+        removed_dirs: 0,
+        failed: Vec::new(),
+        failed_more: 0,
+        folder_id: Some(B64Bytes::new(vec![1, 2, 3])),
+    })
+    .unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "result": "tree_removal",
+            "state": "more",
+            "removed_files": 4096,
+            "removed_dirs": 0,
+            "folder_id": "AQID",
+        })
+    );
     for (state, text) in [
         (TreeState::More, "more"),
         (TreeState::Blocked, "blocked"),
@@ -2991,9 +3046,9 @@ fn a_tree_removal_without_its_optional_fields_decodes() {
         "session": SessionId::new().to_string(),
         "result": {
             "result": "tree_removal",
-            "state": "more",
-            "removed_files": 4096,
-            "removed_dirs": 0,
+            "state": "removed",
+            "removed_files": 40,
+            "removed_dirs": 2,
         },
     });
     let decoded = Message::decode(payload.to_string().as_bytes()).unwrap();
@@ -3001,15 +3056,113 @@ fn a_tree_removal_without_its_optional_fields_decodes() {
         decoded,
         Message::Response {
             result: OpResult::TreeRemoval {
-                state: TreeState::More,
-                removed_files: 4096,
-                removed_dirs: 0,
+                state: TreeState::Removed,
+                removed_files: 40,
+                removed_dirs: 2,
                 ref failed,
                 failed_more: 0,
+                folder_id: None,
             },
             ..
         } if failed.is_empty()
     ));
+}
+
+/// One removal is about one folder: an answer that says more remains names
+/// the folder the next step goes on with, and no other answer names one. The
+/// rule holds on both ends: such a message is neither sent nor accepted.
+#[test]
+fn only_a_removal_that_continues_names_its_folder() {
+    let answer = |state, folder_id| {
+        response(OpResult::TreeRemoval {
+            state,
+            removed_files: 1,
+            removed_dirs: 0,
+            failed: Vec::new(),
+            failed_more: 0,
+            folder_id,
+        })
+    };
+    let malformed = |message: &Message| {
+        assert_eq!(
+            message.validate().unwrap_err().code(),
+            ErrorCode::MalformedMessage,
+            "{message:?}"
+        );
+        assert!(message.encode().is_err(), "{message:?}");
+    };
+
+    round_trip(answer(TreeState::More, Some(folder_id())));
+    malformed(&answer(TreeState::More, None));
+    for state in [
+        TreeState::Removed,
+        TreeState::Incomplete,
+        TreeState::Blocked,
+        TreeState::Stopped,
+    ] {
+        round_trip(answer(state, None));
+        malformed(&answer(state, Some(folder_id())));
+    }
+
+    // And on receipt, from a peer that sends it all the same.
+    let session = SessionId::new().to_string();
+    for result in [
+        json!({ "result": "tree_removal", "state": "more", "removed_files": 1, "removed_dirs": 0 }),
+        json!({
+            "result": "tree_removal", "state": "removed",
+            "removed_files": 1, "removed_dirs": 1, "folder_id": "AQID",
+        }),
+        // Not base64 at all.
+        json!({
+            "result": "tree_removal", "state": "more",
+            "removed_files": 1, "removed_dirs": 0, "folder_id": "not base64!",
+        }),
+    ] {
+        let payload = json!({ "type": "response", "id": 1, "session": session, "result": result });
+        let err = Message::decode(payload.to_string().as_bytes()).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::MalformedMessage, "{payload}");
+    }
+}
+
+/// What identifies a folder is bounded in both directions, and is never
+/// empty: an empty one would bind the next step to nothing.
+#[test]
+fn a_folder_id_is_bounded_and_never_empty() {
+    let answer = |id: Vec<u8>| {
+        response(OpResult::TreeRemoval {
+            state: TreeState::More,
+            removed_files: 1,
+            removed_dirs: 0,
+            failed: Vec::new(),
+            failed_more: 0,
+            folder_id: Some(B64Bytes::new(id)),
+        })
+    };
+    let step = |id: Vec<u8>| {
+        request(Operation::RemoveTree {
+            path: abs("C:\\Temp\\old"),
+            stop: false,
+            folder_id: Some(B64Bytes::new(id)),
+        })
+    };
+
+    let longest = vec![7u8; limits::MAX_FOLDER_ID_BYTES];
+    round_trip(answer(longest.clone()));
+    round_trip(step(longest));
+    round_trip(answer(vec![7]));
+    round_trip(step(vec![7]));
+
+    let too_long = vec![7u8; limits::MAX_FOLDER_ID_BYTES + 1];
+    assert_limit_exceeded(&answer(too_long.clone()));
+    assert_limit_exceeded(&step(too_long));
+
+    for empty in [answer(Vec::new()), step(Vec::new())] {
+        assert_eq!(
+            empty.validate().unwrap_err().code(),
+            ErrorCode::MalformedMessage
+        );
+        assert!(empty.encode().is_err());
+    }
 }
 
 #[test]
@@ -3026,16 +3179,19 @@ fn remove_tree_path_gets_the_adversarial_path_rules() {
         assert_invalid_path(&request(Operation::RemoveTree {
             path: abs(bad),
             stop: false,
+            folder_id: None,
         }));
     }
     assert_invalid_path(&request(Operation::RemoveTree {
         path: staging("..\\outside"),
         stop: false,
+        folder_id: None,
     }));
     // The rules hold for a request that only stops, too.
     assert_invalid_path(&request(Operation::RemoveTree {
         path: abs("C:\\a\\..\\b"),
         stop: true,
+        folder_id: None,
     }));
     let mut deep = String::from("C:");
     for _ in 0..=limits::MAX_PATH_DEPTH {
@@ -3044,6 +3200,7 @@ fn remove_tree_path_gets_the_adversarial_path_rules() {
     assert_limit_exceeded(&request(Operation::RemoveTree {
         path: abs(&deep),
         stop: false,
+        folder_id: None,
     }));
 }
 
@@ -3147,6 +3304,7 @@ fn tree_removal_counts_are_bounded_by_one_step() {
         removed_dirs: 0,
         failed: Vec::new(),
         failed_more: 0,
+        folder_id: Some(folder_id()),
     }));
     assert_limit_exceeded(&response(OpResult::TreeRemoval {
         state: TreeState::More,
@@ -3154,6 +3312,7 @@ fn tree_removal_counts_are_bounded_by_one_step() {
         removed_dirs: over,
         failed: Vec::new(),
         failed_more: 0,
+        folder_id: Some(folder_id()),
     }));
     assert_limit_exceeded(&response(OpResult::TreeRemoval {
         state: TreeState::Blocked,
@@ -3161,6 +3320,7 @@ fn tree_removal_counts_are_bounded_by_one_step() {
         removed_dirs: 0,
         failed: vec![tree_failure("C:\\a", ErrorCode::AccessDenied)],
         failed_more: over,
+        folder_id: None,
     }));
     round_trip(response(OpResult::TreeRemoval {
         state: TreeState::More,
@@ -3168,6 +3328,7 @@ fn tree_removal_counts_are_bounded_by_one_step() {
         removed_dirs: limits::MAX_TREE_STEP_ENTRIES,
         failed: Vec::new(),
         failed_more: limits::MAX_TREE_STEP_ENTRIES,
+        folder_id: Some(folder_id()),
     }));
 }
 
@@ -3235,12 +3396,15 @@ fn the_largest_drives_and_tree_removal_answers_fit_one_secure_record() {
             )
         })
         .collect();
+    // The largest answer is one that leaves more to do: it also names the
+    // folder, with an identity at its bound.
     let encoded = response(OpResult::TreeRemoval {
-        state: TreeState::Incomplete,
+        state: TreeState::More,
         removed_files: limits::MAX_TREE_STEP_ENTRIES,
         removed_dirs: limits::MAX_TREE_STEP_ENTRIES,
         failed,
         failed_more: limits::MAX_TREE_STEP_ENTRIES,
+        folder_id: Some(B64Bytes::new(vec![0xFF; limits::MAX_FOLDER_ID_BYTES])),
     })
     .encode()
     .unwrap();
@@ -3330,6 +3494,7 @@ fn a_peer_before_minor_12_rejects_the_explorer_operations() {
         Operation::RemoveTree {
             path: abs("C:\\Temp\\old"),
             stop: false,
+            folder_id: None,
         },
     ] {
         let value = serde_json::to_value(op).unwrap();

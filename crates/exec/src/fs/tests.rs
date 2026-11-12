@@ -1446,6 +1446,7 @@ async fn a_folder_with_its_content_is_removed_in_one_operation() {
         .perform(Operation::RemoveTree {
             path: abs(&target, "old"),
             stop: false,
+            folder_id: None,
         })
         .await
         .expect("the folder is removed");
@@ -1457,11 +1458,13 @@ async fn a_folder_with_its_content_is_removed_in_one_operation() {
             removed_dirs,
             failed,
             failed_more,
+            folder_id,
         } => {
             assert_eq!(state, TreeState::Removed);
             assert_eq!((removed_files, removed_dirs), (2, 2));
             assert!(failed.is_empty());
             assert_eq!(failed_more, 0);
+            assert!(folder_id.is_none(), "a removal that ended names no folder");
         }
         other => panic!("expected TreeRemoval, got {other:?}"),
     }
@@ -1491,6 +1494,7 @@ async fn a_folder_in_the_staging_area_is_removed_by_its_name() {
         .perform(Operation::RemoveTree {
             path: staging("unpacked"),
             stop: false,
+            folder_id: None,
         })
         .await
         .expect("the staged folder is removed");
@@ -1527,6 +1531,7 @@ async fn a_stop_request_ends_a_removal_and_touches_nothing() {
             .perform(Operation::RemoveTree {
                 path: abs(&target, name),
                 stop: true,
+                folder_id: None,
             })
             .await
             .expect("a stop is always answered");
@@ -1539,6 +1544,7 @@ async fn a_stop_request_ends_a_removal_and_touches_nothing() {
                 removed_dirs: 0,
                 failed: Vec::new(),
                 failed_more: 0,
+                folder_id: None,
             }
         );
     }
@@ -1563,12 +1569,16 @@ async fn a_large_folder_takes_several_requests() {
     }
 
     let (mut removed, mut requests) = (0, 0);
+    // What the step before answered as the folder's identity, given back
+    // with the next request, as a caller does.
+    let mut folder = None;
     loop {
         requests += 1;
         let result = store
             .perform(Operation::RemoveTree {
                 path: abs(&target, "big"),
                 stop: false,
+                folder_id: folder.take(),
             })
             .await
             .expect("a step");
@@ -1577,6 +1587,7 @@ async fn a_large_folder_takes_several_requests() {
             state,
             removed_files,
             removed_dirs,
+            folder_id,
             ..
         } = result
         else {
@@ -1585,8 +1596,15 @@ async fn a_large_folder_takes_several_requests() {
         assert!(removed_files + removed_dirs <= limits::MAX_TREE_STEP_ENTRIES);
         removed += removed_files + removed_dirs;
         match state {
-            TreeState::More => assert!(big.exists()),
-            TreeState::Removed => break,
+            TreeState::More => {
+                assert!(big.exists());
+                assert!(folder_id.is_some(), "more to do names the folder");
+                folder = folder_id;
+            }
+            TreeState::Removed => {
+                assert!(folder_id.is_none(), "the end names no folder");
+                break;
+            }
             other => panic!("unexpected state {other:?}"),
         }
         assert!(requests < 1000, "the removal must end");

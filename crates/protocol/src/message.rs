@@ -612,10 +612,19 @@ pub enum Operation {
     ///
     /// One step settles at most [`limits::MAX_TREE_STEP_ENTRIES`] entries and
     /// answers after about [`limits::MAX_TREE_STEP_MS`] milliseconds; while
-    /// the answer is [`TreeState::More`] the caller sends the same request
-    /// again. The agent keeps nothing between two steps, so it stays free to
-    /// serve a stop, a revocation or any other request in between, and a
-    /// caller that wants to cancel simply stops asking.
+    /// the answer is [`TreeState::More`] the caller sends the request again,
+    /// with the `folder_id` of that answer. The agent keeps nothing between
+    /// two steps, so it stays free to serve a stop, a revocation or any other
+    /// request in between, and a caller that wants to cancel simply stops
+    /// asking.
+    ///
+    /// **One removal is about one folder.** The folder is the one that lies
+    /// at `path` when the first step opens it: a path that leads to it
+    /// through a link (a junction or a symbolic link in a folder above it)
+    /// yields `InvalidPath` and nothing is removed. Every later step names
+    /// that folder by its `folder_id`, and a step that finds another folder
+    /// at the path — one that was put there in the meantime — yields
+    /// `InvalidPath` before it removes anything.
     ///
     /// The step never leaves the folder: a symbolic link, a junction or any
     /// other entry that stands for another place is removed as a link and
@@ -634,6 +643,13 @@ pub enum Operation {
         /// REQ-N-008). Omitted when `false`.
         #[serde(default, skip_serializing_if = "is_false")]
         stop: bool,
+        /// The folder this removal began with: the `folder_id` of the
+        /// previous answer of this removal ([`OpResult::TreeRemoval`]), given
+        /// back unchanged. Absent in the first request of a removal, which
+        /// takes the folder that lies at `path`. From 1 to
+        /// [`limits::MAX_FOLDER_ID_BYTES`] bytes; omitted when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_id: Option<B64Bytes>,
     },
     // --- Interactive terminal (ADR-0013, ST-M003-009, CAP_TERM_V1) ---
     /// Open an interactive pseudo-console terminal. **A terminal is a job**: the
@@ -913,6 +929,14 @@ pub enum OpResult {
         /// Omitted when zero.
         #[serde(default, skip_serializing_if = "is_zero")]
         failed_more: u64,
+        /// What identifies the folder being removed, for the next step: the
+        /// caller gives it back in [`Operation::RemoveTree`], so that the
+        /// removal goes on with this folder and no other. Present **exactly
+        /// when** `state` is [`TreeState::More`]; from 1 to
+        /// [`limits::MAX_FOLDER_ID_BYTES`] bytes, whose meaning is the
+        /// agent's own. Omitted when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_id: Option<B64Bytes>,
     },
     /// Result of [`Operation::TermOpen`]: the interactive terminal job started.
     /// Its merged output arrives as [`EventKind::JobOutput`] and its exit as
@@ -1724,8 +1748,16 @@ fn validate_operation(op: &Operation) -> Result<(), ProtocolError> {
         Operation::FsStat { path }
         | Operation::CreateDir { path }
         | Operation::FsDelete { path }
-        | Operation::RemoveDir { path }
-        | Operation::RemoveTree { path, .. } => validate_remote_path("path", path),
+        | Operation::RemoveDir { path } => validate_remote_path("path", path),
+        Operation::RemoveTree {
+            path, folder_id, ..
+        } => {
+            validate_remote_path("path", path)?;
+            if let Some(id) = folder_id {
+                check_folder_id("remove_tree folder_id length", id)?;
+            }
+            Ok(())
+        }
         Operation::FsAbort { dest } => validate_remote_path("dest", dest),
         Operation::FsList {
             path,
@@ -1953,12 +1985,32 @@ fn validate_result(result: &OpResult) -> Result<(), ProtocolError> {
             Ok(())
         }
         OpResult::TreeRemoval {
+            state,
             removed_files,
             removed_dirs,
             failed,
             failed_more,
-            ..
+            folder_id,
         } => {
+            // A removal that goes on names the folder it goes on with, and
+            // only such a removal does: an answer that ends a removal has no
+            // next step to bind.
+            match (state, folder_id) {
+                (TreeState::More, Some(id)) => {
+                    check_folder_id("tree_removal folder_id length", id)?;
+                }
+                (TreeState::More, None) => {
+                    return Err(malformed(
+                        "a folder removal that continues must name its folder",
+                    ));
+                }
+                (_, Some(_)) => {
+                    return Err(malformed(
+                        "only a folder removal that continues names its folder",
+                    ));
+                }
+                (_, None) => {}
+            }
             // One step settles at most `MAX_TREE_STEP_ENTRIES` entries, so no
             // count of one step can be larger.
             check_limit(
@@ -2366,6 +2418,20 @@ fn check_digest_len(field: &'static str, digest: &B64Bytes) -> Result<(), Protoc
     check_limit(field, digest.len() as u64, limits::DIGEST_LEN as u64)
 }
 
+/// Bounds what identifies a folder between two steps of its removal: from 1
+/// to [`limits::MAX_FOLDER_ID_BYTES`] bytes. An empty one identifies nothing.
+fn check_folder_id(field: &'static str, id: &B64Bytes) -> Result<(), ProtocolError> {
+    if id.is_empty() {
+        return Err(malformed("a folder id is never empty"));
+    }
+    check_limit(field, id.len() as u64, limits::MAX_FOLDER_ID_BYTES as u64)
+}
+
+/// A message that breaks a rule of its schema that the types do not express.
+fn malformed(rule: &'static str) -> ProtocolError {
+    ProtocolError::Malformed(<serde_json::Error as serde::de::Error>::custom(rule))
+}
+
 /// Validates a [`FileEntry`] carried in a result.
 fn validate_file_entry(entry: &FileEntry) -> Result<(), ProtocolError> {
     check_limit(
@@ -2412,9 +2478,7 @@ fn require_single_line(text: &str, rule: &'static str) -> Result<(), ProtocolErr
     if is_single_line(text) {
         Ok(())
     } else {
-        Err(ProtocolError::Malformed(
-            <serde_json::Error as serde::de::Error>::custom(rule),
-        ))
+        Err(malformed(rule))
     }
 }
 

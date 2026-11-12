@@ -133,9 +133,13 @@ use crate::error::ProtocolError;
 /// [`crate::limits::MAX_TREE_STEP_MS`] milliseconds per request): the caller
 /// repeats the request while the answer is [`crate::TreeState::More`], the
 /// agent keeps no state between two steps, and so a stop, a revocation or a
-/// cancellation takes effect between them. A step never leaves the folder —
-/// a link is removed as a link and never walked — and it names the first
-/// entries it could not remove with their reasons; only
+/// cancellation takes effect between them. One removal is about one folder:
+/// an answer that says more remains carries a `folder_id` (at most
+/// [`crate::limits::MAX_FOLDER_ID_BYTES`] bytes) that the next request gives
+/// back, and a step that finds another folder at the path, or a path that
+/// leads to the folder through a link, removes nothing. A step never leaves
+/// the folder — a link is removed as a link and never walked — and it names
+/// the first entries it could not remove with their reasons; only
 /// [`crate::TreeState::Removed`] is a success (REQ-N-008). An agent that does
 /// not advertise [`crate::CAP_FS_V2`] answers both operations with
 /// [`crate::ErrorCode::Unsupported`] before it lists or removes anything

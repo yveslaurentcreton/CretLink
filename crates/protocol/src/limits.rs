@@ -186,6 +186,13 @@ pub const MAX_TREE_FAILURES: usize = 16;
 /// for a whole one.
 pub const MAX_TREE_FAILURE_PATH_BYTES: usize = 1024;
 
+/// Maximum byte length of a `folder_id`: what identifies the folder being
+/// removed between two steps of one removal
+/// ([`crate::OpResult::TreeRemoval`], [`crate::Operation::RemoveTree`]). The
+/// agent chooses the bytes; the longest it has today is a volume serial number
+/// with a 128-bit file identifier.
+pub const MAX_FOLDER_ID_BYTES: usize = 32;
+
 // --- Interactive terminal (ADR-0013, ST-M003-009) ---
 
 /// The smallest accepted terminal column count for a `TermOpen`/`TermResize`.

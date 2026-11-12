@@ -1057,6 +1057,7 @@ async fn simulator_removes_a_folder_with_its_content() {
         Operation::RemoveTree {
             path: staging("unpacked"),
             stop: false,
+            folder_id: None,
         },
     )
     .await;
@@ -1068,6 +1069,7 @@ async fn simulator_removes_a_folder_with_its_content() {
             removed_dirs: 2,
             failed: Vec::new(),
             failed_more: 0,
+            folder_id: None,
         }
     );
     assert!(!folder.exists(), "the folder is gone");
@@ -1080,6 +1082,7 @@ async fn simulator_removes_a_folder_with_its_content() {
         Operation::RemoveTree {
             path: staging("unpacked"),
             stop: false,
+            folder_id: None,
         },
     )
     .await;
@@ -1103,6 +1106,7 @@ async fn simulator_stops_a_removal_and_refuses_a_file() {
         Operation::RemoveTree {
             path: staging("kept"),
             stop: true,
+            folder_id: None,
         },
     )
     .await;
@@ -1132,6 +1136,7 @@ async fn simulator_stops_a_removal_and_refuses_a_file() {
         Operation::RemoveTree {
             path: staging("tool.zip"),
             stop: false,
+            folder_id: None,
         },
     )
     .await;

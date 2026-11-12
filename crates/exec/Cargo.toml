@@ -64,15 +64,26 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 #   - Piped-mode kill-on-close containment (ST-M006-007): its own Job Object
 #     assigned while the child is suspended, then resumed via the Toolhelp thread
 #     snapshot — so a hard `TerminateProcess` of the agent still reaps the tree.
-#   - The drive list and the removal of a folder with its content
-#     (ST-M010-001): the volume queries behind `FsDrives`, with the thread's
-#     error mode set so that an empty card reader shows no system dialog
-#     (`Win32_System_Diagnostics_Debug`), and the two handle calls that keep
-#     `RemoveTree` inside its folder: the final path of an opened entry and its
-#     removal through that same handle (`Win32_Storage_FileSystem`).
+#   - The drive list (ST-M010-001): the volume queries behind `FsDrives`, with
+#     the thread's error mode set so that an empty card reader shows no system
+#     dialog (`Win32_System_Diagnostics_Debug`).
+#   - The verified folder behind the removal of a folder with its content and
+#     behind a file sent to a folder (ST-M010-001, `fs/anchor.rs`): the final
+#     path and the identifier of an opened entry and its removal through that
+#     same handle (`Win32_Storage_FileSystem`); the comparison of two paths
+#     without regard to case, as the system compares names
+#     (`Win32_Globalization`); and the two native calls that Win32 has no
+#     equal for: an open of one name relative to an opened folder
+#     (`NtCreateFile`) and a rename inside the folder a file lies in
+#     (`NtSetInformationFile`), with their structures (`Wdk_Foundation`,
+#     `Wdk_Storage_FileSystem`, `Win32_System_IO`). These are features of the
+#     `windows` crate that is in the lockfile already: no package is added.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
+  "Wdk_Foundation",
+  "Wdk_Storage_FileSystem",
   "Win32_Foundation",
+  "Win32_Globalization",
   "Win32_Security",
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
@@ -91,6 +102,7 @@ windows = { version = "0.62", features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_DataExchange",
+  "Win32_System_IO",
   "Win32_System_Memory",
   "Win32_System_StationsAndDesktops",
   "Win32_System_RemoteDesktop",

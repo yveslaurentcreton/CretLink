@@ -2,11 +2,12 @@
 //! system: every test works in a unique temporary directory that it removes
 //! when it ends.
 //!
-//! The walk, its bounds, its honest states and the handling of links are
-//! covered on every platform. What only Windows has — junctions, a file held
-//! open by another program, the read-only attribute — is covered by the tests
-//! marked `cfg(windows)`, and the permission-based refusals by the ones marked
-//! `cfg(unix)`.
+//! The walk, its bounds, its honest states, the one folder a removal is about
+//! and the handling of links are covered on every platform. What only Windows
+//! has — junctions, a path that leads through one, a folder that is held, a
+//! file held open by another program, the read-only attribute, names that
+//! Win32 would rewrite — is covered by the tests marked `cfg(windows)`, and
+//! the permission-based refusals by the ones marked `cfg(unix)`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -106,14 +107,33 @@ fn never() -> bool {
 /// One step with roomy bounds that nobody stops.
 #[track_caller]
 fn remove(root: &Path) -> StepReport {
-    let report = remove_step(root, roomy(), &never).expect("the folder is taken up");
+    let report = remove_step(root, None, roomy(), &never).expect("the folder is taken up");
     assert_on_the_wire(&report);
     report
 }
 
+/// Removes the folder at `root` in steps within `bounds`, the way a caller
+/// does: each step is given the identity of the folder that the step before
+/// answered with. Returns the report of every step.
+#[track_caller]
+fn remove_in_steps(root: &Path, bounds: StepBounds) -> Vec<StepReport> {
+    let mut reports: Vec<StepReport> = Vec::new();
+    loop {
+        let began = reports.last().and_then(|before| before.folder_id.clone());
+        let report = remove_step(root, began.as_deref(), bounds, &never).expect("a step");
+        assert_on_the_wire(&report);
+        let more = report.state == TreeState::More;
+        reports.push(report);
+        if !more {
+            return reports;
+        }
+        assert!(reports.len() < 100, "the removal must end");
+    }
+}
+
 /// Every answer of a step must be one the wire carries: within its bounds,
-/// every text on one line, and small enough for one record of the secure
-/// channel.
+/// every text on one line, the folder named exactly when more remains, and
+/// small enough for one record of the secure channel.
 #[track_caller]
 fn assert_on_the_wire(report: &StepReport) {
     let message = Message::Response {
@@ -189,7 +209,7 @@ fn an_empty_folder_is_removed() {
 #[test]
 fn a_folder_that_is_not_there_is_not_found() {
     let sb = Sandbox::new();
-    let error = remove_step(&sb.path("nothing-here"), roomy(), &never)
+    let error = remove_step(&sb.path("nothing-here"), None, roomy(), &never)
         .expect_err("a missing folder cannot be removed");
     assert_eq!(error.code, ErrorCode::PathNotFound);
 }
@@ -198,7 +218,8 @@ fn a_folder_that_is_not_there_is_not_found() {
 fn a_file_is_not_removed_as_a_folder() {
     let sb = Sandbox::new();
     let file = sb.file("report.txt");
-    let error = remove_step(&file, roomy(), &never).expect_err("a file is not a folder to remove");
+    let error =
+        remove_step(&file, None, roomy(), &never).expect_err("a file is not a folder to remove");
     assert_eq!(error.code, ErrorCode::WrongPathKind);
     assert!(file.exists(), "the file is untouched");
 }
@@ -218,7 +239,7 @@ fn a_drive_is_not_a_folder() {
 
     // The step itself refuses, shown with a path that has no folder above it
     // and names nothing on the disk.
-    let error = remove_step(Path::new(""), roomy(), &never)
+    let error = remove_step(Path::new(""), None, roomy(), &never)
         .expect_err("a path without a folder above it is refused");
     assert_eq!(error.code, ErrorCode::InvalidPath);
 }
@@ -243,30 +264,23 @@ fn a_step_stops_at_its_entry_bound_and_the_next_one_gets_further() {
         ..roomy()
     };
 
-    let (mut files, mut dirs, mut steps) = (0, 0, 0);
-    loop {
-        let report = remove_step(&root, bounds, &never).expect("a step");
-        assert_on_the_wire(&report);
-        steps += 1;
-        assert!(
-            report.removed_files + report.removed_dirs <= bounds.entries,
-            "a step settles at most its bound: {report:?}"
+    let reports = remove_in_steps(&root, bounds);
+
+    let (last, before) = reports.split_last().expect("at least one step");
+    for report in before {
+        assert_eq!(report.state, TreeState::More);
+        assert_eq!(
+            report.removed_files + report.removed_dirs,
+            bounds.entries,
+            "a step settles its bound and no more: {report:?}"
         );
-        files += report.removed_files;
-        dirs += report.removed_dirs;
-        match report.state {
-            TreeState::More => {
-                assert!(root.exists(), "an unfinished removal leaves the folder");
-                assert_eq!(report.removed_files + report.removed_dirs, bounds.entries);
-            }
-            TreeState::Removed => break,
-            other => panic!("unexpected state {other:?}"),
-        }
-        assert!(steps < 100, "the removal must end");
     }
+    assert_eq!(last.state, TreeState::Removed);
+    let files: u64 = reports.iter().map(|report| report.removed_files).sum();
+    let dirs: u64 = reports.iter().map(|report| report.removed_dirs).sum();
     assert_eq!(files, 25);
     assert_eq!(dirs, 2, "sub and big itself");
-    assert_eq!(steps, 3, "27 entries in steps of ten");
+    assert_eq!(reports.len(), 3, "27 entries in steps of ten");
     assert!(!root.exists());
 }
 
@@ -284,16 +298,17 @@ fn a_step_answers_when_its_time_is_up() {
         ..roomy()
     };
 
-    let first = remove_step(&root, bounds, &never).expect("a step");
+    let first = remove_step(&root, None, bounds, &never).expect("a step");
     assert_eq!(first.state, TreeState::More);
     assert_eq!(first.removed_files + first.removed_dirs, 1);
     assert_eq!(count_entries(&root), 3);
 
-    let mut steps = 1;
-    while remove_step(&root, bounds, &never).expect("a step").state == TreeState::More {
-        steps += 1;
-        assert!(steps < 100, "the removal must end");
-    }
+    let rest = remove_in_steps(&root, bounds);
+    assert_eq!(
+        rest.len(),
+        4,
+        "one step for each file left and for the folder"
+    );
     assert!(!root.exists());
 }
 
@@ -310,7 +325,7 @@ fn a_folder_nested_deeper_than_the_bound_is_left() {
         ..roomy()
     };
 
-    let report = remove_step(&root, bounds, &never).expect("a step");
+    let report = remove_step(&root, None, bounds, &never).expect("a step");
     assert_on_the_wire(&report);
 
     assert_eq!(report.state, TreeState::Incomplete);
@@ -326,6 +341,151 @@ fn a_folder_nested_deeper_than_the_bound_is_left() {
     assert!(sb.path("nest/1/2/3/4/bottom.txt").exists());
 }
 
+// --- one folder -------------------------------------------------------------
+
+/// A step that leaves more to do names the folder it is removing, so that the
+/// next step can go on with that folder. A step that ends the removal has no
+/// next step and names nothing.
+#[test]
+fn a_step_that_leaves_more_to_do_names_its_folder_and_no_other_step_does() {
+    let sb = Sandbox::new();
+    let root = sb.dir("old");
+    for n in 0..5 {
+        sb.file(&format!("old/{n}.txt"));
+    }
+    let small = StepBounds {
+        entries: 2,
+        ..roomy()
+    };
+
+    let first = remove_step(&root, None, small, &never).expect("a step");
+    assert_eq!(first.state, TreeState::More);
+    let named = first
+        .folder_id
+        .clone()
+        .expect("more to do names the folder");
+    assert!(!named.is_empty());
+
+    // The same folder is named again by the step that continues.
+    let second = remove_step(&root, Some(&named), small, &never).expect("a step");
+    assert_eq!(second.state, TreeState::More);
+    assert_eq!(second.folder_id.as_ref(), Some(&named));
+
+    // Stopped, and then removed: neither names a folder.
+    let stopped = remove_step(&root, Some(&named), small, &|| true).expect("a step");
+    assert_eq!(stopped.state, TreeState::Stopped);
+    assert_eq!(stopped.folder_id, None);
+    let last = remove_step(&root, Some(&named), roomy(), &never).expect("a step");
+    assert_eq!(last.state, TreeState::Removed);
+    assert_eq!(last.folder_id, None);
+    assert_on_the_wire(&last);
+}
+
+/// One removal is about one folder. Between two steps nothing holds the
+/// folder, and someone can put another folder in its place. The step that
+/// continues the removal is given the identity of the folder it began with:
+/// it refuses the other folder and removes nothing from it.
+#[test]
+fn a_continuation_in_another_folder_is_refused_and_removes_nothing() {
+    let sb = Sandbox::new();
+    let root = sb.dir("old");
+    for n in 0..6 {
+        sb.file(&format!("old/{n}.txt"));
+    }
+    let small = StepBounds {
+        entries: 2,
+        ..roomy()
+    };
+    let first = remove_step(&root, None, small, &never).expect("a step");
+    assert_eq!(first.state, TreeState::More);
+    let began = first.folder_id.expect("more to do names the folder");
+
+    // The folder is moved away, and another one takes over its name. Both
+    // exist at the same time, so they are two folders to any file system.
+    let moved = sb.path("moved");
+    std::fs::rename(&root, &moved).expect("move the folder away");
+    let other = sb.dir("old");
+    let theirs = sb.file("old/theirs.txt");
+
+    let error = remove_step(&root, Some(&began), roomy(), &never)
+        .expect_err("another folder is not removed");
+    assert_eq!(error.code, ErrorCode::InvalidPath);
+    assert!(theirs.exists(), "nothing was removed from the other folder");
+    assert_eq!(count_entries(&other), 1);
+    assert_eq!(count_entries(&moved), 4, "nor from the one moved away");
+
+    // Asked for as a removal of its own, the other folder is removed.
+    assert_eq!(remove(&root).state, TreeState::Removed);
+    // And the first folder, back in its place, is taken up again.
+    std::fs::rename(&moved, &root).expect("move the folder back");
+    let last = remove_step(&root, Some(&began), roomy(), &never).expect("a step");
+    assert_eq!(last.state, TreeState::Removed);
+    assert_eq!(last.removed_files, 4);
+}
+
+/// A removal that began with a folder does not go on with a link that was put
+/// in its place — not even to remove the link, which a first step would do.
+#[cfg(unix)]
+#[test]
+fn a_continuation_that_finds_a_link_in_the_place_of_the_folder_is_refused() {
+    let sb = Sandbox::new();
+    let root = sb.dir("old");
+    for n in 0..4 {
+        sb.file(&format!("old/{n}.txt"));
+    }
+    let small = StepBounds {
+        entries: 2,
+        ..roomy()
+    };
+    let first = remove_step(&root, None, small, &never).expect("a step");
+    let began = first.folder_id.expect("more to do names the folder");
+
+    let moved = sb.path("moved");
+    std::fs::rename(&root, &moved).expect("move the folder away");
+    std::os::unix::fs::symlink(&moved, &root).expect("a link takes its place");
+
+    let error = remove_step(&root, Some(&began), roomy(), &never)
+        .expect_err("a link is not the folder the removal began with");
+    assert_eq!(error.code, ErrorCode::InvalidPath);
+    assert!(std::fs::symlink_metadata(&root).is_ok(), "the link stays");
+    assert_eq!(count_entries(&moved), 2, "and so does what it points at");
+}
+
+/// Only what a step removed is reported as removed. A folder that is renamed
+/// away while the step runs is gone from its path, and its content lives on
+/// under the new name: the step says that the folder was not found, never
+/// that it removed it. Off Windows only, where nothing holds the folder; on
+/// Windows the step holds it and the rename is refused (see the Windows
+/// tests).
+#[cfg(not(windows))]
+#[test]
+fn a_folder_that_vanishes_during_the_step_is_never_reported_as_removed() {
+    let sb = Sandbox::new();
+    let root = sb.dir("old");
+    for n in 0..5 {
+        sb.file(&format!("old/{n}.txt"));
+    }
+    let away = sb.path("away");
+    let renamed = Cell::new(false);
+    // The step asks before every entry whether to stop: the first time it
+    // asks, the folder is renamed behind it.
+    let rename_behind_the_walk = || {
+        if !renamed.replace(true) {
+            std::fs::rename(&root, &away).expect("rename the folder away");
+        }
+        false
+    };
+
+    let report = remove_step(&root, None, roomy(), &rename_behind_the_walk).expect("a step");
+    assert_on_the_wire(&report);
+
+    assert_eq!(report.state, TreeState::Incomplete, "never removed");
+    assert_eq!((report.removed_files, report.removed_dirs), (0, 0));
+    assert_eq!(failed_paths(&report), vec![root.display().to_string()]);
+    assert_eq!(report.failed[0].code, ErrorCode::PathNotFound);
+    assert_eq!(count_entries(&away), 5, "the content lives on elsewhere");
+}
+
 // --- stop -----------------------------------------------------------------
 
 #[test]
@@ -334,7 +494,7 @@ fn a_step_that_is_stopped_at_once_removes_nothing() {
     let root = sb.dir("keep");
     sb.file("keep/a.txt");
 
-    let report = remove_step(&root, roomy(), &|| true).expect("a step");
+    let report = remove_step(&root, None, roomy(), &|| true).expect("a step");
 
     assert_eq!(report.state, TreeState::Stopped);
     assert_eq!((report.removed_files, report.removed_dirs), (0, 0));
@@ -356,7 +516,7 @@ fn a_step_that_is_stopped_midway_reports_what_it_had_removed() {
         asked.get() >= 4
     };
 
-    let report = remove_step(&root, roomy(), &stop_at_the_fourth).expect("a step");
+    let report = remove_step(&root, None, roomy(), &stop_at_the_fourth).expect("a step");
     assert_on_the_wire(&report);
 
     assert_eq!(report.state, TreeState::Stopped);
@@ -547,7 +707,7 @@ fn a_step_that_can_remove_nothing_is_blocked() {
         ..roomy()
     };
 
-    let report = remove_step(&root, bounds, &never).expect("a step");
+    let report = remove_step(&root, None, bounds, &never).expect("a step");
     assert_on_the_wire(&report);
 
     assert_eq!(report.state, TreeState::Blocked);
@@ -583,30 +743,14 @@ fn a_name_with_a_line_break_is_reported_on_one_line() {
 
 #[cfg(windows)]
 mod windows {
+    use std::cell::Cell;
     use std::os::windows::fs::OpenOptionsExt;
-    use std::path::Path;
 
     use cretlink_protocol::{ErrorCode, TreeState};
 
-    use super::{Sandbox, failed_paths, remove};
-
-    /// Makes `link` a junction to the folder `target`. A junction needs no
-    /// privilege, unlike a symbolic link.
-    fn junction(link: &Path, target: &Path) {
-        let made = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(link)
-            .arg(target)
-            .output()
-            .expect("run mklink");
-        assert!(
-            made.status.success(),
-            "mklink /J failed: {}",
-            String::from_utf8_lossy(&made.stderr)
-        );
-    }
+    use super::super::super::testing::{junction, reported, verbatim};
+    use super::super::{StepBounds, remove_step};
+    use super::{Sandbox, count_entries, failed_paths, never, remove, roomy};
 
     /// A junction in the folder is removed as a link: the folder it points at,
     /// elsewhere on the disk, keeps everything.
@@ -703,7 +847,9 @@ mod windows {
         assert_eq!(report.state, TreeState::Incomplete, "never a success");
         assert_eq!(report.removed_files, 1, "free.txt");
         assert_eq!(report.removed_dirs, 0);
-        assert_eq!(failed_paths(&report), vec![held.display().to_string()]);
+        // Named by where it really lies, without the prefix of a verbatim
+        // path.
+        assert_eq!(failed_paths(&report), vec![reported(&held)]);
         assert_eq!(report.failed[0].code, ErrorCode::FileInUse);
         assert!(held.exists());
         assert!(root.exists());
@@ -755,5 +901,168 @@ mod windows {
         assert_eq!(report.state, TreeState::Removed, "{report:?}");
         assert_eq!((report.removed_files, report.removed_dirs), (1, 9));
         assert!(!root.exists());
+    }
+
+    /// A folder that is reached through a junction in its path is not the
+    /// folder that lies at that path. The removal is refused before anything
+    /// is removed, and what the junction leads to keeps its content.
+    #[test]
+    fn a_folder_reached_through_a_junction_is_refused_and_its_target_keeps_everything() {
+        let sb = Sandbox::new();
+        let target = sb.dir("elsewhere/old");
+        let inner = sb.file("elsewhere/old/inner.txt");
+        sb.file("elsewhere/old/sub/deeper.txt");
+        let via = sb.path("via");
+        junction(&via, &sb.path("elsewhere"));
+
+        let error = remove_step(&via.join("old"), None, roomy(), &never)
+            .expect_err("a path through a link is refused");
+        assert_eq!(error.code, ErrorCode::InvalidPath);
+        assert!(inner.exists(), "the target keeps its content");
+        assert_eq!(count_entries(&target), 3);
+
+        // By its own path the folder is removed, and the junction stays.
+        assert_eq!(remove(&target).state, TreeState::Removed);
+        assert!(std::fs::symlink_metadata(&via).is_ok());
+    }
+
+    /// Between two steps of a removal the folder above the one being removed
+    /// is swapped for a junction to another place that has a folder of the
+    /// same name. The step that continues the removal refuses, and nothing
+    /// in that other place is removed.
+    #[test]
+    fn a_parent_swapped_for_a_junction_between_two_steps_is_refused() {
+        let sb = Sandbox::new();
+        let root = sb.dir("parent/old");
+        for n in 0..6 {
+            sb.file(&format!("parent/old/{n}.txt"));
+        }
+        let victim = sb.dir("victim/old");
+        let theirs = sb.file("victim/old/theirs.txt");
+        let small = StepBounds {
+            entries: 2,
+            ..roomy()
+        };
+
+        let first = remove_step(&root, None, small, &never).expect("a step");
+        assert_eq!(first.state, TreeState::More);
+        let began = first.folder_id.expect("more to do names the folder");
+
+        let parent = sb.path("parent");
+        let moved = sb.path("parent-moved");
+        std::fs::rename(&parent, &moved).expect("move the parent away");
+        junction(&parent, &sb.path("victim"));
+
+        let error = remove_step(&root, Some(&began), roomy(), &never)
+            .expect_err("the path now leads through a link");
+        assert_eq!(error.code, ErrorCode::InvalidPath);
+        assert!(theirs.exists(), "nothing was removed in the other place");
+        assert_eq!(count_entries(&victim), 1);
+        assert_eq!(count_entries(&moved.join("old")), 4);
+
+        // Without the identity the path is refused all the same: it is the
+        // link in the path that is refused, whatever the removal began with.
+        let error = remove_step(&root, None, roomy(), &never)
+            .expect_err("a path through a link is refused");
+        assert_eq!(error.code, ErrorCode::InvalidPath);
+        assert!(theirs.exists());
+    }
+
+    /// A step holds the folder it removes: nobody renames it away or removes
+    /// it while the step runs, so the folder that is emptied and removed is
+    /// the folder that was verified.
+    #[test]
+    fn the_folder_cannot_be_renamed_away_while_a_step_holds_it() {
+        let sb = Sandbox::new();
+        let root = sb.dir("old");
+        for n in 0..5 {
+            sb.file(&format!("old/{n}.txt"));
+        }
+        let away = sb.path("away");
+        let tried = Cell::new(false);
+        let refused = Cell::new(false);
+        // The step asks before every entry whether to stop: the first time
+        // it asks, another program tries to rename the folder away.
+        let rename_behind_the_walk = || {
+            if !tried.replace(true) {
+                refused.set(std::fs::rename(&root, &away).is_err());
+            }
+            false
+        };
+
+        let report = remove_step(&root, None, roomy(), &rename_behind_the_walk).expect("a step");
+
+        assert!(tried.get(), "the rename was tried during the step");
+        assert!(refused.get(), "and refused: the step holds the folder");
+        assert_eq!(report.state, TreeState::Removed, "{report:?}");
+        assert_eq!((report.removed_files, report.removed_dirs), (5, 1));
+        assert!(!root.exists());
+        assert!(!away.exists());
+    }
+
+    /// Names that Win32 would rewrite — one that ends in a dot or a space,
+    /// the name of a device — are plain names to the walk: the entry of that
+    /// very name is the one that is opened and removed. Such entries are
+    /// created through verbatim paths, the way a program can that wants a
+    /// removal to miss them or to open something else.
+    #[test]
+    fn names_that_win32_would_rewrite_are_removed_as_plain_names() {
+        let sb = Sandbox::new();
+        let root = sb.dir("old");
+        let inside = verbatim(&root);
+        for name in [
+            "ends-in-a-dot.",
+            "ends-in-a-space ",
+            "nul",
+            "con",
+            "aux.txt",
+        ] {
+            std::fs::write(inside.join(name), name.as_bytes()).expect("create by a verbatim path");
+        }
+        std::fs::create_dir(inside.join("folder.")).expect("create by a verbatim path");
+        std::fs::write(inside.join("folder.").join("lpt1"), b"inner").expect("create");
+        // A sibling that such a name must not be taken for.
+        sb.file("old/ends-in-a-dot");
+
+        let report = remove(&root);
+
+        assert_eq!(report.state, TreeState::Removed, "{report:?}");
+        assert_eq!(report.removed_files, 7);
+        assert_eq!(
+            report.removed_dirs, 2,
+            "the folder with a dot and old itself"
+        );
+        assert!(!root.exists());
+    }
+
+    /// A junction that was put in the place of the folder between two steps
+    /// is not removed by the step that continues: the removal began with a
+    /// folder, and that folder is somewhere else now.
+    #[test]
+    fn a_continuation_that_finds_a_junction_in_the_place_of_the_folder_is_refused() {
+        let sb = Sandbox::new();
+        let root = sb.dir("old");
+        for n in 0..4 {
+            sb.file(&format!("old/{n}.txt"));
+        }
+        let small = StepBounds {
+            entries: 2,
+            ..roomy()
+        };
+        let first = remove_step(&root, None, small, &never).expect("a step");
+        let began = first.folder_id.expect("more to do names the folder");
+
+        let moved = sb.path("moved");
+        std::fs::rename(&root, &moved).expect("move the folder away");
+        junction(&root, &moved);
+
+        let error = remove_step(&root, Some(&began), roomy(), &never)
+            .expect_err("a link is not the folder the removal began with");
+        assert_eq!(error.code, ErrorCode::InvalidPath);
+        assert!(
+            std::fs::symlink_metadata(&root).is_ok(),
+            "the junction stays"
+        );
+        assert_eq!(count_entries(&moved), 2, "and so does what it points at");
     }
 }
