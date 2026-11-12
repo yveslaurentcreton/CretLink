@@ -68,7 +68,11 @@ pub use activity::{
     ActivityEntry, ActivityFeed, ActivityItem, ActivityKind, ActivitySource, ActivityState,
     CustomerActivity,
 };
-pub use dial::{Dial, DirectDial, RelayDial, WssRelayDial};
+pub use dial::{
+    DEFAULT_JOIN_LIMIT, DEFAULT_PARK_LIMIT, DEFAULT_REDIAL_PAUSE, Dial, DirectDial, JoiningDial,
+    RELAY_ANSWER_TIMEOUT, RELAY_CONNECT_TIMEOUT, RelayDial, RelayFailure, RelayLeg,
+    RendezvousLapsed, WaitingDial, WssRelayDial, rendezvous_lapsed,
+};
 // The wss trust material a retrying endpoint builds once and clones per attempt
 // (see `WssRelayDial::connector`). Re-exported so a caller can name the connector
 // it holds across a reconnect loop without a direct `cretlink-wss` dependency.
@@ -609,6 +613,11 @@ pub enum SessionError {
     /// Binding the console listener or dialing the target failed.
     #[error("session transport setup failed")]
     Io(#[source] std::io::Error),
+    /// The session could not be set up through the relay: it cannot be
+    /// reached, is not trusted, does not answer, or refused (ST-M007-012).
+    /// The source says which.
+    #[error("the session could not be set up through the relay")]
+    Relay(#[from] RelayFailure),
 }
 
 /// A sink for session lifecycle audit events (REQ-F-017, REQ-S-017).

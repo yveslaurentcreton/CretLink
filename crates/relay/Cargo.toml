@@ -22,6 +22,12 @@ tokio.workspace = true
 rand.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
+# HKDF-SHA256 derives the rendezvous ticket from the seed of a relay code and
+# the relay's host name (ST-M007-012). The same RustCrypto crates the secure
+# channel already uses for the Session Approval Code; the relay server itself
+# never derives a ticket and still holds no session key.
+hkdf.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 # The forwarding tests drive the *real* Noise XX pairing and secure channel

@@ -204,7 +204,9 @@ async function browse(): Promise<void> {
 async function viewCommand(
   busy: string,
   call: () => Promise<ConsentView>,
-  failure: Omit<UiError, "message">,
+  // What to say around the backend's message, or how to choose that from the
+  // refusal itself.
+  failure: Omit<UiError, "message"> | ((error: unknown) => Omit<UiError, "message">),
 ): Promise<void> {
   const startGen = pushGeneration;
   set({ busy, error: undefined });
@@ -213,7 +215,8 @@ async function viewCommand(
     if (pushGeneration === startGen) adoptView(next);
     set({ busy: undefined });
   } catch (error) {
-    set({ busy: undefined, error: { ...failure, message: describe(error) } });
+    const around = typeof failure === "function" ? failure(error) : failure;
+    set({ busy: undefined, error: { ...around, message: describe(error) } });
   }
 }
 
@@ -247,10 +250,19 @@ function connectCode(): void {
     });
     return;
   }
-  void viewCommand("connect", () => api.startLiveSession(code), {
-    title: "That code did not work",
-    next: "Check the code with your technician and type it again.",
-  });
+  void viewCommand("connect", () => api.startLiveSession(code), (error) =>
+    // A relay code is not a mistyped code: typing it again would not help
+    // (ST-M007-012).
+    isCommandError(error) && error.stage === "relay"
+      ? {
+          title: "This copy cannot use a relay code",
+          next: "Ask your technician for a copy of CretLink that is set up for their relay, or connect while you are on the same network.",
+        }
+      : {
+          title: "That code did not work",
+          next: "Check the code with your technician and type it again.",
+        },
+  );
 }
 
 async function relaunch(): Promise<void> {

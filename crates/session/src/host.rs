@@ -179,13 +179,20 @@ impl SessionHost {
     ///
     /// This is the relay-mode console entry (ST-M007-008): the console dials the
     /// relay outbound, writes its rendezvous preamble, and pairs over the spliced
-    /// stream. An unreachable relay, a rejected preamble, or a never-matched peer
-    /// fails closed as [`SessionError::Io`] and never yields a fabricated session
-    /// (REQ-N-008, REQ-N-015).
+    /// stream. A relay that cannot be reached, is not trusted, does not answer
+    /// or refuses fails closed as [`SessionError::Relay`] with its reason, and
+    /// never yields a fabricated session (REQ-N-008, REQ-N-015).
+    ///
+    /// The handle exists once the dialer has its stream. With a plain relay
+    /// dial that is as soon as the relay admitted the leg, and pairing then
+    /// has its usual time limit to hear the peer. A side that may wait longer
+    /// wraps its dial in [`WaitingDial`](crate::WaitingDial), which returns
+    /// when the peer is heard.
     ///
     /// # Errors
     ///
-    /// [`SessionError::Io`] if the dialer cannot obtain the stream.
+    /// The dialer's error if it cannot obtain the stream: [`SessionError::Relay`]
+    /// for a relay dial, [`SessionError::Io`] for a direct one.
     pub async fn host_dialed<D: Dial>(
         dialer: D,
         hints: ConsoleHints,

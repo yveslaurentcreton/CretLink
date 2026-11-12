@@ -21,6 +21,9 @@ mdns-sd.workspace = true
 # Local interface enumeration for REQ-S-010 private-interface scoping.
 # MIT OR BSD-3-Clause, both in the deny.toml allow set.
 if-addrs.workspace = true
+# OS randomness for the seed of a relay code (ST-M007-012); the same `rand`
+# the relay's rendezvous ticket and the session nonces use.
+rand.workspace = true
 
 [lints]
 workspace = true

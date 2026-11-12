@@ -42,6 +42,9 @@ tokio = { workspace = true, features = ["net"] }
 # whole attended-session trust model across the splice.
 cretlink-session.workspace = true
 cretlink-protocol.workspace = true
+# The relay code that both copies of a session type and derive their rendezvous
+# ticket from (ST-M007-012): the test pairs two endpoints through a typed code.
+cretlink-discovery.workspace = true
 # The wss verification suite (ST-M007-009) mints a runtime self-signed leaf with
 # `testcert::self_signed` (feature `test-cert`), stands up `serve_wss` behind it,
 # and drives both endpoints' real `WssRelayDial` through it. Enabling the feature

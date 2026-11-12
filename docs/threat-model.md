@@ -1905,7 +1905,16 @@ single-use rendezvous ticket) so the relay can match the two ends of a session;
 a forwarding channel that carries opaque, end-to-end encrypted session frames
 between the matched endpoints; and relay-operator surfaces (admission
 authentication, rate limits, concurrency quotas, and metadata-only metrics and
-event logs) for self-hosted deployments.
+event logs) for self-hosted deployments. The relay answers each preamble once,
+with a fixed frame that says "admitted" or names the reason of a refusal
+(ST-M007-012); it is the only thing the relay itself ever writes to an
+endpoint.
+
+The ticket of a session is derived from a **relay code** that the technician
+reads to the customer, and from the host name of the relay that both programs
+have in their settings (ST-M007-012). The code is a third thing a person
+reads or types, next to the LAN connection code and the approval code, and
+like the first it is addressing only.
 
 **Threat actors.** A malicious or compromised relay operator — the defining
 actor for this boundary, modelled as fully hostile: it may observe, store,
@@ -1993,6 +2002,25 @@ metadata rather than content.
   an anonymous abuse service, plus self-hosting documentation with verifiable
   release provenance (REQ-S-019; M007 scope covering REQ-S-017 through
   REQ-S-022).
+- *A relay code grants nothing.* It holds a random seed of 64 bits and a
+  typing check, no address and no key. Someone who overhears or guesses a code
+  can at most reach the rendezvous before the customer does: the approval
+  codes then differ on the two screens and the session ends before consent
+  (REQ-S-006, REQ-S-009). The relay's rate limit bounds guessing, a ticket
+  works once, and a code is minted for one session. Someone who holds the
+  code and joins without speaking can hold up one parked leg; the waiting
+  side gives up a silent leg after 45 seconds and parks a new one. Because
+  the relay's host name enters the derivation, a code read
+  aloud names nothing on any other relay. The code is named and drawn
+  differently from the approval code, which alone establishes trust.
+- *The relay's answer says only what admission decided.* The reasons it can
+  name (no key, an unknown key, the rate limit, the quota, not available,
+  another preamble version) concern the use of the forwarder, never a session
+  (ADR-0016 §4). The answer carries no credential, no ticket and no session
+  data, and an endpoint never takes an unknown status for an admission. To a
+  stranger it confirms what the port already shows, that a relay runs there
+  and whether it asks for a key; something that sends no preamble gets no
+  answer.
 - *Adversarial validation gates release.* M007 cannot exit until tests
   demonstrate that a relay which observes, delays, drops, replays, reorders,
   or modifies traffic gains neither plaintext nor command authority (M007 exit
