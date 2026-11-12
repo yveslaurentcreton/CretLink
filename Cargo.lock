@@ -405,6 +405,7 @@ dependencies = [
  "cretlink-protocol",
  "if-addrs",
  "mdns-sd",
+ "rand 0.9.5",
  "thiserror 2.0.19",
 ]
 
