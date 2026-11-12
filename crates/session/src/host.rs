@@ -893,11 +893,12 @@ impl HostHandle {
     /// agent's typed result (ST-M003-004/005).
     ///
     /// This is the console's single primitive for the file surface: every
-    /// `Operation::Fs*`, `CreateDir`, `RemoveDir`, `ListStaged`, and
-    /// `StagingCleanup` travels through it and comes back as the matching
-    /// [`OpResult`] variant, so higher layers — the transfer engine and the MCP
-    /// bridge — compose it without duplicating the wire loop. The caller matches
-    /// the variant it expects; an unexpected shape is [`SessionError::Unexpected`].
+    /// `Operation::Fs*`, `CreateDir`, `RemoveDir`, `RemoveTree`, `ListStaged`,
+    /// and `StagingCleanup` travels through it and comes back as the matching
+    /// [`OpResult`] variant, so higher layers — the transfer engine, the folder
+    /// removal engine and the MCP bridge — compose it without duplicating the
+    /// wire loop. The caller matches the variant it expects; an unexpected shape
+    /// is [`SessionError::Unexpected`].
     ///
     /// The bytes carried by `FsWrite`/`FsRead` and any path are remote-facing
     /// data; the operation is validated against the protocol limits locally

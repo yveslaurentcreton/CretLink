@@ -9,8 +9,9 @@
 //! 1. connect and derive the same six-digit **Session Approval Code**;
 //! 2. grant **one** informed full-control consent (REQ-F-006, REQ-S-003);
 //! 3. hold an active session ([`SessionEvent::Active`]) in which the console
-//!    drives jobs, file operations, interactive terminals and the desktop
-//!    surface, with liveness heartbeats underneath; and
+//!    drives jobs, file operations (transfers, the drive list and the removal
+//!    of a folder among them), interactive terminals and the desktop surface,
+//!    with liveness heartbeats underneath; and
 //! 4. **revoke and clean up** from either side, fail-closed (REQ-F-018,
 //!    REQ-F-019, REQ-S-004, REQ-S-009).
 //!
@@ -52,6 +53,7 @@ use thiserror::Error;
 mod action;
 pub mod activity;
 mod dial;
+mod files;
 mod host;
 mod joiner;
 mod reboot;
@@ -69,6 +71,7 @@ pub use activity::{
     CustomerActivity,
 };
 pub use dial::{Dial, DirectDial, RelayDial, WssRelayDial};
+pub use files::{TreeRemovalError, TreeRemovalProgress, TreeRemovalReport};
 // The wss trust material a retrying endpoint builds once and clones per attempt
 // (see `WssRelayDial::connector`). Re-exported so a caller can name the connector
 // it holds across a reconnect loop without a direct `cretlink-wss` dependency.
@@ -95,8 +98,8 @@ pub use cretlink_protocol::RevokeReason;
 // crate for the whole command surface (ST-M003-001/002). `JobId`/`SessionId`
 // appear in the public `HostHandle` exec API, so they are re-exported too.
 pub use cretlink_protocol::{
-    CAP_DESKTOP_V1, CAP_REBOOT_RESUME_V1, CAP_TERM_V1, JobId, JobOutcome, JobSummary, Origin,
-    OutputStream, Purpose, SessionId, Shell,
+    CAP_DESKTOP_V1, CAP_FS_V2, CAP_REBOOT_RESUME_V1, CAP_TERM_V1, JobId, JobOutcome, JobSummary,
+    Origin, OutputStream, Purpose, SessionId, Shell,
 };
 // File-operation wire vocabulary surfaced by `HostHandle::file_op` and the
 // transfer engine, re-exported so callers name one crate (ST-M003-004/005).
@@ -104,6 +107,10 @@ pub use cretlink_protocol::{
     B64Bytes, CleanupFailure, CleanupPolicy, CleanupTrigger, DigestAlgo, FileEntry, FileKind,
     OpResult, Operation, RemotePath, StagedEntry,
 };
+// The drive list and the folder removal of the technician's file explorer,
+// surfaced by `HostHandle::list_drives` and `HostHandle::remove_tree`
+// (ST-M010-001).
+pub use cretlink_protocol::{DriveEntry, DriveKind, TreeFailure, TreeState};
 // Interactive-desktop wire vocabulary surfaced by the `HostHandle` desktop API
 // (ADR-0015, ST-M005-001/002/003), re-exported so callers name one crate for
 // the whole capture-and-input surface.
@@ -375,6 +382,11 @@ pub enum SessionEvent {
     /// when sending starts (`outcome` [`ActionOutcome::InProgress`]) and again
     /// when it completes or fails, with the byte count. A received file is
     /// reported at its commit with its byte count (ST-M009-011).
+    ///
+    /// The removal of a folder with its content takes several requests and is
+    /// reported under one `id` too: in progress when its first step leaves
+    /// more to do, and once more when it ends — done only when the folder is
+    /// gone, cancelled, or failed with the first reason (ST-M010-001).
     RequestHandled {
         /// Stable for the life of one activity item: a later `RequestHandled`
         /// with the same id (a finished file transfer) replaces the earlier one.

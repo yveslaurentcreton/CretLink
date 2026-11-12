@@ -194,6 +194,7 @@ impl ActivityState {
             ActionOutcome::InProgress => Self::Running,
             ActionOutcome::Succeeded => Self::Done { exit_code: None },
             ActionOutcome::Failed { code } => Self::failed(error_text(code)),
+            ActionOutcome::Cancelled => Self::Cancelled,
             ActionOutcome::Unknown => Self::failed(UNKNOWN_RESULT),
         }
     }

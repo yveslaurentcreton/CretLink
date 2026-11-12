@@ -58,11 +58,17 @@ pub enum ActionOutcome {
     InProgress,
     /// The agent performed the operation and answered with a result.
     Succeeded,
-    /// The agent refused or failed the operation with this error category.
+    /// The agent refused or failed the operation with this error category. A
+    /// folder removal that left something behind is one of these, with the
+    /// reason of the first entry it could not remove (ST-M010-001).
     Failed {
         /// The machine-readable category the agent answered with.
         code: ErrorCode,
     },
+    /// The caller ended the action before it was finished: a folder removal
+    /// that the technician cancelled (ST-M010-001). What it had done until
+    /// then stays done.
+    Cancelled,
     /// The agent sent no answer (the channel failed first), so the outcome is
     /// not known.
     Unknown,
@@ -262,6 +268,52 @@ mod tests {
             keys: vec!["ctrl".to_owned(), "shift".to_owned(), "esc".to_owned()],
         };
         assert_eq!(describe_operation(&op), "press ctrl+shift+esc");
+    }
+
+    /// The drive list and the removal of a folder say what they are, the
+    /// removal with its folder and with the fact that everything in it goes
+    /// too; the request that ends a removal says that it stops one
+    /// (ST-M010-001).
+    #[test]
+    fn describes_the_explorer_operations() {
+        assert_eq!(
+            describe_operation(&Operation::FsDrives {}),
+            "list the drives"
+        );
+        let folder = RemotePath::Absolute {
+            path: "C:\\Users\\ann\\Downloads\\old-setup".to_owned(),
+        };
+        assert_eq!(
+            describe_operation(&Operation::RemoveTree {
+                path: folder.clone(),
+                stop: false,
+            }),
+            "delete the folder C:\\Users\\ann\\Downloads\\old-setup and everything in it"
+        );
+        assert_eq!(
+            describe_operation(&Operation::RemoveTree {
+                path: folder,
+                stop: true,
+            }),
+            "stop deleting the folder C:\\Users\\ann\\Downloads\\old-setup"
+        );
+        assert_eq!(
+            describe_operation(&Operation::RemoveTree {
+                path: RemotePath::Staging {
+                    name: "unpacked".to_owned(),
+                },
+                stop: false,
+            }),
+            "delete the folder unpacked (CretLink staging folder) and everything in it"
+        );
+        // Neither is a step of a transfer: both are reported as actions.
+        assert!(!is_transfer_step(&Operation::FsDrives {}));
+        assert!(!is_transfer_step(&Operation::RemoveTree {
+            path: RemotePath::Staging {
+                name: "unpacked".to_owned(),
+            },
+            stop: false,
+        }));
     }
 
     #[test]
