@@ -37,6 +37,7 @@
 //! No message of this module ever contains a key: an error names the line and
 //! the label.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -166,8 +167,13 @@ pub enum KeysError {
 ///
 /// The first rule the text breaks, as a [`KeysError`].
 pub fn parse_keys(text: &str) -> Result<Keys, KeysError> {
-    // Label and key of every entry so far, with its line, to find duplicates.
-    let mut seen: Vec<(usize, &str, &str)> = Vec::new();
+    // Some editors put a byte-order mark in front of a text file.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    // The entries so far, and the line of every label and key, to find a
+    // second use.
+    let mut entries: Vec<(&str, &str)> = Vec::new();
+    let mut label_lines: HashMap<&str, usize> = HashMap::new();
+    let mut key_lines: HashMap<&str, usize> = HashMap::new();
     for (index, raw) in text.lines().enumerate() {
         let line = index + 1;
         let entry = raw.trim();
@@ -208,32 +214,32 @@ pub fn parse_keys(text: &str) -> Result<Keys, KeysError> {
                 label: label_of_line(),
             });
         }
-        for (first, earlier_label, earlier_key) in &seen {
-            if *earlier_label == label {
-                return Err(KeysError::DuplicateLabel {
-                    line,
-                    first: *first,
-                    label: label_of_line(),
-                });
-            }
-            if *earlier_key == key {
-                return Err(KeysError::DuplicateKey {
-                    line,
-                    first: *first,
-                });
-            }
+        if let Some(first) = label_lines.get(label) {
+            return Err(KeysError::DuplicateLabel {
+                line,
+                first: *first,
+                label: label_of_line(),
+            });
         }
-        if seen.len() == MAX_KEYS {
+        if let Some(first) = key_lines.get(key) {
+            return Err(KeysError::DuplicateKey {
+                line,
+                first: *first,
+            });
+        }
+        if entries.len() == MAX_KEYS {
             return Err(KeysError::TooMany);
         }
-        seen.push((line, label, key));
+        label_lines.insert(label, line);
+        key_lines.insert(key, line);
+        entries.push((label, key));
     }
-    if seen.is_empty() {
+    if entries.is_empty() {
         return Err(KeysError::Empty);
     }
-    Ok(seen
+    Ok(entries
         .into_iter()
-        .map(|(_line, label, key)| (AdmissionToken::from_text(key), ClientId::new(label)))
+        .map(|(label, key)| (AdmissionToken::from_text(key), ClientId::new(label)))
         .collect())
 }
 
@@ -332,6 +338,15 @@ mod tests {
         let keys = parse_keys(&text).unwrap();
         assert_eq!(labels(&keys), ["acme", "frontdesk"]);
         assert_eq!(keys[0].0.as_bytes(), KEY_A.as_bytes());
+        assert_eq!(keys[1].0.as_bytes(), KEY_B.as_bytes());
+    }
+
+    #[test]
+    fn a_file_from_a_windows_editor_reads_the_same() {
+        // A byte-order mark in front and line ends of two characters.
+        let text = format!("\u{feff}acme:{KEY_A}\r\nfrontdesk:{KEY_B}\r\n");
+        let keys = parse_keys(&text).unwrap();
+        assert_eq!(labels(&keys), ["acme", "frontdesk"]);
         assert_eq!(keys[1].0.as_bytes(), KEY_B.as_bytes());
     }
 
