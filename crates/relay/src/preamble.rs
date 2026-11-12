@@ -34,6 +34,29 @@
 //! so this codec never touches a session key and the token is the *only* secret
 //! it handles — held in the zeroizing [`AdmissionToken`] and never logged.
 //!
+//! # The relay's answer
+//!
+//! The relay answers every preamble once, before it forwards anything
+//! (ST-M007-012, ADR-0016 §5):
+//!
+//! ```text
+//! magic      4 bytes   b"CRLR"
+//! version    1 byte    the relay's PREAMBLE_VERSION
+//! status     1 byte    0 = admitted; 1..=6 = refused, see RelayRefusal
+//! ```
+//!
+//! *Admitted* means that the leg waits for its peer, or has met it: whatever
+//! follows on the stream comes from the peer and is opaque to the relay.
+//! Without the answer a refusal, a full relay and a rendezvous that nobody
+//! joined all looked the same to an endpoint, a closed connection. With it an
+//! endpoint tells them apart: a refusal is said, and a stream that ends after
+//! *admitted* before the peer was heard is a rendezvous that lapsed.
+//!
+//! The answer is the relay's own addressing metadata. It is fixed in size,
+//! written once, carries nothing of a session and gives nobody control: the
+//! reasons are those of admission (ADR-0016 §4), which decides only who may
+//! use the forwarder.
+//!
 //! # Fail-closed reading
 //!
 //! [`read_preamble`] validates every field with a hard bound *before* it
@@ -56,9 +79,77 @@ use crate::ticket::{RENDEZVOUS_TICKET_LEN, RendezvousTicket};
 /// the port; it is not a secret and provides no authentication.
 pub const PREAMBLE_MAGIC: [u8; 4] = *b"CRLR";
 
-/// The preamble wire version this build reads and writes. A future
-/// transport change bumps this and the relay rejects mismatches fail-closed.
-pub const PREAMBLE_VERSION: u8 = 1;
+/// The preamble wire version this build reads and writes. A relay refuses
+/// another version and says so in its answer ([`RelayRefusal::UnsupportedVersion`]).
+///
+/// Version 2 added the relay's answer ([`RelayAnswer`]); a version 1 relay
+/// answers nothing.
+pub const PREAMBLE_VERSION: u8 = 2;
+
+/// Length in bytes of the relay's answer to a preamble.
+pub const RELAY_ANSWER_LEN: usize = 6;
+
+/// The status byte of an admitted leg.
+const STATUS_ADMITTED: u8 = 0;
+
+/// The relay's answer to a rendezvous preamble. See the [module docs](self).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayAnswer {
+    /// The leg may use the forwarder. It waits for its peer or has met it;
+    /// everything that follows on the stream comes from the peer.
+    Admitted,
+    /// The leg is refused. The relay closes the connection after the answer
+    /// and forwards nothing.
+    Refused(RelayRefusal),
+}
+
+/// Why a relay refused a leg. Every reason is secret-free and says what to do
+/// next (REQ-N-015). None of them concerns a session: a relay decides only who
+/// may use the forwarder (ADR-0016 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RelayRefusal {
+    /// The relay admits only with an admission key and none was presented.
+    #[error("the relay asks for an admission key and none was presented")]
+    CredentialRequired,
+    /// The relay does not know the admission key that was presented.
+    #[error("the relay does not know the admission key that was presented")]
+    CredentialRejected,
+    /// Too many attempts in a short time. Wait before trying again.
+    #[error("the relay had too many attempts in a short time; wait a moment")]
+    RateLimited,
+    /// The relay, or this client's share of it, has no free place.
+    #[error("the relay has no free place right now")]
+    Busy,
+    /// The relay cannot admit anybody right now and needs its operator.
+    #[error("the relay cannot admit connections right now")]
+    Unavailable,
+    /// The relay speaks another version of the rendezvous preamble: the relay
+    /// server and this program come from releases that do not fit together.
+    #[error("the relay speaks version {relay} of the rendezvous preamble, this program another")]
+    UnsupportedVersion {
+        /// The preamble version the relay speaks.
+        relay: u8,
+    },
+}
+
+impl RelayRefusal {
+    /// The status byte of this refusal on the wire.
+    const fn status(self) -> u8 {
+        match self {
+            Self::CredentialRequired => 1,
+            Self::CredentialRejected => 2,
+            Self::RateLimited => 3,
+            Self::Busy => 4,
+            Self::Unavailable => 5,
+            Self::UnsupportedVersion { .. } => STATUS_UNSUPPORTED_VERSION,
+        }
+    }
+}
+
+/// The status byte of [`RelayRefusal::UnsupportedVersion`]. It keeps its
+/// meaning in every preamble version, so that two versions can at least say
+/// that they differ.
+const STATUS_UNSUPPORTED_VERSION: u8 = 6;
 
 /// The largest admission token, in bytes, the preamble will carry. A bearer
 /// credential is small; this cap bounds the pre-splice allocation so a malicious
@@ -116,6 +207,13 @@ pub enum PreambleError {
         len: usize,
         /// The accepted maximum ([`MAX_PREAMBLE_TOKEN_BYTES`]).
         max: usize,
+    },
+    /// The relay's answer carried a status this build does not know. It is
+    /// never taken for an admission.
+    #[error("the relay answered with an unknown status {status}")]
+    UnknownAnswer {
+        /// The status byte the relay sent.
+        status: u8,
     },
     /// The underlying stream failed or ended mid-preamble (a truncated or reset
     /// connection). Reading fails closed; the caller forwards nothing.
@@ -229,11 +327,183 @@ where
     Ok(())
 }
 
+/// Writes the relay's answer to a preamble and flushes it. The relay calls
+/// this once per connection, before it parks or splices the leg.
+///
+/// # Errors
+///
+/// Returns the I/O error of a failed write; the relay then drops the leg.
+pub async fn write_answer<W>(writer: &mut W, answer: RelayAnswer) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let status = match answer {
+        RelayAnswer::Admitted => STATUS_ADMITTED,
+        RelayAnswer::Refused(refusal) => refusal.status(),
+    };
+    let mut frame = [0u8; RELAY_ANSWER_LEN];
+    frame[..PREAMBLE_MAGIC.len()].copy_from_slice(&PREAMBLE_MAGIC);
+    frame[4] = PREAMBLE_VERSION;
+    frame[5] = status;
+    writer.write_all(&frame).await?;
+    writer.flush().await
+}
+
+/// Reads the relay's answer to the preamble this endpoint wrote. It consumes
+/// exactly [`RELAY_ANSWER_LEN`] bytes and nothing of what follows. Run it under
+/// a timeout: a relay that stalls otherwise holds the read open.
+///
+/// A relay of another preamble version is reported as
+/// [`RelayRefusal::UnsupportedVersion`], whatever status it sent, because its
+/// other statuses may mean something else.
+///
+/// # Errors
+///
+/// [`PreambleError::BadMagic`] if the peer is no CretLink relay,
+/// [`PreambleError::UnknownAnswer`] for a status this build does not know, and
+/// [`PreambleError::Io`] if the stream failed or ended first, as it does with
+/// a version 1 relay, which answers nothing. An error is never an admission.
+pub async fn read_answer<R>(reader: &mut R) -> Result<RelayAnswer, PreambleError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut frame = [0u8; RELAY_ANSWER_LEN];
+    reader.read_exact(&mut frame).await?;
+    if frame[..PREAMBLE_MAGIC.len()] != PREAMBLE_MAGIC {
+        return Err(PreambleError::BadMagic);
+    }
+    let (version, status) = (frame[4], frame[5]);
+    if status == STATUS_UNSUPPORTED_VERSION || version != PREAMBLE_VERSION {
+        return Ok(RelayAnswer::Refused(RelayRefusal::UnsupportedVersion {
+            relay: version,
+        }));
+    }
+    let refusal = match status {
+        STATUS_ADMITTED => return Ok(RelayAnswer::Admitted),
+        1 => RelayRefusal::CredentialRequired,
+        2 => RelayRefusal::CredentialRejected,
+        3 => RelayRefusal::RateLimited,
+        4 => RelayRefusal::Busy,
+        5 => RelayRefusal::Unavailable,
+        status => return Err(PreambleError::UnknownAnswer { status }),
+    };
+    Ok(RelayAnswer::Refused(refusal))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    const REFUSALS: [RelayRefusal; 6] = [
+        RelayRefusal::CredentialRequired,
+        RelayRefusal::CredentialRejected,
+        RelayRefusal::RateLimited,
+        RelayRefusal::Busy,
+        RelayRefusal::Unavailable,
+        RelayRefusal::UnsupportedVersion {
+            relay: PREAMBLE_VERSION,
+        },
+    ];
+
+    async fn answer_round_trip(answer: RelayAnswer) -> RelayAnswer {
+        let mut buf = Vec::new();
+        write_answer(&mut buf, answer).await.unwrap();
+        assert_eq!(buf.len(), RELAY_ANSWER_LEN);
+        read_answer(&mut buf.as_slice()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_answer_round_trips() {
+        assert_eq!(
+            answer_round_trip(RelayAnswer::Admitted).await,
+            RelayAnswer::Admitted
+        );
+        for refusal in REFUSALS {
+            assert_eq!(
+                answer_round_trip(RelayAnswer::Refused(refusal)).await,
+                RelayAnswer::Refused(refusal)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_answer_is_frozen_on_the_wire() {
+        // FROZEN: magic, the relay's preamble version, the status.
+        let mut buf = Vec::new();
+        write_answer(&mut buf, RelayAnswer::Admitted).await.unwrap();
+        assert_eq!(buf, [b'C', b'R', b'L', b'R', 2, 0]);
+        buf.clear();
+        write_answer(
+            &mut buf,
+            RelayAnswer::Refused(RelayRefusal::CredentialRejected),
+        )
+        .await
+        .unwrap();
+        assert_eq!(buf, [b'C', b'R', b'L', b'R', 2, 2]);
+        // Every refusal has a status of its own, and none is the admission.
+        let mut statuses: Vec<u8> = REFUSALS.iter().map(|refusal| refusal.status()).collect();
+        statuses.sort_unstable();
+        assert_eq!(statuses, [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn reading_an_answer_leaves_the_peer_stream_untouched() {
+        let mut bytes = Vec::new();
+        write_answer(&mut bytes, RelayAnswer::Admitted)
+            .await
+            .unwrap();
+        bytes.extend_from_slice(b"opaque session bytes");
+        let mut reader = bytes.as_slice();
+        assert_eq!(
+            read_answer(&mut reader).await.unwrap(),
+            RelayAnswer::Admitted
+        );
+        assert_eq!(reader, b"opaque session bytes");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_status_is_never_an_admission() {
+        let bytes = [b'C', b'R', b'L', b'R', PREAMBLE_VERSION, 0x7f];
+        let err = read_answer(&mut bytes.as_slice()).await.unwrap_err();
+        assert!(
+            matches!(err, PreambleError::UnknownAnswer { status: 0x7f }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_of_another_version_is_reported_as_such() {
+        // Its version byte differs: whatever status it sent, even the one
+        // that means "admitted" here, is read as a version mismatch.
+        for status in [0u8, 2, 6, 0x7f] {
+            let bytes = [b'C', b'R', b'L', b'R', PREAMBLE_VERSION + 1, status];
+            assert_eq!(
+                read_answer(&mut bytes.as_slice()).await.unwrap(),
+                RelayAnswer::Refused(RelayRefusal::UnsupportedVersion {
+                    relay: PREAMBLE_VERSION + 1
+                }),
+                "status {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_from_something_else_or_none_at_all_fails_closed() {
+        let not_a_relay = *b"HTTP/1";
+        let err = read_answer(&mut not_a_relay.as_slice()).await.unwrap_err();
+        assert!(matches!(err, PreambleError::BadMagic), "{err:?}");
+        // A version 1 relay answers nothing and closes.
+        let nothing: [u8; 0] = [];
+        let err = read_answer(&mut nothing.as_slice()).await.unwrap_err();
+        assert!(matches!(err, PreambleError::Io(_)), "{err:?}");
+        // A truncated answer.
+        let err = read_answer(&mut PREAMBLE_MAGIC.as_slice())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PreambleError::Io(_)), "{err:?}");
+    }
 
     async fn round_trip(preamble: &Preamble) -> Preamble {
         let mut buf = Vec::new();

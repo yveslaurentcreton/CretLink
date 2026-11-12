@@ -240,19 +240,21 @@ two connections opaquely will interoperate with stock CretLink endpoints,
 because everything after the preamble is the unmodified end-to-end session the
 relay is not party to.
 
-Each endpoint writes this preamble **once**, immediately after connecting, then
-sends and receives only opaque session bytes:
+Each endpoint writes this preamble **once**, immediately after connecting,
+reads the relay's answer, and then sends and receives only opaque session
+bytes:
 
 ```text
 magic      4 bytes   b"CRLR"  (CretLink Relay Rendezvous)
-version    1 byte    0x01
+version    1 byte    0x02
 token_len  2 bytes   little-endian, 0..=512
 token      token_len bytes   (absent when token_len == 0)
 ticket     16 bytes  the single-use rendezvous ticket
 ```
 
 - **magic / version** guard against a wrong protocol reaching the port and let a
-  future transport bump the version; a mismatch is rejected fail-closed.
+  future transport bump the version; a mismatch is rejected fail-closed, and
+  the relay says so in its answer.
 - **token** is the optional admission credential — abuse control only, capped at
   512 bytes and validated from the length field *before* any buffer is
   allocated. It is never session authority and is never logged.
@@ -260,6 +262,78 @@ ticket     16 bytes  the single-use rendezvous ticket
   parks the first leg to arrive with a given ticket and, when the second leg
   presents the same ticket within the rendezvous timeout, splices the two and
   forwards opaque bytes in both directions until either side closes.
+
+### The relay's answer
+
+The relay answers every well-formed preamble **once**, before it forwards
+anything (ST-M007-012):
+
+```text
+magic      4 bytes   b"CRLR"
+version    1 byte    the preamble version the relay speaks (0x02)
+status     1 byte    see the table
+```
+
+| Status | Meaning | What the endpoint does |
+|---|---|---|
+| `0` | Admitted. The leg waits for its peer, or has met it; what follows comes from the peer. | Start the session. |
+| `1` | The relay asks for an admission key and none was presented. | Stop; a key is missing in the relay settings. |
+| `2` | The relay does not know the key that was presented. | Stop; the key is wrong or was withdrawn. |
+| `3` | Too many attempts in a short time. | Stop; try again after a moment. |
+| `4` | No free place: a concurrency quota is full. | Stop; try again later. |
+| `5` | The relay cannot admit anybody right now. | Stop; the relay needs its operator. |
+| `6` | The relay does not speak the preamble version of this endpoint. The version byte names the one it speaks. | Stop; the relay server and the program come from releases that do not fit together. |
+
+After any status but `0` the relay closes the connection. Status `6` keeps its
+meaning in every preamble version, and an endpoint reads an answer with
+another version byte as status `6` whatever its status says, so two versions
+can always tell each other that they differ. A status that an endpoint does
+not know is never taken for an admission. Something that sends no preamble at
+all, such as a port scan, gets no answer.
+
+The answer exists so that an endpoint can say what went wrong. Without it a
+refusal, a full relay and a rendezvous that nobody joined all looked the same:
+a closed connection. With it, a connection that ends **after** status `0` and
+before a single byte of the peer arrived means that nobody joined the
+rendezvous before the relay let it lapse, and nothing else. The waiting
+endpoint then simply dials again with the same ticket; the joining endpoint
+reports that nobody waits on that code.
+
+The answer is the relay's own addressing metadata: fixed in size, written
+once, with nothing of a session in it. Its reasons are those of admission,
+which decides only who may use the forwarder and never anything about a
+session.
+
+### The relay code and the ticket
+
+Two people do not exchange a 16-byte ticket. The technician reads a **relay
+code** aloud, sixteen characters in four groups such as `53ST-A71D-JKKV-0VGH`,
+and both programs derive the ticket from it (ST-M007-012):
+
+```text
+relay code  16 Crockford Base32 characters = 80 bits
+              4 bits   format version (2)
+             64 bits   rendezvous seed, random, minted per session
+             12 bits   CRC-12 (polynomial 0x80F) over the first 68 bits
+
+ticket      HKDF-SHA256(salt = "CretLink relay rendezvous ticket v1",
+                        ikm  = seed,
+                        info = canonical host name of the relay)[..16]
+```
+
+The code carries no address: each program takes the relay from its own
+settings. The host name is part of the derivation, so two programs that name
+different relays never meet. The canonical form is the host name in lower case
+without a trailing dot, or an IP address in its standard text form; the port
+is not part of it. The alphabet has no `I`, `L`, `O` or `U`; input in any case
+is accepted, `I` and `L` read as `1`, `O` as `0`, and hyphens and spaces are
+ignored. The checksum rejects every mistyped character and every swap of two
+neighbours before anything is dialled. It is a typing check and no secret.
+
+A relay code grants nothing, like the ticket it stands for. Someone who
+overhears or guesses it can at most reach the rendezvous first; the approval
+codes that both people compare then differ, and the session ends before any
+control exists.
 
 The session that flows after the preamble is CretLink's standard wire encoding
 (ADR-0010) carrying a Noise `XX` handshake and secure channel (ADR-0016 §5); a
@@ -272,5 +346,6 @@ any such tampering, permanently poisoning the channel (REQ-S-008, REQ-S-009).
 *Requirements: REQ-F-022 (internet relay), REQ-S-019/REQ-S-020 (relay operator
 posture), REQ-N-016 through REQ-N-019 (provenance, honest failure, versioned
 artifacts). Stories: ST-M007-005 (deployment), ST-M007-007 (server binary),
-ST-M007-009 (built-in wss/TLS transport). Architecture: ADR-0016 §3 (shipped
-wss transport), ADR-0016 §5 (opaque rendezvous forwarder).*
+ST-M007-009 (built-in wss/TLS transport), ST-M007-012 (the relay's answer and
+the relay code). Architecture: ADR-0016 §2 (rendezvous is addressing), §3
+(shipped wss transport), §5 (opaque rendezvous forwarder).*

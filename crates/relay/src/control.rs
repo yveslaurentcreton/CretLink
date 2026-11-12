@@ -106,6 +106,21 @@ pub enum Denied {
     Unavailable,
 }
 
+/// What the relay tells the endpoint it denied ([`crate::preamble::RelayAnswer`],
+/// ST-M007-012): the same reason, without the internal detail of which quota
+/// was full.
+impl From<Denied> for crate::preamble::RelayRefusal {
+    fn from(denied: Denied) -> Self {
+        match denied {
+            Denied::Auth(AdmissionError::CredentialRequired) => Self::CredentialRequired,
+            Denied::Auth(AdmissionError::CredentialRejected) => Self::CredentialRejected,
+            Denied::RateLimited => Self::RateLimited,
+            Denied::Quota(_) => Self::Busy,
+            Denied::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
 /// The mutable, lock-guarded operational state.
 #[derive(Debug)]
 struct State {

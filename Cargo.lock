@@ -475,6 +475,7 @@ dependencies = [
 name = "cretlink-relay-server"
 version = "0.0.0"
 dependencies = [
+ "cretlink-discovery",
  "cretlink-protocol",
  "cretlink-relay",
  "cretlink-session",

@@ -73,7 +73,8 @@ pub use events::{EventLog, OpEvent, OpEventKind, RetentionPolicy};
 pub use metrics::{MetricsSnapshot, RelayMetrics};
 pub use preamble::{
     MAX_PREAMBLE_TOKEN_BYTES, PREAMBLE_MAGIC, PREAMBLE_VERSION, Preamble, PreambleError,
-    read_preamble, write_preamble,
+    RELAY_ANSWER_LEN, RelayAnswer, RelayRefusal, read_answer, read_preamble, write_answer,
+    write_preamble,
 };
 pub use quota::{QuotaError, QuotaState, SessionQuota};
 pub use ratelimit::{RateLimit, RateLimiter};

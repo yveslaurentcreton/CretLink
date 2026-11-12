@@ -42,15 +42,19 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use cretlink_discovery::{ManualEntry, RelayCode, parse_entry};
 use cretlink_protocol::{Origin, PROTOCOL_V1, TargetIdentity};
 use cretlink_relay::{
     AdmissionControl, AdmissionPolicy, AdmissionToken, ClientId, ControlConfig, MetricsSnapshot,
-    Preamble, RENDEZVOUS_TICKET_LEN, Rendezvous, RendezvousTicket, StopSignal, write_preamble,
+    PREAMBLE_MAGIC, PREAMBLE_VERSION, Preamble, RENDEZVOUS_TICKET_LEN, RateLimit, RelayAnswer,
+    RelayRefusal, Rendezvous, RendezvousTicket, SessionQuota, StopSignal, read_answer,
+    write_preamble,
 };
 use cretlink_relay_server::{Leg, ServeConfig, serve};
 use cretlink_session::{
-    ConsoleHints, ExecRequest, HostHandle, JobId, JobOutcome, JoinHandle, NoAudit, NoRebootResume,
-    RelayDial, RevokeReason, SessionError, SessionEvent, SessionHost, SessionJoiner, Shell,
+    ConsoleHints, Dial, ExecRequest, HostHandle, JobId, JobOutcome, JoinHandle, NoAudit,
+    NoRebootResume, RelayDial, RelayFailure, RevokeReason, SessionError, SessionEvent, SessionHost,
+    SessionJoiner, Shell, WaitingDial, rendezvous_lapsed,
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, copy_bidirectional};
@@ -130,7 +134,22 @@ async fn start_relay(
     StopSignal,
     tokio::task::JoinHandle<()>,
 ) {
-    let control = AdmissionControl::new(policy, ControlConfig::public_default());
+    start_relay_with(policy, ControlConfig::public_default(), config).await
+}
+
+/// Like [`start_relay`], with the admission posture of `control_config`, for the
+/// tests that need a tight rate limit or quota.
+async fn start_relay_with(
+    policy: AdmissionPolicy,
+    control_config: ControlConfig,
+    config: ServeConfig,
+) -> (
+    SocketAddr,
+    AdmissionControl,
+    StopSignal,
+    tokio::task::JoinHandle<()>,
+) {
+    let control = AdmissionControl::new(policy, control_config);
     let rendezvous: Arc<Rendezvous<Leg<TcpStream>>> = Arc::new(Rendezvous::new());
     let listener = TcpListener::bind(loopback()).await.expect("bind relay");
     let addr = listener.local_addr().expect("relay addr");
@@ -157,6 +176,7 @@ fn spawn_console_leg(
         write_preamble(&mut relay, &Preamble::new(token, ticket))
             .await
             .expect("console leg writes preamble");
+        expect_admitted(&mut relay).await;
         let mut console = TcpStream::connect(console_addr)
             .await
             .expect("console leg dials console");
@@ -184,9 +204,64 @@ async fn spawn_agent_leg(
         write_preamble(&mut relay, &Preamble::new(token, ticket))
             .await
             .expect("agent leg writes preamble");
+        expect_admitted(&mut relay).await;
         let _ = copy_bidirectional(&mut joiner, &mut relay).await;
     });
     (addr, task)
+}
+
+/// Reads the relay's answer to the preamble just written (ST-M007-012).
+async fn answer_of(relay: &mut TcpStream) -> RelayAnswer {
+    timeout(STEP_TIMEOUT, read_answer(relay))
+        .await
+        .expect("the relay answers the preamble promptly")
+        .expect("a well-formed answer")
+}
+
+/// Asserts that the relay admitted the leg: what follows is the peer's stream.
+async fn expect_admitted(relay: &mut TcpStream) {
+    assert_eq!(answer_of(relay).await, RelayAnswer::Admitted);
+}
+
+/// Dials the relay, writes a preamble with `token` and `ticket`, and returns
+/// the connection with the relay's answer.
+async fn dial_with(
+    relay_addr: SocketAddr,
+    token: Option<&str>,
+    ticket: u8,
+) -> (TcpStream, RelayAnswer) {
+    let mut relay = TcpStream::connect(relay_addr).await.expect("dial relay");
+    let preamble = Preamble::new(
+        token.map(AdmissionToken::from_text),
+        RendezvousTicket::from_bytes([ticket; RENDEZVOUS_TICKET_LEN]),
+    );
+    write_preamble(&mut relay, &preamble)
+        .await
+        .expect("write preamble");
+    let answer = answer_of(&mut relay).await;
+    (relay, answer)
+}
+
+/// Asserts that the relay closed `relay` without forwarding a byte. A relay
+/// that closes while the endpoint's bytes are still unread resets the
+/// connection, which is a close as well.
+async fn expect_closed(relay: &mut TcpStream) {
+    let mut buf = [0u8; 1];
+    let read = timeout(STEP_TIMEOUT, relay.read(&mut buf))
+        .await
+        .expect("the relay closes the connection promptly");
+    match read {
+        Ok(n) => assert_eq!(n, 0, "the connection is closed with nothing forwarded"),
+        Err(error) => assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ),
+            "unexpected read error: {error}"
+        ),
+    }
 }
 
 /// Polls the relay's metrics until `pred` holds, or fails the test if it never
@@ -434,8 +509,9 @@ async fn a_full_session_survives_the_real_relay_server_and_metrics_are_honest() 
 }
 
 /// A wrong admission credential is denied at authentication before anything is
-/// forwarded: the connection is closed with zero bytes moved and the denial is
-/// recorded — never a reserved slot (REQ-N-008, ADR-0016 §4).
+/// forwarded: the relay says so, the connection is closed with zero bytes moved
+/// and the denial is recorded — never a reserved slot (REQ-N-008, ADR-0016 §4,
+/// ST-M007-012).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wrong_admission_token_is_denied_and_forwards_nothing() {
     let policy = AdmissionPolicy::SharedToken {
@@ -444,24 +520,14 @@ async fn a_wrong_admission_token_is_denied_and_forwards_nothing() {
     };
     let (relay_addr, control, _signal, _serve) = start_relay(policy, ServeConfig::default()).await;
 
-    // Dial the relay and present the WRONG secret in the preamble.
-    let mut relay = TcpStream::connect(relay_addr).await.expect("dial relay");
-    let ticket = RendezvousTicket::from_bytes([0x11; RENDEZVOUS_TICKET_LEN]);
-    write_preamble(
-        &mut relay,
-        &Preamble::new(Some(AdmissionToken::from_text("not-the-secret")), ticket),
-    )
-    .await
-    .expect("write preamble");
-
-    // The relay denies admission and closes the connection: a read sees EOF with
-    // nothing forwarded.
-    let mut buf = [0u8; 1];
-    let n = timeout(STEP_TIMEOUT, relay.read(&mut buf))
-        .await
-        .expect("the relay closes the denied connection promptly")
-        .expect("read result");
-    assert_eq!(n, 0, "a denied connection is closed with nothing forwarded");
+    // Dial the relay and present the WRONG secret in the preamble. The relay
+    // answers with the reason and closes: nothing is forwarded.
+    let (mut relay, answer) = dial_with(relay_addr, Some("not-the-secret"), 0x11).await;
+    assert_eq!(
+        answer,
+        RelayAnswer::Refused(RelayRefusal::CredentialRejected)
+    );
+    expect_closed(&mut relay).await;
 
     let m = wait_until_metrics(&control, |m| m.denied_auth == 1).await;
     assert_eq!(m.denied_auth, 1, "the wrong credential was denied at auth");
@@ -485,14 +551,15 @@ async fn a_lone_arrival_times_out_fail_closed() {
     };
     let (relay_addr, control, _signal, _serve) = start_relay(AdmissionPolicy::Open, config).await;
 
-    let mut relay = TcpStream::connect(relay_addr).await.expect("dial relay");
-    let ticket = RendezvousTicket::from_bytes([0x22; RENDEZVOUS_TICKET_LEN]);
-    write_preamble(&mut relay, &Preamble::new(None, ticket))
-        .await
-        .expect("write preamble");
+    // The lone leg is admitted and told so; then nothing comes.
+    let (mut relay, answer) = dial_with(relay_addr, None, 0x22).await;
+    assert_eq!(answer, RelayAnswer::Admitted);
 
     // No peer ever arrives; the parked leg times out, its guard drops, and the
-    // relay records an honest unknown end and releases the slot.
+    // relay records an honest unknown end and releases the slot. The endpoint
+    // sees the stream end without a byte of a peer: a rendezvous that lapsed,
+    // which it can tell from a refusal because it was admitted first.
+    expect_closed(&mut relay).await;
     let m = wait_until_metrics(&control, |m| m.sessions_ended == 1).await;
     assert_eq!(m.sessions_admitted, 1, "the lone leg was admitted");
     assert_eq!(
@@ -642,4 +709,332 @@ async fn the_real_endpoint_dialers_pair_through_the_relay_with_direct_path_parit
     assert_eq!(m.denied_rate_limit, 0);
     assert_eq!(m.denied_quota, 0);
     assert_eq!(m.denied_unavailable, 0);
+}
+
+/// A relay that asks for a key says that none was presented (ST-M007-012).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_admission_token_is_answered_as_required() {
+    let policy = AdmissionPolicy::SharedToken {
+        token: AdmissionToken::from_text("relay-secret"),
+        client: ClientId::new("shared"),
+    };
+    let (relay_addr, control, _signal, _serve) = start_relay(policy, ServeConfig::default()).await;
+
+    let (mut relay, answer) = dial_with(relay_addr, None, 0x31).await;
+    assert_eq!(
+        answer,
+        RelayAnswer::Refused(RelayRefusal::CredentialRequired)
+    );
+    expect_closed(&mut relay).await;
+    let m = wait_until_metrics(&control, |m| m.denied_auth == 1).await;
+    assert_eq!(m.sessions_admitted, 0);
+}
+
+/// Too many attempts in a short time are answered as such, so that an endpoint
+/// waits instead of taking the relay for unreachable (ST-M007-012).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn too_many_attempts_are_answered_as_rate_limited() {
+    // One attempt, and no refill within the test.
+    let control_config = ControlConfig {
+        rate_limit: RateLimit {
+            capacity: 1,
+            refill_tokens: 1,
+            refill_ms: 3_600_000,
+            max_clients: 16,
+        },
+        ..ControlConfig::public_default()
+    };
+    let (relay_addr, control, _signal, _serve) = start_relay_with(
+        AdmissionPolicy::Open,
+        control_config,
+        ServeConfig::default(),
+    )
+    .await;
+
+    let (_first, answer) = dial_with(relay_addr, None, 0x41).await;
+    assert_eq!(answer, RelayAnswer::Admitted);
+    let (mut second, answer) = dial_with(relay_addr, None, 0x42).await;
+    assert_eq!(answer, RelayAnswer::Refused(RelayRefusal::RateLimited));
+    expect_closed(&mut second).await;
+    let m = wait_until_metrics(&control, |m| m.denied_rate_limit == 1).await;
+    assert_eq!(
+        m.sessions_admitted, 1,
+        "only the first attempt was admitted"
+    );
+}
+
+/// A relay without a free place says so (ST-M007-012).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_relay_is_answered_as_busy() {
+    let control_config = ControlConfig {
+        quota: SessionQuota {
+            global_max: 1,
+            per_client_max: 1,
+        },
+        ..ControlConfig::public_default()
+    };
+    let (relay_addr, control, _signal, _serve) = start_relay_with(
+        AdmissionPolicy::Open,
+        control_config,
+        ServeConfig::default(),
+    )
+    .await;
+
+    // The first leg is admitted and parks: it holds the only place.
+    let (_parked, answer) = dial_with(relay_addr, None, 0x51).await;
+    assert_eq!(answer, RelayAnswer::Admitted);
+    let (mut second, answer) = dial_with(relay_addr, None, 0x52).await;
+    assert_eq!(answer, RelayAnswer::Refused(RelayRefusal::Busy));
+    expect_closed(&mut second).await;
+    let m = wait_until_metrics(&control, |m| m.denied_quota == 1).await;
+    assert_eq!(m.sessions_active, 1, "the parked leg keeps its place");
+}
+
+/// An endpoint of another preamble version is told which version the relay
+/// speaks, instead of a connection that closes without a reason (ST-M007-012).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_preamble_version_is_answered_with_the_relays_version() {
+    use tokio::io::AsyncWriteExt;
+
+    let (relay_addr, control, _signal, _serve) =
+        start_relay(AdmissionPolicy::Open, ServeConfig::default()).await;
+
+    // A well-formed preamble of the version before this one.
+    let mut relay = TcpStream::connect(relay_addr).await.expect("dial relay");
+    let mut preamble = Vec::new();
+    preamble.extend_from_slice(&PREAMBLE_MAGIC);
+    preamble.push(PREAMBLE_VERSION - 1);
+    preamble.extend_from_slice(&0u16.to_le_bytes());
+    preamble.extend_from_slice(&[0x61; RENDEZVOUS_TICKET_LEN]);
+    relay.write_all(&preamble).await.expect("write preamble");
+
+    assert_eq!(
+        answer_of(&mut relay).await,
+        RelayAnswer::Refused(RelayRefusal::UnsupportedVersion {
+            relay: PREAMBLE_VERSION
+        })
+    );
+    expect_closed(&mut relay).await;
+    let m = control.metrics();
+    assert_eq!(m.sessions_admitted, 0, "nothing was admitted");
+}
+
+/// Something that is no CretLink endpoint gets no answer at all: the relay
+/// says nothing to a port scan (ST-M007-012).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn something_that_is_no_endpoint_gets_no_answer() {
+    use tokio::io::AsyncWriteExt;
+
+    let (relay_addr, _control, _signal, _serve) =
+        start_relay(AdmissionPolicy::Open, ServeConfig::default()).await;
+    let mut other = TcpStream::connect(relay_addr).await.expect("dial relay");
+    other
+        .write_all(b"GET / HTTP/1.1\r\nHost: relay.example.net\r\n\r\n")
+        .await
+        .expect("write");
+    expect_closed(&mut other).await;
+}
+
+/// The host name both copies have in their relay profile in the tests below.
+const RELAY_HOST: &str = "relay.example.net";
+
+/// ST-M007-012 — two copies find each other through a typed relay code, also
+/// when the customer needs longer than the relay parks a leg: the waiting side
+/// dials again every time its rendezvous lapses, and the session that follows is
+/// the unchanged attended session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_typed_relay_code_pairs_after_the_waiting_side_outlived_lapsed_rendezvous() {
+    // The relay lets a parked leg lapse after a moment, as a real one does
+    // after half a minute.
+    let config = ServeConfig {
+        rendezvous_timeout: Duration::from_millis(150),
+        ..ServeConfig::default()
+    };
+    let (relay_addr, control, _signal, _serve) = start_relay(AdmissionPolicy::Open, config).await;
+
+    // The technician's copy mints a code, shows it, and waits on its ticket.
+    let code = RelayCode::generate().expect("mint a relay code");
+    let shown = code.encode();
+    let waiting_ticket =
+        RendezvousTicket::derive(code.seed(), RELAY_HOST).expect("derive the waiting ticket");
+    let host_task = tokio::spawn(SessionHost::host_dialed(
+        WaitingDial::with_pause(
+            RelayDial::new(relay_addr, waiting_ticket, None),
+            Duration::from_millis(20),
+        ),
+        console_hints(),
+        PROTOCOL_V1,
+        caps(),
+        Arc::new(NoAudit),
+    ));
+
+    // Nobody joins for a while: several rendezvous lapse and the waiting side
+    // dials again each time, without giving up and without a session.
+    let m = wait_until_metrics(&control, |m| m.sessions_ended >= 3).await;
+    assert!(m.sessions_ended >= 3, "several rendezvous lapsed");
+    assert_eq!(m.bytes_forwarded, 0, "nothing was forwarded meanwhile");
+    assert!(
+        !host_task.is_finished(),
+        "the waiting side is still waiting"
+    );
+
+    // The customer types the code as people do, and their copy names the same
+    // relay in another spelling. Both derive the same ticket.
+    let typed = shown.to_lowercase().replace('-', " ");
+    let ManualEntry::Relay(typed_code) = parse_entry(&typed).expect("the typed code parses") else {
+        panic!("a relay code was typed");
+    };
+    let joining_ticket = RendezvousTicket::derive(typed_code.seed(), "Relay.Example.NET.")
+        .expect("derive the joining ticket");
+    let mut joiner = SessionJoiner::join_with_reboot_resume_over(
+        RelayDial::new(relay_addr, joining_ticket, None),
+        agent_identity(),
+        PROTOCOL_V1,
+        caps(),
+        Arc::new(NoAudit),
+        Arc::new(|| false),
+        Arc::new(NoRebootResume),
+    )
+    .await
+    .expect("the customer's copy joins through the relay");
+
+    let mut host = timeout(STEP_TIMEOUT, host_task)
+        .await
+        .expect("the waiting side meets its peer")
+        .expect("the waiting task ends in order")
+        .expect("the technician's copy hosts over the relay");
+
+    // From here everything is as on a LAN: the approval codes match, consent
+    // binds the target, a command runs, and the technician's stop ends it.
+    let observed = drive_full_lifecycle(&mut host, &mut joiner, "typed-code-3c1d").await;
+    assert!(
+        observed.sac_matches,
+        "both ends show the same approval code"
+    );
+    assert_eq!(observed.consent_identity, agent_identity());
+    assert_eq!(observed.exit_code, Some(0));
+    assert!(observed.stdout_has_marker);
+}
+
+/// ST-M007-012 — a code that nobody waits on: the relay admits the leg, lets
+/// the rendezvous lapse, and the joining side reports exactly that instead of a
+/// pairing failure of unknown cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_code_that_nobody_waits_on_is_reported_as_a_lapsed_rendezvous() {
+    let config = ServeConfig {
+        rendezvous_timeout: Duration::from_millis(150),
+        ..ServeConfig::default()
+    };
+    let (relay_addr, _control, _signal, _serve) = start_relay(AdmissionPolicy::Open, config).await;
+
+    let code = RelayCode::from_seed([0x5a; 8]);
+    let ticket = RendezvousTicket::derive(code.seed(), RELAY_HOST).expect("derive");
+    let mut joiner = SessionJoiner::join_with_reboot_resume_over(
+        RelayDial::new(relay_addr, ticket, None),
+        agent_identity(),
+        PROTOCOL_V1,
+        caps(),
+        Arc::new(NoAudit),
+        Arc::new(|| false),
+        Arc::new(NoRebootResume),
+    )
+    .await
+    .expect("the relay admits the leg");
+
+    match next_event!(joiner) {
+        SessionEvent::Failed { stage, message } => {
+            assert_eq!(stage, "rendezvous", "{message}");
+            assert!(message.contains("nobody joined"), "{message}");
+        }
+        other => panic!("expected a lapsed rendezvous, got {other:?}"),
+    }
+}
+
+/// ST-M007-012 — only "nobody joined yet" is waited out. A refusal ends the
+/// wait at once with the relay's reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_ends_the_wait_with_the_relays_reason() {
+    let policy = AdmissionPolicy::SharedToken {
+        token: AdmissionToken::from_text("relay-secret"),
+        client: ClientId::new("shared"),
+    };
+    let (relay_addr, _control, _signal, _serve) = start_relay(policy, ServeConfig::default()).await;
+    let ticket = || RendezvousTicket::from_bytes([0x71; RENDEZVOUS_TICKET_LEN]);
+
+    let wrong_key = WaitingDial::new(RelayDial::new(
+        relay_addr,
+        ticket(),
+        Some(AdmissionToken::from_text("not-the-secret")),
+    ));
+    let error = timeout(STEP_TIMEOUT, wrong_key.dial())
+        .await
+        .expect("a refusal is not waited out")
+        .expect_err("a wrong key is refused");
+    assert!(
+        matches!(
+            error,
+            SessionError::Relay(RelayFailure::Refused(RelayRefusal::CredentialRejected))
+        ),
+        "{error:?}"
+    );
+    assert!(!rendezvous_lapsed(&error));
+
+    let no_key = WaitingDial::new(RelayDial::new(relay_addr, ticket(), None));
+    let error = timeout(STEP_TIMEOUT, no_key.dial())
+        .await
+        .expect("a refusal is not waited out")
+        .expect_err("a missing key is refused");
+    assert!(
+        matches!(
+            error,
+            SessionError::Relay(RelayFailure::Refused(RelayRefusal::CredentialRequired))
+        ),
+        "{error:?}"
+    );
+}
+
+/// ST-M007-012 — a relay that is not there, and a server that is no relay of
+/// this version, are told apart from each other and from a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreachable_relay_and_a_silent_server_are_told_apart() {
+    let ticket = || RendezvousTicket::from_bytes([0x72; RENDEZVOUS_TICKET_LEN]);
+
+    // Nothing listens on this address any more.
+    let gone = TcpListener::bind(loopback()).await.expect("bind");
+    let gone_addr = gone.local_addr().expect("addr");
+    drop(gone);
+    let error = timeout(
+        STEP_TIMEOUT,
+        RelayDial::new(gone_addr, ticket(), None).dial(),
+    )
+    .await
+    .expect("a refused connection resolves promptly")
+    .expect_err("nothing listens there");
+    assert!(
+        matches!(error, SessionError::Relay(RelayFailure::Unreachable(_))),
+        "{error:?}"
+    );
+
+    // A server that takes the connection and closes without an answer, as a
+    // relay server of the version before this one does.
+    let silent = TcpListener::bind(loopback()).await.expect("bind");
+    let silent_addr = silent.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let (mut stream, _peer) = silent.accept().await.expect("accept");
+        // Read what one preamble holds, then close without a word.
+        let mut preamble = [0u8; 4 + 1 + 2 + RENDEZVOUS_TICKET_LEN];
+        let _ = stream.read_exact(&mut preamble).await;
+    });
+    let error = timeout(
+        STEP_TIMEOUT,
+        RelayDial::new(silent_addr, ticket(), None).dial(),
+    )
+    .await
+    .expect("a closed connection resolves promptly")
+    .expect_err("no answer came");
+    assert!(
+        matches!(error, SessionError::Relay(RelayFailure::NoAnswer(_))),
+        "{error:?}"
+    );
+    server.await.expect("the silent server ends");
 }
