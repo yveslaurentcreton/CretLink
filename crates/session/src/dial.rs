@@ -60,6 +60,24 @@ use crate::SessionError;
 /// How long an endpoint waits for the relay's answer to its preamble.
 pub const RELAY_ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long an endpoint waits for the connection to the relay, and again for
+/// the TLS and WebSocket handshake on it. Without a limit a relay behind a
+/// firewall that drops packets would keep a person waiting for minutes before
+/// anything is said.
+pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs one step of a relay dial under a time limit. A step that does not
+/// finish in time fails with a timed-out I/O error that names the step.
+async fn within<T, E>(
+    limit: Duration,
+    step: &'static str,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<Result<T, E>, io::Error> {
+    tokio::time::timeout(limit, future)
+        .await
+        .map_err(|_elapsed| io::Error::new(io::ErrorKind::TimedOut, step))
+}
+
 /// How long [`WaitingDial`] pauses before it dials again after a rendezvous
 /// lapsed. Short, because the customer may be typing the code right now; not
 /// zero, so that a relay which closes at once is not dialled in a tight loop
@@ -343,9 +361,7 @@ impl Dial for RelayDial {
     type Stream = RelayLeg<TcpStream>;
 
     async fn dial(&self) -> Result<Self::Stream, SessionError> {
-        let stream = TcpStream::connect(self.relay)
-            .await
-            .map_err(RelayFailure::Unreachable)?;
+        let stream = connect(self.relay).await?;
         // Clone the ticket and token into the one-shot preamble. Both are
         // zeroizing secrets that are `Clone` (not `Copy`), so the clones are
         // erased on drop alongside the originals; the relay consumes them to
@@ -356,25 +372,48 @@ impl Dial for RelayDial {
     }
 }
 
+/// Connects to the relay's address within [`RELAY_CONNECT_TIMEOUT`].
+async fn connect(relay: SocketAddr) -> Result<TcpStream, RelayFailure> {
+    within(
+        RELAY_CONNECT_TIMEOUT,
+        "no connection to the relay in time",
+        TcpStream::connect(relay),
+    )
+    .await
+    .and_then(|connected| connected)
+    .map_err(RelayFailure::Unreachable)
+}
+
 /// Writes the rendezvous preamble on a connected relay stream and reads the
 /// relay's answer, the same way over raw TCP and over wss. Only an admitted
 /// leg comes back; everything else is a [`RelayFailure`] and no stream.
-async fn rendezvous<S>(mut stream: S, preamble: &Preamble) -> Result<RelayLeg<S>, SessionError>
+async fn rendezvous<S>(stream: S, preamble: &Preamble) -> Result<RelayLeg<S>, SessionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    rendezvous_within(RELAY_ANSWER_TIMEOUT, stream, preamble).await
+}
+
+/// [`rendezvous`] with the time limit for the relay's answer as a parameter.
+async fn rendezvous_within<S>(
+    answer_timeout: Duration,
+    mut stream: S,
+    preamble: &Preamble,
+) -> Result<RelayLeg<S>, SessionError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     write_preamble(&mut stream, preamble)
         .await
         .map_err(map_preamble_error)?;
-    let answer = tokio::time::timeout(RELAY_ANSWER_TIMEOUT, read_answer(&mut stream))
-        .await
-        .map_err(|_elapsed| {
-            RelayFailure::NoAnswer(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "no answer to the rendezvous preamble in time",
-            ))
-        })?
-        .map_err(map_preamble_error)?;
+    let answer = within(
+        answer_timeout,
+        "no answer to the rendezvous preamble in time",
+        read_answer(&mut stream),
+    )
+    .await
+    .map_err(RelayFailure::NoAnswer)?
+    .map_err(map_preamble_error)?;
     match answer {
         RelayAnswer::Admitted => Ok(RelayLeg::new(stream)),
         RelayAnswer::Refused(refusal) => Err(RelayFailure::Refused(refusal).into()),
@@ -512,12 +551,17 @@ impl Dial for WssRelayDial {
         // certificate is validated against `server_name` inside `connect`; an
         // untrusted or mismatched certificate returns an error and no stream, so
         // the preamble below is never written on an unauthenticated channel.
-        let tcp = TcpStream::connect(self.relay)
-            .await
-            .map_err(RelayFailure::Unreachable)?;
-        let stream = cretlink_wss::connect(&self.connector, &self.server_name, tcp)
-            .await
-            .map_err(map_wss_error)?;
+        let tcp = connect(self.relay).await?;
+        let stream = within(
+            RELAY_CONNECT_TIMEOUT,
+            "no TLS and WebSocket handshake with the relay in time",
+            cretlink_wss::connect(&self.connector, &self.server_name, tcp),
+        )
+        .await
+        // A server that takes the connection and then says nothing is no
+        // relay that this program can use.
+        .map_err(RelayFailure::NoAnswer)?
+        .map_err(map_wss_error)?;
         // From here the leg is identical to a raw relay dial: write the one-shot
         // rendezvous preamble and read the relay's answer, after which the relay
         // only ever sees the opaque Noise session (ADR-0016 §5).
@@ -778,6 +822,83 @@ mod tests {
             "nothing listens there",
         )));
         assert!(!rendezvous_lapsed(&unreachable));
+    }
+
+    fn sample_preamble() -> Preamble {
+        Preamble::new(None, RendezvousTicket::from_bytes([0x42; 16]))
+    }
+
+    #[tokio::test]
+    async fn a_server_that_says_nothing_is_given_up_after_the_time_limit() {
+        // The far end takes the preamble and never answers.
+        let (near, _far) = tokio::io::duplex(256);
+        let error = rendezvous_within(Duration::from_millis(30), near, &sample_preamble())
+            .await
+            .unwrap_err();
+        match error {
+            SessionError::Relay(RelayFailure::NoAnswer(io)) => {
+                assert_eq!(io.kind(), io::ErrorKind::TimedOut);
+            }
+            other => panic!("expected no answer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_admitted_leg_and_a_refusal_are_told_apart() {
+        use cretlink_relay::write_answer;
+
+        // Admitted: the leg comes back and the peer's bytes follow untouched.
+        let (near, mut far) = tokio::io::duplex(256);
+        write_answer(&mut far, RelayAnswer::Admitted).await.unwrap();
+        far.write_all(b"peer").await.unwrap();
+        let mut leg = rendezvous(near, &sample_preamble()).await.unwrap();
+        let mut heard = [0u8; 4];
+        leg.read_exact(&mut heard).await.unwrap();
+        assert_eq!(&heard, b"peer");
+
+        // Refused: no stream, and the reason.
+        let (near, mut far) = tokio::io::duplex(256);
+        write_answer(&mut far, RelayAnswer::Refused(RelayRefusal::Busy))
+            .await
+            .unwrap();
+        let error = rendezvous(near, &sample_preamble()).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SessionError::Relay(RelayFailure::Refused(RelayRefusal::Busy))
+            ),
+            "{error:?}"
+        );
+
+        // Something that answers, but not as a relay.
+        let (near, mut far) = tokio::io::duplex(256);
+        far.write_all(b"HTTP/1.1 400 Bad Request\r\n")
+            .await
+            .unwrap();
+        let error = rendezvous(near, &sample_preamble()).await.unwrap_err();
+        assert!(
+            matches!(error, SessionError::Relay(RelayFailure::NoAnswer(_))),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_that_does_not_finish_fails_with_its_name() {
+        let never = std::future::pending::<Result<(), io::Error>>();
+        let error = within(Duration::from_millis(10), "no connection in time", never)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "no connection in time");
+
+        let done = async { Ok::<u8, io::Error>(7) };
+        assert_eq!(
+            within(Duration::from_secs(5), "unused", done)
+                .await
+                .unwrap()
+                .unwrap(),
+            7
+        );
     }
 
     #[test]
