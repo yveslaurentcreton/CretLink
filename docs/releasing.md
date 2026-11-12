@@ -189,6 +189,31 @@ CretLink uses GitHub Flow:
 `main` must remain releasable. Direct feature commits and manually created
 release tags are not part of the normal workflow.
 
+### One release for several changes: the `next` branch (ST-M006-018)
+
+Every `feat` or `fix` that reaches `main` is released at once, and the README
+and the documentation site on `main` describe the latest release. Changes that
+must ship together are therefore collected on a branch `next` first:
+
+1. `next` starts from `main` when the maintainer decides on a combined
+   release.
+2. Each story still gets its own short-lived branch and pull request, now
+   with `next` as the base branch. `ci.yml` and `hygiene.yml` run for a pull
+   request whatever its base, so it passes the same checks. It is
+   squash-merged into `next` under its Conventional Commit title.
+3. One draft pull request from `next` to `main` stays open meanwhile. Its
+   checks run on every state of `next`, and the `preview-build` label on it
+   builds the archives of the whole coming release.
+4. Corrections to the latest release (documentation, the site, the
+   workflows) still go to `main` as usual; `main` is then merged into `next`.
+   `next` is never rebased or force-pushed.
+5. Merging the pull request from `next` to `main` publishes the one release.
+   `next` is deleted afterwards, and the flow above applies again.
+
+Until then `main` stays what the latest release is. A page of the site or a
+section of the README that describes a change on `next` is part of that
+change, so it is published with the release and not before it.
+
 ## Conventional Commits
 
 Examples:

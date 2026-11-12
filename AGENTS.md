@@ -88,7 +88,8 @@ must not run automatically in untrusted contribution contexts.
 
 Follow [`docs/releasing.md`](docs/releasing.md).
 
-- Use GitHub Flow with a short-lived branch from the latest `main`.
+- Use GitHub Flow with a short-lived branch from the latest `main`, or from
+  `next` while a release of several changes is collected there.
 - Name feature branches after their Ready story and intent.
 - Open a pull request, run required verification, and squash-merge.
 - Keep `main` releasable and do not push feature work directly to it.
