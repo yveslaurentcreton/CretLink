@@ -1036,11 +1036,22 @@ async fn a_large_file_arrives_whole_and_a_cancelled_one_leaves_nothing() {
     );
     assert_eq!(entries_in(&downloads), 1, "no part is left beside the file");
 
-    // Cancelled as soon as the first bytes are confirmed.
+    // Cancelled once the first bytes are confirmed, and not before: the
+    // progress that is reported first carries no bytes at all. By then the
+    // part of the transfer lies in the folder, so that "it was discarded"
+    // below is something the test can see fail.
     let cancel = CancelToken::new();
+    let beside_the_file_when_cancelled = Arc::new(Mutex::new(None));
     let sink: ProgressSink<cretlink_session::TransferProgress> = {
         let cancel = cancel.clone();
-        Box::new(move |_| cancel.cancel())
+        let seen = Arc::clone(&beside_the_file_when_cancelled);
+        let downloads = downloads.clone();
+        Box::new(move |progress| {
+            if progress.transferred > 0 && !cancel.is_cancelled() {
+                *seen.lock().unwrap() = Some(entries_in(&downloads));
+                cancel.cancel();
+            }
+        })
     };
     let cancelled = files
         .send_to_folder(
@@ -1051,6 +1062,11 @@ async fn a_large_file_arrives_whole_and_a_cancelled_one_leaves_nothing() {
         .await
         .expect("a cancelled transfer is a report");
     assert_eq!(cancelled.outcome, JobOutcome::Cancelled);
+    assert_eq!(
+        *beside_the_file_when_cancelled.lock().unwrap(),
+        Some(2),
+        "the transfer was cancelled on its way: its part lay beside the first file"
+    );
     assert!(!downloads.join("second.bin").exists());
     assert_eq!(
         entries_in(&downloads),
