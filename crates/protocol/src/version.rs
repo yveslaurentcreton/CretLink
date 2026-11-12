@@ -138,11 +138,13 @@ use crate::error::ProtocolError;
 /// entries it could not remove with their reasons; only
 /// [`crate::TreeState::Removed`] is a success (REQ-N-008). An agent that does
 /// not advertise [`crate::CAP_FS_V2`] answers both operations with
-/// [`crate::ErrorCode::Unsupported`], so same-major peers on different minors
-/// interoperate (REQ-N-012). Sending a file to a folder on any drive needs no
-/// addition: `FsWrite` and `FsCommit` take an absolute destination since
-/// minor `1`, and the part of such a transfer lies beside its destination, so
-/// the verified rename never crosses a volume.
+/// [`crate::ErrorCode::Unsupported`] before it lists or removes anything
+/// (REQ-N-012); a peer on an older minor does not get as far as a request,
+/// because the pairing prologue commits both endpoints to the identical
+/// version. Sending a file to a folder on any drive needs no addition:
+/// `FsWrite` and `FsCommit` take an absolute destination since minor `1`, and
+/// the part of such a transfer lies beside its destination, so the verified
+/// rename never crosses a volume.
 pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion {
     major: 1,
     minor: 12,

@@ -148,13 +148,15 @@ pub const CAP_DESKTOP_V1: &str = "desktop.v1";
 /// needs (ADR-0012, ST-M010-001, protocol minor `12`).
 ///
 /// An agent lists this in its served capabilities when it can service
-/// [`Operation::FsDrives`] and [`Operation::RemoveTree`]. A peer that receives
-/// one of them without advertising it answers [`ErrorCode::Unsupported`], so
-/// same-major peers on different minors interoperate (REQ-N-012). Like
-/// [`CAP_TERM_V1`], this gate is **enforced** by the agent runtime
-/// (`cretlink-session`): nothing is listed and nothing is removed unless the
-/// capability was advertised. It adds to [`CAP_FS_V1`] and does not replace it;
-/// an agent that serves this one serves that one too.
+/// [`Operation::FsDrives`] and [`Operation::RemoveTree`]. An agent that
+/// receives one of them without advertising it answers
+/// [`ErrorCode::Unsupported`] (REQ-N-012). Like [`CAP_TERM_V1`], this gate is
+/// **enforced** by the agent runtime (`cretlink-session`): nothing is listed
+/// and nothing is removed unless the capability was advertised. A peer on an
+/// older minor does not get as far as a request: the pairing prologue commits
+/// both endpoints to the identical version. The capability adds to
+/// [`CAP_FS_V1`] and does not replace it; an agent that serves this one serves
+/// that one too.
 pub const CAP_FS_V2: &str = "fs.v2";
 
 /// The frozen, version-canonical capability set that **both** endpoints hash
