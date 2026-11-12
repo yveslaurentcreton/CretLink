@@ -2481,6 +2481,13 @@ async fn a_file_is_committed_into_the_root_of_a_drive() {
         return;
     }
     let _ = std::fs::remove_file(&probe);
+    let parts_in_the_root = || {
+        names_in(&root)
+            .into_iter()
+            .filter(|entry| entry.starts_with(".cretlink-part."))
+            .count()
+    };
+    let parts_before = parts_in_the_root();
 
     let committed = transfer(
         &store,
@@ -2493,10 +2500,7 @@ async fn a_file_is_committed_into_the_root_of_a_drive() {
     )
     .await;
     let on_disk = std::fs::read(root.join(&name));
-    let parts_left = names_in(&root)
-        .into_iter()
-        .filter(|entry| entry.starts_with(".cretlink-part."))
-        .count();
+    let parts_left = parts_in_the_root().saturating_sub(parts_before);
     let _ = std::fs::remove_file(root.join(&name));
 
     match committed {
