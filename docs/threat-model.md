@@ -1350,6 +1350,16 @@ hostile-input tests has landed — see the per-abuse-case evidence below
 maintainer-run hardware half ([`manual-tests.md`](manual-tests.md)) is still
 outstanding.
 
+The operations the technician's file explorer adds (ST-M010-001, REQ-F-028) —
+the list of drives, the removal of a folder with its content, and a file sent
+into a folder on any drive — have landed with automated tests on every CI
+platform. What only Windows has (junctions and other reparse points, a file
+held open by another program, a second drive) is covered by tests that run on
+the Windows CI runner only; the run on real hardware is scenario MT-14 in
+[`manual-tests.md`](manual-tests.md), not yet recorded. The technician reaches
+these operations through the console library; the explorer screen that calls
+them is ST-M010-002. The AI tool surface does not contain them.
+
 **Entry points.**
 
 - The MCP bridge file and transfer tools on the technician computer
@@ -1359,6 +1369,13 @@ outstanding.
   output is untrusted input. There is deliberately no file-content read or
   write tool; content crosses only through `remote_upload` and
   `remote_download`.
+- The technician's own file actions in the console library
+  (`TechnicianFiles`, ST-M010-001): the list of drives, the removal of a folder
+  with everything in it, and a file sent into a folder on any drive. Their
+  requests carry the origin `console`; they are not MCP tools. The first two
+  are wire operations of their own (`fs_drives`, `remove_tree`), which an
+  agent serves only when it advertises the capability `fs.v2`; the third uses
+  the transfer operations with an absolute destination.
 - The chunked transfer messages carried inside the authenticated encrypted
   session channel.
 - The file and transfer functions of the elevated execution broker on the
@@ -1504,6 +1521,151 @@ adversarial oversized-input tests cover this end to end
 (`crates/protocol/src/tests.rs`) — so an oversized or inconsistent frame is
 rejected rather than buffered (REQ-N-010, ST-M003-007).
 
+*FT-7 — Removal of a folder with its content (ST-M010-001).* One operation
+removes a whole folder tree, and what it removes is gone: there is no recycle
+bin. Beyond a wrong path, four things can go wrong. The removal can be led out
+of its folder: the agent is elevated, the folder may belong to an account that
+is not, and a program of that account can plant a junction or a symbolic link
+in the folder, or swap a folder for a link while the removal is on its way to
+it, so that the removal reaches the system folders or another user's files.
+The removal can hold the agent: the agent serves one request at a time, so a
+removal that ran to its end inside one request would keep a stop by the
+customer waiting for as long as the tree takes. A removal that left something
+behind can be reported as done. And an answer that names every entry it could
+not remove can outgrow what the channel carries, or carry a file name made to
+forge a line in the activity view or the audit log. Mitigations:
+
+- *Consent, attribution and visibility.* The operation exists only inside an
+  attended session with full-control consent, whose disclosure names reading,
+  modifying and deleting files (REQ-S-001, REQ-S-003). Every request carries
+  its origin, and the customer's activity shows the removal as one item with
+  its kind and its path: in progress from the first step that leaves more to
+  do, then done, cancelled or failed (REQ-F-017).
+- *Audit.* The agent records `fs_remove_tree` with the honest outcome when a
+  removal ends, and `fs_remove_tree_start` when a removal that takes more
+  than one step begins. The console records `console_remove_tree_start`
+  before the first request and `console_remove_tree` after the last, with the
+  path, the number of files and folders removed, the number of entries left
+  behind and the first of them with its reason (REQ-S-017).
+- *Never out of the folder.* An entry that stands for another place — a
+  symbolic link, a junction, a volume mount point — is removed as that entry
+  and never entered; what it points at is not looked at. On Windows nothing is
+  removed by its name alone: every entry is opened without following a link,
+  what it is and where it really lies are read from the opened handle, an
+  entry whose real location is not inside the folder is refused as
+  `invalid_path`, and the removal goes through that same handle. The check and
+  the removal are about one object, so a swap between them changes nothing. A
+  link in the place of the folder itself is removed as a link, the root of a
+  drive is refused, and the path of the request passes the same rules as every
+  remote path on both ends (FT-1).
+- *Bounded steps.* One request settles at most `MAX_TREE_STEP_ENTRIES` (4096)
+  entries and, once it has removed something, answers after
+  `MAX_TREE_STEP_MS` (one second); the console asks again while the answer
+  says that more remains. The agent keeps nothing between two steps, so there
+  is no state to tear down when the session ends. A folder nested deeper than
+  `MAX_TREE_DEPTH` (256) is reported and left. The answer names at most
+  `MAX_TREE_FAILURES` (16) entries, each path cut to
+  `MAX_TREE_FAILURE_PATH_BYTES` and kept on one line, counts the others, and
+  always fits one record of the secure channel (REQ-N-006).
+- *Stop and cancel.* Between two steps the agent serves whatever arrives, so a
+  stop or a revocation from either side takes effect within one step
+  (REQ-S-004, REQ-F-018). A cancellation is the console no longer asking; it
+  tells the agent that the removal ended, so the customer's item ends as
+  cancelled and does not stay in progress.
+- *Honest outcome.* Only a folder that is gone is reported as removed. A
+  removal that left an entry behind is a failure that names it, a cancelled
+  one says what it had removed, and one cut short by the end of the session is
+  never recorded as done: the agent records its result as unknown. The console
+  treats an answer that contradicts itself — more to do but nothing removed,
+  gone but with failures — as an error, never as a result (REQ-N-008).
+- *Capability gate.* An agent that does not advertise `fs.v2` answers
+  `unsupported` before it lists or removes anything (REQ-N-012).
+
+Evidence: `links_in_the_folder_are_removed_and_never_followed`,
+`a_link_in_the_place_of_the_folder_is_removed_as_a_link`,
+`a_step_stops_at_its_entry_bound_and_the_next_one_gets_further`,
+`what_cannot_be_removed_is_named_and_the_rest_is_removed` and
+`a_drive_is_not_a_folder` (`crates/exec/src/fs/tree/tests.rs`), with
+`a_junction_in_the_folder_is_removed_and_never_followed`,
+`a_junction_in_the_place_of_the_folder_is_removed_as_a_link` and
+`a_file_held_open_by_another_program_is_named_as_in_use` on Windows;
+`a_cancelled_removal_stops_between_steps_and_says_so_on_both_sides`,
+`a_revoke_during_a_removal_never_reads_as_a_success`,
+`a_removal_that_leaves_something_behind_is_a_failure_with_its_reasons` and
+`without_the_capability_the_explorer_operations_are_unsupported`
+(`crates/session/tests/e2e.rs`);
+`the_largest_drives_and_tree_removal_answers_fit_one_secure_record`
+(`crates/protocol/src/tests.rs`); and
+`a_stop_ends_a_removal_and_later_actions_fail_closed`
+(`apps/console/tests/technician_files_e2e.rs`).
+
+*FT-8 — A file sent into any folder (ST-M010-001).* The transfer engine could
+already commit a file at an absolute path; the explorer makes that an everyday
+action of the technician. Such a file is the customer's to keep: it lies
+outside the staging area, in no manifest, and no cleanup removes it. What can
+go wrong: the unfinished part of a transfer that never completes stays in the
+customer's folder; a program of an unprivileged account plants a link under
+the part's name, so that the elevated agent writes somewhere else; a file that
+was already there is replaced unasked; a torn or unverified file appears under
+the final name; a full disk is reported as something else. Mitigations:
+
+- *Verified before it has its name.* The bytes go to a part file beside the
+  destination — on the same drive, so the commit is one rename on any drive
+  and the file gets the permissions of its folder — and the file appears under
+  its name only after its length and SHA-256 are verified (FT-2, FT-3,
+  REQ-N-007).
+- *Replaced only on request.* Without the request to replace, a file of that
+  name fails the transfer with `already_exists` and stays as it is.
+- *No write through a planted link.* The part is opened without following a
+  link, and a part that is not a regular file is refused: never written to,
+  never published.
+- *The part is cleaned up.* The agent remembers every unfinished part that
+  lies outside the staging area (at most 1024 at a time; one more is refused)
+  and removes them with every cleanup: the one the session runs by itself
+  when it ends by a stop, a revocation or a lost connection, and one the
+  console asks for. A part it could not remove is reported like any other
+  cleanup failure and tried again by the next cleanup (REQ-F-019).
+- *A name is one name.* The technician computer refuses, before anything is
+  sent, a name that is a path and a folder that is not a rooted path on a
+  drive; the wire validation applies the path rules again on both ends (FT-1).
+- *Attributed, visible, recorded.* The transfer carries the origin `console`,
+  the customer's activity shows a received file with its path and size, and
+  the console records `console_send_start` and `console_send` with the path
+  the agent committed, the length and the verified digest, and whether a
+  replacement was asked for (REQ-F-017, REQ-S-017). A full disk is reported as
+  `storage_exhausted` (REQ-N-015).
+
+Evidence: `the_part_lies_beside_the_destination_until_the_verified_commit`,
+`a_file_sent_to_a_folder_is_kept_and_not_staged`,
+`the_part_of_an_unfinished_transfer_to_a_folder_is_removed_by_the_cleanup`,
+`a_part_the_cleanup_cannot_remove_is_reported_and_tried_again`,
+`a_link_planted_under_the_parts_name_is_never_written_through` and
+`a_full_disk_is_reported_as_exhausted_storage`
+(`crates/exec/src/fs/tests.rs`); `a_name_that_is_a_path_is_refused`
+(`apps/console/src/service.rs`); and, on Windows only, because the wire
+accepts a path only when it is rooted on a drive,
+`a_file_is_sent_to_a_folder_and_replaced_only_on_request`,
+`a_revoke_during_a_transfer_to_a_folder_leaves_no_part_behind`
+(`crates/session/tests/e2e.rs`) and
+`a_file_is_sent_into_a_folder_verified_and_replaced_only_on_request`
+(`apps/console/tests/technician_files_e2e.rs`).
+
+*FT-9 — The list of drives (ST-M010-001).* The list reads facts and changes
+nothing, but it carries text that anyone can choose — the label of a USB
+stick — into the technician's view and the audit trail, and a careless query
+could open a system dialog on the customer's screen or wait on a file server
+while the agent serves nothing else. Mitigations: at most `MAX_DRIVES` (32)
+entries, a root and a label bounded and kept on one line by the agent and
+checked again by the wire validation on both ends; a drive without a medium
+is listed with its kind and no size, and no dialog is shown for it; a drive on
+the network is listed with its kind only, so the list never waits on the
+network; a value the system cannot give is absent, never zero and never
+guessed (REQ-N-006, REQ-N-008). Evidence:
+`a_label_is_bounded_and_kept_on_one_line`,
+`a_drive_without_a_usable_root_is_left_out` (`crates/exec/src/fs/drives.rs`),
+`drive_texts_are_single_lines` and `too_many_drives_rejected`
+(`crates/protocol/src/tests.rs`).
+
 **Residual risks.**
 
 - An authorised technician is trusted with file content. Once the customer
@@ -1523,6 +1685,28 @@ rejected rather than buffered (REQ-N-010, ST-M003-007).
 - Resource limits are robustness bounds, not quotas. An authorised session can
   still legitimately fill a disk with a large installer; limits exist to stop
   unbounded or accidental exhaustion, not to police approved work.
+- A removed folder is gone. The removal does not use a recycle bin and cannot
+  be undone; the operation removes what it is asked to remove, and any
+  question before it is the calling screen's. The defence is consent, the
+  customer's view of the action, the audit record, and the stop control.
+- A file sent to a folder stays. It is outside the staging area by design, so
+  the cleanup that removes staged files does not remove it; the audit record
+  and the customer's activity are what remains of how it got there.
+- A part can outlive a killed agent. The list of unfinished parts outside the
+  staging area is kept in memory. An agent that is killed, or a computer that
+  loses power, in the middle of such a transfer leaves a file named
+  `.cretlink-part.` followed by sixteen hexadecimal digits beside the
+  destination, and `cretlink recover` does not look for it.
+- A folder of a cloud drive is removed with its content. A folder that is a
+  reparse point without standing for another place — a folder that OneDrive
+  manages — is walked like any folder, and the cloud service may then remove
+  the same files from the cloud, as it does when the folder is removed in
+  Windows itself.
+- The removal verifies the opened object on Windows only. Elsewhere it removes
+  by name without following the last part of the name; a non-Windows agent is
+  a development and test tool that is never elevated on a customer computer.
+- The behaviour that only Windows has was not run on real hardware yet
+  (MT-14), and its automated tests run on the Windows CI runner only.
 - Cleanup can fail. A staged file may survive an unclean shutdown; the
   commitment is to report residual artifacts prominently (REQ-F-019), not to
   guarantee their removal. This honesty is verified by
@@ -1748,6 +1932,9 @@ a hard kill of the agent reaps it.
   on either endpoint (REQ-S-007).
 - Files staged onto the customer computer during the session: scripts,
   utilities, installers, and drivers (REQ-F-012).
+- The unfinished part of a file on its way into a folder outside the staging
+  area (ST-M010-001): it lies beside its destination until the verified
+  commit gives the file its name.
 - The cleanup process itself, including its result reporting (REQ-F-019) — a
   cleanup that misreports success is an asset an attacker can hide behind.
 
@@ -1841,6 +2028,12 @@ while cleanup is incomplete.
   windows, or connection state (REQ-S-002), any residue that does survive is
   at least discoverable by ordinary inspection rather than concealed, and the
   audit trail (REQ-S-017) records what was created during the session.
+- *Parts outside the staging area.* A file sent into a folder is written to a
+  part beside its destination. The agent remembers each such part until the
+  transfer is committed or discarded, removes the remaining ones with the
+  session's cleanup, and reports a part it could not remove in the cleanup
+  report, where the next cleanup tries again (ST-M010-001, REQ-F-019; see
+  FT-8).
 
 **Residual risks.**
 
@@ -1861,6 +2054,11 @@ while cleanup is incomplete.
   (disk failure, forced power-off, removal of the portable media), residue can
   remain until the documented manual remediation is followed. The commitment
   is honest reporting and recoverable tooling, not impossibility of residue.
+- A part beside a destination can outlive a killed agent. The agent remembers
+  the unfinished parts outside the staging area in memory only, so a hard
+  kill or a power loss in the middle of a transfer into a folder leaves the
+  part where it is (see the residual risks of
+  [File transfer and staging](#file-transfer-and-staging)).
 - The reboot-resume window is persistence by design. Between the approved
   reboot and the resumed session, reconnect authority necessarily exists on
   disk. Scoping, expiry, and single-use consumption bound the risk; they do
@@ -2523,8 +2721,11 @@ Known upcoming triggers for revision:
 
 - the maintainer-run hardware half of the privileged adversarial and negative
   execution suite (ST-M003-007) and the other hardware scenarios in
-  [`manual-tests.md`](manual-tests.md), including the reboot-resume run (MT-8),
-  being recorded;
+  [`manual-tests.md`](manual-tests.md), including the reboot-resume run (MT-8)
+  and the file operations of the explorer (MT-14), being recorded;
+- the explorer screen (ST-M010-002), which makes the removal of a folder and
+  the transfer into any folder everyday actions of the technician and must
+  record what it asks before a removal;
 - promotion of desktop observation and control (M005) or the technician
   terminal (M008) out of draft, which must record their actual status and any
   new residual risk in the
