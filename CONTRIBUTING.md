@@ -129,6 +129,10 @@ Follow [`docs/releasing.md`](docs/releasing.md):
 
 - GitHub Flow: short-lived branch from the latest `main`, pull request,
   verification, squash-merge. Never push feature work directly to `main`.
+- While a release of several changes is collected, the base branch is `next`
+  instead of `main` (see "One release for several changes" in
+  `docs/releasing.md`). Ask in an issue when you are not sure which one
+  applies.
 - Branch names carry the story: `feat/ST-M004-004-target-binding`.
 - [Conventional Commits](https://www.conventionalcommits.org): `fix` → patch,
   `feat` → minor, `!`/`BREAKING CHANGE:` → major. `docs`, `test`, `build`,
