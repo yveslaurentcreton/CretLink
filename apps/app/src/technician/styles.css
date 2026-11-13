@@ -290,8 +290,11 @@ body {
 .xp-transfers-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
 .xp-transfers-head .xp-h { margin: 0; }
 .xp-queue-words { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); }
-.list.files.queue .it { padding: 8px 0; }
+.xp-transfers.queued { max-height: 42%; min-height: 132px; }
+.list.files.queue .it { padding: 6px 0; align-items: center; }
 .list.files.queue .it .file-text { flex: 1; }
+.q-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.q-line b { min-width: 0; overflow-wrap: anywhere; }
 .list.files.queue .it.failed .k,
 .list.files.queue .it.left_out .k,
 .list.files.queue .it.stopped .k { background: var(--bad-soft); border-color: var(--bad-line); color: var(--bad); }
@@ -313,6 +316,7 @@ body {
 .xp-all { display: inline-flex; align-items: center; gap: 6px; margin: 4px 0 0; }
 .xp-all.on { background: var(--tech-soft); border-color: var(--tech-line); color: var(--tech-deep); font-weight: 600; }
 .xp-dialog .row.end { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.xp-dialog .row.end .btn { padding: 8px 14px; }
 
 /* Transfers and audit */
 .list.files .it { align-items: flex-start; }

@@ -776,7 +776,7 @@ describe("the context menu", () => {
       "Download",
       "Download to…",
       "RenameF2",
-      "DeleteDelete",
+      "DeleteDel",
       "Upload files…",
       "Upload a folder…",
       "RefreshF5",
@@ -2015,7 +2015,7 @@ describe("changes and the session", () => {
       ["Download", null],
       ["Download to…", null],
       ["RenameF2", "F2"],
-      ["DeleteDelete", "Delete"],
+      ["DeleteDel", "Delete"],
     ]);
     expect($(".xp-actions").getAttribute("role")).toBe("toolbar");
     key("F10", { shiftKey: true });

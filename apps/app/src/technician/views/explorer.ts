@@ -134,6 +134,14 @@ function toolbar(x: ExplorerState, host: string): HTMLElement {
   );
 }
 
+/**
+ * A key as a keyboard prints it, for the hint beside an action: the Delete
+ * key is `Del`. `aria-keyshortcuts` keeps the key's own name.
+ */
+function keyCap(keys: string): string {
+  return keys === "Delete" ? "Del" : keys;
+}
+
 /** The actions of the selection as buttons, by the action each dispatches. */
 const ACTION_BUTTONS: ReadonlyArray<{ action: string; icon?: IconName; danger?: boolean }> = [
   { action: "xp-download" },
@@ -181,7 +189,7 @@ function actionBar(x: ExplorerState): HTMLElement {
         },
         spec.icon ? icon(spec.icon, "sm") : null,
         action.label,
-        action.keys ? h("kbd", { "aria-hidden": "true" }, action.keys) : null,
+        action.keys ? h("kbd", { "aria-hidden": "true" }, keyCap(action.keys)) : null,
       );
     }),
   );
@@ -654,7 +662,7 @@ function menu(x: ExplorerState): HTMLElement | null {
             disabled: item.disabled,
           },
           h("span", null, item.label),
-          item.keys ? h("kbd", { "aria-hidden": "true" }, item.keys) : null,
+          item.keys ? h("kbd", { "aria-hidden": "true" }, keyCap(item.keys)) : null,
         ),
       ),
     ),
@@ -720,10 +728,13 @@ function queueRow(entry: TransferEntry): HTMLElement {
     h(
       "div",
       { class: "file-text" },
-      h("b", { class: "mono" }, entry.name),
+      // One line for a transfer that has nothing to explain: its name, its
+      // state and which way it goes. The place on the customer computer is
+      // read out, and shown when the pointer rests on the name.
       h(
         "div",
-        { class: "m" },
+        { class: "q-line" },
+        h("b", { class: "mono", title: entry.remote || null }, entry.name),
         stateBadge(entry),
         h("span", { class: send ? "who sys" : "flag" }, directionWords(entry)),
       ),
@@ -737,12 +748,7 @@ function queueRow(entry: TransferEntry): HTMLElement {
         : null,
       entry.reason ? h("p", { class: "why" }, entry.reason) : null,
       entry.remote
-        ? h(
-            "code",
-            { class: "path", title: entry.remote },
-            h("span", { class: "sr-only" }, "On the customer computer: "),
-            entry.remote,
-          )
+        ? h("span", { class: "sr-only" }, `On the customer computer: ${entry.remote}`)
         : null,
       !send && entry.local
         ? h(
@@ -842,7 +848,10 @@ function transfers(s: TechnicianSnapshot): HTMLElement {
   const open = queued.filter(isOpen).length;
   return h(
     "section",
-    { class: "xp-transfers", "aria-labelledby": "xp-transfers-h" },
+    {
+      class: queued.length > 0 ? "xp-transfers queued" : "xp-transfers",
+      "aria-labelledby": "xp-transfers-h",
+    },
     h(
       "div",
       { class: "xp-transfers-head" },
