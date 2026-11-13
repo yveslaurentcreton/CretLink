@@ -25,6 +25,7 @@
 
 pub mod install;
 pub mod process;
+pub mod relay_profile;
 pub mod setup;
 pub mod shell;
 

@@ -585,12 +585,14 @@ version = "0.0.0"
 dependencies = [
  "cretlink-mcp",
  "cretlink-protocol",
+ "cretlink-relay",
  "cretlink-shared",
  "cretlink-support-agent",
  "serde",
  "serde_json",
  "tokio",
  "windows 0.62.2",
+ "zeroize",
 ]
 
 [[package]]
