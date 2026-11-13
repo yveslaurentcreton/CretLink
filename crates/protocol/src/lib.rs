@@ -61,6 +61,7 @@ mod error;
 mod ids;
 pub mod limits;
 mod message;
+mod page;
 mod pairing;
 mod purpose;
 mod reboot_resume;
@@ -78,6 +79,7 @@ pub use message::{
     OutputStream, PairingMessage, PointerAction, PointerButton, RemotePath, RevokeReason, Role,
     Shell, StagedEntry, TargetIdentity, TreeFailure, TreeState, validate_remote_absolute_path,
 };
+pub use page::DirPage;
 pub use pairing::{
     PAIRING_PROLOGUE_MAGIC, SAC_COMMITMENT_LEN, SAC_DIGITS, SAC_HKDF_SALT, SAC_MODULUS,
     SAC_NONCE_LEN, SessionApprovalCode, derive_session_approval_code, pairing_prologue,

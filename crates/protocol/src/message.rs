@@ -504,7 +504,9 @@ pub enum Operation {
         /// The path to describe.
         path: RemotePath,
     },
-    /// List a directory, one bounded page at a time.
+    /// List a directory, one bounded page at a time. A page is as long as
+    /// fits one record of the secure channel, so a folder of long names takes
+    /// more pages than a folder of short ones (ST-M010-005).
     FsList {
         /// The directory to list.
         path: RemotePath,
@@ -858,7 +860,12 @@ pub enum OpResult {
     },
     /// Result of [`Operation::FsList`]: one bounded page.
     DirEntries {
-        /// At most [`limits::MAX_DIR_PAGE`] entries, ordered by name.
+        /// At most [`limits::MAX_DIR_PAGE`] entries, ordered by name, and
+        /// never more than fit, with this answer, in one record of the secure
+        /// channel ([`limits::MAX_RECORD_BYTES`]): the agent ends the page
+        /// before the entry that would not fit ([`crate::DirPage`],
+        /// ST-M010-005). A page that is not the final one holds at least one
+        /// entry.
         entries: Vec<FileEntry>,
         /// Whether this is the final page (no more entries follow).
         end: bool,

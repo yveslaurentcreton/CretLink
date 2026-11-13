@@ -4838,3 +4838,160 @@ async fn a_revoke_during_a_transfer_to_a_folder_leaves_no_part_behind() {
     assert_eq!(entries_in(&folder), 0, "and its part is gone");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- A folder page always fits the channel (ST-M010-005) --------------------
+
+/// How many characters the names of the long-name test have. Windows takes a
+/// name of 255 UTF-16 units, so 250 characters of three bytes each; the other
+/// systems the agent is built for take 255 bytes, which is 85 of them.
+const LONG_NAME_CHARS: usize = if cfg!(windows) { 250 } else { 85 };
+
+/// A name of [`LONG_NAME_CHARS`] characters of three bytes each, told apart by
+/// `n`, which is written in digits of three bytes too.
+fn long_name(n: usize) -> String {
+    let digits: String = format!("{n:03}")
+        .chars()
+        .map(|digit| {
+            let value = digit.to_digit(10).expect("a decimal digit");
+            // The fullwidth digits U+FF10 to U+FF19.
+            char::from_u32(0xFF10 + value).expect("a fullwidth digit")
+        })
+        .collect();
+    let name = format!("{digits}{}", "\u{8A9E}".repeat(LONG_NAME_CHARS - 3));
+    assert_eq!(name.chars().count(), LONG_NAME_CHARS);
+    assert_eq!(name.len(), 3 * LONG_NAME_CHARS);
+    name
+}
+
+/// A folder of 600 files whose names are as long as the system takes, in
+/// characters of three bytes each (250 of them on Windows), is listed through
+/// a session. A page of 256 such names does not fit one record of the secure
+/// channel; the agent ends each page before the entry that would not fit, so
+/// every page arrives, the pages together name every file exactly once, and
+/// the session is alive afterwards.
+#[tokio::test]
+async fn a_folder_of_long_names_is_listed_through_a_session_every_name_exactly_once() {
+    use cretlink_protocol::limits::MAX_DIR_PAGE;
+
+    let (mut host, mut joiner) = connected_pair().await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let folder = staged_folder(&host, "long-names");
+    let mut expected: Vec<String> = (0..600).map(long_name).collect();
+    for name in &expected {
+        std::fs::write(folder.join(name), b"x").expect("plant a file with a long name");
+    }
+    expected.sort();
+
+    let mut listed: Vec<String> = Vec::new();
+    let mut pages = 0;
+    let mut continue_after = None;
+    loop {
+        let page = host
+            .file_op(Operation::FsList {
+                path: staged("long-names"),
+                continue_after: continue_after.clone(),
+            })
+            .await
+            .expect("a page arrives: the session is not lost over a folder of long names");
+        let OpResult::DirEntries { entries, end } = page else {
+            panic!("expected DirEntries");
+        };
+        pages += 1;
+        assert!(
+            entries.len() < MAX_DIR_PAGE,
+            "a page of {} long names fits no record",
+            entries.len()
+        );
+        listed.extend(entries.into_iter().map(|entry| entry.name));
+        if end {
+            break;
+        }
+        continue_after = Some(
+            listed
+                .last()
+                .expect("a page that says more follows holds an entry")
+                .clone(),
+        );
+        assert!(pages < 1000, "the listing must end");
+    }
+
+    assert!(pages > 600 / MAX_DIR_PAGE + 1, "{pages} pages");
+    assert_eq!(listed.len(), expected.len());
+    assert!(listed == expected, "every name exactly once, in order");
+
+    assert_the_session_still_runs_a_command(&mut host).await;
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// An answer that is too large to send does not end the session. A read of
+/// more bytes than one record of the secure channel carries is within the
+/// bounds of the protocol, so the agent serves it and then cannot send what it
+/// read. The request fails with that reason, the customer sees it as failed,
+/// and the session goes on: the next command runs, and a read that fits is
+/// answered.
+#[tokio::test]
+async fn an_answer_too_large_to_send_fails_its_request_and_the_session_goes_on() {
+    use cretlink_protocol::limits::{MAX_CHUNK_BYTES, MAX_RECORD_BYTES};
+    use cretlink_session::{ActionOutcome, ActivityKind};
+
+    let (mut host, mut joiner) = connected_pair().await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let dir = temp_dir_for("unsendable-answer");
+    let data = pattern(3 * MAX_RECORD_BYTES);
+    stage_artifact(&host, &dir, "large.bin", &data).await;
+    let read = |len: usize| Operation::FsRead {
+        path: staged("large.bin"),
+        offset: 0,
+        len: u32::try_from(len).expect("a length the wire carries"),
+    };
+
+    let refused = host
+        .file_op(read(MAX_CHUNK_BYTES))
+        .await
+        .expect_err("what was read does not fit one record");
+    match refused {
+        SessionError::Remote { code, message } => {
+            assert_eq!(code, ErrorCode::OversizedMessage);
+            assert!(message.contains("too large to send"), "{message}");
+        }
+        other => panic!("expected the agent's reason, got {other:?}"),
+    }
+
+    // The customer sees the read as a failed request, with the reason. The
+    // items before it are those of the upload that staged the file.
+    let failed_read = loop {
+        let parts = handled_parts(next_handled(&mut joiner).await);
+        if parts.2 == ActivityKind::FileSent {
+            break parts;
+        }
+    };
+    assert_eq!(
+        failed_read.6,
+        ActionOutcome::Failed {
+            code: ErrorCode::OversizedMessage
+        }
+    );
+    assert_eq!(
+        failed_read.5, None,
+        "nothing of the file is reported as sent"
+    );
+
+    // The session goes on.
+    assert_the_session_still_runs_a_command(&mut host).await;
+    match host
+        .file_op(read(1024))
+        .await
+        .expect("a read that fits is answered")
+    {
+        OpResult::FileData { data: chunk, .. } => assert_eq!(chunk.as_bytes(), &data[..1024]),
+        other => panic!("expected FileData, got {other:?}"),
+    }
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+    let _ = std::fs::remove_dir_all(&dir);
+}

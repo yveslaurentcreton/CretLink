@@ -66,6 +66,16 @@
 //! bounded step at a time, without ever leaving the folder (see the `tree`
 //! module). It takes up its folder as a verified folder too.
 //!
+//! # A folder page fits the channel (ST-M010-005)
+//!
+//! [`Operation::FsList`] answers one page of a folder, ordered by name. A
+//! page holds at most [`limits::MAX_DIR_PAGE`] entries and ends earlier,
+//! before the entry that would make its answer larger than one record of the
+//! secure channel: an answer that does not fit a record cannot be sent. The
+//! size is the one the answer really has when it is encoded
+//! ([`cretlink_protocol::DirPage`]), so a name that the encoding writes
+//! longer is counted as it is written.
+//!
 //! # The staging area is CretLink's own (ST-M006-020, REQ-S-024)
 //!
 //! A cleanup acts on what a manifest in the staging area names, and a staged
@@ -110,8 +120,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use cretlink_protocol::{
-    B64Bytes, CleanupFailure, CleanupTrigger, DigestAlgo, ErrorCode, FileEntry, FileKind, OpResult,
-    Operation, RemotePath, SessionId, StagedEntry, limits,
+    B64Bytes, CleanupFailure, CleanupTrigger, DigestAlgo, DirPage, ErrorCode, FileEntry, FileKind,
+    OpResult, Operation, RemotePath, SessionId, StagedEntry, limits,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -588,8 +598,7 @@ impl FileStore {
             Err(e) => return Err(FsError::from_io("failed to open the directory", &e)),
         }
         let hide_internal = dir == self.staging_root;
-        let (entries, end) = list_dir(&dir, continue_after, hide_internal).await?;
-        Ok(OpResult::DirEntries { entries, end })
+        list_dir(&dir, continue_after, hide_internal).await
     }
 
     /// Lists the drives of this computer (ST-M010-001). The system is asked
@@ -2084,13 +2093,19 @@ async fn append_to_part(part: &Path, data: &[u8]) -> Result<(), FsError> {
 ///
 /// Only the smallest [`limits::MAX_DIR_PAGE`] names greater than `continue_after`
 /// are retained, via a bounded max-heap, so a directory with millions of entries
-/// still costs one page of memory. `end` is false when more names remain beyond
-/// the page.
+/// still costs one page of memory.
+///
+/// The page takes those names in order for as long as its answer fits one
+/// record of the secure channel, and ends before the entry that would make it
+/// larger (ST-M010-005): an answer that does not fit a record cannot be sent.
+/// The answer says that more follows when the page ended that way, or when
+/// more names remain beyond the ones retained; the caller continues after the
+/// last name of the page.
 async fn list_dir(
     dir: &Path,
     continue_after: Option<&str>,
     hide_internal: bool,
-) -> Result<(Vec<FileEntry>, bool), FsError> {
+) -> Result<OpResult, FsError> {
     let mut rd = tokio::fs::read_dir(dir)
         .await
         .map_err(|e| FsError::from_io("failed to open the directory", &e))?;
@@ -2117,16 +2132,44 @@ async fn list_dir(
             overflow = true;
         }
     }
-    let names = heap.into_sorted_vec();
-    let mut entries = Vec::with_capacity(names.len());
-    for name in names {
+    let mut page = DirPage::new();
+    let mut more = overflow;
+    for name in heap.into_sorted_vec() {
         let child = dir.join(&name);
         // A file may vanish between listing and stat; skip it rather than fail.
-        if let Ok(meta) = tokio::fs::symlink_metadata(&child).await {
-            entries.push(file_entry(name, &meta));
+        let Ok(meta) = tokio::fs::symlink_metadata(&child).await else {
+            continue;
+        };
+        if !add_to_page(&mut page, file_entry(name, &meta))? {
+            // The page ended before this entry: it opens the next one. What
+            // comes after it is not looked at for this page.
+            more = true;
+            break;
         }
     }
-    Ok((entries, !overflow))
+    Ok(page.into_result(!more))
+}
+
+/// Adds `entry` to `page`, or says with `false` that the page ended before it:
+/// it holds as many entries as a page may, or its answer would no longer fit
+/// one record of the secure channel with this entry in it.
+///
+/// # Errors
+///
+/// When not even an empty page takes the entry. A page that says more follows
+/// must hold an entry to continue after, so the listing fails with the reason
+/// instead of ending a page empty. No file system the agent runs on has a name
+/// that long: the largest entry the protocol carries is a small part of a
+/// record.
+fn add_to_page(page: &mut DirPage, entry: FileEntry) -> Result<bool, FsError> {
+    match page.push(entry) {
+        Ok(()) => Ok(true),
+        Err(_) if !page.is_empty() => Ok(false),
+        Err(_) => Err(FsError::new(
+            ErrorCode::LimitExceeded,
+            "an entry of the folder has a name too long to be listed",
+        )),
+    }
 }
 
 /// Hashes a file with SHA-256, up to `limit` bytes when set, returning the
