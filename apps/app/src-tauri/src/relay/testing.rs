@@ -152,7 +152,7 @@ pub(crate) struct TestRelay {
     /// Its admission gate, to read its counters.
     pub(crate) control: AdmissionControl,
     /// Keeps the relay serving: when it is dropped, the relay stops.
-    _signal: StopSignal,
+    signal: StopSignal,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -197,9 +197,15 @@ impl TestRelay {
             addr,
             cert_pem,
             control,
-            _signal: signal,
+            signal,
             task,
         }
+    }
+
+    /// Stops the relay as its operator would: it takes no new connection,
+    /// and every session it is passing on is cut on both sides.
+    pub(crate) fn stop(&self) {
+        self.signal.stop();
     }
 
     /// The text of a profile file for this relay: its loopback address, the

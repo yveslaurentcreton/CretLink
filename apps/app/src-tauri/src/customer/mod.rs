@@ -1278,6 +1278,9 @@ fn approval_code(session: SessionId) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod testing;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

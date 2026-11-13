@@ -99,6 +99,15 @@ impl RelayWait {
     pub(super) fn address(&self) -> String {
         self.relay.view().address
     }
+
+    /// The same wait with other timing, for a test that lets a rendezvous
+    /// lapse.
+    #[cfg(test)]
+    pub(super) fn with_timing(mut self, pause: Duration, park_limit: Duration) -> Self {
+        self.pause = pause;
+        self.park_limit = park_limit;
+        self
+    }
 }
 
 /// The key and the code are not in it.

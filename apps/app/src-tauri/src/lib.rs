@@ -27,6 +27,10 @@ mod start;
 mod customer;
 mod technician;
 
+// A session through the relay, with both roles' drivers (ST-M007-013).
+#[cfg(test)]
+mod relayed_session_tests;
+
 use std::io;
 use std::path::Path;
 use std::process::ExitCode;
