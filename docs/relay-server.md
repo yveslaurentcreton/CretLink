@@ -370,10 +370,18 @@ settings:
   `0600`); on Windows it lies in your own `%LOCALAPPDATA%` folder and has the
   access rules of that folder. `cretlink uninstall` removes both files and
   says so before it does.
+- `relay-ca.pem` holds **the certificates of the file you chose and nothing
+  else**, written anew. Some tools keep the private key of an authority in
+  the same file as its certificate; that key is not copied.
+- **A save lands whole or not at all.** The relay and its certificate file
+  change together: when a save fails, both are as they were, and the screen
+  says that nothing was changed.
 - The **key is never shown** again once it is saved: the screen says only
   that a key is set. Leave the field empty to keep it. A kept key stays with
-  its relay: when you change the form to another relay, the application asks
-  for that relay's key instead of presenting the kept one to it.
+  its relay as it was saved: when you change the host of the address, the
+  name in the certificate or the certificate authority, the application asks
+  for the key again instead of presenting the kept one. Another port of the
+  same host keeps it.
 - **Test** reaches the relay once, with what stands in the form, and says in
   words what came of it: the relay admits this copy, or it could not be
   reached, its certificate is not trusted, it asks for a key, it does not

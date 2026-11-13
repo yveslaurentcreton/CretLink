@@ -3206,11 +3206,25 @@ metadata rather than content.
   shows it again once it is saved, never logs it, puts it in no audit record
   and in no error text; a form that leaves the key alone tells the backend to
   keep it instead of sending it back. A kept key stays with the relay it was
-  saved for: when the form names another relay, by another host name for its
-  certificate, the application refuses to keep the key and asks for that
-  relay's own, so a test or a save never presents one relay's key to
-  another. The test of a relay in Settings presents a ticket of its own,
-  meets nobody and carries nothing of a session.
+  saved for, and that is more than its name: the host of the address, the
+  name its certificate must carry and the authority that certificate is
+  checked against. When a form changes one of the three, the application
+  refuses to keep the key and asks for it again, so neither a test nor a
+  save presents the key to another host that claims the same name, or to
+  the same host under an authority that somebody else chose. The test of a
+  relay in Settings presents a ticket of its own, meets nobody and carries
+  nothing of a session.
+- *The settings and the certificate file change together.* The installed
+  copy keeps the relay in `settings.toml` and, for a private authority, the
+  certificates of the chosen file in `relay-ca.pem`. A save writes the new
+  certificate file under another name, then the settings, and only then lets
+  the certificate file take its place; when a step fails, both are as they
+  were. A save that reached only one of them would leave the relay of before
+  with the authority of after. A crash between the two steps leaves the new
+  relay with the old authority, which fails closed: nothing is sent to a
+  relay whose certificate that authority did not sign. The kept file holds
+  the certificates only, written anew, so that a private key which stood in
+  the chosen file is never copied next to the settings.
 - *A relay code grants nothing.* It holds a random seed of 64 bits and a
   typing check, no address and no key. Someone who overhears or guesses a code
   can at most reach the rendezvous before the customer does: the approval

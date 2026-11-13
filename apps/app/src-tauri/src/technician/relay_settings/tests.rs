@@ -169,27 +169,41 @@ fn a_kept_key_is_never_given_to_another_relay() {
     assert_eq!(refused.stage, "relay_key");
     assert_eq!(
         refused.message,
-        "The key that is kept is the key of the relay relay.example.org; enter the key of this \
-         relay, or remove the key."
+        "The key that is kept was saved for the relay relay.example.org as it was: its host, \
+         the name in its certificate and its certificate authority. This form changes one of \
+         them, so enter the key again, or remove the key."
     );
     assert!(!refused.message.contains(KEY));
     let refused = relay_to_test(&copy, Some(&other), &pending).unwrap_err();
     assert_eq!(refused.stage, "relay_key");
+
+    // The name alone does not carry the key: another host that claims the
+    // same name in its certificate is another place the key would go to.
+    let mut moved = form("192.0.2.1:443");
+    moved.name = Some("relay.example.org".to_owned());
+    // And the same host under another name for its certificate.
+    let mut renamed = form("relay.example.org:443");
+    renamed.name = Some("host-01.example.org".to_owned());
+    for changed in [&moved, &renamed] {
+        assert_eq!(
+            save(&copy, changed, &pending).unwrap_err().stage,
+            "relay_key"
+        );
+        assert_eq!(
+            relay_to_test(&copy, Some(changed), &pending)
+                .unwrap_err()
+                .stage,
+            "relay_key"
+        );
+    }
     assert_eq!(home.folder.snapshot(), before);
 
-    // The same relay under another address is still the same relay: its name
-    // in the certificate is what the key was saved for.
-    let mut same = form("192.0.2.1:443");
+    // The same relay written another way is the same relay: another port,
+    // capitals, and its name spelled out.
+    let mut same = form("Relay.Example.ORG:9970");
     same.name = Some("relay.example.org".to_owned());
     save(&copy, &same, &pending).unwrap();
     assert_eq!(stored_key(&home).as_deref(), Some(KEY.as_bytes()));
-    // And a name that says otherwise is another relay.
-    let mut renamed = form("192.0.2.1:443");
-    renamed.name = Some("host-01.example.org".to_owned());
-    assert_eq!(
-        save(&copy, &renamed, &pending).unwrap_err().stage,
-        "relay_key"
-    );
 
     // The other relay with a key of its own, or with none, is saved.
     save(
@@ -208,6 +222,175 @@ fn a_kept_key_is_never_given_to_another_relay() {
     assert_eq!(stored_key(&home), None);
     // Without a kept key there is nothing to hold back.
     save(&copy, &form("host-01.example.org:443"), &pending).unwrap();
+}
+
+#[test]
+fn a_kept_key_does_not_follow_a_changed_certificate_file() {
+    let home = Home::new("settings-key-ca");
+    let copy = home.installed();
+    let pending = PendingCa::default();
+    let authority = certificate();
+    let another = certificate();
+    assert_ne!(authority, another);
+    let relay = |pending: &PendingCa, ca: Option<&[u8]>| {
+        let mut form = form("192.0.2.1:443");
+        form.name = Some(RELAY_NAME.to_owned());
+        match ca {
+            Some(pem) => {
+                form.ca_mode = CaMode::Chosen;
+                form.ca_pick = Some(pending.keep(pem.to_vec()));
+            }
+            None => form.ca_mode = CaMode::None,
+        }
+        form
+    };
+    save(
+        &copy,
+        &with_key(relay(&pending, Some(&authority)), KEY),
+        &pending,
+    )
+    .unwrap();
+    let before = home.folder.snapshot();
+
+    // The same host and the same name, checked against another authority or
+    // against the system's: whoever chose that authority would get the key.
+    // Neither a save nor a test presents it.
+    for changed in [Some(another.as_slice()), None] {
+        let form = relay(&pending, changed);
+        let refused = save(&copy, &form, &pending).unwrap_err();
+        assert_eq!(refused.stage, "relay_key", "{}", refused.message);
+        assert!(
+            refused.message.contains("its certificate authority"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(
+            relay_to_test(&copy, Some(&form), &pending)
+                .unwrap_err()
+                .stage,
+            "relay_key"
+        );
+        assert_eq!(home.folder.snapshot(), before);
+    }
+    assert_eq!(std::fs::read(&home.layout.relay_ca).unwrap(), authority);
+
+    // With the key typed again, the relay is saved with its new authority.
+    save(
+        &copy,
+        &with_key(relay(&pending, Some(&another)), KEY),
+        &pending,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&home.layout.relay_ca).unwrap(), another);
+
+    // The same file chosen again is the same authority, also when the file
+    // holds more than its certificate: the key stays.
+    let end = KEY_MARKER.replace("BEGIN", "END");
+    let chosen_again = home.folder.write(
+        "authority-again.pem",
+        format!(
+            "# the same authority\n{KEY_MARKER}bm90IGEga2V5\n{end}{}",
+            String::from_utf8_lossy(&another)
+        ),
+    );
+    let read = read_chosen_ca(&chosen_again).unwrap();
+    save(&copy, &relay(&pending, Some(&read)), &pending).unwrap();
+    assert_eq!(stored_key(&home).as_deref(), Some(KEY.as_bytes()));
+    // And so it does when the file is left alone.
+    let mut keep = form("192.0.2.1:9970");
+    keep.name = Some(RELAY_NAME.to_owned());
+    save(&copy, &keep, &pending).unwrap();
+    assert_eq!(stored_key(&home).as_deref(), Some(KEY.as_bytes()));
+
+    // A relay that was checked against the system's authorities does not
+    // take its key to an authority file either.
+    let home = Home::new("settings-key-ca-system");
+    let copy = home.installed();
+    let mut system = with_key(form("192.0.2.1:443"), KEY);
+    system.name = Some(RELAY_NAME.to_owned());
+    save(&copy, &system, &pending).unwrap();
+    assert_eq!(
+        save(&copy, &relay(&pending, Some(&authority)), &pending)
+            .unwrap_err()
+            .stage,
+        "relay_key"
+    );
+    assert!(!home.layout.relay_ca.exists());
+}
+
+#[test]
+fn a_save_that_fails_changes_nothing() {
+    let home = Home::new("settings-save-fails");
+    let copy = home.installed();
+    let pending = PendingCa::default();
+    let authority = certificate();
+    let mut first = with_key(form("192.0.2.1:443"), KEY);
+    first.name = Some(RELAY_NAME.to_owned());
+    first.ca_mode = CaMode::Chosen;
+    first.ca_pick = Some(pending.keep(authority.clone()));
+    save(&copy, &first, &pending).unwrap();
+    // The network to wait on is kept in the same file, so that removing the
+    // relay writes the file too.
+    let mut kept = stored(&home);
+    kept.network_adapter = Some("Wi-Fi".to_owned());
+    settings::write(&home.layout, &kept).unwrap();
+
+    // Something stands where the settings are written through: the settings
+    // cannot be written any more.
+    let in_the_way = home
+        .layout
+        .settings
+        .with_file_name("settings.toml.cretlink-new");
+    std::fs::create_dir_all(&in_the_way).unwrap();
+    std::fs::write(in_the_way.join("in-the-way"), b"").unwrap();
+    let before = home.folder.snapshot();
+
+    // Another relay with another key and another authority.
+    let mut second = with_key(
+        form("host-01.example.org:9970"),
+        "another-key-for-this-copy",
+    );
+    second.ca_mode = CaMode::Chosen;
+    second.ca_pick = Some(pending.keep(certificate()));
+    let failed = save(&copy, &second, &pending).unwrap_err();
+    assert_eq!(failed.stage, "relay_settings");
+    assert!(
+        failed
+            .message
+            .starts_with("The relay could not be saved, and nothing was changed: "),
+        "{}",
+        failed.message
+    );
+    // Nothing was: not the settings, and not the certificate file that the
+    // relay of before is checked against.
+    assert_eq!(home.folder.snapshot(), before);
+    assert_eq!(std::fs::read(&home.layout.relay_ca).unwrap(), authority);
+    let in_use = relay_of_copy(&copy).unwrap();
+    assert_eq!(in_use.view().address, "192.0.2.1:443");
+    assert_eq!(
+        in_use.profile().key().map(|key| key.as_bytes().to_vec()),
+        Some(KEY.as_bytes().to_vec())
+    );
+    // Removing fails the same way and changes nothing either.
+    let failed = remove(&copy, &pending).unwrap_err();
+    assert!(
+        failed
+            .message
+            .starts_with("The relay could not be removed, and nothing was changed: "),
+        "{}",
+        failed.message
+    );
+    assert_eq!(home.folder.snapshot(), before);
+
+    // The chosen file is still at hand: once the settings can be written,
+    // the same form is saved.
+    std::fs::remove_dir_all(&in_the_way).unwrap();
+    let view = save(&copy, &second, &pending).unwrap();
+    assert_eq!(
+        view.stored.unwrap().relay.unwrap().address,
+        "host-01.example.org:9970"
+    );
+    assert_ne!(std::fs::read(&home.layout.relay_ca).unwrap(), authority);
 }
 
 #[test]
@@ -309,6 +492,23 @@ fn a_chosen_certificate_file_is_kept_next_to_the_settings() {
     assert_eq!(std::fs::read(&home.layout.relay_ca).unwrap(), pem);
     // The choice was used up: its number names nothing any more.
     assert!(save(&copy, &chosen, &pending).is_err_and(|error| error.stage == "relay_ca"));
+
+    // The file of an authority may hold its private key beside the
+    // certificate. What is read of it, and what is kept, is the certificate
+    // alone, written anew: the same text as the file without the key.
+    let end = KEY_MARKER.replace("BEGIN", "END");
+    let whole = format!(
+        "{KEY_MARKER}bm90IGEga2V5\n{end}{}",
+        String::from_utf8_lossy(&pem)
+    );
+    let file = home.folder.write("authority-with-key.pem", &whole);
+    assert_eq!(read_chosen_ca(&file).unwrap(), pem);
+    // Also when the whole text reached the save by another way.
+    chosen.ca_pick = Some(pending.keep(whole.into_bytes()));
+    save(&copy, &chosen, &pending).unwrap();
+    let kept = std::fs::read_to_string(&home.layout.relay_ca).unwrap();
+    assert_eq!(kept.as_bytes(), pem);
+    assert!(!kept.contains("PRIVATE"), "{kept}");
 
     // Saved again with the file left alone: it stays.
     let mut keep = form("192.0.2.1:9970");
@@ -467,6 +667,58 @@ fn a_file_next_to_the_program_wins_and_the_view_says_so() {
     assert_eq!(view.source, "file");
     assert_eq!(view.file.relay.unwrap().address, "192.0.2.1:443");
     assert_eq!(view.stored, None);
+}
+
+#[test]
+fn the_key_of_the_settings_is_not_taken_to_the_relay_of_the_file() {
+    let home = Home::new("settings-key-file");
+    let copy = home.installed();
+    let pending = PendingCa::default();
+    save(
+        &copy,
+        &with_key(form("relay.example.org:443"), KEY),
+        &pending,
+    )
+    .unwrap();
+    let file = relay_profile::path_next_to(&copy.exe).unwrap();
+    let key_in_use = |copy: &ThisCopy| {
+        relay_of_copy(copy)
+            .unwrap()
+            .profile()
+            .key()
+            .map(|key| String::from_utf8_lossy(key.as_bytes()).into_owned())
+    };
+    assert_eq!(key_in_use(&copy).as_deref(), Some(KEY));
+
+    // A file next to the program names another relay and no key. The relay
+    // in use is that one, and the key that Settings keeps for the other
+    // relay is no part of it: not in the profile, and not in what the relay
+    // would be dialled with.
+    for text in [
+        "[relay]\naddress = \"host-01.example.org:9970\"\n",
+        // Also when the file names the very relay of the settings.
+        "[relay]\naddress = \"relay.example.org:443\"\n",
+    ] {
+        home.folder.write(file.to_str().unwrap(), text);
+        let in_use = relay_of_copy(&copy).unwrap();
+        assert!(matches!(in_use.source(), Source::File(_)));
+        assert_eq!(key_in_use(&copy), None, "{text}");
+        let connector = cretlink_session::WssRelayDial::connector(Some(&certificate())).unwrap();
+        let ticket = cretlink_session::RendezvousTicket::generate().unwrap();
+        let dial = format!("{:?}", in_use.dial(connector, ticket));
+        assert!(dial.contains("has_token: false"), "{dial}");
+        assert!(!format!("{in_use:?}").contains(KEY));
+    }
+    // A key in the file is the key of the file.
+    home.folder.write(
+        file.to_str().unwrap(),
+        "[relay]\naddress = \"host-01.example.org:9970\"\nkey = \"the-key-of-the-file\"\n",
+    );
+    assert_eq!(key_in_use(&copy).as_deref(), Some("the-key-of-the-file"));
+    // The settings still hold theirs, for when the file is gone.
+    assert_eq!(stored_key(&home).as_deref(), Some(KEY.as_bytes()));
+    std::fs::remove_file(&file).unwrap();
+    assert_eq!(key_in_use(&copy).as_deref(), Some(KEY));
 }
 
 #[test]

@@ -689,6 +689,27 @@ fn a_certificate_file_that_a_person_chose_is_read_with_the_same_rules() {
     let file = folder.write("authority.crt", pem);
     assert_eq!(read_certificate_file(&file).unwrap(), pem);
 
+    // Only the certificates come back, written anew: a file that also holds
+    // the private key of the authority, a comment and Windows line ends gives
+    // the same text as the file with the certificate alone.
+    let end = KEY_MARKER.replace("BEGIN", "END");
+    let with_key = format!(
+        "# our authority\r\n{KEY_MARKER}bm90IGEga2V5\r\n{end}-----BEGIN CERTIFICATE-----\r\n\
+         MIIB\r\n-----END CERTIFICATE-----\r\n"
+    );
+    let kept = read_certificate_file(&folder.write("with-key.pem", with_key.as_bytes())).unwrap();
+    assert_eq!(kept, pem);
+    assert_eq!(certificates_only(with_key.as_bytes()).unwrap(), pem);
+    // A block that is begun and holds no certificate is none.
+    let broken = folder.write("broken.pem", b"-----BEGIN CERTIFICATE-----\n!!\n");
+    let problem = read_certificate_file(&broken).unwrap_err();
+    assert_eq!(problem.field, Some(Field::Ca));
+    assert!(
+        problem.text.contains("no certificate that can be read"),
+        "{}",
+        problem.text
+    );
+
     let missing = read_certificate_file(&folder.0.join("missing.crt")).unwrap_err();
     assert_eq!(missing.field, Some(Field::Ca));
     assert!(missing.text.contains("is not there"), "{}", missing.text);

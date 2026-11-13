@@ -167,7 +167,7 @@ function caField(draft: RelayDraft, stored: RelayView | undefined, busy: boolean
     h(
       "p",
       { class: "muted" },
-      "Only for a relay whose certificate comes from an authority of your own: the PEM file of that authority. A copy of it is kept with your settings.",
+      "Only for a relay whose certificate comes from an authority of your own: the PEM file of that authority. A copy of its certificates is kept with your settings; a private key in the file is not.",
     ),
   );
 }
@@ -209,7 +209,7 @@ function form(s: TechnicianSnapshot, settings: RelaySettings): HTMLElement {
         "p",
         { class: "muted", id: "relay-key-hint" },
         stored?.keySet
-          ? "A key is set. It is never shown. Leave this empty to keep it; it stays with this relay and is not taken to another one."
+          ? "A key is set. It is never shown. Leave this empty to keep it. A kept key stays with this relay as it was saved: when you change the host, the name in the certificate or the certificate authority, enter the key again."
           : "The key the relay's operator gave this copy. Leave it empty when the relay asks for none.",
       ),
       stored?.keySet

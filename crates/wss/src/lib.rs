@@ -21,6 +21,10 @@
 //!   runtime operate over it exactly as over a bare `TcpStream`.
 //! - [`accept_plain`] is the same without TLS, for a relay behind a reverse
 //!   proxy that ends TLS (ST-M007-015).
+//! - [`is_server_name`] says whether a certificate can be checked for a name,
+//!   and [`certs_to_pem`] writes certificates back as the text of a PEM file,
+//!   so that a copy of a certificate authority file holds its certificates
+//!   and nothing else (ST-M007-011).
 //!
 //! # Cryptographic backend
 //!
@@ -42,6 +46,7 @@ pub mod testcert;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
 use rustls::pki_types::pem::{self, PemObject};
@@ -207,6 +212,35 @@ pub fn certs_from_pem(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, WssErr
         return Err(WssError::NoCertificates);
     }
     Ok(certs)
+}
+
+/// Writes certificates as the text of a PEM file: one `CERTIFICATE` block
+/// each, the base64 of its DER in lines of 64 characters (RFC 7468).
+///
+/// Together with [`certs_from_pem`] this copies the certificates of a file
+/// and nothing else of it: a private key, a comment or any other block that
+/// stood beside them is not in the result. A caller that keeps a copy of a
+/// certificate authority file keeps this text, never the file as it was
+/// (ST-M007-011).
+#[must_use]
+pub fn certs_to_pem(certs: &[CertificateDer<'_>]) -> String {
+    /// The length of a line of base64 in a PEM block.
+    const LINE: usize = 64;
+    let mut out = String::new();
+    for cert in certs {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+        out.push_str("-----BEGIN CERTIFICATE-----\n");
+        let mut rest = encoded.as_str();
+        while !rest.is_empty() {
+            // Base64 is ASCII, so any byte offset is a character boundary.
+            let (line, tail) = rest.split_at(rest.len().min(LINE));
+            out.push_str(line);
+            out.push('\n');
+            rest = tail;
+        }
+        out.push_str("-----END CERTIFICATE-----\n");
+    }
+    out
 }
 
 /// Parses the first private key from PEM bytes (PKCS#8, PKCS#1, or SEC1).

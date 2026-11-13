@@ -164,3 +164,52 @@ async fn a_certificate_for_another_address_is_refused() {
         );
     }
 }
+
+/// The first line of a private key in the text form of a key file, written
+/// in two parts so that no scanner takes this file for one that holds a key.
+const KEY_MARKER: &str = concat!("-----BEGIN PRIVATE", " KEY-----");
+
+/// A copy of a certificate file holds its certificates and nothing else of
+/// it (ST-M007-011): what stood beside them is gone, and the copy reads back
+/// as the same certificates.
+#[test]
+fn certificates_are_written_anew_without_what_stood_beside_them() {
+    let (first, _) = testcert::self_signed("relay.example.org").expect("mint test cert");
+    let (second, _) = testcert::self_signed("host-01.example.org").expect("mint test cert");
+    let written = cretlink_wss::certs_to_pem(&[first.clone(), second.clone()]);
+    assert_eq!(
+        cretlink_wss::certs_from_pem(written.as_bytes()).expect("read back"),
+        vec![first.clone(), second.clone()]
+    );
+    assert!(written.lines().all(|line| line.len() <= 64), "{written}");
+    assert!(
+        written.ends_with("-----END CERTIFICATE-----\n"),
+        "{written}"
+    );
+
+    // The same certificates in a file as people keep them: a comment, a
+    // private key between them, lines of another length, Windows line ends.
+    let end = KEY_MARKER.replace("BEGIN", "END");
+    let one_line = |cert: &CertificateDer<'_>| {
+        cretlink_wss::certs_to_pem(std::slice::from_ref(cert))
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>()
+    };
+    let messy = format!(
+        "# the authority of our relay\r\n-----BEGIN CERTIFICATE-----\r\n{}\r\n-----END \
+         CERTIFICATE-----\r\n{KEY_MARKER}\r\nbm90IGEga2V5\r\n{end}\r\n-----BEGIN \
+         CERTIFICATE-----\r\n{}\r\n-----END CERTIFICATE-----\r\n",
+        one_line(&first),
+        one_line(&second),
+    );
+    let certs = cretlink_wss::certs_from_pem(messy.as_bytes()).expect("read the messy file");
+    assert_eq!(certs, vec![first, second]);
+    let anew = cretlink_wss::certs_to_pem(&certs);
+    assert_eq!(anew, written);
+    assert!(!anew.contains("PRIVATE"), "{anew}");
+    assert!(!anew.contains('#'), "{anew}");
+    assert!(!anew.contains('\r'), "{anew}");
+
+    assert_eq!(cretlink_wss::certs_to_pem(&[]), "");
+}

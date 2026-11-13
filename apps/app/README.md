@@ -143,9 +143,19 @@ authority file `ca` and an optional `name` in the certificate
   `Debug`). No view sent to the window holds it — `RelayView.keySet` says
   only whether there is one — and a form that leaves the key alone says
   `keep`. It is not logged and is no argument of any audit record. `keep` is
-  honoured only while the relay's host name is the one the key was saved
-  for: a form that names another relay must bring that relay's key or none,
-  so a kept key is never presented to another relay.
+  honoured only while the host of the address, the name for the certificate
+  and the certificate authority are all what the key was saved for: a form
+  that changes one of them must bring the key again or none, so a kept key
+  is never presented to a server the technician did not give it to, in a
+  save or in a test.
+- **A save lands whole or not at all**
+  (`cretlink_cli::settings::write_with_relay_ca`). The settings and the
+  certificate file change together: the new certificate file is written
+  under another name, the settings are written, and only then the
+  certificate file takes its place. When a step fails, both are as they
+  were. `relay-ca.pem` holds the certificates of the chosen file and nothing
+  else, written anew; a private key in that file is neither kept nor held in
+  memory.
 - **Always TLS** (`relay::EndpointDial`). A relay is reached over `wss` only,
   with its certificate checked against the system's authorities or the
   profile's `ca` file, for the profile's `name` or else the host of its

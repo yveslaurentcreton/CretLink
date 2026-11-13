@@ -570,6 +570,7 @@ dependencies = [
 name = "cretlink-wss"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "const-oid",
  "cretlink-wss",
  "futures-util",

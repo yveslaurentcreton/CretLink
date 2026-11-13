@@ -15,9 +15,12 @@
 //! adapter = "Wi-Fi"
 //! ```
 //!
-//! When the relay's certificate comes from a private authority, a copy of that
-//! authority's PEM file stands next to it as [`Layout::relay_ca`], and the
-//! profile names it.
+//! When the relay's certificate comes from a private authority, a copy of the
+//! certificates of that authority's PEM file stands next to it as
+//! [`Layout::relay_ca`], and the profile names it. The copy holds the
+//! certificates only: a private key in the chosen file is not kept. The two
+//! files change together ([`write_with_relay_ca`]): a change that fails
+//! leaves both as they were.
 //!
 //! - **Only the installed copy** reads and writes these files. A copy that
 //!   runs once writes nothing but its audit trail, and the customer role
@@ -190,7 +193,9 @@ pub fn read(layout: &Layout) -> Result<Settings, ProfileError> {
 }
 
 /// Writes the settings of the installed copy, for this user only, replacing
-/// the file in one step. Settings that hold nothing remove the file.
+/// the file in one step. Settings that hold nothing remove the file. The
+/// certificate authority file of the relay is not touched: a change of the
+/// relay goes through [`write_with_relay_ca`].
 ///
 /// # Errors
 ///
@@ -211,42 +216,150 @@ pub fn write(layout: &Layout, settings: &Settings) -> io::Result<()> {
     write_private(&layout.settings, settings.to_text().as_bytes())
 }
 
-/// Keeps a copy of the certificate authority file of the relay in the
-/// settings ([`Layout::relay_ca`]). The profile names it as
-/// [`RELAY_CA_FILE`].
+/// What a change of the relay in the settings does to the certificate
+/// authority file that is kept next to them ([`Layout::relay_ca`], which the
+/// profile names as [`RELAY_CA_FILE`]).
+#[derive(Debug, Clone, Copy)]
+pub enum RelayCa<'a> {
+    /// The file stays as it is: the relay keeps its authority, or has none
+    /// and there is no file.
+    Keep,
+    /// No file: the relay is checked against the system's authorities, or
+    /// the settings hold no relay any more.
+    Remove,
+    /// The certificates of this PEM text become the file. Only the
+    /// certificates are kept, written anew
+    /// ([`relay_profile::certificates_only`]): a private key that stood in
+    /// the same file is not.
+    Replace(&'a [u8]),
+}
+
+/// Writes the settings and the certificate authority file of their relay as
+/// one change: afterwards both are as asked, or both are as they were.
+///
+/// The two are one thing to a person: a relay and the authority its
+/// certificate is checked against. A change that reached only one of them
+/// would leave the relay of before with the authority of after, or the other
+/// way round. So the new certificate file is written under another name
+/// first, the settings are written, and only then the certificate file takes
+/// its place or goes; when that last step fails, the settings of before are
+/// put back.
+///
+/// A crash between the two steps leaves the new settings with the
+/// certificate file of before. That fails closed: the new relay is then
+/// checked against the old authority, and nothing is sent to a relay whose
+/// certificate that authority did not sign.
 ///
 /// # Errors
 ///
-/// Returns `InvalidInput` when `pem` is larger than a certificate authority
-/// file may be, or the error of the file system.
-pub fn write_relay_ca(layout: &Layout, pem: &[u8]) -> io::Result<()> {
-    if pem.len() as u64 > MAX_CA_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the certificate file is too large",
-        ));
+/// Returns `InvalidInput` when a certificate text holds no certificate or is
+/// larger than a certificate authority file may be, and for an adapter name
+/// that cannot be kept; otherwise the error of the file system. Nothing was
+/// changed then, with one exception that the error says itself
+/// ([`is_not_put_back`]): the last step failed and the settings of before
+/// could not be written again.
+pub fn write_with_relay_ca(
+    layout: &Layout,
+    settings: &Settings,
+    ca: RelayCa<'_>,
+) -> io::Result<()> {
+    let invalid = |text: &str| io::Error::new(io::ErrorKind::InvalidInput, text.to_owned());
+    // The certificate file of after, under another name: the one in use is
+    // not touched until the settings are written.
+    if let RelayCa::Replace(pem) = ca {
+        let certificates = relay_profile::certificates_only(pem)
+            .map_err(|_| invalid("the certificate file holds no certificate"))?;
+        if certificates.len() as u64 > MAX_CA_BYTES {
+            return Err(invalid("the certificate file is too large"));
+        }
+        stage_private(&layout.relay_ca, &certificates)?;
     }
-    write_private(&layout.relay_ca, pem)
+    let discard = || {
+        if matches!(ca, RelayCa::Replace(_)) {
+            let _ = fs::remove_file(temporary_name(&layout.relay_ca));
+        }
+    };
+    // What the settings hold now, to put it back. A file that cannot be read
+    // cannot be put back either: then nothing is begun.
+    let before = match fs::read(&layout.settings) {
+        Ok(bytes) => Some(Zeroizing::new(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            discard();
+            return Err(error);
+        }
+    };
+    if let Err(error) = write(layout, settings) {
+        discard();
+        return Err(error);
+    }
+    let moved = match ca {
+        RelayCa::Keep => Ok(()),
+        RelayCa::Remove => remove_file_if_exists(&layout.relay_ca).map(drop),
+        RelayCa::Replace(_) => fs::rename(temporary_name(&layout.relay_ca), &layout.relay_ca),
+    };
+    let Err(error) = moved else {
+        return Ok(());
+    };
+    discard();
+    let restored = match &before {
+        Some(bytes) => write_private(&layout.settings, bytes),
+        None => remove_file_if_exists(&layout.settings).map(drop),
+    };
+    Err(match restored {
+        Ok(()) => error,
+        Err(restore) => io::Error::other(NotPutBack {
+            change: error,
+            restore,
+        }),
+    })
 }
 
-/// Removes the kept certificate authority file. Nothing to remove is fine.
-///
-/// # Errors
-///
-/// Returns the error of the file system.
-pub fn remove_relay_ca(layout: &Layout) -> io::Result<()> {
-    remove_file_if_exists(&layout.relay_ca).map(drop)
+/// A change of the settings that failed half way and could not be undone:
+/// the settings are the new ones, and the certificate file is still the one
+/// of before. It is the payload of the error of [`write_with_relay_ca`] in
+/// that one case, so that a caller never says "nothing was changed" then
+/// ([`is_not_put_back`]).
+#[derive(Debug)]
+pub struct NotPutBack {
+    /// Why the certificate file could not take its place or go.
+    pub change: io::Error,
+    /// Why the settings of before could not be written again.
+    pub restore: io::Error,
 }
 
-/// Writes `bytes` to `path` through a temporary file in the same folder that
-/// only this user can read, so that the file is never there half written and
-/// never readable by others on the way.
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+impl std::fmt::Display for NotPutBack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the certificate file could not be changed ({}), and the settings of before could \
+             not be put back ({}); the relay in the settings is the new one and its certificate \
+             file is the old one, so save or remove the relay again",
+            self.change, self.restore
+        )
+    }
+}
+
+impl std::error::Error for NotPutBack {}
+
+/// Whether `error` of [`write_with_relay_ca`] says that the settings were
+/// changed and could not be put back. Every other error of it means that
+/// nothing was changed.
+#[must_use]
+pub fn is_not_put_back(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<NotPutBack>())
+}
+
+/// Writes `bytes` under the temporary name of `path`, in the same folder and
+/// for this user only. One left behind by a run that was interrupted is
+/// replaced. `path` itself is not touched.
+fn stage_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let temporary = temporary_name(path);
-    // One left behind by a run that was interrupted.
     remove_file_if_exists(&temporary)?;
     let written = (|| {
         let mut options = fs::OpenOptions::new();
@@ -259,14 +372,25 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
             options.mode(0o600);
         }
         let mut file = options.open(&temporary)?;
-        file.write_all(bytes)?;
-        drop(file);
-        fs::rename(&temporary, path)
+        file.write_all(bytes)
     })();
     if written.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     written
+}
+
+/// Writes `bytes` to `path` through a temporary file in the same folder that
+/// only this user can read, so that the file is never there half written and
+/// never readable by others on the way.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    stage_private(path, bytes)?;
+    let temporary = temporary_name(path);
+    let moved = fs::rename(&temporary, path);
+    if moved.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    moved
 }
 
 #[cfg(test)]
@@ -276,6 +400,16 @@ mod tests {
     use std::path::PathBuf;
 
     const KEY: &str = "5f2c9d0e7a1b4c3d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5";
+
+    /// A certificate file in the form it is kept in. Its one block is no
+    /// real certificate: whether a certificate can be used is decided where
+    /// the TLS settings are built.
+    const PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+    /// The first line of a private key in the text form of a key file,
+    /// written in two parts so that no scanner takes this file for one that
+    /// holds a key.
+    const KEY_MARKER: &str = concat!("-----BEGIN PRIVATE", " KEY-----\n");
 
     /// A home folder of its own for one test, removed afterwards.
     struct Home {
@@ -443,8 +577,9 @@ mod tests {
         write(&home.layout, &settings).unwrap();
         assert_eq!(mode(&home.layout.settings), 0o600);
 
-        write_relay_ca(&home.layout, b"-----BEGIN CERTIFICATE-----\n").unwrap();
+        write_with_relay_ca(&home.layout, &settings, RelayCa::Replace(PEM)).unwrap();
         assert_eq!(mode(&home.layout.relay_ca), 0o600);
+        assert_eq!(mode(&home.layout.settings), 0o600);
     }
 
     #[test]
@@ -540,30 +675,155 @@ mod tests {
     #[test]
     fn the_certificate_file_is_kept_next_to_the_settings_and_read_through_the_profile() {
         let home = Home::new("ca", Platform::MacOs);
-        let pem = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
-        write_relay_ca(&home.layout, pem).unwrap();
-        write(
-            &home.layout,
-            &Settings {
-                relay: Some(relay()),
-                network_adapter: None,
-            },
-        )
-        .unwrap();
+        let with_relay = Settings {
+            relay: Some(relay()),
+            network_adapter: None,
+        };
+        write_with_relay_ca(&home.layout, &with_relay, RelayCa::Replace(PEM)).unwrap();
         let settings = read(&home.layout).unwrap();
         let found = relay_profile::read_ca(&home.layout.settings, settings.relay.as_ref().unwrap())
             .unwrap();
-        assert_eq!(found.as_deref(), Some(&pem[..]));
+        assert_eq!(found.as_deref(), Some(PEM));
+        // No temporary file stays behind.
+        assert!(!temporary_name(&home.layout.relay_ca).exists());
 
-        remove_relay_ca(&home.layout).unwrap();
-        remove_relay_ca(&home.layout).unwrap();
-        assert!(!home.layout.relay_ca.exists());
-        let too_large = vec![b'A'; usize::try_from(MAX_CA_BYTES).unwrap() + 1];
+        // Kept: the file stays what it is while the settings change.
+        let moved = Settings {
+            relay: Some(
+                RelayProfile::from_fields("192.0.2.1:9970", None, Some(RELAY_CA_FILE), None)
+                    .unwrap(),
+            ),
+            network_adapter: None,
+        };
+        write_with_relay_ca(&home.layout, &moved, RelayCa::Keep).unwrap();
+        assert_eq!(fs::read(&home.layout.relay_ca).unwrap(), PEM);
         assert_eq!(
-            write_relay_ca(&home.layout, &too_large).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
+            read(&home.layout)
+                .unwrap()
+                .relay
+                .unwrap()
+                .address()
+                .to_string(),
+            "192.0.2.1:9970"
         );
+
+        // Removed, and nothing to remove is fine.
+        let without = Settings::default();
+        write_with_relay_ca(&home.layout, &without, RelayCa::Remove).unwrap();
+        write_with_relay_ca(&home.layout, &without, RelayCa::Remove).unwrap();
         assert!(!home.layout.relay_ca.exists());
+        assert!(!home.layout.settings.exists());
+    }
+
+    #[test]
+    fn only_the_certificates_of_a_chosen_file_are_kept() {
+        let home = Home::new("ca-only", Platform::Linux);
+        let with_relay = Settings {
+            relay: Some(relay()),
+            network_adapter: None,
+        };
+        // The file of an authority as some tools write it: its private key
+        // first, then its certificate.
+        let end = KEY_MARKER.replace("BEGIN", "END");
+        let whole = format!(
+            "# kept by Sam\n{KEY_MARKER}bm90IGEga2V5\n{end}{}",
+            String::from_utf8_lossy(PEM)
+        );
+        write_with_relay_ca(
+            &home.layout,
+            &with_relay,
+            RelayCa::Replace(whole.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&home.layout.relay_ca).unwrap(), PEM);
+
+        // A text without a certificate, or a larger one than a certificate
+        // file may be, is refused before anything changes.
+        let before = fs::read(&home.layout.settings).unwrap();
+        let other = Settings {
+            relay: Some(
+                RelayProfile::from_fields("192.0.2.1:9970", None, Some(RELAY_CA_FILE), None)
+                    .unwrap(),
+            ),
+            network_adapter: None,
+        };
+        let mut too_large = Vec::new();
+        while too_large.len() as u64 <= MAX_CA_BYTES {
+            too_large.extend_from_slice(PEM);
+        }
+        for refused in [KEY_MARKER.as_bytes(), b"", too_large.as_slice()] {
+            let error =
+                write_with_relay_ca(&home.layout, &other, RelayCa::Replace(refused)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(fs::read(&home.layout.settings).unwrap(), before);
+            assert_eq!(fs::read(&home.layout.relay_ca).unwrap(), PEM);
+            assert!(!temporary_name(&home.layout.relay_ca).exists());
+        }
+    }
+
+    /// A folder with something in it where a file should go: nothing can be
+    /// written or moved there, and a file cannot be removed there either.
+    fn block(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("in-the-way"), b"").unwrap();
+    }
+
+    #[test]
+    fn a_change_that_fails_leaves_the_settings_and_the_certificate_file_as_they_were() {
+        let other_pem = b"-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n";
+        let before = Settings {
+            relay: Some(relay()),
+            network_adapter: Some("Wi-Fi".to_owned()),
+        };
+        let after = Settings {
+            relay: Some(
+                RelayProfile::from_fields(
+                    "host-01.example.org:9970",
+                    Some("another-key"),
+                    Some(RELAY_CA_FILE),
+                    None,
+                )
+                .unwrap(),
+            ),
+            network_adapter: None,
+        };
+
+        // The settings cannot be written: the certificate file of before is
+        // still the one in use, and nothing of the new one stays behind.
+        let home = Home::new("fails-settings", Platform::Linux);
+        write_with_relay_ca(&home.layout, &before, RelayCa::Replace(PEM)).unwrap();
+        let settings_before = fs::read(&home.layout.settings).unwrap();
+        block(&temporary_name(&home.layout.settings));
+        for ca in [RelayCa::Replace(other_pem), RelayCa::Remove, RelayCa::Keep] {
+            write_with_relay_ca(&home.layout, &after, ca).unwrap_err();
+            assert_eq!(fs::read(&home.layout.settings).unwrap(), settings_before);
+            assert_eq!(fs::read(&home.layout.relay_ca).unwrap(), PEM);
+            assert!(!temporary_name(&home.layout.relay_ca).exists());
+        }
+
+        // The certificate file cannot take its place: the settings of before
+        // are put back.
+        let home = Home::new("fails-ca", Platform::Linux);
+        write(&home.layout, &before).unwrap();
+        let settings_before = fs::read(&home.layout.settings).unwrap();
+        block(&home.layout.relay_ca);
+        for ca in [RelayCa::Replace(other_pem), RelayCa::Remove] {
+            write_with_relay_ca(&home.layout, &after, ca).unwrap_err();
+            assert_eq!(fs::read(&home.layout.settings).unwrap(), settings_before);
+            assert!(home.layout.relay_ca.join("in-the-way").exists());
+            assert!(!temporary_name(&home.layout.relay_ca).exists());
+            assert!(!temporary_name(&home.layout.settings).exists());
+        }
+        let kept = read(&home.layout).unwrap();
+        assert_eq!(key_of(&kept).as_deref(), Some(KEY));
+        assert_eq!(kept.network_adapter.as_deref(), Some("Wi-Fi"));
+
+        // There were no settings before: there are none afterwards.
+        let home = Home::new("fails-first", Platform::Linux);
+        block(&home.layout.relay_ca);
+        write_with_relay_ca(&home.layout, &after, RelayCa::Replace(other_pem)).unwrap_err();
+        assert!(!home.layout.settings.exists());
+        assert!(!temporary_name(&home.layout.relay_ca).exists());
     }
 
     #[test]

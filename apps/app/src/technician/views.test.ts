@@ -1100,7 +1100,7 @@ describe("settings: the relay (ST-M007-011)", () => {
     expect(key.hasAttribute("value")).toBe(false);
     expect(key.value).toBe("");
     expect(text(card.querySelector("#relay-key-hint"))).toBe(
-      "A key is set. It is never shown. Leave this empty to keep it; it stays with this relay and is not taken to another one.",
+      "A key is set. It is never shown. Leave this empty to keep it. A kept key stays with this relay as it was saved: when you change the host, the name in the certificate or the certificate authority, enter the key again.",
     );
     expect(text(card)).toContain(
       "A key only admits this copy to the relay. It gives nobody control over a session.",

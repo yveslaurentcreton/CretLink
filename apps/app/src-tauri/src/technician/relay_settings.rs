@@ -19,13 +19,18 @@
 //!   one to the window. The view says only whether a key is set, a form that
 //!   leaves the key alone says `keep`, and no message names it.
 //! - **A kept key stays with its relay.** `keep` is honoured only while the
-//!   relay's host name, the name its certificate must carry, is the one the
-//!   key was saved for. A form that names another relay must bring that
-//!   relay's key or none, so that the key of one relay is never presented to
-//!   another one, in a test or in a session.
+//!   host of the address, the name the certificate must carry and the
+//!   authority that certificate is checked against are all what the key was
+//!   saved for. A form that changes one of them must bring the key again or
+//!   none, so that a kept key is never presented to a server the technician
+//!   did not give it to, in a test or in a session.
+//! - **A save lands whole or not at all.** The settings and the certificate
+//!   file change together; when a save fails, both are as they were.
 //! - **The window names no path of this computer.** The certificate file is
-//!   chosen in the system's dialog, opened from here, and a copy of it is
-//!   kept next to the settings; the form names it by a number.
+//!   chosen in the system's dialog, opened from here, and a copy of its
+//!   certificates is kept next to the settings; the form names it by a
+//!   number. The copy holds the certificates only, written anew: a private
+//!   key in the chosen file is neither kept nor held in memory.
 //! - **Nothing here grants anything.** A relay profile is addressing
 //!   (ADR-0016 §2, §4): saving one opens no connection, and [`test_relay`]
 //!   presents a ticket of its own that meets nobody.
@@ -36,7 +41,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use cretlink_cli::install::{Layout, RELAY_CA_FILE};
 use cretlink_cli::relay_profile::{self, Field, Problem, RelayProfile};
-use cretlink_cli::settings::{self, Settings};
+use cretlink_cli::settings::{self, RelayCa, Settings};
 use serde::{Deserialize, Serialize};
 use tauri::{State, WebviewWindow};
 
@@ -229,8 +234,17 @@ fn not_installed() -> CommandError {
     )
 }
 
+/// A change of the settings that the file system refused. The settings and
+/// the certificate file are then as they were, and the message says so; in
+/// the one case in which they are not, the error's own words say what is
+/// left ([`settings::is_not_put_back`]).
 fn settings_io(what: &str, error: &std::io::Error) -> CommandError {
-    CommandError::new("relay_settings", format!("{what}: {error}."))
+    let message = if settings::is_not_put_back(error) {
+        format!("{what}: {error}.")
+    } else {
+        format!("{what}, and nothing was changed: {error}.")
+    };
+    CommandError::new("relay_settings", message)
 }
 
 /// The relay of a form, with what the relay in the settings keeps. Returns
@@ -256,23 +270,6 @@ fn relay_of(
         .filter(|name| !name.is_empty());
     let mut profile = RelayProfile::from_fields(&form.address, key, None, name)
         .map_err(|problem| of_problem(&problem))?;
-    if form.key_mode == KeyMode::Keep
-        && let Some(stored) = stored.as_ref().filter(|stored| stored.key().is_some())
-    {
-        // The kept key is the key of one relay. A form that names another
-        // one does not get it: it would be presented to that other relay.
-        if stored.server_name() != profile.server_name() {
-            return Err(refused(
-                Some(Field::Key),
-                &format!(
-                    "the key that is kept is the key of the relay {}; enter the key of this \
-                     relay, or remove the key",
-                    stored.server_name()
-                ),
-            ));
-        }
-        profile = profile.with_key(stored.key().cloned());
-    }
     let ca_pem = match form.ca_mode {
         CaMode::None => None,
         CaMode::Chosen => Some(form.ca_pick.and_then(|pick| pending.get(pick)).ok_or_else(
@@ -289,12 +286,54 @@ fn relay_of(
                 .map_err(|error| of_problem(&error.problem))?,
         },
     };
+    if form.key_mode == KeyMode::Keep
+        && let Some(stored) = stored.as_ref().filter(|stored| stored.key().is_some())
+    {
+        // The kept key was saved for one relay: where it is reached, the
+        // name its certificate must carry, and the authority that
+        // certificate is checked against. A form that changes one of the
+        // three could take the key to a server that the technician never
+        // gave it to, in a test or in a session, so it must bring the key
+        // again.
+        if !same_relay(layout, stored, &profile, ca_pem.as_deref()) {
+            return Err(refused(
+                Some(Field::Key),
+                &format!(
+                    "the key that is kept was saved for the relay {} as it was: its host, the \
+                     name in its certificate and its certificate authority. This form changes \
+                     one of them, so enter the key again, or remove the key",
+                    stored.server_name()
+                ),
+            ));
+        }
+        profile = profile.with_key(stored.key().cloned());
+    }
     if ca_pem.is_some() {
         profile = profile
             .with_ca(Some(RELAY_CA_FILE))
             .map_err(|problem| of_problem(&problem))?;
     }
     Ok((profile, ca_pem))
+}
+
+/// Whether the relay of a form is the one that `stored` was saved as, as far
+/// as a kept key is concerned: the same host in the address (the port may
+/// differ), the same name for the certificate, and the same authority, which
+/// is the same certificates in the kept file or the system's authorities on
+/// both sides. A kept file that cannot be read is no authority that anything
+/// could be the same as.
+fn same_relay(
+    layout: &Layout,
+    stored: &RelayProfile,
+    form: &RelayProfile,
+    form_ca: Option<&[u8]>,
+) -> bool {
+    let Ok(stored_ca) = relay_profile::read_ca(&layout.settings, stored) else {
+        return false;
+    };
+    stored.address().host() == form.address().host()
+        && stored.server_name() == form.server_name()
+        && stored_ca.as_deref() == form_ca
 }
 
 /// The relay of a form as one that can be reached, checked as the saved one
@@ -316,6 +355,11 @@ fn checked(
 
 /// Keeps the relay of `form` in the settings of the installed copy `copy`.
 /// The network to wait on, kept in the same file, stays as it is.
+///
+/// The settings and the certificate file change together
+/// ([`settings::write_with_relay_ca`]): a save that fails leaves both as
+/// they were, so that the relay of before is never left with the authority
+/// of after.
 pub(crate) fn save(
     copy: &ThisCopy,
     form: &RelayForm,
@@ -323,31 +367,24 @@ pub(crate) fn save(
 ) -> Result<RelaySettingsView, CommandError> {
     let layout = copy.installed.as_ref().ok_or_else(not_installed)?;
     let (relay, ca_pem) = checked(layout, form, pending)?;
-    // The certificate file first: a profile never names a file that is not
-    // there. A file that is kept is there already.
-    if let (Some(pem), CaMode::Chosen) = (&ca_pem, form.ca_mode) {
-        settings::write_relay_ca(layout, pem)
-            .map_err(|error| settings_io("The certificate file could not be kept", &error))?;
-    }
+    let ca = match (&ca_pem, form.ca_mode) {
+        (Some(pem), CaMode::Chosen) => RelayCa::Replace(pem),
+        // A file that is kept is there already.
+        (Some(_), CaMode::Keep | CaMode::None) => RelayCa::Keep,
+        (None, _) => RelayCa::Remove,
+    };
     let network_adapter = settings::read(layout)
         .ok()
         .and_then(|settings| settings.network_adapter);
-    settings::write(
+    settings::write_with_relay_ca(
         layout,
         &Settings {
             relay: Some(relay.profile().clone()),
             network_adapter,
         },
+        ca,
     )
-    .map_err(|error| settings_io("The settings could not be written", &error))?;
-    if ca_pem.is_none() {
-        settings::remove_relay_ca(layout).map_err(|error| {
-            settings_io(
-                "The certificate file of the earlier relay could not be removed",
-                &error,
-            )
-        })?;
-    }
+    .map_err(|error| settings_io("The relay could not be saved", &error))?;
     pending.clear();
     Ok(RelaySettingsView::of(copy))
 }
@@ -367,10 +404,8 @@ pub(crate) fn remove(
         },
         Err(_) => Settings::default(),
     };
-    settings::write(layout, &kept)
-        .map_err(|error| settings_io("The settings could not be written", &error))?;
-    settings::remove_relay_ca(layout)
-        .map_err(|error| settings_io("The certificate file could not be removed", &error))?;
+    settings::write_with_relay_ca(layout, &kept, RelayCa::Remove)
+        .map_err(|error| settings_io("The relay could not be removed", &error))?;
     pending.clear();
     Ok(RelaySettingsView::of(copy))
 }
@@ -462,7 +497,8 @@ pub(crate) async fn choose_relay_ca(
 }
 
 /// Reads a certificate file the technician chose and checks that it holds a
-/// certificate that can be used.
+/// certificate that can be used. Answers its certificates written anew, and
+/// nothing else of the file.
 pub(crate) fn read_chosen_ca(path: &std::path::Path) -> Result<Vec<u8>, CommandError> {
     let pem = relay_profile::read_certificate_file(path).map_err(|problem| of_problem(&problem))?;
     cretlink_session::WssRelayDial::connector(Some(&pem)).map_err(|_| {

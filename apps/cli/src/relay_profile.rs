@@ -666,7 +666,7 @@ pub fn read_next_to(exe: &Path) -> Result<Option<(PathBuf, RelayProfile)>, Profi
 ///
 /// Returns what is wrong with the file, in words that name it as `what`.
 /// `Ok(None)` when the file is not there.
-fn read_certificates(path: &Path, what: &str) -> Result<Option<Vec<u8>>, Problem> {
+fn read_certificates(path: &Path, what: &str) -> Result<Option<Zeroizing<Vec<u8>>>, Problem> {
     let Some(bytes) = read_bounded(path, MAX_CA_BYTES, what)? else {
         return Ok(None);
     };
@@ -678,11 +678,13 @@ fn read_certificates(path: &Path, what: &str) -> Result<Option<Vec<u8>>, Problem
             ),
         ));
     }
-    Ok(Some(bytes.to_vec()))
+    Ok(Some(bytes))
 }
 
 /// Reads a certificate authority file that a person chose, to keep a copy of
-/// it with a profile.
+/// it with a profile. What comes back is the certificates of the file,
+/// written anew ([`certificates_only`]): a private key or anything else that
+/// stood beside them is not in it.
 ///
 /// # Errors
 ///
@@ -690,9 +692,34 @@ fn read_certificates(path: &Path, what: &str) -> Result<Option<Vec<u8>>, Problem
 /// larger than [`MAX_CA_BYTES`] or holds no PEM certificate.
 pub fn read_certificate_file(path: &Path) -> Result<Vec<u8>, Problem> {
     let what = "the certificate file";
-    read_certificates(path, what)
+    // The file as it was is erased when this returns: it may hold a key.
+    let whole = read_certificates(path, what)
         .map_err(|problem| Problem::of(Field::Ca, problem.text))?
-        .ok_or_else(|| Problem::of(Field::Ca, format!("{what} is not there")))
+        .ok_or_else(|| Problem::of(Field::Ca, format!("{what} is not there")))?;
+    certificates_only(&whole)
+}
+
+/// The certificates of a PEM text, written anew as a PEM text that holds
+/// nothing else.
+///
+/// A certificate authority file that a person hands over may hold more than
+/// certificates: the private key of the authority is kept in the same file by
+/// some tools. A copy that CretLink keeps or hands on holds the certificates
+/// only, so that such a key never travels with it.
+///
+/// # Errors
+///
+/// Returns a problem of `ca` when the text holds no certificate that can be
+/// read.
+pub fn certificates_only(pem: &[u8]) -> Result<Vec<u8>, Problem> {
+    let certs = cretlink_wss::certs_from_pem(pem).map_err(|_| {
+        Problem::of(
+            Field::Ca,
+            "the certificate file holds no certificate that can be read; a PEM file has blocks \
+             between -----BEGIN CERTIFICATE----- and -----END CERTIFICATE-----",
+        )
+    })?;
+    Ok(cretlink_wss::certs_to_pem(&certs).into_bytes())
 }
 
 /// Reads the certificate authority file that `profile` names, from the folder
@@ -721,7 +748,7 @@ pub fn read_ca(
     read_certificates(&folder.join(name), "the file that `ca` names")
         .map_err(|problem| in_file(&problem.text))?
         .ok_or_else(|| in_file("`ca` names a file that is not in the folder of this file"))
-        .map(Some)
+        .map(|whole| Some(whole.to_vec()))
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
