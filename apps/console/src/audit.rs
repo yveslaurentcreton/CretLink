@@ -135,6 +135,7 @@ const NEVER_ELIDED_ACTIONS: &[&str] = &[
     SESSION_ENDED_ACTION,
     CLEANUP_REPORT_ACTION,
     TARGET_IDENTITY_ACTION,
+    SESSION_ROUTE_ACTION,
 ];
 
 /// The audit action of the record of who ended a session (ST-M009-012).
@@ -147,6 +148,10 @@ pub const CLEANUP_REPORT_ACTION: &str = "cleanup_report";
 /// The audit action of the record of the consent-bound target identity
 /// (ST-M009-012).
 pub const TARGET_IDENTITY_ACTION: &str = "target_identity";
+
+/// The audit action of the record that a session runs through a relay
+/// (ST-M007-013). A session on one network has no such record.
+pub const SESSION_ROUTE_ACTION: &str = "session_route";
 
 /// The `source` of a [`CLEANUP_REPORT_ACTION`] record: the agent sent its
 /// report, none was needed because control was never granted, or none
@@ -306,6 +311,21 @@ impl SessionAudit for ChannelAudit {
             self.record_entry(entry);
         }
     }
+}
+
+/// The record that this session runs through the relay `host`
+/// (ST-M007-013): the transport, and the relay's host name as both people
+/// were shown it. It holds nothing else of the relay profile, and never the
+/// admission key or the relay code. The relay is where the session travels;
+/// the records of pairing, consent and every action stay what they are on
+/// one network.
+#[must_use]
+pub fn relay_route_entry(host: &str) -> AuditEntry {
+    let mut entry = AuditEntry::event(Actor::Console, None, SESSION_ROUTE_ACTION, Outcome::Ok);
+    entry.args = AuditArgs::new()
+        .with("transport", AuditValue::String("relay".to_owned()))
+        .with("relay_host", truncate_field(host));
+    entry
 }
 
 /// The record of the honest identity the customer's consent bound

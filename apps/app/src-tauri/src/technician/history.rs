@@ -280,6 +280,7 @@ mod tests {
             integrity: Integrity::Verified,
             hostname: None,
             os: None,
+            relay: None,
             started_at: None,
             ended_at: None,
             duration_ms: None,
