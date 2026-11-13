@@ -1176,7 +1176,14 @@ It needs a relay server that both can reach, set up as
 [`relay-server.md`](relay-server.md) describes: with TLS, and with one key
 for each of the two copies in its key file. The technician's installed copy
 has the relay in **Settings → Relay**; the customer's copy has a
-`cretlink.toml` next to `CretLink-Support.exe`.
+`cretlink.toml` next to `CretLink-Support.exe`. Make that copy with the
+application itself: **Settings → Relay → Make a customer copy…**, with
+**Generate** for the customer's key, the line it shows added to the relay's
+key file, and the folder carried to the customer computer as it is
+(ST-M007-016). Expect the folder to hold `CretLink-Support.exe`,
+`cretlink.toml`, `README.txt` and, for a relay with an authority of its own,
+its certificate file; expect Windows to show the same publisher for
+`CretLink-Support.exe` as for the program it was copied from.
 
 1. **The relay admits this copy.** In **Settings → Relay** press **Test**.
    - Expected: the relay answers and admits this copy, and its certificate is

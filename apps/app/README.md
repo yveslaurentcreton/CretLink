@@ -195,6 +195,55 @@ To try the screen without a backend, run `npx vite` and open
 `?relay=admit|key|down`): the real controller against a copy and a relay held
 in memory.
 
+## Make a customer copy (ST-M007-016)
+
+With a relay that can be used, **Settings → Relay** offers **Make a customer
+copy…** (`src/technician/views/customer-copy.ts`): one folder
+`CretLink-Support-<label>` for one customer, with `CretLink-Support.exe`, a
+`cretlink.toml` that names the relay of this copy with that customer's key,
+the relay's certificate file when the profile names one, and `README.txt`.
+The rules live in `src-tauri/src/technician/customer_copy.rs`.
+
+| Command (Give help) | What it does |
+| --- | --- |
+| `customer_copy_options` | what a copy would hold (`CustomerCopyOptions`): the relay of this copy without any key, and where the program comes from: `this_program` on Windows, `choose` elsewhere. Rejects with `relay_none` or `relay_profile` without a relay that can be used |
+| `choose_customer_program` | the system's dialog for `cretlink.exe` from the Windows archive of a release (macOS, Linux); a file that is no Windows program is refused, and the file is kept under a number (`ChosenForCopy`) |
+| `choose_customer_place` | the system's dialog for the folder the copy is made in, kept under a number |
+| `generate_customer_key` | a new admission key from the system's random source (`GeneratedKey`). The window shows it once, with the label, as the line `label:key` of the relay's key file; the backend keeps nothing |
+| `make_customer_copy` `{ form }` | writes the folder (`CustomerCopyForm` → `CustomerCopyMade`). Rejects with the stage of the field it is about (`copy_label`, `copy_key`, `copy_program`, `copy_place`), with `copy_exists` when a folder of that name is there and `replace` was not said, with `copy_relay` when the relay cannot go into a copy, and with `copy_write` when writing failed |
+| `show_customer_copy` `{ copy }` | shows the folder that was written in the file manager, by the number of the copy; no other folder can be shown |
+
+- **The technician's own key is never written.** The backend builds the
+  copy's profile from the address, the name and the certificate file of the
+  relay in use and from the key of the form; it does not read the key of the
+  technician's profile, and `keyMode` is `set` or `none`. A relay that asks
+  for no key gets a copy without one.
+- **Names.** The label is letters, digits and hyphens, at most 40. The
+  label, the folder and the name of the certificate file are each checked as
+  one plain name that Windows takes, before anything is written; the window
+  names the program, the place and the copy by a number and sends no path.
+- **The program is copied byte for byte.** On Windows it is the running
+  program itself (`std::env::current_exe`).
+- **No half copy.** The folder is written as
+  `CretLink-Support-<label>.cretlink-new` beside its place, read back with
+  `relay::next_to_program`, the reader of the customer role, and renamed
+  only then. A failure removes it; `copy_write` says when it could not be
+  removed and where it lies. A folder that is replaced is set aside under
+  the same name with `.cretlink-old` first, and comes back when the new one
+  cannot take its place.
+- **The step** asks for the label, the key (typed, **Generate**, or none)
+  and the place, and elsewhere than on Windows for the program. It says that
+  the key stands in the file in readable form, only admits to the relay and
+  can be withdrawn. A generated key fixes the label it was generated for and
+  is shown with **Copy**; it is forgotten when the step is closed or the
+  page is left. A refusal moves the focus to the field it is about, and
+  "a folder of that name is there already" is a question, with the focus on
+  the answer that keeps it.
+
+The dev page `/dev/relay.html` drives the step too (`?os=windows` for the copy
+that is this program itself; the labels `exists` and `fail` for a folder that
+is there and a copy that cannot be written).
+
 ## A session through the relay (ST-M007-013)
 
 With a profile in both copies the technician helps someone who is not on

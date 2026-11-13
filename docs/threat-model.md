@@ -3235,6 +3235,31 @@ metadata rather than content.
   relay whose certificate that authority did not sign. The kept file holds
   the certificates only, written anew, so that a private key which stood in
   the chosen file is never copied next to the settings.
+- *A customer copy carries a key of its own, and nothing of the
+  technician's.* **Make a customer copy** writes one folder for one customer:
+  the support program, a `cretlink.toml` with the relay of the technician's
+  copy and that customer's admission key, the relay's certificate file when
+  the profile names one, and a note (ST-M007-016). The key is the one the
+  technician typed or had generated for this customer, or none; nothing reads
+  the key of the technician's own profile, and the form has no way to ask for
+  it, so handing out copies never spreads the technician's key. A generated
+  key comes from the system's random source and is shown once, as the line
+  for the relay's key file; the application keeps it nowhere but in the copy.
+  The key stands in the copy in readable form, and whoever has the folder
+  has it: it admits to the forwarder and nothing else, and the operator
+  withdraws it by deleting its line. The certificate file of a copy holds
+  certificates only, also when the technician's own file holds the private
+  key of the authority. The program is copied byte for byte, so its signature
+  is the one of the release. Every name that goes into a path (the label, the
+  folder, the certificate file) is checked as one plain name that Windows
+  takes before anything is written; the window names the program, the place
+  and the copy by a number and never sends a path. The folder is written
+  beside its place and takes its name only when it is whole and was read back
+  as the customer's copy will read it, so a failure leaves no folder that
+  looks like a copy; a folder that is there already is replaced only on the
+  technician's answer. Nothing is sent anywhere: how the folder reaches the
+  customer is the technician's to choose, and a folder that is intercepted on
+  the way gives away the key and the relay's address, not a session.
 - *A relay code grants nothing.* It holds a random seed of 64 bits and a
   typing check, no address and no key. Someone who overhears or guesses a code
   can at most reach the rendezvous before the customer does: the approval

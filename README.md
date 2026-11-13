@@ -134,6 +134,10 @@ CretLink is under active development. Versions are `0.x` pre-releases;
   CretLink is told which relay to use in a file `cretlink.toml` next to the
   program or in **Settings → Relay** of the installed copy, and can test it
   ([how](docs/relay-server.md#3-tell-a-copy-of-cretlink-which-relay-to-use)).
+  For a customer, **Settings → Relay → Make a customer copy…** writes one
+  folder to hand over: the support program and a `cretlink.toml` with your
+  relay and a key of that customer's own
+  ([how](docs/relay-server.md#make-a-customer-copy)).
   With that, the technician chooses **Use relay** on the waiting screen and
   reads out a relay code, the customer types it, and from there the session
   is the one of one network: the same approval code on both screens, the

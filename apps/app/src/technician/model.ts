@@ -28,6 +28,11 @@ import type {
   RelayPlace,
   RelaySettings,
   RelayTest,
+  ChosenForCopy,
+  CustomerCopyForm,
+  CustomerCopyMade,
+  CustomerCopyOptions,
+  GeneratedKey,
   RelayView,
   UninstallPlan,
   SessionSummary,
@@ -120,6 +125,62 @@ export function initialRelayDraft(round = 0): RelayDraft {
   return { ca: { mode: "keep" }, round };
 }
 
+/**
+ * The step **Make a customer copy…** of Settings → Relay (ST-M007-016): what
+ * it holds beside the typed label and key.
+ */
+export interface CustomerCopyDraft {
+  // What a copy would hold, as the backend said; `null` while it is asked.
+  options: CustomerCopyOptions | null;
+  // `cretlink.exe` of a release, where the technician chooses the program.
+  program?: ChosenForCopy;
+  // The folder the copy is made in.
+  place?: ChosenForCopy;
+  // A key that was generated for this customer, with the label it was
+  // generated for: together they are the line of the relay's key file. The
+  // label cannot be changed while the key is there.
+  generated?: { label: string; key: string };
+  // "A folder of that name is there already": the backend's sentence, while
+  // the technician is asked whether to replace it.
+  replacing?: string;
+  // The copy that was written.
+  made?: CustomerCopyMade;
+}
+
+/** Whether `label` can name a customer copy: letters, digits and hyphens. */
+export function isCopyLabel(label: string, max: number): boolean {
+  return label.length >= 1 && label.length <= max && /^[A-Za-z0-9-]+$/.test(label);
+}
+
+/** The line of the relay's key file for a customer copy: `label:key`. */
+export function keyFileLine(label: string, key: string): string {
+  return `${label}:${key}`;
+}
+
+/**
+ * Reads the step as the backend takes it. The key is the generated one, or
+ * the one that was typed; the technician's own key is not among the
+ * choices. With `noKey` ticked, for a relay that asks for none, the copy
+ * holds no key, whatever stands in the field. A generated key is a key that
+ * was asked for: it is used.
+ */
+export function customerCopyForm(
+  fields: { label: string; key: string; noKey: boolean },
+  draft: CustomerCopyDraft,
+  replace = false,
+): CustomerCopyForm {
+  const noKey = fields.noKey && draft.generated === undefined;
+  const form: CustomerCopyForm = {
+    label: draft.generated?.label ?? fields.label.trim(),
+    keyMode: noKey ? "none" : "set",
+  };
+  if (!noKey) form.key = draft.generated?.key ?? fields.key;
+  if (draft.program) form.programPick = draft.program.pick;
+  if (draft.place) form.placePick = draft.place.pick;
+  if (replace) form.replace = true;
+  return form;
+}
+
 export interface TechnicianSnapshot {
   console: ConsoleState;
   // The feed of the current or last session, oldest first.
@@ -161,6 +222,8 @@ export interface TechnicianSnapshot {
   // `null` until the backend has said.
   relay: RelaySettings | null;
   relayDraft: RelayDraft;
+  // The step **Make a customer copy…**, while it is open (ST-M007-016).
+  customerCopy?: CustomerCopyDraft;
   // The file explorer of the Files tab (ST-M010-002): where it stands in the
   // customer computer's files, and what is listed there. It belongs to one
   // session: it starts empty with full control and is dropped when that ends.
@@ -881,6 +944,46 @@ export function isRelaySettings(value: unknown): value is RelaySettings {
     (settings.source === "file" || settings.source === "settings" || settings.source === "none") &&
     isRelayPlace(settings.file) &&
     (settings.stored === undefined || isRelayPlace(settings.stored))
+  );
+}
+
+/** Whether a value is a `CustomerCopyOptions` of the contract (ST-M007-016). */
+export function isCustomerCopyOptions(value: unknown): value is CustomerCopyOptions {
+  if (typeof value !== "object" || value === null) return false;
+  const options = value as Record<string, unknown>;
+  return (
+    isRelayView(options.relay) &&
+    (options.program === "this_program" || options.program === "choose") &&
+    typeof options.labelMax === "number" &&
+    isText(options.folderPrefix) &&
+    isText(options.programName)
+  );
+}
+
+/** Whether a value is a `ChosenForCopy` of the contract (ST-M007-016). */
+export function isChosenForCopy(value: unknown): value is ChosenForCopy {
+  if (typeof value !== "object" || value === null) return false;
+  const chosen = value as Record<string, unknown>;
+  return typeof chosen.pick === "number" && isText(chosen.name);
+}
+
+/** Whether a value is a `GeneratedKey` of the contract (ST-M007-016). */
+export function isGeneratedKey(value: unknown): value is GeneratedKey {
+  if (typeof value !== "object" || value === null) return false;
+  const key = (value as Record<string, unknown>).key;
+  return isText(key) && key !== "";
+}
+
+/** Whether a value is a `CustomerCopyMade` of the contract (ST-M007-016). */
+export function isCustomerCopyMade(value: unknown): value is CustomerCopyMade {
+  if (typeof value !== "object" || value === null) return false;
+  const made = value as Record<string, unknown>;
+  return (
+    typeof made.copy === "number" &&
+    isText(made.folder) &&
+    Array.isArray(made.files) &&
+    made.files.every(isText) &&
+    (made.setAside === undefined || isText(made.setAside))
   );
 }
 

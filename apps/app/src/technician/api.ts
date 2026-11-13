@@ -23,6 +23,11 @@ import type {
   ExplorerListing,
   ListenNetwork,
   RelayForm,
+  ChosenForCopy,
+  CustomerCopyForm,
+  CustomerCopyMade,
+  CustomerCopyOptions,
+  GeneratedKey,
   RelaySettings,
   RelayTest,
   RelayTrust,
@@ -294,6 +299,20 @@ export const api = {
   testRelay: (form?: RelayForm) =>
     invoke<RelayTest>("test_relay", form === undefined ? {} : { form }),
   removeRelay: () => invoke<RelaySettings>("remove_relay"),
+
+  // Make a customer copy (ST-M007-016), from Settings → Relay: a folder with
+  // the support program and the `cretlink.toml` of this copy's relay with the
+  // customer's key. The program and the place are chosen in dialogs of the
+  // system, opened by the backend, and named here by a number. A generated
+  // key comes back once, to show the line for the relay's key file. Nothing
+  // is sent anywhere: the folder is written and can be shown.
+  customerCopyOptions: () => invoke<CustomerCopyOptions>("customer_copy_options"),
+  chooseCustomerProgram: () => invoke<ChosenForCopy | null>("choose_customer_program"),
+  chooseCustomerPlace: () => invoke<ChosenForCopy | null>("choose_customer_place"),
+  generateCustomerKey: () => invoke<GeneratedKey>("generate_customer_key"),
+  makeCustomerCopy: (form: CustomerCopyForm) =>
+    invoke<CustomerCopyMade>("make_customer_copy", { form }),
+  showCustomerCopy: (copy: number) => invoke<void>("show_customer_copy", { copy }),
 };
 
 // The Tauri event name the backend emits a whole `ConsoleState` on during a

@@ -9,6 +9,8 @@
 //   as the one that is not used.
 // - A copy that runs once keeps no settings: the screen says where its relay
 //   goes.
+// - With a relay that can be used, the card offers **Make a customer copy…**
+//   (ST-M007-016, `./customer-copy`).
 //
 // The admission key is never shown: the screen says only whether one is set,
 // and the key field is always empty. Every text of a profile is written as
@@ -20,6 +22,7 @@ import { icon } from "../../shared/icons";
 import { relayLabel, relayWords } from "../../shared/relay";
 import type { RelayDraft, TechnicianSnapshot } from "../model";
 import { button, card, kv, pill, unavailable } from "./common";
+import { customerCopyPart } from "./customer-copy";
 
 const INTRO =
   "A relay lets you help someone who is not on your network. You host it yourself. It only passes encrypted traffic on: it cannot look into a session and it grants nothing. The approval code and the customer's consent decide, as on one network.";
@@ -348,8 +351,16 @@ export function relayCard(s: TechnicianSnapshot): HTMLElement {
   const head = h("h4", { id: "relay-head" }, "Relay");
   if (!settings) return card(head, unavailable("The relay of this copy"));
   const intro = h("p", null, INTRO);
+  // With a relay that can be used, the card offers a customer copy of it
+  // (ST-M007-016); `customerCopyPart` shows nothing without one.
   if (settings.source === "file") {
-    return card(head, intro, fileRelay(s, settings), testResult(s.relayDraft));
+    return card(
+      head,
+      intro,
+      fileRelay(s, settings),
+      testResult(s.relayDraft),
+      customerCopyPart(s),
+    );
   }
   if (!settings.editable) return card(head, intro, runOnce(settings));
   return card(
@@ -362,5 +373,6 @@ export function relayCard(s: TechnicianSnapshot): HTMLElement {
     form(s, settings),
     s.relayDraft.removing ? removeQuestion(s, settings.stored) : null,
     testResult(s.relayDraft),
+    customerCopyPart(s),
   );
 }

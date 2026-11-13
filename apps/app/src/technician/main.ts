@@ -42,17 +42,24 @@ import {
   type UiError,
   applyConsole,
   canStop,
+  customerCopyForm,
   initialRelayDraft,
   initialSnapshot,
   isActivityEvent,
   isAuditEntry,
   isBridgeStatus,
   isChosenCa,
+  isChosenForCopy,
   isConsoleNotice,
+  isCopyLabel,
+  isCustomerCopyMade,
+  isCustomerCopyOptions,
+  isGeneratedKey,
   isListenNetwork,
   isRelaySettings,
   isRelayTest,
   isUninstallPlan,
+  keyFileLine,
   listenHost,
   placeholderConsole,
   relayForm,
@@ -395,6 +402,8 @@ function relayChanged(relay: RelaySettings, notice: string, focus: string): void
     relay,
     // A new form: no typed key stays in a field.
     relayDraft: initialRelayDraft(snap.relayDraft.round + 1),
+    // A customer copy names the relay as it was: the step closes with it.
+    customerCopy: undefined,
     notice,
   });
 }
@@ -488,6 +497,200 @@ async function chooseRelayCa(): Promise<void> {
       "That certificate file cannot be used",
       "Choose the PEM file of the authority that signed the relay's certificate.",
     );
+  }
+}
+
+// --- Make a customer copy (ST-M007-016) ---
+
+// The field of the step that a refusal of the backend is about.
+const COPY_FIELDS: Record<string, string> = {
+  copy_label: "#copy-label",
+  copy_key: "#copy-key, #copy-generate",
+  copy_program: "#copy-program-choose",
+  copy_place: "#copy-place-choose",
+};
+
+/** A refusal about a customer copy: its words, and the field they are about. */
+function copyRefused(error: unknown, title: string, otherwise: string): void {
+  const field = isCommandError(error) ? COPY_FIELDS[error.stage] : undefined;
+  if (field) focusNext = field;
+  set({
+    busy: undefined,
+    error: {
+      title,
+      // The backend's sentence stands alone: it says what is asked.
+      message: isCommandError(error) ? error.message : describe(error),
+      next: field ? "Correct it, then try again." : otherwise,
+    },
+  });
+}
+
+/** Opens the step and asks the backend what a copy of this relay would hold. */
+async function openCustomerCopy(): Promise<void> {
+  if (snap.busy !== undefined || snap.customerCopy) return;
+  focusNext = "#copy-step";
+  set({ customerCopy: { options: null }, error: undefined });
+  try {
+    const options = await api.customerCopyOptions();
+    // The step was closed meanwhile.
+    if (!snap.customerCopy) return;
+    if (!isCustomerCopyOptions(options)) throw new Error("The relay of this copy could not be read.");
+    focusNext = "#copy-label";
+    set({ customerCopy: { options } });
+  } catch (error) {
+    focusNext = "#copy-open";
+    set({
+      customerCopy: undefined,
+      error: {
+        title: "A customer copy cannot be made",
+        message: isCommandError(error) ? error.message : describe(error),
+        next: "A customer copy names the relay of this copy. Check the relay above, then try again.",
+      },
+    });
+    void loadRelay();
+  }
+}
+
+/** Closes the step. What was typed or generated is forgotten with it. */
+function closeCustomerCopy(): void {
+  focusNext = "#copy-open";
+  set({ customerCopy: undefined });
+}
+
+/** The system's dialog for the program of a copy, or for where to make it. */
+async function chooseForCopy(what: "program" | "place"): Promise<void> {
+  if (snap.busy !== undefined || !snap.customerCopy) return;
+  set({ busy: `copy-${what}`, error: undefined });
+  try {
+    const chosen =
+      what === "program" ? await api.chooseCustomerProgram() : await api.chooseCustomerPlace();
+    if (!snap.customerCopy || chosen === null) {
+      set({ busy: undefined });
+      return;
+    }
+    if (!isChosenForCopy(chosen)) throw new Error("The choice could not be read.");
+    set({ busy: undefined, customerCopy: { ...snap.customerCopy, [what]: chosen } });
+  } catch (error) {
+    copyRefused(
+      error,
+      what === "program" ? "That file cannot be the program of a copy" : "That folder cannot be used",
+      "Choose again.",
+    );
+  }
+}
+
+/** What stands in the fields of the step. */
+function copyFields(): { label: string; key: string; noKey: boolean } {
+  const input = (id: string): HTMLInputElement | null | undefined =>
+    live?.querySelector<HTMLInputElement>(`#${id}`);
+  return {
+    label: input("copy-label")?.value ?? "",
+    key: input("copy-key")?.value ?? "",
+    noKey: input("copy-no-key")?.checked ?? false,
+  };
+}
+
+/**
+ * **Generate**: a new key from the backend's random source, shown with the
+ * label as the line of the relay's key file. The label must stand first: it
+ * is half of that line.
+ */
+async function generateCustomerKey(): Promise<void> {
+  const draft = snap.customerCopy;
+  if (snap.busy !== undefined || !draft?.options) return;
+  const label = copyFields().label.trim();
+  if (!isCopyLabel(label, draft.options.labelMax)) {
+    focusNext = "#copy-label";
+    set({
+      error: {
+        title: "Give the copy a label first",
+        message: `The label holds letters, digits and hyphens only, at least one and at most ${draft.options.labelMax}. It is the name the key is listed under in the relay's key file.`,
+        next: "Type the label, then generate the key.",
+      },
+    });
+    return;
+  }
+  set({ busy: "copy-generate", error: undefined });
+  try {
+    const generated = await api.generateCustomerKey();
+    if (!snap.customerCopy) {
+      set({ busy: undefined });
+      return;
+    }
+    if (!isGeneratedKey(generated)) throw new Error("No key was generated.");
+    // The keyboard was on Generate, which is gone: on to Copy.
+    focusNext = '[data-action="copy-key-line"]';
+    set({
+      busy: undefined,
+      customerCopy: { ...snap.customerCopy, generated: { label, key: generated.key } },
+      notice: "A new key was generated. It is shown once, with its line for the key file.",
+    });
+  } catch (error) {
+    copyRefused(error, "No key was generated", "Try again, or type a key.");
+  }
+}
+
+/** Copies the line `label:key` of the generated key. */
+async function copyKeyLine(): Promise<void> {
+  const generated = snap.customerCopy?.generated;
+  if (!generated) return;
+  try {
+    if (!navigator.clipboard) throw new Error("no clipboard");
+    await navigator.clipboard.writeText(keyFileLine(generated.label, generated.key));
+    set({ notice: "The line for the key file was copied." });
+  } catch {
+    set({ notice: "The line could not be copied. Select it and copy it by hand." });
+  }
+}
+
+/**
+ * **Make the copy**. `replace` is the technician's answer to "a folder of
+ * that name is there already"; without it such a folder is never touched.
+ */
+async function makeCustomerCopy(replace: boolean): Promise<void> {
+  const draft = snap.customerCopy;
+  if (snap.busy !== undefined || !draft?.options || draft.made) return;
+  const form = customerCopyForm(copyFields(), draft, replace);
+  set({ busy: "copy-make", error: undefined });
+  try {
+    const made = await api.makeCustomerCopy(form);
+    if (!isCustomerCopyMade(made)) throw new Error("The result could not be read.");
+    focusNext = "#copy-step";
+    const { replacing: _asked, ...rest } = snap.customerCopy ?? draft;
+    set({
+      busy: undefined,
+      customerCopy: { ...rest, made },
+      notice: `The customer copy was written to ${made.folder}.`,
+    });
+  } catch (error) {
+    if (isCommandError(error) && error.stage === "copy_exists" && snap.customerCopy) {
+      // Nothing was changed. The technician is asked.
+      focusNext = "#copy-replace-step [data-autofocus]";
+      set({ busy: undefined, customerCopy: { ...snap.customerCopy, replacing: error.message } });
+      return;
+    }
+    if (snap.customerCopy?.replacing !== undefined) {
+      const { replacing: _asked, ...rest } = snap.customerCopy;
+      snap = { ...snap, customerCopy: rest };
+    }
+    copyRefused(error, "The customer copy was not made", "Try again.");
+  }
+}
+
+/** **Show in folder**: the folder that was written, in the file manager. */
+async function showCustomerCopy(): Promise<void> {
+  const made = snap.customerCopy?.made;
+  if (!made || snap.busy !== undefined) return;
+  try {
+    await api.showCustomerCopy(made.copy);
+  } catch (error) {
+    set({
+      error: {
+        title: "The folder could not be shown",
+        message: isCommandError(error) ? error.message : describe(error),
+        next: `Open ${made.folder} in your file manager.`,
+      },
+    });
   }
 }
 
@@ -734,6 +937,9 @@ function onAction(event: ActionEvent): void {
           confirm: undefined,
           uninstall: undefined,
           relayDraft: { ...snap.relayDraft, removing: false },
+          // A generated key is shown once: the step does not wait behind
+          // another page with the key still in it.
+          customerCopy: undefined,
         });
         // A profile file may have been put next to the program meanwhile.
         if (arg === "settings") void loadRelay();
@@ -831,6 +1037,49 @@ function onAction(event: ActionEvent): void {
       break;
     case "relay-remove-confirm":
       void removeRelay();
+      break;
+    case "copy-open":
+      void openCustomerCopy();
+      break;
+    case "copy-cancel":
+    case "copy-done":
+      closeCustomerCopy();
+      break;
+    case "copy-program":
+      void chooseForCopy("program");
+      break;
+    case "copy-place":
+      void chooseForCopy("place");
+      break;
+    case "copy-generate":
+      void generateCustomerKey();
+      break;
+    case "copy-discard-key":
+      if (snap.customerCopy) {
+        // The key is forgotten here; the label can be changed again.
+        focusNext = "#copy-key";
+        const { generated: _discarded, ...rest } = snap.customerCopy;
+        set({ customerCopy: rest });
+      }
+      break;
+    case "copy-key-line":
+      void copyKeyLine();
+      break;
+    case "copy-make":
+      void makeCustomerCopy(false);
+      break;
+    case "copy-replace":
+      void makeCustomerCopy(true);
+      break;
+    case "copy-replace-cancel":
+      if (snap.customerCopy) {
+        focusNext = "#copy-make";
+        const { replacing: _asked, ...rest } = snap.customerCopy;
+        set({ customerCopy: rest });
+      }
+      break;
+    case "copy-show":
+      void showCustomerCopy();
       break;
     default:
       // The controls of the file explorer.

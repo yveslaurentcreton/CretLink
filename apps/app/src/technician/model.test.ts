@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { ActivityEntry } from "../shared/contract";
 import {
   AUDIT,
+  COPY_KEY,
+  COPY_MADE,
+  COPY_OPTIONS,
+  COPY_OPTIONS_CHOOSE,
   FEED,
   FIXTURES,
   NETWORKS,
@@ -22,12 +26,14 @@ import {
   consoleIn,
 } from "./fixtures";
 import {
+  type CustomerCopyDraft,
   activeRelay,
   applyConsole,
   auditActionWords,
   auditOutcomeWords,
   canStop,
   cleanupWords,
+  customerCopyForm,
   formatDuration,
   groupCode,
   initialRelayDraft,
@@ -36,10 +42,16 @@ import {
   isAuditEntry,
   isBridgeStatus,
   isChosenCa,
+  isChosenForCopy,
   isConsoleNotice,
+  isCopyLabel,
+  isCustomerCopyMade,
+  isCustomerCopyOptions,
+  isGeneratedKey,
   isListenNetwork,
   isRelaySettings,
   isRelayTest,
+  keyFileLine,
   listenHost,
   otherNetworks,
   phaseAnnouncement,
@@ -662,5 +674,91 @@ describe("a session through the relay (ST-M007-013)", () => {
     expect(words.message).toContain("The relay may have stopped");
     expect(words.next).toContain("Nobody has access");
     expect(words.next).toContain("new relay code");
+  });
+});
+
+describe("make a customer copy (ST-M007-016)", () => {
+  it("takes a label of letters, digits and hyphens within the bound", () => {
+    for (const label of ["a", "ACME-07", "2026-front-desk", "-", "A".repeat(40)]) {
+      expect(isCopyLabel(label, 40), label).toBe(true);
+    }
+    for (const label of ["", " ", "front desk", "../x", "a/b", "a\\b", "a.b", "a_b", "café", "A".repeat(41)]) {
+      expect(isCopyLabel(label, 40), label).toBe(false);
+    }
+  });
+
+  it("writes the line of the relay's key file as label and key", () => {
+    expect(keyFileLine("acme-front-desk", COPY_KEY)).toBe(`acme-front-desk:${COPY_KEY}`);
+  });
+
+  it("sends the key that was typed for this customer, by the numbers of what was chosen", () => {
+    const draft: CustomerCopyDraft = {
+      options: COPY_OPTIONS_CHOOSE,
+      program: { pick: 3, name: "cretlink.exe" },
+      place: { pick: 4, name: "/home/sam/Customers" },
+    };
+    const typed = "cd".repeat(16);
+    expect(customerCopyForm({ label: "  acme ", key: typed, noKey: false }, draft)).toEqual({
+      label: "acme",
+      keyMode: "set",
+      key: typed,
+      programPick: 3,
+      placePick: 4,
+    });
+    // Neither a path nor a name of what was chosen travels: only numbers.
+    const sent = JSON.stringify(customerCopyForm({ label: "acme", key: typed, noKey: false }, draft));
+    expect(sent).not.toContain("cretlink.exe");
+    expect(sent).not.toContain("/home/sam");
+    // The technician's answer to "replace it?" is said only when it was given.
+    expect(customerCopyForm({ label: "acme", key: typed, noKey: false }, draft, true).replace).toBe(true);
+    expect("replace" in customerCopyForm({ label: "acme", key: typed, noKey: false }, draft)).toBe(false);
+  });
+
+  it("sends a generated key with the label it was generated for", () => {
+    const draft: CustomerCopyDraft = {
+      options: COPY_OPTIONS,
+      generated: { label: "acme-front-desk", key: COPY_KEY },
+    };
+    // Whatever stands in the fields: the generated key and its label go.
+    expect(customerCopyForm({ label: "something-else", key: "", noKey: true }, draft)).toEqual({
+      label: "acme-front-desk",
+      keyMode: "set",
+      key: COPY_KEY,
+    });
+  });
+
+  it("makes a copy without a key for a relay that asks for none, and has no other choice", () => {
+    const draft: CustomerCopyDraft = { options: COPY_OPTIONS };
+    const none = customerCopyForm({ label: "acme", key: "typed-and-ignored", noKey: true }, draft);
+    expect(none).toEqual({ label: "acme", keyMode: "none" });
+    // A form says "set" or "none": there is no word for the technician's own key.
+    const empty = customerCopyForm({ label: "acme", key: "", noKey: false }, draft);
+    expect(empty).toEqual({ label: "acme", keyMode: "set", key: "" });
+  });
+
+  it("recognises what the backend answers", () => {
+    expect(isCustomerCopyOptions(COPY_OPTIONS)).toBe(true);
+    expect(isCustomerCopyOptions(COPY_OPTIONS_CHOOSE)).toBe(true);
+    for (const bad of [
+      null,
+      {},
+      { ...COPY_OPTIONS, relay: { host: "h" } },
+      { ...COPY_OPTIONS, program: "ask" },
+      { ...COPY_OPTIONS, labelMax: "40" },
+      { ...COPY_OPTIONS, folderPrefix: undefined },
+    ]) {
+      expect(isCustomerCopyOptions(bad)).toBe(false);
+    }
+    expect(isChosenForCopy({ pick: 1, name: "cretlink.exe" })).toBe(true);
+    expect(isChosenForCopy({ pick: "1", name: "cretlink.exe" })).toBe(false);
+    expect(isChosenForCopy({ pick: 1 })).toBe(false);
+    expect(isGeneratedKey({ key: COPY_KEY })).toBe(true);
+    expect(isGeneratedKey({ key: "" })).toBe(false);
+    expect(isGeneratedKey({})).toBe(false);
+    expect(isCustomerCopyMade(COPY_MADE)).toBe(true);
+    expect(isCustomerCopyMade({ ...COPY_MADE, setAside: "x" })).toBe(true);
+    expect(isCustomerCopyMade({ ...COPY_MADE, files: [1] })).toBe(false);
+    expect(isCustomerCopyMade({ ...COPY_MADE, copy: undefined })).toBe(false);
+    expect(isCustomerCopyMade({ ...COPY_MADE, setAside: 1 })).toBe(false);
   });
 });

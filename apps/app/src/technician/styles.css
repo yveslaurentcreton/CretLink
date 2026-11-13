@@ -421,6 +421,17 @@ table.audit tr.gap td { color: var(--warn); font-weight: 600; }
 .relay-result .next { font-weight: 600; }
 .relay-unused { border-top: 1px solid var(--line); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
 .relay-example { margin: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); font: 12.5px var(--mono); overflow: auto; }
+/* Make a customer copy (ST-M007-016). */
+.copy-offer { border-top: 1px solid var(--line); padding-top: 12px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.copy-offer p { margin: 0; }
+.copy-step { border-top: 1px solid var(--line); padding-top: 12px; display: flex; flex-direction: column; gap: 14px; }
+.copy-step:focus { outline: none; }
+.copy-step h5 { margin: 0; font-size: 14px; }
+.copy-step p { margin: 0; }
+.copy-key-entry .field-input { flex: 1; min-width: 180px; }
+.copy-key-line { display: flex; flex-direction: column; gap: 6px; }
+.copy-key-line p { max-width: 560px; }
+.key-line { padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); font-size: 12.5px; overflow-wrap: anywhere; user-select: all; }
 .relay-where { overflow-wrap: anywhere; font-size: 12.5px; }
 
 /* ---------- Narrow windows ---------- */

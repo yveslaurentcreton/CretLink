@@ -9,6 +9,10 @@ import {
   APP_INSTALLED,
   AUDIT,
   CLIENTS,
+  COPY_KEY,
+  COPY_MADE,
+  COPY_OPTIONS,
+  COPY_OPTIONS_CHOOSE,
   FEED,
   NETWORKS,
   RELAY,
@@ -1185,5 +1189,337 @@ describe("Settings: what uninstall leaves in place (ST-M007-011)", () => {
     expect(alert()).toContain("CretLink could not check what to uninstall");
     expect(alert()).toContain("Nothing was changed.");
     expect(asked("uninstall_app")).toBe(0);
+  });
+});
+
+describe("Settings: make a customer copy (ST-M007-016)", () => {
+  const asked = (cmd: string): number => backend.calls.filter(([name]) => name === cmd).length;
+  const sent = (cmd: string): Record<string, unknown> | undefined =>
+    backend.calls.filter(([name]) => name === cmd).at(-1)?.[1];
+  const alert = (): string => app().querySelector('[role="alert"]')?.textContent ?? "";
+  const announced = (): string => app().querySelector("#announce")?.textContent ?? "";
+  const focused = (): string => (document.activeElement as HTMLElement | null)?.id ?? "";
+  const input = (id: string): HTMLInputElement => {
+    const found = app().querySelector<HTMLInputElement>(`#${id}`);
+    if (!found) throw new Error(`no #${id}`);
+    return found;
+  };
+  const type = (id: string, value: string): void => {
+    input(id).value = value;
+  };
+  // A sample value that no scanner takes for a real key.
+  const TYPED = "cd".repeat(16);
+  const PROGRAM = { pick: 3, name: "cretlink.exe" };
+  const PLACE = { pick: 4, name: "C:\\Users\\sam\\Documents\\Customers" };
+
+  /** Settings with the step open, on a system where the program is chosen. */
+  async function open(handlers: Record<string, Handler> = {}, options = COPY_OPTIONS_CHOOSE): Promise<void> {
+    await boot({
+      get_app_info: () => APP_INSTALLED,
+      get_relay_settings: () => RELAY_STORED,
+      customer_copy_options: () => options,
+      choose_customer_program: () => PROGRAM,
+      choose_customer_place: () => PLACE,
+      generate_customer_key: () => ({ key: COPY_KEY }),
+      make_customer_copy: () => COPY_MADE,
+      show_customer_copy: () => null,
+      ...handlers,
+    });
+    click('nav.side [data-arg="settings"]');
+    await flush();
+    click("#copy-open");
+    await flush();
+  }
+
+  it("opens on the label, with the relay the backend says a copy would name", async () => {
+    await open();
+    expect(asked("customer_copy_options")).toBe(1);
+    expect(app().querySelector("#copy-step")?.textContent).toContain("host-01.example.org");
+    expect(focused()).toBe("copy-label");
+    // The offer gave way to the step, and nothing was written by looking.
+    expect(app().querySelector("#copy-open")).toBeNull();
+    expect(asked("make_customer_copy")).toBe(0);
+  });
+
+  it("says why no copy can be made when this copy has no relay to name, and closes the step", async () => {
+    await open({
+      customer_copy_options: () => {
+        throw { stage: "relay_profile", message: "Line 2: `address` needs a port. (C:\\cretlink.toml)" };
+      },
+    });
+    expect(app().querySelector("#copy-step")).toBeNull();
+    expect(alert()).toContain("A customer copy cannot be made");
+    expect(alert()).toContain("Line 2: `address` needs a port.");
+    expect(focused()).toBe("copy-open");
+  });
+
+  it("makes the copy with the typed key and the numbers of what was chosen, and shows the result", async () => {
+    await open();
+    type("copy-label", "acme-front-desk");
+    type("copy-key", TYPED);
+    click("#copy-program-choose");
+    await flush();
+    click("#copy-place-choose");
+    await flush();
+    expect(app().querySelector("#copy-program")?.textContent).toBe("cretlink.exe · chosen");
+    expect(app().querySelector("#copy-place")?.textContent).toContain(PLACE.name);
+    // What was typed stays in the fields while choices come in.
+    expect(input("copy-label").value).toBe("acme-front-desk");
+    expect(input("copy-key").value).toBe(TYPED);
+
+    click("#copy-make");
+    await flush();
+    expect(sent("make_customer_copy")).toEqual({
+      form: {
+        label: "acme-front-desk",
+        keyMode: "set",
+        key: TYPED,
+        programPick: 3,
+        placePick: 4,
+      },
+    });
+    // The result, where the keyboard and a screen reader land.
+    expect(app().querySelector("#copy-folder")?.textContent).toBe(COPY_MADE.folder);
+    expect(focused()).toBe("copy-step");
+    expect(announced()).toBe(`The customer copy was written to ${COPY_MADE.folder}.`);
+    // The typed key is in no field any more, and no key line is shown: none
+    // was generated.
+    expect(app().querySelector("#copy-key")).toBeNull();
+    expect(app().querySelector("#copy-key-line")).toBeNull();
+    expect(app().textContent).not.toContain(TYPED);
+
+    // Show in folder names the copy by its number.
+    click("#copy-show");
+    await flush();
+    expect(sent("show_customer_copy")).toEqual({ copy: 7 });
+    // Done closes the step and offers the next copy.
+    click('[data-action="copy-done"]');
+    await flush();
+    expect(app().querySelector("#copy-step")).toBeNull();
+    expect(focused()).toBe("copy-open");
+  });
+
+  it("generates a key only for a label, shows its line once, and sends that key", async () => {
+    const written: string[] = [];
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: async (text: string) => void written.push(text) },
+    });
+    try {
+      await open({}, COPY_OPTIONS);
+      // Without a label there is no line to show: nothing is asked.
+      click("#copy-generate");
+      await flush();
+      expect(asked("generate_customer_key")).toBe(0);
+      expect(alert()).toContain("Give the copy a label first");
+      expect(focused()).toBe("copy-label");
+
+      type("copy-label", "acme-front-desk");
+      click("#copy-generate");
+      await flush();
+      expect(asked("generate_customer_key")).toBe(1);
+      expect(alert()).toBe("");
+      expect(app().querySelector("#copy-key-line")?.textContent).toBe(
+        `acme-front-desk:${COPY_KEY}`,
+      );
+      // The keyboard is on Copy; the label is fixed and still says what was typed.
+      expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe("copy-key-line");
+      expect(input("copy-label").hasAttribute("readonly")).toBe(true);
+      expect(input("copy-label").value).toBe("acme-front-desk");
+      click('[data-action="copy-key-line"]');
+      await flush();
+      expect(written).toEqual([`acme-front-desk:${COPY_KEY}`]);
+      expect(announced()).toBe("The line for the key file was copied.");
+
+      click("#copy-place-choose");
+      await flush();
+      click("#copy-make");
+      await flush();
+      expect(sent("make_customer_copy")).toEqual({
+        form: { label: "acme-front-desk", keyMode: "set", key: COPY_KEY, placePick: 4 },
+      });
+      // The line once more with the result, and gone with Done.
+      expect(app().querySelector("#copy-key-line")?.textContent).toBe(
+        `acme-front-desk:${COPY_KEY}`,
+      );
+      click('[data-action="copy-done"]');
+      await flush();
+      expect(app().textContent).not.toContain(COPY_KEY);
+    } finally {
+      Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
+
+  it("forgets a generated key when it is discarded or the page is left", async () => {
+    await open({}, COPY_OPTIONS);
+    type("copy-label", "acme");
+    click("#copy-generate");
+    await flush();
+    expect(app().textContent).toContain(COPY_KEY);
+    click("#copy-discard-key");
+    await flush();
+    expect(app().textContent).not.toContain(COPY_KEY);
+    // The label can be changed again, and a key typed instead.
+    expect(input("copy-label").hasAttribute("readonly")).toBe(false);
+    expect(input("copy-label").value).toBe("acme");
+    expect(focused()).toBe("copy-key");
+
+    click("#copy-generate");
+    await flush();
+    expect(app().textContent).toContain(COPY_KEY);
+    // Another page: the step does not wait there with the key in it.
+    click('nav.side [data-arg="home"]');
+    await flush();
+    click('nav.side [data-arg="settings"]');
+    await flush();
+    expect(app().textContent).not.toContain(COPY_KEY);
+    expect(app().querySelector("#copy-step")).toBeNull();
+    expect(app().querySelector("#copy-open")).not.toBeNull();
+  });
+
+  it("makes a copy without a key when the relay asks for none", async () => {
+    await open({}, COPY_OPTIONS);
+    type("copy-label", "acme");
+    type("copy-key", "left-in-the-field");
+    input("copy-no-key").checked = true;
+    click("#copy-place-choose");
+    await flush();
+    click("#copy-make");
+    await flush();
+    expect(sent("make_customer_copy")).toEqual({
+      form: { label: "acme", keyMode: "none", placePick: 4 },
+    });
+  });
+
+  it("asks before a folder that is there is replaced, and replaces only on that answer", async () => {
+    let calls = 0;
+    await open(
+      {
+        make_customer_copy: (args) => {
+          calls += 1;
+          const form = (args as { form: { replace?: boolean } }).form;
+          if (!form.replace) {
+            throw {
+              stage: "copy_exists",
+              message: `A folder ${COPY_MADE.folder} is there already. Nothing was changed.`,
+            };
+          }
+          return COPY_MADE;
+        },
+      },
+      COPY_OPTIONS,
+    );
+    type("copy-label", "acme-front-desk");
+    type("copy-key", TYPED);
+    click("#copy-place-choose");
+    await flush();
+    click("#copy-make");
+    await flush();
+    // The question, not an error; the keyboard is on the answer that keeps.
+    expect(alert()).toBe("");
+    expect(app().querySelector("#copy-replace-step")?.textContent).toContain("is there already");
+    expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe(
+      "copy-replace-cancel",
+    );
+    // Keep it: nothing more is asked of the backend, and the form is back.
+    click('[data-action="copy-replace-cancel"]');
+    await flush();
+    expect(calls).toBe(1);
+    expect(app().querySelector("#copy-replace-step")).toBeNull();
+    expect(focused()).toBe("copy-make");
+    expect(input("copy-key").value).toBe(TYPED);
+
+    // Asked again and answered with Replace: the same form, with the answer.
+    click("#copy-make");
+    await flush();
+    click('[data-action="copy-replace"]');
+    await flush();
+    expect(calls).toBe(3);
+    expect(sent("make_customer_copy")).toEqual({
+      form: {
+        label: "acme-front-desk",
+        keyMode: "set",
+        key: TYPED,
+        placePick: 4,
+        replace: true,
+      },
+    });
+    expect(app().querySelector("#copy-folder")?.textContent).toBe(COPY_MADE.folder);
+  });
+
+  it.each([
+    ["copy_label", "copy-label"],
+    ["copy_key", "copy-key"],
+    ["copy_program", "copy-program-choose"],
+    ["copy_place", "copy-place-choose"],
+  ])("puts the keyboard on the field a refusal is about (%s)", async (stage, field) => {
+    await open({
+      make_customer_copy: () => {
+        throw { stage, message: "What the backend says about this field." };
+      },
+    });
+    type("copy-label", "acme");
+    click("#copy-make");
+    await flush();
+    expect(alert()).toContain("The customer copy was not made");
+    expect(alert()).toContain("What the backend says about this field.");
+    expect(alert()).toContain("Correct it, then try again.");
+    expect(focused()).toBe(field);
+    // The step is still open with what was typed.
+    expect(input("copy-label").value).toBe("acme");
+  });
+
+  it("says when a copy could not be written, and that nothing was left behind", async () => {
+    await open({
+      make_customer_copy: () => {
+        throw {
+          stage: "copy_write",
+          message:
+            "The customer copy could not be written: the disk is full. Nothing of it was left behind.",
+        };
+      },
+    });
+    type("copy-label", "acme");
+    click("#copy-make");
+    await flush();
+    expect(alert()).toContain("Nothing of it was left behind.");
+    expect(alert()).toContain("Try again.");
+    expect(app().querySelector("#copy-result")).toBeNull();
+    expect(app().querySelector("#copy-make")).not.toBeNull();
+  });
+
+  it("keeps the step as it is when a dialog is closed without a choice, or a file is refused", async () => {
+    await open({
+      choose_customer_place: () => null,
+      choose_customer_program: () => {
+        throw {
+          stage: "copy_program",
+          message:
+            "That file is not a Windows program. A customer copy holds cretlink.exe from the Windows archive of a CretLink release.",
+        };
+      },
+    });
+    click("#copy-place-choose");
+    await flush();
+    expect(app().querySelector("#copy-place")?.textContent).toBe("None chosen yet");
+    expect(alert()).toBe("");
+    click("#copy-program-choose");
+    await flush();
+    expect(alert()).toContain("That file cannot be the program of a copy");
+    expect(alert()).toContain("That file is not a Windows program.");
+    expect(app().querySelector("#copy-program")?.textContent).toBe("None chosen yet");
+    expect(focused()).toBe("copy-program-choose");
+  });
+
+  it("closes the step when the relay it would name is saved anew or removed", async () => {
+    await open({ remove_relay: () => RELAY_NONE }, COPY_OPTIONS);
+    expect(app().querySelector("#copy-step")).not.toBeNull();
+    click('[data-action="relay-remove"]');
+    await flush();
+    click('[data-action="relay-remove-confirm"]');
+    await flush();
+    expect(app().querySelector("#copy-step")).toBeNull();
+    // Without a relay there is no copy to offer.
+    expect(app().querySelector("#copy-open")).toBeNull();
   });
 });

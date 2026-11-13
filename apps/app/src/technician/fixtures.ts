@@ -7,6 +7,8 @@ import type {
   AiClientStatus,
   AppInfo,
   AuditEntryView,
+  CustomerCopyMade,
+  CustomerCopyOptions,
   ExplorerDrive,
   ExplorerEntry,
   ListenNetwork,
@@ -163,6 +165,36 @@ export const RELAY_PRIVATE: RelayView = {
   keySet: false,
   ca: "relay-ca.pem",
   name: "host-01.example.org",
+};
+
+// --- Make a customer copy (ST-M007-016) ---
+
+/** A customer copy on Windows: the copy is this program itself. */
+export const COPY_OPTIONS: CustomerCopyOptions = {
+  // The relay of this copy without any key: the technician's own key is no
+  // part of a customer copy.
+  relay: { ...RELAY, keySet: false },
+  program: "this_program",
+  labelMax: 40,
+  folderPrefix: "CretLink-Support-",
+  programName: "CretLink-Support.exe",
+};
+
+/** A customer copy on macOS or Linux, of a relay with its own authority. */
+export const COPY_OPTIONS_CHOOSE: CustomerCopyOptions = {
+  ...COPY_OPTIONS,
+  relay: RELAY_PRIVATE,
+  program: "choose",
+};
+
+/** A sample value that no scanner takes for a real key. */
+export const COPY_KEY = "ab".repeat(32);
+
+/** The folder a customer copy was written to. */
+export const COPY_MADE: CustomerCopyMade = {
+  copy: 7,
+  folder: "C:\\Users\\sam\\Documents\\Customers\\CretLink-Support-acme-front-desk",
+  files: ["CretLink-Support.exe", "cretlink.toml", "relay-ca.pem", "README.txt"],
 };
 
 const SETTINGS_PATH = "C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\settings.toml";
@@ -1435,6 +1467,118 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
     nav: "settings",
     app: APP_RUN_ONCE,
     relay: RELAY_RUN_ONCE_FILE,
+  },
+  // Make a customer copy (ST-M007-016): the step while the relay is looked
+  // at, as a form on Windows and elsewhere, with what was chosen, with a
+  // generated key, with the question about a folder that is there, and with
+  // the copy that was written.
+  "settings-copy-loading": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: { options: null },
+  },
+  "settings-copy-windows": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: { options: COPY_OPTIONS },
+  },
+  "settings-copy-choose": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE_FILE,
+    customerCopy: { options: COPY_OPTIONS_CHOOSE },
+  },
+  "settings-copy-chosen": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE_FILE,
+    customerCopy: {
+      options: COPY_OPTIONS_CHOOSE,
+      program: { pick: 3, name: "cretlink.exe" },
+      place: { pick: 4, name: "/home/sam/Customers" },
+    },
+  },
+  "settings-copy-generated": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: COPY_OPTIONS,
+      place: { pick: 4, name: "C:\\Users\\sam\\Documents\\Customers" },
+      generated: { label: "acme-front-desk", key: COPY_KEY },
+    },
+  },
+  "settings-copy-replacing": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: COPY_OPTIONS,
+      place: { pick: 4, name: "C:\\Users\\sam\\Documents\\Customers" },
+      replacing: `A folder ${COPY_MADE.folder} is there already. Nothing was changed.`,
+    },
+  },
+  "settings-copy-made": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: COPY_OPTIONS,
+      generated: { label: "acme-front-desk", key: COPY_KEY },
+      made: COPY_MADE,
+    },
+  },
+  "settings-copy-made-set-aside": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: COPY_OPTIONS,
+      made: {
+        ...COPY_MADE,
+        files: ["CretLink-Support.exe", "cretlink.toml", "README.txt"],
+        setAside: `${COPY_MADE.folder}.cretlink-old`,
+      },
+    },
+  },
+  // What a copy names comes from a profile that somebody else may have
+  // written, and a path from this computer.
+  "settings-copy-xss": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: {
+        ...COPY_OPTIONS_CHOOSE,
+        relay: {
+          host: XSS,
+          address: XSS,
+          trust: "profile_file",
+          keySet: false,
+          ca: XSS,
+          name: XSS,
+        },
+        folderPrefix: XSS,
+        programName: XSS,
+      },
+      program: { pick: 1, name: XSS },
+      place: { pick: 2, name: `C:\\${XSS_NAME}` },
+      replacing: XSS,
+    },
+  },
+  "settings-copy-made-xss": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: COPY_OPTIONS,
+      generated: { label: XSS_NAME, key: XSS },
+      made: { copy: 1, folder: `C:\\${XSS_NAME}`, files: [XSS], setAside: XSS },
+    },
   },
   // A profile's texts come from a file that somebody else may have written.
   "settings-relay-xss": {

@@ -358,6 +358,8 @@ ca = "relay-ca.pem"
   key of its own, so that you can withdraw one by deleting its line from the
   relay's key file. A key that leaks lets a stranger use the forwarder until
   then; it shows no session and controls none.
+- You do not have to write this file by hand for a customer: the application
+  makes the whole folder, see [Make a customer copy](#make-a-customer-copy).
 
 ### Settings, in the installed copy
 
@@ -398,6 +400,55 @@ not used. A copy that runs once keeps no settings; its relay goes in the file.
 
 The installed copy keeps one more thing in the same file: the network it
 waits on when your computer is on several (ST-M009-016).
+
+### Make a customer copy
+
+A customer needs two things from you: the support program, and a
+`cretlink.toml` with your relay and a key of their own. The application
+writes both into one folder that you hand over (ST-M007-016). In **Settings →
+Relay**, a copy that has a relay offers **Make a customer copy…**:
+
+```text
+CretLink-Support-acme/
+  CretLink-Support.exe   the support program
+  cretlink.toml          your relay's address, this customer's key, and the
+                         name and certificate file when your relay has them
+  relay-ca.pem           the certificates of your own authority, when your
+                         profile names a certificate file
+  README.txt             a few lines for the customer
+```
+
+- **The label** names who the copy is for and becomes part of the folder's
+  name: letters, digits and hyphens, at most 40. It is also the label of the
+  customer's line in the relay's key file.
+- **The program.** On Windows the copy is the program you are running,
+  written under the name `CretLink-Support.exe`. On macOS and Linux you
+  point at `cretlink.exe` from the Windows archive of a
+  [release](verifying-artifacts.md); a file that is no Windows program is
+  refused. Either way the file is copied byte for byte, so a signed program
+  stays signed.
+- **The key** is this customer's own: type or paste the key that the relay's
+  key file lists for them, or press **Generate**. Generate draws a new key
+  from the system's random source and shows the line `label:key` once, with
+  **Copy**: add that line to the relay's key file
+  ([§2](#one-key-per-customer)), and the relay takes it up without a restart.
+  For a relay without keys, tick that the relay asks for none. **Your own
+  key is never written into a customer copy**, and there is no way to ask
+  for it: a copy holds the key you gave for that customer, or none.
+- **The place** is a folder you choose. A folder of the copy's name that is
+  there already is never replaced without asking; when you say so, it is
+  replaced as a whole.
+- **Nothing half.** The folder is written under another name beside its
+  place, read back the way the customer's copy will read it, and only then
+  given its name. When that fails, what was written is removed, and the
+  screen says so; if it could not be removed, it says where it lies.
+- **Nothing leaves your computer.** The application writes the folder and
+  shows it (**Show in folder**). Getting it to the customer is up to you.
+
+The key stands in `cretlink.toml` in readable form, and whoever has the
+folder has the key. It admits that copy to your relay and nothing else: it
+shows no session and controls none (ADR-0016 §4). To withdraw it, delete its
+line from the relay's key file.
 
 ### Always TLS
 

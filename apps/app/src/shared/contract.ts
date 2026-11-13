@@ -513,6 +513,66 @@ export interface RelayTest {
   next: string;
 }
 
+// --- Make a customer copy (ST-M007-016) ---
+
+// `customer_copy_options`: what a customer copy would hold, before anything
+// is typed. `relay` is the relay of this technician copy without any key:
+// the technician's own key is never part of a customer copy.
+export interface CustomerCopyOptions {
+  relay: RelayView;
+  // Where the program comes from: on Windows the copy is this program
+  // itself; elsewhere the technician points at `cretlink.exe` of a release.
+  program: "this_program" | "choose";
+  // The longest label: letters, digits and hyphens.
+  labelMax: number;
+  // The folder is named `folderPrefix` and the label; `programName` is the
+  // name of the program in it.
+  folderPrefix: string;
+  programName: string;
+}
+
+// `choose_customer_program` and `choose_customer_place`: what the technician
+// chose in the system's dialog, opened by the backend. The window names it
+// by its number and never sends a path of this computer; `name` is the
+// file's name or the folder's path, for the words. `null` when the dialog
+// was closed.
+export interface ChosenForCopy {
+  pick: number;
+  name: string;
+}
+
+// `generate_customer_key`: a new random admission key, drawn by the backend
+// from the system's random source. The window shows it once, with the label,
+// as the line `label:key` of the relay's key file; nothing keeps it but the
+// copy that is made with it.
+export interface GeneratedKey {
+  key: string;
+}
+
+// `make_customer_copy`. The key is the one the technician typed or had
+// generated for this customer; there is no way to ask for the technician's
+// own key. `replace` is the technician's answer to "a folder of that name is
+// there already".
+export interface CustomerCopyForm {
+  label: string;
+  keyMode: "set" | "none";
+  key?: string;
+  programPick?: number;
+  placePick?: number;
+  replace?: boolean;
+}
+
+// The answer of `make_customer_copy`: the folder that was written and the
+// names of its files. `copy` is the number `show_customer_copy` takes.
+// `setAside` is the folder that was replaced, when it could not be removed
+// and still lies beside the copy under another name.
+export interface CustomerCopyMade {
+  copy: number;
+  folder: string;
+  files: string[];
+  setAside?: string;
+}
+
 // The `console-notice` event: something the technician should know that is
 // not the failure of a command, with a next step.
 export interface ConsoleNotice {

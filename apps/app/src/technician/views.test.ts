@@ -5,8 +5,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { DISCLOSURE_TEXT } from "./disclosure";
 import {
+  COPY_KEY,
   FIXTURES,
   RELAY_CODE,
+  RELAY_FILE_PROBLEM,
+  RELAY_NONE,
+  RELAY_RUN_ONCE,
   RELAY_RUN_ONCE_FILE,
   VIA_RELAY_ELSEWHERE,
   XSS,
@@ -1422,5 +1426,265 @@ describe("errors and announcements", () => {
         show("live", { notice: "Connection code copied." }).querySelector('[aria-live="polite"]'),
       ),
     ).toBe("Connection code copied.");
+  });
+});
+
+describe("make a customer copy (ST-M007-016)", () => {
+  const step = (root: HTMLElement): HTMLElement | null => root.querySelector("#copy-step");
+  const field = (root: HTMLElement, id: string): HTMLInputElement | null =>
+    root.querySelector<HTMLInputElement>(`#${id}`);
+
+  it("is offered in Settings, Relay when this copy has a relay, and only then", () => {
+    // The installed copy with a relay in Settings, with a file next to the
+    // program, and a copy that runs once with a file: each has a relay.
+    for (const name of ["settings-relay", "settings-relay-file", "settings-relay-run-once-file"]) {
+      const root = show(name);
+      const open = buttonNamed(root, "Make a customer copy…");
+      expect(open?.dataset.action, name).toBe("copy-open");
+      expect(open?.id).toBe("copy-open");
+      expect(step(root)).toBeNull();
+    }
+    // Without a relay, or with a profile that cannot be used, there is
+    // nothing a copy could name.
+    for (const patch of [RELAY_NONE, RELAY_FILE_PROBLEM, RELAY_RUN_ONCE, null]) {
+      const root = show("settings-relay", { relay: patch });
+      expect(buttonNamed(root, "Make a customer copy…")).toBeUndefined();
+    }
+  });
+
+  it("says that it looks at the relay while the step opens", () => {
+    const root = show("settings-copy-loading");
+    expect(text(step(root))).toContain("Looking at the relay of this copy…");
+    expect(step(root)?.querySelector('[aria-busy="true"]')).not.toBeNull();
+    // The offer gave way to the step.
+    expect(buttonNamed(root, "Make a customer copy…")).toBeUndefined();
+    expect(buttonNamed(root, "Make the copy")).toBeUndefined();
+  });
+
+  it("says what a copy is, names the relay it will hold, and asks for a label, a key and a place", () => {
+    const root = show("settings-copy-windows");
+    const form = step(root);
+    expect(form?.getAttribute("role")).toBe("group");
+    expect(form?.getAttribute("aria-labelledby")).toBe("copy-head");
+    expect(text(root.querySelector("#copy-head"))).toBe("Make a customer copy");
+    expect(text(form)).toContain(
+      "A folder for one customer: the support program, and the file that tells it which relay to use. You hand over the folder; the customer needs nothing else. CretLink writes it on this computer and sends nothing anywhere.",
+    );
+    // The relay the copy will name.
+    expect(text(form)).toContain("Relay relay.example.org");
+    expect(text(form)).toContain("Address relay.example.org:443");
+    // The label, bounded, with what it becomes.
+    const label = field(root, "copy-label");
+    expect(label?.getAttribute("maxlength")).toBe("40");
+    expect(label?.hasAttribute("readonly")).toBe(false);
+    expect(text(root.querySelector("#copy-label-hint"))).toBe(
+      "Who the copy is for: letters, digits and hyphens, at most 40. The folder is named CretLink-Support- and the label.",
+    );
+    expect(text(root.querySelector('label[for="copy-label"]'))).toBe("Label");
+    // The key of this customer: typed or pasted, or generated.
+    const key = field(root, "copy-key");
+    expect(key?.type).toBe("password");
+    expect(key?.hasAttribute("value")).toBe(false);
+    expect(buttonNamed(root, "Generate a new key for this customer")?.dataset.action).toBe(
+      "copy-generate",
+    );
+    expect(text(root.querySelector('label[for="copy-no-key"]'))).toBe(
+      "The relay asks for no key: make the copy without one",
+    );
+    expect(field(root, "copy-no-key")?.type).toBe("checkbox");
+    // The place, chosen in a dialog of the system.
+    expect(text(root.querySelector("#copy-place"))).toBe("None chosen yet");
+    expect(buttonNamed(root, "Choose a folder…")?.dataset.action).toBe("copy-place");
+    expect(buttonNamed(root, "Make the copy")?.dataset.action).toBe("copy-make");
+    expect(buttonNamed(form as HTMLElement, "Cancel")?.dataset.action).toBe("copy-cancel");
+    // The relay's own form is still there above the step.
+    expect(field(root, "relay-address")).not.toBeNull();
+  });
+
+  it("is honest about the key: readable, admits only, no control, can be withdrawn, never the technician's own", () => {
+    const honest = text(show("settings-copy-windows").querySelector("#copy-key-honest"));
+    expect(honest).toBe(
+      "The key stands in the file cretlink.toml of the copy in readable form. It only admits that copy to the relay and gives nobody control over a session. As the relay's operator you withdraw it by deleting its line from the relay's key file. Your own key is never written into a customer copy.",
+    );
+    // The same on every state of the form.
+    for (const name of ["settings-copy-choose", "settings-copy-generated", "settings-copy-replacing"]) {
+      expect(text(show(name).querySelector("#copy-key-honest")), name).toBe(honest);
+    }
+  });
+
+  it("copies this program itself on Windows, and says so", () => {
+    const root = show("settings-copy-windows");
+    expect(text(root.querySelector("#copy-program"))).toBe(
+      "This program itself, written under the name CretLink-Support.exe. It is copied unchanged.",
+    );
+    expect(buttonNamed(root, /Choose cretlink\.exe/)).toBeUndefined();
+  });
+
+  it("asks for cretlink.exe of a release elsewhere, and says that it is copied unchanged", () => {
+    const root = show("settings-copy-choose");
+    expect(text(root.querySelector("#copy-program"))).toBe("None chosen yet");
+    const choose = buttonNamed(root, "Choose cretlink.exe…");
+    expect(choose?.dataset.action).toBe("copy-program");
+    expect(choose?.id).toBe("copy-program-choose");
+    expect(text(step(root))).toContain(
+      "The support program runs on Windows. Point at cretlink.exe from the Windows archive of a CretLink release. It is copied unchanged as CretLink-Support.exe, so a signed program stays signed.",
+    );
+    // A relay with an authority of its own: the copy names where it is
+    // reached, its certificate file and what vouches for it.
+    const facts = text(step(root));
+    expect(facts).toContain("Relay host-01.example.org (reached at 192.0.2.1:9970)");
+    expect(facts).toContain("Certificate file relay-ca.pem");
+    expect(facts).toContain(
+      "Certificate The relay's certificate is checked against a certificate file of this copy's relay settings",
+    );
+  });
+
+  it("shows what was chosen: the program by its name, and where the folder is made", () => {
+    const root = show("settings-copy-chosen");
+    expect(text(root.querySelector("#copy-program"))).toBe("cretlink.exe · chosen");
+    expect(buttonNamed(root, "Choose another file…")?.dataset.action).toBe("copy-program");
+    expect(text(root.querySelector("#copy-place"))).toBe(
+      "The folder CretLink-Support-<label> is made in /home/sam/Customers",
+    );
+    expect(buttonNamed(root, "Choose another folder…")?.dataset.action).toBe("copy-place");
+  });
+
+  it("shows a generated key once, as the line for the relay's key file, with Copy", () => {
+    const root = show("settings-copy-generated");
+    const line = root.querySelector("#copy-key-line");
+    expect(text(line)).toBe(`acme-front-desk:${COPY_KEY}`);
+    expect(line?.getAttribute("aria-labelledby")).toBe("copy-key-line-h");
+    expect(text(root.querySelector("#copy-key-line-h"))).toBe(
+      "A new key for this customer. The line for your relay's key file:",
+    );
+    const copy = buttonNamed(root, "Copy the line for the key file");
+    expect(copy?.dataset.action).toBe("copy-key-line");
+    // The key is in no attribute of the page: it is text, in one place.
+    expect(copy?.dataset.arg).toBeUndefined();
+    expect(text(root.querySelector("#copy-key-generated"))).toContain(
+      "Add it to the relay's key file; the relay takes it up without a restart. The key is shown here only: CretLink keeps it nowhere but in the copy you make.",
+    );
+    // The label belongs to the key now, and there is no other key to type.
+    const label = field(root, "copy-label");
+    expect(label?.hasAttribute("readonly")).toBe(true);
+    expect(label?.getAttribute("value")).toBe("acme-front-desk");
+    expect(text(root.querySelector("#copy-label-hint"))).toContain(
+      "The generated key belongs to this label; discard the key to change it.",
+    );
+    expect(field(root, "copy-key")).toBeNull();
+    expect(field(root, "copy-no-key")).toBeNull();
+    expect(buttonNamed(root, "Generate a new key for this customer")).toBeUndefined();
+    expect(buttonNamed(root, "Discard this key")?.dataset.action).toBe("copy-discard-key");
+  });
+
+  it("asks before a folder that is there is replaced, and offers nothing else meanwhile", () => {
+    const root = show("settings-copy-replacing");
+    const question = root.querySelector("#copy-replace-step");
+    expect(text(question?.querySelector(".confirm-head"))).toBe("Replace the folder that is there?");
+    expect(text(question)).toContain(
+      "A folder C:\\Users\\sam\\Documents\\Customers\\CretLink-Support-acme-front-desk is there already. Nothing was changed. Replacing it removes that folder with everything in it and puts the new copy in its place.",
+    );
+    expect(buttonNamed(root, "Replace")?.dataset.action).toBe("copy-replace");
+    const keep = buttonNamed(root, "Keep it");
+    expect(keep?.dataset.action).toBe("copy-replace-cancel");
+    // Keeping is where the keyboard starts: nothing is replaced by accident.
+    expect(keep?.hasAttribute("data-autofocus")).toBe(true);
+    expect(buttonNamed(root, "Replace")?.hasAttribute("data-autofocus")).toBe(false);
+    expect(buttonNamed(root, "Make the copy")).toBeUndefined();
+    // The choices wait for the answer.
+    expect(buttonNamed(root, "Choose another folder…")?.disabled).toBe(true);
+    expect(buttonNamed(root, "Generate a new key for this customer")?.disabled).toBe(true);
+  });
+
+  it("shows the copy that was written, with Show in folder, and the key line once more", () => {
+    const root = show("settings-copy-made");
+    const result = root.querySelector("#copy-result");
+    expect(result?.getAttribute("role")).toBe("status");
+    expect(text(result?.querySelector(".pill"))).toBe("The customer copy was written");
+    expect(text(root.querySelector("#copy-folder"))).toBe(
+      "C:\\Users\\sam\\Documents\\Customers\\CretLink-Support-acme-front-desk",
+    );
+    expect(Array.from(root.querySelectorAll("#copy-files li")).map(text)).toEqual([
+      "CretLink-Support.exe",
+      "cretlink.toml",
+      "relay-ca.pem",
+      "README.txt",
+    ]);
+    expect(text(result)).toContain(
+      "Hand the whole folder to the customer and keep its files together. Nothing was sent anywhere.",
+    );
+    const show_ = buttonNamed(root, "Show in folder");
+    expect(show_?.dataset.action).toBe("copy-show");
+    expect(buttonNamed(root, "Done")?.dataset.action).toBe("copy-done");
+    // The generated key, a last time.
+    expect(text(root.querySelector("#copy-key-line"))).toBe(`acme-front-desk:${COPY_KEY}`);
+    expect(text(root.querySelector("#copy-key-generated"))).toContain(
+      "Add it to the key file before the customer connects. It is not shown again: CretLink keeps the key nowhere but in the copy.",
+    );
+    // The form is gone: nothing is typed or chosen any more.
+    expect(field(root, "copy-label")).toBeNull();
+    expect(buttonNamed(root, "Make the copy")).toBeUndefined();
+    expect(root.querySelector("#copy-set-aside")).toBeNull();
+  });
+
+  it("says when the folder that was replaced could not be removed, and where it lies", () => {
+    const root = show("settings-copy-made-set-aside");
+    expect(text(root.querySelector("#copy-set-aside"))).toBe(
+      "The folder that was there before could not be removed. It lies in C:\\Users\\sam\\Documents\\Customers\\CretLink-Support-acme-front-desk.cretlink-old; remove it yourself.",
+    );
+    expect(Array.from(root.querySelectorAll("#copy-files li")).map(text)).toEqual([
+      "CretLink-Support.exe",
+      "cretlink.toml",
+      "README.txt",
+    ]);
+    // No key was generated for this copy: no line is shown.
+    expect(root.querySelector("#copy-key-line")).toBeNull();
+  });
+
+  it("says what the backend refused in the alert, with the step still open", () => {
+    const root = show("settings-copy-windows", {
+      error: {
+        title: "The customer copy was not made",
+        message:
+          "The label holds letters, digits and hyphens only, at least one and at most 40. It becomes part of the folder's name.",
+        next: "Correct it, then try again.",
+      },
+    });
+    const alert = root.querySelector('[role="alert"]');
+    expect(text(alert)).toContain("The customer copy was not made");
+    expect(text(alert)).toContain("letters, digits and hyphens only");
+    expect(text(alert)).toContain("Correct it, then try again.");
+    expect(step(root)).not.toBeNull();
+    expect(buttonNamed(root, "Make the copy")?.disabled).toBe(false);
+    // A copy that could not be written says that nothing was left behind.
+    const failed = show("settings-copy-windows", {
+      error: {
+        title: "The customer copy was not made",
+        message:
+          "The customer copy could not be written: the disk is full. Nothing of it was left behind.",
+        next: "Try again.",
+      },
+    });
+    expect(text(failed.querySelector('[role="alert"]'))).toContain(
+      "Nothing of it was left behind.",
+    );
+  });
+
+  it("waits while a choice or the copy is on its way", () => {
+    const root = show("settings-copy-chosen", { busy: "copy-make" });
+    for (const name of ["Make the copy", "Choose another file…", "Choose another folder…"]) {
+      expect(buttonNamed(root, name)?.disabled, name).toBe(true);
+    }
+    expect(buttonNamed(root, "Generate a new key for this customer")?.disabled).toBe(true);
+  });
+
+  it("writes a relay, a path, a label and a key as text, never as markup", () => {
+    for (const name of ["settings-copy-xss", "settings-copy-made-xss"]) {
+      const root = show(name);
+      expect(root.querySelector("img"), name).toBeNull();
+      expect(root.querySelector("script"), name).toBeNull();
+      expect(step(root)?.querySelector("b:not(.relay-name)"), name).toBeNull();
+      expect(text(step(root)), name).toContain(XSS);
+    }
   });
 });

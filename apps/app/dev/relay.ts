@@ -21,6 +21,12 @@
 // Settings also offers **Uninstall…** in an installed copy: the plan names a
 // profile file next to the program among what stays (`?copy=file`).
 //
+// **Make a customer copy…** (ST-M007-016) is offered with a relay that can be
+// used. `?os=windows` makes the copy this program itself; otherwise the
+// program is chosen, and the dialog "chooses" a file at once. The label
+// `exists` names a folder that is there already, and `fail` a copy that
+// cannot be written. Nothing is written anywhere.
+//
 // A session through the relay (ST-M007-013) starts from **Start a session**
 // and **Use relay** on the waiting screen: the simulated backend stops the
 // wait on the network, answers with a relay code, and a moment later says
@@ -43,6 +49,8 @@ import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type {
   AppInfo,
   ChosenCa,
+  CustomerCopyForm,
+  CustomerCopyMade,
   RelayForm,
   RelaySettings,
   RelayTest,
@@ -88,6 +96,62 @@ let picked: ChosenCa | null = null;
 /** A refusal as the backend words one. */
 function refuse(stage: string, message: string): never {
   throw { stage, message };
+}
+
+// --- Make a customer copy (ST-M007-016) ---
+
+/** What was "chosen" in the dialogs, by its number, and the copy made last. */
+const copyPicks: { program?: number; place?: number } = {};
+let nextCopyPick = 1;
+let madeCopy = 0;
+
+/** The customer copy of a form, by the rules of the backend. */
+function makeCustomerCopy(form: CustomerCopyForm): CustomerCopyMade {
+  if (!/^[A-Za-z0-9-]{1,40}$/.test(form.label)) {
+    refuse(
+      "copy_label",
+      "The label holds letters, digits and hyphens only, at least one and at most 40. It becomes part of the folder's name.",
+    );
+  }
+  if (form.keyMode === "set") {
+    if (!form.key) {
+      refuse(
+        "copy_key",
+        "Type the admission key of this customer or generate one, or say that the relay asks for no key.",
+      );
+    }
+    if (/\s/.test(form.key)) {
+      refuse("copy_key", "The key holds a blank or a character that is not plain text.");
+    }
+  }
+  if (params.get("os") !== "windows" && form.programPick !== copyPicks.program) {
+    refuse("copy_program", "Choose cretlink.exe from the Windows archive of a CretLink release.");
+  }
+  if (form.placePick === undefined || form.placePick !== copyPicks.place) {
+    refuse("copy_place", "Choose the folder to make the copy in.");
+  }
+  const folder = `C:\\Users\\sam\\Documents\\Customers\\CretLink-Support-${form.label}`;
+  if (form.label === "exists" && !form.replace) {
+    refuse("copy_exists", `A folder ${folder} is there already. Nothing was changed.`);
+  }
+  if (form.label === "fail") {
+    refuse(
+      "copy_write",
+      "The customer copy could not be written: the disk is full. Nothing of it was left behind.",
+    );
+  }
+  madeCopy += 1;
+  const relay = activeRelay(settings);
+  return {
+    copy: madeCopy,
+    folder,
+    files: [
+      "CretLink-Support.exe",
+      "cretlink.toml",
+      ...(relay?.ca ? [relay.ca] : []),
+      "README.txt",
+    ],
+  };
 }
 
 /** The relay of a form, as the backend would keep it. */
@@ -364,6 +428,36 @@ mockIPC(
         return app;
       case "get_relay_settings":
         return settings;
+      case "customer_copy_options": {
+        const relay = activeRelay(settings);
+        if (!relay) refuse("relay_none", "This copy has no relay. Set one up in Settings, under Relay.");
+        return {
+          relay: { ...relay, keySet: false },
+          program: params.get("os") === "windows" ? "this_program" : "choose",
+          labelMax: 40,
+          folderPrefix: "CretLink-Support-",
+          programName: "CretLink-Support.exe",
+        };
+      }
+      case "choose_customer_program":
+        // The system's dialog cannot open here: a file is "chosen" at once.
+        copyPicks.program = nextCopyPick;
+        nextCopyPick += 1;
+        return { pick: copyPicks.program, name: "cretlink.exe" };
+      case "choose_customer_place":
+        copyPicks.place = nextCopyPick;
+        nextCopyPick += 1;
+        return { pick: copyPicks.place, name: "C:\\Users\\sam\\Documents\\Customers" };
+      case "generate_customer_key": {
+        // As the backend draws one: 32 random bytes as 64 hexadecimal digits.
+        const bytes = crypto.getRandomValues(new Uint8Array(32));
+        return { key: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("") };
+      }
+      case "make_customer_copy":
+        return makeCustomerCopy(payload.form as CustomerCopyForm);
+      case "show_customer_copy":
+        if (payload.copy !== madeCopy) refuse("copy_show", "That customer copy is no longer at hand.");
+        return null;
       case "uninstall_plan": {
         // What uninstall leaves in place: a relay profile next to the
         // installed program stays, and the plan says what it holds.
