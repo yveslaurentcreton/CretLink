@@ -4025,3 +4025,1304 @@ fn an_entry_that_fits_no_page_fails_the_listing_instead_of_ending_a_page_empty()
     }
     assert!(n > 1 && page.len() == n + 1);
 }
+
+// --- a change to one entry happens where it was asked for (ST-M010-004) ------
+
+/// Makes `link` a symbolic link to the folder `target`. `false` when this
+/// account may not create one — on Windows that takes a privilege — and the
+/// caller has nothing to test.
+#[cfg(any(unix, windows))]
+fn plant_dir_link(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let planted = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let planted = std::os::windows::fs::symlink_dir(target, link);
+    match planted {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("skipped: this account may not create symbolic links ({error})");
+            false
+        }
+    }
+}
+
+/// Whether something lies at `path` itself: a link there counts, whatever it
+/// points at.
+fn lies_there(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Whether a link lies at `path`.
+fn is_a_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|facts| facts.file_type().is_symlink())
+}
+
+/// A folder with a file, a folder that holds a file, and three symbolic links
+/// beside them: one to the file, one to the folder, one to nothing. `None`
+/// when this account may not create symbolic links.
+#[cfg(any(unix, windows))]
+struct Linked {
+    /// The folder that holds everything below.
+    folder: PathBuf,
+    /// A file with the content `kept`.
+    file: PathBuf,
+    /// A folder that holds `inner.txt`.
+    inner: PathBuf,
+    /// What the link to nothing points at.
+    nothing: PathBuf,
+}
+
+#[cfg(any(unix, windows))]
+impl Linked {
+    const TO_FILE: &'static str = "to-file";
+    const TO_FOLDER: &'static str = "to-folder";
+    const TO_NOTHING: &'static str = "to-nothing";
+
+    fn plant(sb: &Sandbox) -> Option<Self> {
+        let folder = sb.target();
+        let file = folder.join("kept.txt");
+        std::fs::write(&file, b"kept").expect("write");
+        let kept_folder = folder.join("kept-folder");
+        std::fs::create_dir(&kept_folder).expect("create");
+        let inner = kept_folder.join("inner.txt");
+        std::fs::write(&inner, b"inner").expect("write");
+        let nothing = folder.join("nothing");
+        if !plant_file_link(&file, &folder.join(Self::TO_FILE)) {
+            return None;
+        }
+        assert!(plant_dir_link(&kept_folder, &folder.join(Self::TO_FOLDER)));
+        assert!(plant_file_link(&nothing, &folder.join(Self::TO_NOTHING)));
+        Some(Self {
+            folder,
+            file,
+            inner,
+            nothing,
+        })
+    }
+
+    fn link(&self, name: &str) -> PathBuf {
+        self.folder.join(name)
+    }
+
+    /// What the links point at is as it was.
+    #[track_caller]
+    fn assert_untouched(&self) {
+        assert_eq!(std::fs::read(&self.file).expect("the file stays"), b"kept");
+        assert_eq!(
+            std::fs::read(&self.inner).expect("the folder keeps its file"),
+            b"inner"
+        );
+        assert!(
+            !lies_there(&self.nothing),
+            "nothing appeared where a link pointed at nothing"
+        );
+    }
+}
+
+/// A link as the entry itself keeps its meaning for a delete: the link is
+/// removed, whatever it points at — a file, a folder or nothing — and what it
+/// points at stays.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn a_delete_removes_a_link_and_never_what_it_points_at() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let Some(linked) = Linked::plant(&sb) else {
+        return;
+    };
+
+    for name in [Linked::TO_FILE, Linked::TO_FOLDER, Linked::TO_NOTHING] {
+        store
+            .perform(Operation::FsDelete {
+                path: abs(&linked.folder, name),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("the link {name} is removed: {error:?}"));
+        assert!(!lies_there(&linked.link(name)), "{name} is gone");
+        linked.assert_untouched();
+    }
+    assert_eq!(names_in(&linked.folder), vec!["kept-folder", "kept.txt"]);
+}
+
+/// A link is not a folder to remove, whatever it points at: the removal of an
+/// empty folder refuses it, and the link and what it points at stay.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn a_link_is_not_removed_as_an_empty_folder() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let Some(linked) = Linked::plant(&sb) else {
+        return;
+    };
+    // The folder a link points at is emptied, so that nothing but the link
+    // being a link stands in the way.
+    std::fs::remove_file(&linked.inner).expect("empty the folder");
+
+    for name in [Linked::TO_FILE, Linked::TO_FOLDER, Linked::TO_NOTHING] {
+        let refused = store
+            .perform(Operation::RemoveDir {
+                path: abs(&linked.folder, name),
+            })
+            .await
+            .expect_err("a link is not a folder");
+        assert_eq!(refused.code, ErrorCode::WrongPathKind, "{name}");
+        assert!(is_a_link(&linked.link(name)), "{name} stays");
+    }
+    assert!(linked.folder.join("kept-folder").is_dir(), "not removed");
+    assert_eq!(std::fs::read(&linked.file).expect("read"), b"kept");
+}
+
+/// A name that a link has is taken: no folder is created under it, and none
+/// where the link points — not even where it points at nothing.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn a_folder_is_not_created_under_the_name_of_a_link() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let Some(linked) = Linked::plant(&sb) else {
+        return;
+    };
+
+    for name in [Linked::TO_FILE, Linked::TO_FOLDER, Linked::TO_NOTHING] {
+        let refused = store
+            .perform(Operation::CreateDir {
+                path: abs(&linked.folder, name),
+            })
+            .await
+            .expect_err("the name is taken");
+        assert_eq!(refused.code, ErrorCode::AlreadyExists, "{name}");
+        assert!(is_a_link(&linked.link(name)), "{name} stays a link");
+        linked.assert_untouched();
+    }
+}
+
+/// A move moves a link as the link it is: it has a new name, in the same
+/// folder or in another, and what it points at stays where it was. A link
+/// under the name of the destination is a taken name.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn a_move_moves_a_link_as_the_link() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let Some(linked) = Linked::plant(&sb) else {
+        return;
+    };
+    let other = sb.root.join("other-folder");
+    std::fs::create_dir(&other).expect("create");
+
+    // Within the folder, and into another one.
+    for (name, to) in [
+        (Linked::TO_FILE, linked.folder.join("renamed-file-link")),
+        (Linked::TO_FOLDER, other.join("moved-folder-link")),
+        (Linked::TO_NOTHING, other.join("moved-link-to-nothing")),
+    ] {
+        store
+            .perform(Operation::FsMove {
+                from: abs(&linked.folder, name),
+                to: RemotePath::Absolute {
+                    path: to.to_string_lossy().into_owned(),
+                },
+                overwrite: false,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("the link {name} is moved: {error:?}"));
+        assert!(!lies_there(&linked.link(name)), "{name} left its place");
+        assert!(is_a_link(&to), "{name} is still a link");
+        linked.assert_untouched();
+    }
+
+    // A link under the destination's name: the name is taken, also when the
+    // link points at nothing.
+    let source = linked.folder.join("source.txt");
+    std::fs::write(&source, b"source").expect("write");
+    for taken in [
+        linked.folder.join("renamed-file-link"),
+        other.join("moved-folder-link"),
+        other.join("moved-link-to-nothing"),
+    ] {
+        let refused = store
+            .perform(Operation::FsMove {
+                from: abs(&linked.folder, "source.txt"),
+                to: RemotePath::Absolute {
+                    path: taken.to_string_lossy().into_owned(),
+                },
+                overwrite: false,
+            })
+            .await
+            .expect_err("the name is taken");
+        assert_eq!(
+            refused.code,
+            ErrorCode::AlreadyExists,
+            "{}",
+            taken.display()
+        );
+        assert!(is_a_link(&taken), "the link stays");
+        assert_eq!(std::fs::read(&source).expect("read"), b"source");
+        linked.assert_untouched();
+    }
+}
+
+/// A move that may replace what lies under the destination's name never
+/// reaches what a link there points at. Whether the system lets a file take
+/// the place of such a link is the system's own answer; either way the link
+/// was the entry, and what it points at is as it was.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn a_move_that_replaces_never_reaches_what_a_link_points_at() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let Some(linked) = Linked::plant(&sb) else {
+        return;
+    };
+
+    for name in [Linked::TO_FILE, Linked::TO_FOLDER, Linked::TO_NOTHING] {
+        let source = linked.folder.join(format!("source-for-{name}.txt"));
+        std::fs::write(&source, b"source").expect("write");
+        let replaced = store
+            .perform(Operation::FsMove {
+                from: abs(&linked.folder, &format!("source-for-{name}.txt")),
+                to: abs(&linked.folder, name),
+                overwrite: true,
+            })
+            .await;
+        match replaced {
+            // The file took the place of the link.
+            Ok(_) => {
+                assert!(!is_a_link(&linked.link(name)), "{name}");
+                assert_eq!(
+                    std::fs::read(linked.link(name)).expect("read"),
+                    b"source",
+                    "{name}"
+                );
+                assert!(!lies_there(&source), "{name}");
+            }
+            // Or nothing changed.
+            Err(_) => {
+                assert!(is_a_link(&linked.link(name)), "{name}");
+                assert_eq!(std::fs::read(&source).expect("read"), b"source", "{name}");
+            }
+        }
+        linked.assert_untouched();
+    }
+}
+
+/// The request of a move from `from` to `to`.
+fn move_of(from: RemotePath, to: RemotePath, overwrite: bool) -> Operation {
+    Operation::FsMove {
+        from,
+        to,
+        overwrite,
+    }
+}
+
+/// A move into another folder keeps the contract a move always had: the entry
+/// has its new name there, a folder moves with its content, a name that is
+/// taken is refused unless the caller asks to replace it, a folder under the
+/// destination's name is never replaced, and a source or a folder that is not
+/// there is "not found". Nothing is copied: what was refused stays where it
+/// was.
+#[tokio::test]
+async fn a_move_into_another_folder_keeps_its_contract() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    let inbox = target.join("inbox");
+    let outbox = target.join("outbox");
+    std::fs::create_dir(&inbox).expect("create");
+    std::fs::create_dir(&outbox).expect("create");
+    std::fs::write(inbox.join("a.txt"), b"a").expect("write");
+    std::fs::write(inbox.join("b.txt"), b"b").expect("write");
+    std::fs::create_dir(inbox.join("folder")).expect("create");
+    std::fs::write(inbox.join("folder").join("inner.txt"), b"inner").expect("write");
+
+    // A file, and a folder with what it holds.
+    store
+        .perform(move_of(abs(&inbox, "a.txt"), abs(&outbox, "a.txt"), false))
+        .await
+        .expect("the file is moved");
+    store
+        .perform(move_of(abs(&inbox, "folder"), abs(&outbox, "moved"), false))
+        .await
+        .expect("the folder is moved");
+    assert_eq!(names_in(&inbox), vec!["b.txt"]);
+    assert_eq!(names_in(&outbox), vec!["a.txt", "moved"]);
+    assert_eq!(
+        std::fs::read(outbox.join("moved").join("inner.txt")).expect("read"),
+        b"inner"
+    );
+
+    // A taken name is refused, and replaced only on request.
+    let refused = store
+        .perform(move_of(abs(&inbox, "b.txt"), abs(&outbox, "a.txt"), false))
+        .await
+        .expect_err("the name is taken");
+    assert_eq!(refused.code, ErrorCode::AlreadyExists);
+    assert_eq!(std::fs::read(outbox.join("a.txt")).expect("read"), b"a");
+    assert_eq!(std::fs::read(inbox.join("b.txt")).expect("read"), b"b");
+    // A folder under the destination's name is never replaced.
+    for overwrite in [false, true] {
+        let refused = store
+            .perform(move_of(
+                abs(&inbox, "b.txt"),
+                abs(&outbox, "moved"),
+                overwrite,
+            ))
+            .await
+            .expect_err("a folder is not replaced");
+        let expected = if overwrite {
+            ErrorCode::WrongPathKind
+        } else {
+            ErrorCode::AlreadyExists
+        };
+        assert_eq!(refused.code, expected, "overwrite {overwrite}");
+    }
+    assert!(outbox.join("moved").join("inner.txt").exists());
+    store
+        .perform(move_of(abs(&inbox, "b.txt"), abs(&outbox, "a.txt"), true))
+        .await
+        .expect("replaced on request");
+    assert_eq!(std::fs::read(outbox.join("a.txt")).expect("read"), b"b");
+    assert!(names_in(&inbox).is_empty());
+
+    // What is not there is not found: the source, its folder, and the folder
+    // of the destination.
+    for (from, to) in [
+        (abs(&inbox, "missing.txt"), abs(&outbox, "x.txt")),
+        (
+            abs(&target.join("no-folder"), "a.txt"),
+            abs(&outbox, "x.txt"),
+        ),
+        (
+            abs(&outbox, "a.txt"),
+            abs(&target.join("no-folder"), "x.txt"),
+        ),
+    ] {
+        let refused = store
+            .perform(move_of(from.clone(), to.clone(), false))
+            .await
+            .expect_err("nothing to move, or nowhere to move it");
+        assert_eq!(refused.code, ErrorCode::PathNotFound, "{from:?} to {to:?}");
+    }
+    assert_eq!(names_in(&outbox), vec!["a.txt", "moved"]);
+}
+
+/// A delete, the removal of an empty folder and the creation of a folder
+/// refuse what they always refused, with the reason they always gave: a
+/// folder that is not there, an entry that is not there, a file where a
+/// folder is asked for, a name that is taken, and a path that goes on
+/// through a file.
+#[tokio::test]
+async fn what_is_not_there_or_not_of_its_kind_is_refused_as_before() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    std::fs::write(target.join("file.txt"), b"file").expect("write");
+
+    // A folder that is not there holds nothing to delete, to remove or to
+    // create in.
+    let nowhere = target.join("no-folder");
+    for op in [
+        Operation::FsDelete {
+            path: abs(&nowhere, "x"),
+        },
+        Operation::RemoveDir {
+            path: abs(&nowhere, "x"),
+        },
+        Operation::CreateDir {
+            path: abs(&nowhere, "x"),
+        },
+        Operation::RemoveDir {
+            path: abs(&target, "missing"),
+        },
+    ] {
+        let refused = store.perform(op.clone()).await.expect_err("not there");
+        assert_eq!(refused.code, ErrorCode::PathNotFound, "{op:?}");
+    }
+    // A file is not removed as a folder.
+    let refused = store
+        .perform(Operation::RemoveDir {
+            path: abs(&target, "file.txt"),
+        })
+        .await
+        .expect_err("a file is not a folder");
+    assert_eq!(refused.code, ErrorCode::WrongPathKind);
+    // A name that a file has is taken.
+    let refused = store
+        .perform(Operation::CreateDir {
+            path: abs(&target, "file.txt"),
+        })
+        .await
+        .expect_err("the name is taken");
+    assert_eq!(refused.code, ErrorCode::AlreadyExists);
+    assert_eq!(
+        std::fs::read(target.join("file.txt")).expect("read"),
+        b"file"
+    );
+
+    // A path that goes on through a file names nothing. Windows calls that a
+    // path that does not exist; the other systems call the file "not a
+    // folder".
+    let through_a_file = target.join("file.txt");
+    let expected = if cfg!(windows) {
+        ErrorCode::PathNotFound
+    } else {
+        ErrorCode::WrongPathKind
+    };
+    for op in [
+        Operation::FsDelete {
+            path: abs(&through_a_file, "x"),
+        },
+        Operation::RemoveDir {
+            path: abs(&through_a_file, "x"),
+        },
+        Operation::CreateDir {
+            path: abs(&through_a_file, "x"),
+        },
+    ] {
+        let refused = store.perform(op.clone()).await.expect_err("no such path");
+        assert_eq!(refused.code, expected, "{op:?}");
+    }
+    assert_eq!(names_in(&target), vec!["file.txt"]);
+}
+
+/// A staged file is moved out of the staging area into a folder, and a file
+/// from a folder into the staging area of a program without administrator
+/// rights, where no boundary is crossed: the staging name is taken as it is,
+/// and the folder is the one the request names.
+#[tokio::test]
+async fn a_file_is_moved_between_the_staging_area_and_a_folder() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    transfer(
+        &store,
+        staging("tool.bin"),
+        b"tool",
+        2,
+        false,
+        Some("C:\\tech\\tool.bin"),
+        CleanupPolicy::Keep,
+    )
+    .await
+    .expect("stage the file");
+
+    store
+        .perform(move_of(
+            staging("tool.bin"),
+            abs(&target, "tool.bin"),
+            false,
+        ))
+        .await
+        .expect("out of the staging area");
+    assert_eq!(
+        std::fs::read(target.join("tool.bin")).expect("read"),
+        b"tool"
+    );
+    assert!(!store.staging_root().join("tool.bin").exists());
+
+    // A staging name that is not there is not found.
+    let refused = store
+        .perform(move_of(
+            staging("tool.bin"),
+            abs(&target, "again.bin"),
+            false,
+        ))
+        .await
+        .expect_err("nothing is staged under that name any more");
+    assert_eq!(refused.code, ErrorCode::PathNotFound);
+
+    store
+        .perform(move_of(
+            abs(&target, "tool.bin"),
+            staging("back.bin"),
+            false,
+        ))
+        .await
+        .expect("into the staging area of the account");
+    assert_eq!(
+        std::fs::read(store.staging_root().join("back.bin")).expect("read"),
+        b"tool"
+    );
+    assert!(names_in(&target).is_empty());
+}
+
+// --- Windows only: the folder that holds the entry is the one that was named
+// --- (ST-M010-004) ----------------------------------------------------------
+
+/// What the Windows tests of one operation work in: a real folder `real` that
+/// holds a file, an empty folder and a folder `inside` with a file and an
+/// empty folder of its own, and a junction `link` beside it that leads to
+/// `real`.
+#[cfg(windows)]
+struct BehindAJunction {
+    /// The folder that holds `real` and `link`.
+    target: PathBuf,
+    /// The real folder.
+    real: PathBuf,
+    /// The junction to it.
+    link: PathBuf,
+}
+
+#[cfg(windows)]
+impl BehindAJunction {
+    fn plant(sb: &Sandbox) -> Self {
+        let target = sb.target();
+        let real = target.join("real");
+        std::fs::create_dir_all(real.join("inside").join("empty")).expect("create");
+        std::fs::create_dir(real.join("empty")).expect("create");
+        std::fs::write(real.join("victim.txt"), b"victim").expect("write");
+        std::fs::write(real.join("inside").join("deep.txt"), b"deep").expect("write");
+        let link = target.join("link");
+        super::testing::junction(&link, &real);
+        Self { target, real, link }
+    }
+
+    /// What the junction leads to is exactly as it was planted.
+    #[track_caller]
+    fn assert_untouched(&self) {
+        assert_eq!(
+            names_in(&self.real),
+            vec!["empty", "inside", "victim.txt"],
+            "nothing was removed from, or put into, what the junction leads to"
+        );
+        assert_eq!(
+            names_in(&self.real.join("inside")),
+            vec!["deep.txt", "empty"]
+        );
+        assert_eq!(
+            std::fs::read(self.real.join("victim.txt")).expect("read"),
+            b"victim"
+        );
+        assert_eq!(
+            std::fs::read(self.real.join("inside").join("deep.txt")).expect("read"),
+            b"deep"
+        );
+        assert!(is_a_link(&self.link), "the junction itself stays");
+    }
+}
+
+/// Asserts that `op` is refused because its path leads through a link.
+#[cfg(windows)]
+#[track_caller]
+fn assert_refused_as_a_path_through_a_link(result: Result<OpResult, FsError>, op: &Operation) {
+    match result {
+        Err(refused) => assert_eq!(refused.code, ErrorCode::InvalidPath, "{op:?}"),
+        Ok(done) => panic!("{op:?} went through a link: {done:?}"),
+    }
+}
+
+/// A delete whose path reaches the file's folder through a junction is
+/// refused, whether the junction is the folder itself or a folder above it,
+/// and the file behind it stays. By where it really lies, the file is
+/// deleted.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_delete_through_a_junction_is_refused_and_what_it_leads_to_stays() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let planted = BehindAJunction::plant(&sb);
+
+    for op in [
+        Operation::FsDelete {
+            path: abs(&planted.link, "victim.txt"),
+        },
+        Operation::FsDelete {
+            path: abs(&planted.link.join("inside"), "deep.txt"),
+        },
+    ] {
+        assert_refused_as_a_path_through_a_link(store.perform(op.clone()).await, &op);
+        planted.assert_untouched();
+    }
+
+    store
+        .perform(Operation::FsDelete {
+            path: abs(&planted.real, "victim.txt"),
+        })
+        .await
+        .expect("by its real location the file is deleted");
+    assert_eq!(names_in(&planted.real), vec!["empty", "inside"]);
+}
+
+/// The removal of an empty folder through a junction is refused, and the
+/// folder behind it stays.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_folder_removal_through_a_junction_is_refused_and_what_it_leads_to_stays() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let planted = BehindAJunction::plant(&sb);
+
+    for op in [
+        Operation::RemoveDir {
+            path: abs(&planted.link, "empty"),
+        },
+        Operation::RemoveDir {
+            path: abs(&planted.link.join("inside"), "empty"),
+        },
+    ] {
+        assert_refused_as_a_path_through_a_link(store.perform(op.clone()).await, &op);
+        planted.assert_untouched();
+    }
+
+    store
+        .perform(Operation::RemoveDir {
+            path: abs(&planted.real, "empty"),
+        })
+        .await
+        .expect("by its real location the folder is removed");
+    assert_eq!(names_in(&planted.real), vec!["inside", "victim.txt"]);
+}
+
+/// A folder is not created through a junction: nothing appears in the place
+/// the junction leads to.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_folder_creation_through_a_junction_is_refused_and_nothing_is_created_behind_it() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let planted = BehindAJunction::plant(&sb);
+
+    for op in [
+        Operation::CreateDir {
+            path: abs(&planted.link, "new"),
+        },
+        Operation::CreateDir {
+            path: abs(&planted.link.join("inside"), "new"),
+        },
+    ] {
+        assert_refused_as_a_path_through_a_link(store.perform(op.clone()).await, &op);
+        planted.assert_untouched();
+    }
+
+    store
+        .perform(Operation::CreateDir {
+            path: abs(&planted.real, "new"),
+        })
+        .await
+        .expect("by its real location the folder is created");
+    assert!(planted.real.join("new").is_dir());
+}
+
+/// A move is refused when either of its two folders is reached through a
+/// junction: nothing is taken out of the place the junction leads to, and
+/// nothing is put there or replaced there. By the real locations the entry
+/// is moved, from one folder into another.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_move_through_a_junction_on_either_side_is_refused_and_nothing_moves() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let planted = BehindAJunction::plant(&sb);
+    let outside = planted.target.join("outside.txt");
+    std::fs::write(&outside, b"outside").expect("write");
+    let (target, link) = (&planted.target, &planted.link);
+
+    for op in [
+        // The folder of the source is the junction, or lies behind it.
+        move_of(abs(link, "victim.txt"), abs(target, "taken.txt"), false),
+        move_of(
+            abs(&link.join("inside"), "deep.txt"),
+            abs(target, "taken.txt"),
+            false,
+        ),
+        // The folder of the destination is the junction, or lies behind it.
+        move_of(abs(target, "outside.txt"), abs(link, "planted.txt"), false),
+        move_of(
+            abs(target, "outside.txt"),
+            abs(&link.join("inside"), "planted.txt"),
+            false,
+        ),
+        // Asking to replace changes nothing about that.
+        move_of(abs(target, "outside.txt"), abs(link, "victim.txt"), true),
+    ] {
+        assert_refused_as_a_path_through_a_link(store.perform(op.clone()).await, &op);
+        planted.assert_untouched();
+        assert_eq!(std::fs::read(&outside).expect("read"), b"outside");
+        assert_eq!(names_in(target), vec!["link", "outside.txt", "real"]);
+    }
+
+    store
+        .perform(move_of(
+            abs(&planted.real, "victim.txt"),
+            abs(target, "moved.txt"),
+            false,
+        ))
+        .await
+        .expect("by the real locations the file is moved into the other folder");
+    assert_eq!(
+        std::fs::read(target.join("moved.txt")).expect("read"),
+        b"victim"
+    );
+    assert_eq!(names_in(&planted.real), vec!["empty", "inside"]);
+}
+
+/// What the Windows tests of a swapped folder work in: a folder `work` in
+/// which one operation has been done, and a folder `elsewhere` that holds
+/// what a later operation would look for. [`Self::swap`] moves `work` away
+/// and puts a junction to `elsewhere` in its place, the way a program does
+/// that may rename the folder between two requests.
+#[cfg(windows)]
+struct Swapped {
+    /// The folder that holds the others.
+    target: PathBuf,
+    /// The folder the requests name.
+    work: PathBuf,
+    /// Where `work` is moved to.
+    moved: PathBuf,
+    /// Where the junction leads.
+    elsewhere: PathBuf,
+}
+
+#[cfg(windows)]
+impl Swapped {
+    fn plant(sb: &Sandbox) -> Self {
+        let target = sb.target();
+        let work = target.join("work");
+        let elsewhere = target.join("elsewhere");
+        std::fs::create_dir(&work).expect("create");
+        std::fs::create_dir(&elsewhere).expect("create");
+        Self {
+            moved: target.join("work-moved"),
+            target,
+            work,
+            elsewhere,
+        }
+    }
+
+    /// Moves the folder away and puts a junction in its place.
+    fn swap(&self) {
+        std::fs::rename(&self.work, &self.moved).expect("move the folder away");
+        super::testing::junction(&self.work, &self.elsewhere);
+    }
+
+    /// Removes the junction and puts the folder back.
+    fn put_back(&self) {
+        std::fs::remove_dir(&self.work).expect("remove the junction");
+        std::fs::rename(&self.moved, &self.work).expect("move the folder back");
+    }
+}
+
+/// A file was deleted in a folder. Before the next delete the folder is moved
+/// away and a junction to another place takes its name, where a file of the
+/// name the delete asks for lies. The delete is refused: that file stays, and
+/// so does the one in the folder that was moved away. With the folder back in
+/// its place the delete goes through.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_folder_swapped_for_a_junction_between_two_deletes_is_not_followed() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let swapped = Swapped::plant(&sb);
+    for name in ["one.txt", "two.txt"] {
+        std::fs::write(swapped.work.join(name), b"ours").expect("write");
+    }
+    std::fs::write(swapped.elsewhere.join("two.txt"), b"theirs").expect("write");
+    let delete = |name: &str| Operation::FsDelete {
+        path: abs(&swapped.work, name),
+    };
+
+    store
+        .perform(delete("one.txt"))
+        .await
+        .expect("the first delete");
+    swapped.swap();
+    let op = delete("two.txt");
+    assert_refused_as_a_path_through_a_link(store.perform(op.clone()).await, &op);
+    assert_eq!(
+        std::fs::read(swapped.elsewhere.join("two.txt")).expect("read"),
+        b"theirs",
+        "what the junction leads to is untouched"
+    );
+    assert_eq!(names_in(&swapped.moved), vec!["two.txt"]);
+
+    swapped.put_back();
+    store.perform(op).await.expect("in its own folder again");
+    assert!(names_in(&swapped.work).is_empty());
+    assert_eq!(names_in(&swapped.elsewhere), vec!["two.txt"]);
+}
+
+/// The same for the removal of an empty folder.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_folder_swapped_for_a_junction_between_two_folder_removals_is_not_followed() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let swapped = Swapped::plant(&sb);
+    for name in ["one", "two"] {
+        std::fs::create_dir(swapped.work.join(name)).expect("create");
+    }
+    std::fs::create_dir(swapped.elsewhere.join("two")).expect("create");
+    let remove = |name: &str| Operation::RemoveDir {
+        path: abs(&swapped.work, name),
+    };
+
+    store
+        .perform(remove("one"))
+        .await
+        .expect("the first removal");
+    swapped.swap();
+    let op = remove("two");
+    assert_refused_as_a_path_through_a_link(store.perform(op.clone()).await, &op);
+    assert_eq!(
+        names_in(&swapped.elsewhere),
+        vec!["two"],
+        "what the junction leads to is untouched"
+    );
+    assert_eq!(names_in(&swapped.moved), vec!["two"]);
+
+    swapped.put_back();
+    store.perform(op).await.expect("in its own folder again");
+    assert!(names_in(&swapped.work).is_empty());
+    assert_eq!(names_in(&swapped.elsewhere), vec!["two"]);
+}
+
+/// The same for the creation of a folder: nothing is created where the
+/// junction leads.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_folder_swapped_for_a_junction_between_two_folder_creations_is_not_followed() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let swapped = Swapped::plant(&sb);
+    let create = |name: &str| Operation::CreateDir {
+        path: abs(&swapped.work, name),
+    };
+
+    store
+        .perform(create("one"))
+        .await
+        .expect("the first creation");
+    swapped.swap();
+    let op = create("two");
+    assert_refused_as_a_path_through_a_link(store.perform(op.clone()).await, &op);
+    assert!(
+        names_in(&swapped.elsewhere).is_empty(),
+        "nothing was created where the junction leads"
+    );
+    assert_eq!(names_in(&swapped.moved), vec!["one"]);
+
+    swapped.put_back();
+    store.perform(op).await.expect("in its own folder again");
+    assert_eq!(names_in(&swapped.work), vec!["one", "two"]);
+    assert!(names_in(&swapped.elsewhere).is_empty());
+}
+
+/// The same for a move, with the swapped folder as the folder of the source
+/// and then as the folder of the destination: nothing is taken out of the
+/// place the junction leads to, and nothing is put there.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_folder_swapped_for_a_junction_between_two_moves_is_not_followed() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let swapped = Swapped::plant(&sb);
+    let other = swapped.target.join("other");
+    std::fs::create_dir(&other).expect("create");
+    for name in ["one.txt", "two.txt"] {
+        std::fs::write(swapped.work.join(name), b"ours").expect("write");
+    }
+    std::fs::write(other.join("three.txt"), b"ours").expect("write");
+    std::fs::write(swapped.elsewhere.join("two.txt"), b"theirs").expect("write");
+
+    // The swapped folder holds the source.
+    store
+        .perform(move_of(
+            abs(&swapped.work, "one.txt"),
+            abs(&other, "one.txt"),
+            false,
+        ))
+        .await
+        .expect("the first move");
+    swapped.swap();
+    let out_of_it = move_of(abs(&swapped.work, "two.txt"), abs(&other, "two.txt"), false);
+    assert_refused_as_a_path_through_a_link(store.perform(out_of_it.clone()).await, &out_of_it);
+    // And the destination.
+    let into_it = move_of(
+        abs(&other, "three.txt"),
+        abs(&swapped.work, "three.txt"),
+        false,
+    );
+    assert_refused_as_a_path_through_a_link(store.perform(into_it.clone()).await, &into_it);
+
+    assert_eq!(
+        names_in(&swapped.elsewhere),
+        vec!["two.txt"],
+        "nothing was put where the junction leads"
+    );
+    assert_eq!(
+        std::fs::read(swapped.elsewhere.join("two.txt")).expect("read"),
+        b"theirs",
+        "and nothing was taken from there"
+    );
+    assert_eq!(names_in(&swapped.moved), vec!["two.txt"]);
+    assert_eq!(names_in(&other), vec!["one.txt", "three.txt"]);
+
+    swapped.put_back();
+    store
+        .perform(out_of_it)
+        .await
+        .expect("out of its own folder");
+    store.perform(into_it).await.expect("into its own folder");
+    assert_eq!(names_in(&swapped.work), vec!["three.txt"]);
+    assert_eq!(names_in(&other), vec!["one.txt", "two.txt"]);
+    assert_eq!(names_in(&swapped.elsewhere), vec!["two.txt"]);
+}
+
+/// Once the folder is taken up, the change happens in that folder, whatever
+/// its path leads to by then. The folder is opened as each operation opens
+/// it, then moved away, and a junction to another place takes its name
+/// before the change is made: the entry that is deleted, removed, created or
+/// moved is the one in the folder that was opened, and nothing happens where
+/// the path leads now.
+#[cfg(windows)]
+#[test]
+fn a_change_is_made_in_the_folder_that_was_opened_whatever_its_path_leads_to() {
+    use super::in_folder;
+    use super::testing::junction;
+
+    let sb = Sandbox::new();
+    let target = sb.target();
+    let plant = |folder: &Path, content: &[u8]| {
+        std::fs::create_dir_all(folder.join("sub")).expect("create");
+        for name in ["file.txt", "a.txt"] {
+            std::fs::write(folder.join(name), content).expect("write");
+        }
+    };
+    let folder = target.join("folder");
+    let elsewhere = target.join("elsewhere");
+    let inbox = target.join("inbox");
+    plant(&folder, b"ours");
+    plant(&elsewhere, b"theirs");
+    std::fs::create_dir(&inbox).expect("create");
+
+    let opened = in_folder::open_folder(&folder).expect("the folder is taken up");
+    let into = in_folder::open_folder(&inbox).expect("the other folder is taken up");
+    let (moved, inbox_moved) = (target.join("folder-moved"), target.join("inbox-moved"));
+    std::fs::rename(&folder, &moved).expect("move the folder away");
+    junction(&folder, &elsewhere);
+    std::fs::rename(&inbox, &inbox_moved).expect("move the other folder away");
+    junction(&inbox, &elsewhere);
+
+    in_folder::delete_in(&opened, "file.txt").expect("delete in the opened folder");
+    in_folder::remove_dir_in(&opened, "sub").expect("remove in the opened folder");
+    in_folder::create_dir_in(&opened, "new").expect("create in the opened folder");
+    in_folder::rename_between(&opened, "a.txt", &into, "b.txt", false)
+        .expect("move from one opened folder into the other");
+
+    assert_eq!(names_in(&moved), vec!["new"]);
+    assert!(moved.join("new").is_dir());
+    assert_eq!(names_in(&inbox_moved), vec!["b.txt"]);
+    assert_eq!(
+        std::fs::read(inbox_moved.join("b.txt")).expect("read"),
+        b"ours"
+    );
+    assert_eq!(
+        names_in(&elsewhere),
+        vec!["a.txt", "file.txt", "sub"],
+        "nothing happened where the paths lead now"
+    );
+    for name in ["file.txt", "a.txt"] {
+        assert_eq!(
+            std::fs::read(elsewhere.join(name)).expect("read"),
+            b"theirs"
+        );
+    }
+}
+
+/// A junction as the entry itself keeps the meaning a link always had, for
+/// each of the four operations: it is not removed as an empty folder, no
+/// folder is created under its name, a move moves the junction and a delete
+/// removes it — and the folder it leads to keeps everything. A junction
+/// needs no privilege, so this runs wherever Windows does.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_junction_as_the_entry_keeps_its_meaning_for_every_operation() {
+    use super::testing::junction;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    let kept = target.join("kept");
+    let other = target.join("other");
+    std::fs::create_dir(&kept).expect("create");
+    std::fs::create_dir(&other).expect("create");
+    std::fs::write(kept.join("inner.txt"), b"inner").expect("write");
+    let link = target.join("to-kept");
+    junction(&link, &kept);
+    let untouched = || {
+        assert_eq!(names_in(&kept), vec!["inner.txt"]);
+        assert_eq!(
+            std::fs::read(kept.join("inner.txt")).expect("read"),
+            b"inner"
+        );
+    };
+
+    let refused = store
+        .perform(Operation::RemoveDir {
+            path: abs(&target, "to-kept"),
+        })
+        .await
+        .expect_err("a junction is not a folder");
+    assert_eq!(refused.code, ErrorCode::WrongPathKind);
+    let refused = store
+        .perform(Operation::CreateDir {
+            path: abs(&target, "to-kept"),
+        })
+        .await
+        .expect_err("the name is taken");
+    assert_eq!(refused.code, ErrorCode::AlreadyExists);
+    assert!(is_a_link(&link));
+    untouched();
+
+    // The junction is moved as the junction, into another folder.
+    let moved = other.join("moved-junction");
+    store
+        .perform(move_of(
+            abs(&target, "to-kept"),
+            abs(&other, "moved-junction"),
+            false,
+        ))
+        .await
+        .expect("the junction is moved");
+    assert!(!lies_there(&link) && is_a_link(&moved));
+    untouched();
+
+    // Its name is a taken name for a move, and what replaces it on request,
+    // if the system lets a file take the place of a junction at all, never
+    // reaches the folder behind it.
+    std::fs::write(target.join("source.txt"), b"source").expect("write");
+    let onto_it = |overwrite| {
+        move_of(
+            abs(&target, "source.txt"),
+            abs(&other, "moved-junction"),
+            overwrite,
+        )
+    };
+    let refused = store
+        .perform(onto_it(false))
+        .await
+        .expect_err("the name is taken");
+    assert_eq!(refused.code, ErrorCode::AlreadyExists);
+    match store.perform(onto_it(true)).await {
+        Ok(_) => {
+            assert!(!is_a_link(&moved));
+            assert_eq!(std::fs::read(&moved).expect("read"), b"source");
+        }
+        Err(_) => {
+            assert!(is_a_link(&moved));
+            assert_eq!(
+                std::fs::read(target.join("source.txt")).expect("read"),
+                b"source"
+            );
+            // A delete removes the junction, never what it leads to.
+            store
+                .perform(Operation::FsDelete {
+                    path: abs(&other, "moved-junction"),
+                })
+                .await
+                .expect("the junction is deleted");
+            assert!(!lies_there(&moved));
+        }
+    }
+    untouched();
+
+    // And a delete of a junction on its own, whatever became of the first.
+    let again = target.join("again");
+    junction(&again, &kept);
+    store
+        .perform(Operation::FsDelete {
+            path: abs(&target, "again"),
+        })
+        .await
+        .expect("the junction is deleted");
+    assert!(!lies_there(&again));
+    untouched();
+}
+
+/// A move between the staging area and a folder verifies the folder: a
+/// junction in its place, on either end of the move, is refused, and neither
+/// the staged file nor what the junction leads to is touched.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_move_between_the_staging_area_and_a_folder_behind_a_junction_is_refused() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let planted = BehindAJunction::plant(&sb);
+    transfer(
+        &store,
+        staging("tool.bin"),
+        b"tool",
+        2,
+        false,
+        Some("C:\\tech\\tool.bin"),
+        CleanupPolicy::Keep,
+    )
+    .await
+    .expect("stage the file");
+
+    for op in [
+        move_of(staging("tool.bin"), abs(&planted.link, "tool.bin"), false),
+        move_of(staging("tool.bin"), abs(&planted.link, "victim.txt"), true),
+        move_of(
+            abs(&planted.link, "victim.txt"),
+            staging("victim.txt"),
+            false,
+        ),
+    ] {
+        assert_refused_as_a_path_through_a_link(store.perform(op.clone()).await, &op);
+        planted.assert_untouched();
+        assert_eq!(
+            std::fs::read(store.staging_root().join("tool.bin")).expect("read"),
+            b"tool",
+            "the staged file stays"
+        );
+        assert!(!store.staging_root().join("victim.txt").exists());
+    }
+}
+
+/// The folder may be spelled in another letter case or by its short name: it
+/// is still the place where the folder lies, and the operation works there.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_folder_spelled_by_a_short_name_or_in_another_letter_case_is_the_same_folder() {
+    use super::testing::short_name;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target().join("Long Folder Name");
+    std::fs::create_dir(&folder).expect("create");
+    let text = folder.to_string_lossy().into_owned();
+    let mut spellings = vec![text.to_uppercase(), text.to_lowercase()];
+    match short_name(&folder) {
+        Some(short) => spellings.push(short),
+        None => eprintln!("skipped the short name: this volume keeps none"),
+    }
+
+    for spelled in &spellings {
+        let spelled = Path::new(spelled);
+        let run = |op: Operation| {
+            let store = store.clone();
+            async move {
+                store
+                    .perform(op.clone())
+                    .await
+                    .unwrap_or_else(|error| panic!("{op:?} is refused: {error:?}"));
+            }
+        };
+        run(Operation::CreateDir {
+            path: abs(spelled, "made"),
+        })
+        .await;
+        std::fs::write(folder.join("file.txt"), b"file").expect("write");
+        run(move_of(
+            abs(spelled, "file.txt"),
+            abs(spelled, "MOVED.TXT"),
+            false,
+        ))
+        .await;
+        assert_eq!(names_in(&folder), vec!["MOVED.TXT", "made"]);
+        run(Operation::FsDelete {
+            path: abs(spelled, "moved.txt"),
+        })
+        .await;
+        run(Operation::RemoveDir {
+            path: abs(spelled, "MADE"),
+        })
+        .await;
+        assert!(names_in(&folder).is_empty(), "{}", spelled.display());
+    }
+}
+
+/// A file that another program holds open is not deleted and not moved: the
+/// answer says that it is in use. A read-only file and a read-only empty
+/// folder are deleted and removed like any other.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_held_file_is_in_use_and_read_only_entries_are_removed() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    let held = target.join("held.txt");
+    std::fs::write(&held, b"held").expect("write");
+
+    let block = block_removal(&held);
+    for op in [
+        Operation::FsDelete {
+            path: abs(&target, "held.txt"),
+        },
+        move_of(abs(&target, "held.txt"), abs(&target, "away.txt"), false),
+    ] {
+        let refused = store
+            .perform(op.clone())
+            .await
+            .expect_err("held by another program");
+        assert_eq!(refused.code, ErrorCode::FileInUse, "{op:?}");
+    }
+    assert_eq!(names_in(&target), vec!["held.txt"]);
+    release_block(block, &held);
+
+    let fixed_folder = target.join("fixed");
+    std::fs::create_dir(&fixed_folder).expect("create");
+    for path in [&held, &fixed_folder] {
+        let mut permissions = std::fs::metadata(path).expect("stat").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(path, permissions).expect("mark read-only");
+    }
+    store
+        .perform(Operation::FsDelete {
+            path: abs(&target, "held.txt"),
+        })
+        .await
+        .expect("a read-only file is deleted");
+    store
+        .perform(Operation::RemoveDir {
+            path: abs(&target, "fixed"),
+        })
+        .await
+        .expect("a read-only empty folder is removed");
+    assert!(names_in(&target).is_empty());
+}
+
+/// The root of a drive is no entry of a folder: none of the four operations
+/// takes it for one, and nothing on the drive is touched to say so.
+#[cfg(windows)]
+#[tokio::test]
+async fn the_root_of_a_drive_is_no_entry_to_change() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let target = sb.target();
+    let root = || RemotePath::Absolute {
+        path: sb.root.to_string_lossy()[..3].to_owned(),
+    };
+    std::fs::write(target.join("file.txt"), b"file").expect("write");
+
+    for (op, expected) in [
+        (
+            Operation::FsDelete { path: root() },
+            ErrorCode::WrongPathKind,
+        ),
+        (
+            Operation::RemoveDir { path: root() },
+            ErrorCode::InvalidPath,
+        ),
+        (
+            Operation::CreateDir { path: root() },
+            ErrorCode::AlreadyExists,
+        ),
+        (
+            move_of(root(), abs(&target, "drive"), false),
+            ErrorCode::InvalidPath,
+        ),
+        (
+            move_of(abs(&target, "file.txt"), root(), true),
+            ErrorCode::InvalidPath,
+        ),
+    ] {
+        let refused = store
+            .perform(op.clone())
+            .await
+            .expect_err("a drive is no entry");
+        assert_eq!(refused.code, expected, "{op:?}");
+    }
+    assert_eq!(names_in(&target), vec!["file.txt"]);
+}
