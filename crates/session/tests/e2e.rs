@@ -4347,12 +4347,16 @@ async fn a_folder_swapped_between_two_steps_is_not_removed_in_its_place() {
     let moved = folder.with_file_name("swapped-moved");
 
     // As soon as the first step has been answered, the folder is moved away
-    // and another one takes over its name.
+    // and another one takes over its name. How much that step removed depends
+    // on the disk: a step ends at its bound in entries or at its bound in
+    // time, whichever comes first.
     let mut swapped = false;
+    let mut first_step = 0;
     let report = host
-        .remove_tree(staged("swapped"), &CancelToken::new(), |_| {
+        .remove_tree(staged("swapped"), &CancelToken::new(), |progress| {
             if !swapped {
                 swapped = true;
+                first_step = progress.removed_files;
                 std::fs::rename(&folder, &moved).expect("move the folder away");
                 std::fs::create_dir(&folder).expect("another folder of that name");
                 plant_files(&folder, 3);
@@ -4368,14 +4372,18 @@ async fn a_folder_swapped_between_two_steps_is_not_removed_in_its_place() {
         Some(ErrorCode::InvalidPath),
         "{report:?}"
     );
+    assert!(
+        first_step > 0 && first_step <= MAX_TREE_STEP_ENTRIES,
+        "the first step removed something and kept to its bound: {first_step}"
+    );
     assert_eq!(
-        report.removed_files, MAX_TREE_STEP_ENTRIES,
+        report.removed_files, first_step,
         "what the first step removed, and nothing after it"
     );
     assert_eq!(entries_in(&folder), 3, "the other folder keeps everything");
     assert_eq!(
         entries_in(&moved),
-        files - MAX_TREE_STEP_ENTRIES,
+        files - first_step,
         "and so does the rest of the folder that was moved away"
     );
 
