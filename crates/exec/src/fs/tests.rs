@@ -2238,6 +2238,31 @@ async fn nothing_is_moved_into_a_private_staging_area_from_elsewhere() {
     );
     assert!(!store.staging_root().join("tool.bin").exists());
 
+    // Nor by the full path of the staging folder: where a file would lie
+    // decides, not how the request spells it.
+    transfer(
+        &store,
+        staging("kept.bin"),
+        b"kept",
+        2,
+        false,
+        Some("kept.bin"),
+        CleanupPolicy::Keep,
+    )
+    .await
+    .expect("an upload makes the staging folder");
+    let refused = store
+        .perform(Operation::FsMove {
+            from: abs(&target, "theirs.bin"),
+            to: abs(store.staging_root(), "tool.bin"),
+            overwrite: false,
+        })
+        .await
+        .expect_err("a move into a private staging area by its full path");
+    assert_eq!(refused.code, ErrorCode::Unsupported);
+    assert!(target.join("theirs.bin").exists());
+    assert!(!store.staging_root().join("tool.bin").exists());
+
     let own = FileStore::with_base(
         SessionId::new(),
         OwnFolder::same_account(sb.root.join("own")),
@@ -2268,17 +2293,19 @@ async fn a_file_moved_out_of_a_private_staging_area_takes_the_permissions_of_its
     let target = sb.root.join("target");
     std::fs::create_dir_all(&target).expect("target");
     std::fs::write(target.join("made-here.bin"), b"made here").expect("write");
-    transfer(
-        &store,
-        staging("tool.bin"),
-        b"tool",
-        2,
-        false,
-        Some("tool.bin"),
-        CleanupPolicy::Keep,
-    )
-    .await
-    .expect("the upload");
+    for name in ["tool.bin", "named.bin"] {
+        transfer(
+            &store,
+            staging(name),
+            b"tool",
+            2,
+            false,
+            Some(name),
+            CleanupPolicy::Keep,
+        )
+        .await
+        .expect("the upload");
+    }
     let made_here = crate::own::tests_permission_entries(&target.join("made-here.bin"));
     let staged = crate::own::tests_permission_entries(&store.staging_root().join("tool.bin"));
     assert!(!made_here.is_empty() && !staged.is_empty());
@@ -2300,5 +2327,21 @@ async fn a_file_moved_out_of_a_private_staging_area_takes_the_permissions_of_its
         crate::own::tests_permission_entries(&target.join("tool.bin")),
         made_here,
         "the moved file has the permissions of a file made in that folder"
+    );
+
+    // The same for a staged file that the request names by its full path, as
+    // the answer of an upload gives it: where the file lies decides.
+    store
+        .perform(Operation::FsMove {
+            from: abs(store.staging_root(), "named.bin"),
+            to: abs(&target, "named.bin"),
+            overwrite: false,
+        })
+        .await
+        .expect("the move by the full path");
+    assert_eq!(
+        crate::own::tests_permission_entries(&target.join("named.bin")),
+        made_here,
+        "and so has the one that was named by its full path"
     );
 }

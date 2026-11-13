@@ -219,6 +219,13 @@ impl OwnFolder {
         self.private
     }
 
+    /// The outermost folder that is CretLink's own: this folder, or the
+    /// folder above it from which everything is private.
+    #[must_use]
+    pub fn outermost(&self) -> &Path {
+        self.root.as_deref().unwrap_or(&self.path)
+    }
+
     /// Whether anything stands where the outermost folder of this one
     /// belongs. Where nothing does, CretLink never kept anything.
     #[must_use]

@@ -1600,14 +1600,17 @@ that is already open. Mitigations:
   library and nothing it starts later begins there.
 - *Nothing is moved in.* A move keeps a file as it is, with its permissions
   and with every handle a program opened on it before. An elevated program
-  therefore refuses to move a file from elsewhere into its staging area. A
-  file gets there by an upload, which makes it new.
+  therefore refuses to move a file from elsewhere into its staging area,
+  whether the request names the staging area by a staging name or by its
+  full path: where the file would lie decides. A file gets there by an
+  upload, which makes it new.
 - *What is moved out takes the permissions of where it arrives.* For the same
   reason a file that an elevated program moves from its staging area to
   another place would stay closed to everybody but the administrators, the
   customer included. It is given the permissions that the folder it arrives
-  in hands down, as if it had been made there; if that fails, the move is
-  answered as failed and says so.
+  in hands down, as if it had been made there, also when the request names
+  the staged file by its full path; if that fails, the move is answered as
+  failed and says so.
 - *Said, not passed over.* A session whose cleanup failed, a staging area
   that could not be made private (with the reason), a folder of an earlier
   release that is still there, and a lock that another program holds for
