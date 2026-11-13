@@ -1359,8 +1359,17 @@ and a rename inside an opened folder, a file held open by another program, a
 second drive) is covered by tests that run on the Windows CI runner only; the
 run on real hardware is scenario MT-14 in
 [`manual-tests.md`](manual-tests.md), not yet recorded. The technician reaches
-these operations through the console library; the explorer screen that calls
-them is ST-M010-002. The AI tool surface does not contain them.
+these operations through the console library. The AI tool surface does not
+contain them.
+
+The file explorer in the Files tab of the technician's window (ST-M010-002)
+has landed in its first part, browsing: the list of drives and the listing of
+a folder, with automated tests on every CI platform (FT-12). A folder is
+found by its path only where the wire accepts such a path, so the tests that
+open a real folder by a typed path run on the Windows CI runner only. The
+explorer has no control yet for the removal of a folder or for a file sent
+into one. Its run on real hardware is the browsing steps of scenario MT-14,
+not yet recorded.
 
 The four operations that change one entry of a folder — delete a file, remove
 an empty folder, create a folder, move or rename (M003; the AI tools
@@ -1386,6 +1395,13 @@ swapped run on the Windows CI runner only; the run on real hardware is steps
   are wire operations of their own (`fs_drives`, `remove_tree`), which an
   agent serves only when it advertises the capability `fs.v2`; the third uses
   the transfer operations with an absolute destination.
+- The file explorer in the Files tab of the technician's window
+  (ST-M010-002): the commands `explorer_drives` and `explorer_open` of the
+  application's backend, registered in a technician process only. They call
+  `TechnicianFiles` for the list of drives and for the listing of a folder
+  (`fs_list` with the origin `console`). `explorer_open` takes a path as text
+  from the window; the window shows names, labels and paths that the customer
+  computer supplied.
 - The chunked transfer messages carried inside the authenticated encrypted
   session channel.
 - The file and transfer functions of the elevated execution broker on the
@@ -2020,6 +2036,104 @@ guessed (REQ-N-006, REQ-N-008). Evidence:
 `drive_texts_are_single_lines` and `too_many_drives_rejected`
 (`crates/protocol/src/tests.rs`).
 
+*FT-12 — Looking through the customer computer's files from the technician's
+window (ST-M010-002).* The explorer lets the technician open drives and
+folders of the customer computer and read their names, sizes and dates. It
+reads and changes nothing. What it adds: a command of the application's
+backend that takes a path from the window; text that anyone on the customer
+computer can choose — the name of a file, the label of a drive — shown in the
+technician's window; listings of any length; and many small requests that the
+customer must still be able to follow. Mitigations:
+
+- *No authority of its own.* Both commands exist in a technician process
+  only. Outside a session under full control they refuse with
+  `no_consented_session` before anything is asked, and so they do when the
+  session's audit trail is not open: nothing the technician does through the
+  explorer can miss the trail. Nothing is asked of the customer computer
+  before the technician opens the Files tab. A stop or a revocation ends a
+  listing with the session, between two of its requests, as an error and
+  never as the whole folder; what was listed is dropped from the window when
+  full control ends (REQ-S-023, REQ-S-004, REQ-N-008).
+- *A path from the window.* The path of `explorer_open` is a path on the
+  customer computer. It is never opened, resolved or written on the
+  technician computer. It must be a rooted path on a drive
+  (`validate_remote_absolute_path`: no `..`, no UNC or device namespace, no
+  reserved device name, no alternate data stream, bounded in length and
+  depth); any other text is refused, and recorded as refused, before
+  anything is asked. The wire validation applies the same rules again on both
+  ends (FT-1).
+- *The place that is shown is the real one.* No answer of the agent holds a
+  path, so the explorer names a place by what the customer computer answers:
+  the root of a drive as the drive list gives it, and every further name as a
+  listing of the folder above it gives it. A path that was typed is looked
+  for name by name; in another letter case it is led to the listed spelling,
+  and that is what the window shows, what later requests carry and what the
+  audit record names. A name the folder above does not list is not found —
+  a second spelling such as a short name included — and nothing is opened.
+  The search for a name reads at most as many entries as a listing does; when
+  it stops there, the refusal says so and does not claim that the name is
+  absent (REQ-N-008).
+- *A link is shown, not followed.* A listing describes a link and never
+  follows it. The explorer does not open one, and refuses a typed path that
+  ends in one or leads through one, before anything behind it is asked. So
+  the explorer never stands in a place whose real location differs from the
+  path it shows, which is the path a later change would name (FT-8, FT-11).
+- *Text from the customer computer.* Names, labels and paths are written into
+  the window as text, never as markup, and every string of the backend's
+  events is checked against the contract before it is taken; an event with a
+  malformed entry is dropped whole, so a damaged page cannot make a folder
+  look complete (REQ-S-016, REQ-S-018). The type shown for a file is read
+  from the end of its real name.
+- *A folder of any size.* A page holds at most 256 entries and always fits one
+  record of the secure channel (ST-M010-005). A listing stops at 100 000
+  entries and says that the folder holds more; the window draws only the rows
+  in view. A new listing, or the drive list, leaves the one that is still
+  running, so one window never has two listings in flight. What the session
+  remembers of the places the customer computer confirmed is bounded (the
+  drive roots, 256 folders, 20 000 subfolder names of the folder listed last)
+  and ends with the session (REQ-N-006).
+- *What the customer sees.* Every request carries the origin `console`, so it
+  is shown as the technician's. The requests of one look after another are
+  one item in the customer's activity, *Looked through files and folders*,
+  which names the folder that is looked at now; a change, a transfer, a
+  command and an action of the AI stay items of their own, and a look that
+  the customer computer refused is a failed item of its own that no later
+  look replaces (REQ-F-017). A look of the AI is never folded into it: it
+  keeps the purpose the AI stated (REQ-F-026).
+- *What is recorded.* Each folder that is opened is one pair of audit
+  records, `console_fs_list_start` and `console_fs_list`, with the path as it
+  was asked for, then the folder as the customer computer names it, the
+  number of entries, and an outcome that is `ok` only for a listing that
+  reached the end of the folder or its bound (REQ-S-017).
+
+Evidence: `a_typed_path_is_led_to_the_names_the_target_lists`,
+`a_refused_spelling_reaches_nobody`,
+`a_name_the_folder_does_not_list_is_not_found`,
+`a_link_is_refused_and_nothing_behind_it_is_asked_for`,
+`a_listing_stops_at_its_bound_and_says_that_more_exist`,
+`a_listing_that_fails_on_its_way_is_an_error_with_what_arrived` and
+`a_folder_that_was_forgotten_is_looked_up_again`
+(`apps/console/src/explorer/tests.rs`);
+`a_large_folder_is_listed_in_pages_and_is_one_item_on_both_sides`,
+`looks_follow_along_and_a_change_is_its_own_item_on_both_sides`,
+`a_folder_that_cannot_be_listed_is_refused_and_recorded`,
+`a_stop_ends_a_listing_and_later_looks_fail_closed`,
+`a_path_that_is_no_remote_path_is_refused_before_it_begins` and, on Windows,
+`a_typed_path_opens_the_folder_under_its_real_name`
+(`apps/console/tests/technician_files_e2e.rs`);
+`a_look_that_was_refused_is_a_failed_item_of_its_own` and
+`a_look_of_the_ai_stays_an_item_with_its_stated_purpose`
+(`crates/session/src/activity/tests.rs`);
+`without_a_session_both_commands_fail_closed`,
+`without_an_audit_trail_both_commands_fail_closed`,
+`a_place_that_is_refused_delivers_nothing_and_says_why` and
+`after_a_stop_both_commands_fail_closed`
+(`apps/app/src-tauri/src/technician/explorer/tests.rs`); and the frontend
+tests `explorer.test.ts`, `explorer-views.test.ts` and
+`explorer-controller.test.ts` in `apps/app/src/technician`. The run on real
+hardware is the browsing steps of scenario MT-14 in
+[`manual-tests.md`](manual-tests.md), not yet recorded.
+
 *FT-11 — A change to one entry is led to another place (ST-M010-004).*
 Deleting a file, removing an empty folder, creating a folder and moving or
 renaming an entry each change one entry of a folder. The operations exist
@@ -2276,6 +2390,25 @@ scenario MT-14 in [`manual-tests.md`](manual-tests.md), not yet recorded.
 - Reading goes on by name. A stat, a folder listing, a file read and a
   digest resolve their path as before: they change nothing on the customer
   computer, and what they answer is the target's own account of that path.
+- The explorer names a place from listings that were true when they were
+  made (FT-12). A program on the customer computer can rename a folder, or
+  put a link in its place, after the explorer was led there. The explorer
+  then still shows the old path; the agent lists whatever lies at that path
+  now, and for a change it refuses a path through a link (FT-11). What the
+  session remembers of confirmed places is a help against needless requests,
+  not a check.
+- The customer sees that the technician looks through files and which folder
+  is open now, as one item. The item does not keep every folder that was
+  opened on the way: those are in the technician's audit trail, one record
+  for each, and not in the customer's activity or end report.
+- A name can be made to look like another one, for example with characters
+  that change the direction of writing. The explorer writes a name as text
+  and reads the type of a file from the end of its real name, but it does
+  not mark or rewrite such names. It opens no file and runs nothing.
+- The explorer was not run against a customer computer on real hardware yet
+  (the browsing steps of MT-14). Its window was tested in jsdom and looked at
+  in Chromium with a simulated customer computer, not in WebView2, and no
+  screen reader has read its grid.
 - An operation on a staging name works by path (FT-11). That rests on the
   staging area being a place that no other account can change (FT-7).
 - The identity of a folder is only as good as its file system. On FAT and
@@ -3365,9 +3498,9 @@ Known upcoming triggers for revision:
   execution suite (ST-M003-007) and the other hardware scenarios in
   [`manual-tests.md`](manual-tests.md), including the reboot-resume run (MT-8)
   and the file operations of the explorer (MT-14), being recorded;
-- the explorer screen (ST-M010-002), which makes the removal of a folder and
-  the transfer into any folder everyday actions of the technician and must
-  record what it asks before a removal;
+- the second part of the explorer screen (ST-M010-002), which makes the
+  removal of a folder and the transfer into any folder everyday actions of
+  the technician and must record what it asks before a removal;
 - promotion of desktop observation and control (M005) or the technician
   terminal (M008) out of draft, which must record their actual status and any
   new residual risk in the

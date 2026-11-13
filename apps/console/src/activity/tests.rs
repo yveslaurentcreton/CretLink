@@ -635,28 +635,26 @@ fn the_gui_terminal_records_map_to_terminal_items() {
 
 /// The technician's own file actions (ST-M010-001): each is one item of the
 /// technician, opened by its start record and closed by its completion, in
-/// the words the customer's feed uses.
+/// the words the customer's feed uses. The drive list is a look through the
+/// explorer and is shown once the customer computer answered it
+/// (ST-M010-002).
 #[test]
 fn the_file_actions_of_the_technician_are_items_of_the_technician() {
     let mut fold = TechnicianActivity::new();
 
-    let drives = item_of(fold.apply(
-        &record(
-            Actor::Console,
-            "console_fs_drives_start",
-            Outcome::Ok,
-            &[("action_id", int(1))],
+    assert_eq!(
+        fold.apply(
+            &record(
+                Actor::Console,
+                "console_fs_drives_start",
+                Outcome::Ok,
+                &[("action_id", int(1))],
+            ),
+            T0,
         ),
-        T0,
-    ));
-    assert_eq!(drives.id, "action-1");
-    assert_eq!(drives.source, ActivitySource::Technician);
-    assert_eq!(drives.kind, ActivityKind::FileOperation);
-    assert_eq!(drives.operation, "list the drives");
-    assert_eq!(drives.description, "Worked with files and folders");
-    assert_eq!(drives.state, ActivityState::Running);
-    assert_eq!(drives.client_label, None);
-    assert_eq!(drives.purpose, None);
+        None,
+        "a look shows nothing before it is answered"
+    );
     let mut listed = record(
         Actor::Console,
         "console_fs_drives",
@@ -665,9 +663,14 @@ fn the_file_actions_of_the_technician_are_items_of_the_technician() {
     );
     listed.duration_ms = Some(8);
     let drives = item_of(fold.apply(&listed, T0 + 8));
-    assert_eq!(drives.id, "action-1");
+    assert_eq!(drives.id, "browse-1");
+    assert_eq!(drives.source, ActivitySource::Technician);
+    assert_eq!(drives.kind, ActivityKind::FileOperation);
+    assert_eq!(drives.operation, "list the drives");
+    assert_eq!(drives.description, "Looked through files and folders");
     assert_eq!(drives.state, ActivityState::Done { exit_code: None });
-    assert_eq!(drives.duration_ms, Some(8));
+    assert_eq!(drives.client_label, None);
+    assert_eq!(drives.purpose, None);
 
     let removing = item_of(fold.apply(
         &record(
@@ -874,4 +877,253 @@ fn a_technician_action_never_shares_an_item_with_a_routed_call() {
         )
         .is_none()
     );
+}
+
+// --- The technician's looks through the explorer (ST-M010-002) ---
+
+fn look_start(id: i64, path: &str) -> AuditEntry {
+    record(
+        Actor::Console,
+        "console_fs_list_start",
+        Outcome::Ok,
+        &[("action_id", int(id)), ("path", text(path))],
+    )
+}
+
+fn look_end(id: i64, path: &str, outcome: Outcome, entries: i64) -> AuditEntry {
+    record(
+        Actor::Console,
+        "console_fs_list",
+        outcome,
+        &[
+            ("action_id", int(id)),
+            ("path", text(path)),
+            ("entries", int(entries)),
+        ],
+    )
+}
+
+fn shown(fold: &TechnicianActivity) -> Vec<(String, String, ActivityState)> {
+    fold.entries()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            ActivityEntry::Item { item } => Some((item.id, item.operation, item.state)),
+            ActivityEntry::Gap { .. } => None,
+        })
+        .collect()
+}
+
+/// The drive list and one folder after another are one item of the
+/// technician that names the folder listed last, in the words and under the
+/// description the customer's feed has for it. The path is the one the
+/// completion record carries: the folder as the target names it, not the
+/// path as it was asked for.
+#[test]
+fn the_looks_of_the_technician_are_one_item_that_follows_along() {
+    let mut fold = TechnicianActivity::new();
+    fold.apply(
+        &record(
+            Actor::Console,
+            "console_fs_drives_start",
+            Outcome::Ok,
+            &[("action_id", int(1))],
+        ),
+        T0,
+    );
+    let drives = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_fs_drives",
+            Outcome::Ok,
+            &[("action_id", int(1)), ("drives", int(2))],
+        ),
+        T0 + 5,
+    ));
+    assert_eq!(drives.id, "browse-1");
+    assert_eq!(drives.path, None);
+
+    // Asked for in small letters; listed under its real name.
+    assert_eq!(
+        fold.apply(&look_start(2, "c:\\users\\ann"), T0 + 2_000),
+        None
+    );
+    let folder = item_of(fold.apply(&look_end(2, "C:\\Users\\ann", Outcome::Ok, 12), T0 + 2_040));
+    assert_eq!(folder.id, "browse-1");
+    assert_eq!(folder.source, ActivitySource::Technician);
+    assert_eq!(folder.kind, ActivityKind::FileOperation);
+    assert_eq!(folder.description, "Looked through files and folders");
+    assert_eq!(folder.operation, "list the folder C:\\Users\\ann");
+    assert_eq!(folder.path.as_deref(), Some("C:\\Users\\ann"));
+    assert_eq!(folder.state, ActivityState::Done { exit_code: None });
+    assert_eq!(folder.started_at, drives.started_at);
+    assert_eq!(folder.duration_ms, Some(2_035));
+    assert_eq!(folder.bytes, None);
+
+    fold.apply(&look_start(3, "C:\\Users\\ann\\Documents"), T0 + 5_000);
+    fold.apply(
+        &look_end(3, "C:\\Users\\ann\\Documents", Outcome::Ok, 4_000),
+        T0 + 5_900,
+    );
+    assert_eq!(
+        shown(&fold),
+        [(
+            "browse-1".to_owned(),
+            "list the folder C:\\Users\\ann\\Documents".to_owned(),
+            ActivityState::Done { exit_code: None }
+        )]
+    );
+}
+
+/// A staged folder is named as the customer's side names it.
+#[test]
+fn a_look_at_a_staged_folder_names_the_staging_area() {
+    let mut fold = TechnicianActivity::new();
+    let item = item_of(fold.apply(&look_end(1, "staging:unpacked", Outcome::Ok, 3), T0));
+    assert_eq!(
+        item.operation,
+        "list the folder unpacked (CretLink staging folder)"
+    );
+    assert_eq!(
+        item.path.as_deref(),
+        Some("unpacked (CretLink staging folder)")
+    );
+}
+
+/// A change or a transfer of the technician, an action of the AI, and a gap
+/// lie between two looks: each is its own entry and the next look a new item
+/// behind it.
+#[test]
+fn anything_between_two_looks_starts_a_new_item() {
+    let mut fold = TechnicianActivity::new();
+    fold.apply(&look_end(1, "C:\\Temp", Outcome::Ok, 3), T0);
+    fold.apply(
+        &record(
+            Actor::Console,
+            "console_remove_tree_start",
+            Outcome::Ok,
+            &[("action_id", int(2)), ("path", text("C:\\Temp\\old"))],
+        ),
+        T0 + 10,
+    );
+    fold.apply(
+        &record(
+            Actor::Console,
+            "console_remove_tree",
+            Outcome::Ok,
+            &[("action_id", int(2)), ("path", text("C:\\Temp\\old"))],
+        ),
+        T0 + 20,
+    );
+    assert_eq!(
+        item_of(fold.apply(&look_end(3, "C:\\Temp", Outcome::Ok, 2), T0 + 30)).id,
+        "browse-2"
+    );
+    fold.apply(
+        &record(
+            Actor::Mcp,
+            "mcp_remote_list_jobs_start",
+            Outcome::Ok,
+            &[("call_id", int(9))],
+        ),
+        T0 + 40,
+    );
+    assert_eq!(
+        item_of(fold.apply(&look_end(4, "C:\\Temp", Outcome::Ok, 2), T0 + 50)).id,
+        "browse-3"
+    );
+    fold.shed(2, T0 + 60);
+    assert_eq!(
+        item_of(fold.apply(&look_end(5, "C:\\Temp", Outcome::Ok, 2), T0 + 70)).id,
+        "browse-4"
+    );
+    let ids: Vec<String> = shown(&fold).into_iter().map(|(id, _, _)| id).collect();
+    assert_eq!(
+        ids,
+        [
+            "browse-1", "action-2", "browse-2", "call-9", "browse-3", "browse-4"
+        ]
+    );
+}
+
+/// A look that failed, one whose session was lost and one refused before it
+/// began are failed items of their own with their reason, never part of the
+/// item of the looks and never replaced by a later look (REQ-N-008).
+#[test]
+fn a_look_that_failed_is_an_item_of_its_own_and_stays() {
+    let mut fold = TechnicianActivity::new();
+    fold.apply(&look_end(1, "C:\\Users", Outcome::Ok, 5), T0);
+
+    fold.apply(&look_start(2, "C:\\Users\\jdoe"), T0 + 100);
+    let mut refused = look_end(2, "C:\\Users\\jdoe", Outcome::Failed, 0);
+    refused.args.insert("reason", text("access was denied"));
+    refused.duration_ms = Some(30);
+    let refused = item_of(fold.apply(&refused, T0 + 130));
+    assert_eq!(refused.id, "action-2");
+    assert_eq!(refused.operation, "list the folder C:\\Users\\jdoe");
+    assert_eq!(refused.description, "Worked with files and folders");
+    assert_eq!(
+        refused.state,
+        ActivityState::Failed {
+            exit_code: None,
+            message: Some("access was denied".to_owned()),
+        }
+    );
+
+    let lost = item_of(fold.apply(
+        &look_end(3, "C:\\Users\\ann", Outcome::Unknown, 256),
+        T0 + 200,
+    ));
+    assert_eq!(lost.id, "action-3");
+    assert_eq!(lost.state, ActivityState::failed(UNKNOWN_RESULT));
+
+    // Refused before it began: one failed start record.
+    let mut never = record(
+        Actor::Console,
+        "console_fs_list_start",
+        Outcome::Failed,
+        &[("path", text("..\\Windows"))],
+    );
+    never.args.insert("reason", text("the path was refused"));
+    let never = item_of(fold.apply(&never, T0 + 300));
+    assert_eq!(never.id, "local-1");
+    assert!(matches!(never.state, ActivityState::Failed { .. }));
+
+    fold.apply(&look_end(4, "C:\\Users\\ann", Outcome::Ok, 3), T0 + 400);
+    let all = shown(&fold);
+    let ids: Vec<&str> = all.iter().map(|(id, _, _)| id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["browse-1", "action-2", "action-3", "local-1", "browse-2"]
+    );
+    assert!(matches!(all[1].2, ActivityState::Failed { .. }));
+    assert!(matches!(all[2].2, ActivityState::Failed { .. }));
+}
+
+/// A look the technician left for another place shows nothing: the look that
+/// followed is the one that is shown, whichever of the two records is
+/// written last.
+#[test]
+fn a_look_that_was_left_for_another_place_shows_nothing() {
+    let mut fold = TechnicianActivity::new();
+    fold.apply(&look_end(1, "C:\\Users", Outcome::Ok, 5), T0);
+    fold.apply(&look_start(2, "C:\\Windows\\System32"), T0 + 100);
+    fold.apply(&look_start(3, "C:\\Users\\ann"), T0 + 150);
+    fold.apply(&look_end(3, "C:\\Users\\ann", Outcome::Ok, 3), T0 + 160);
+    assert_eq!(
+        fold.apply(
+            &look_end(2, "C:\\Windows\\System32", Outcome::Cancelled, 512),
+            T0 + 170
+        ),
+        None
+    );
+    assert_eq!(
+        shown(&fold),
+        [(
+            "browse-1".to_owned(),
+            "list the folder C:\\Users\\ann".to_owned(),
+            ActivityState::Done { exit_code: None }
+        )]
+    );
+    // Nothing is left running for the end of the session to close.
+    assert!(fold.session_ended(T0 + 500).is_empty());
 }

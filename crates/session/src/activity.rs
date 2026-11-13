@@ -24,6 +24,27 @@
 //! under pressure arrive as a count and become an [`ActivityEntry::Gap`] at the
 //! place where they were dropped; items evicted because the feed reached its
 //! bound are counted into a leading gap.
+//!
+//! # Looking through folders is one item (ST-M010-002)
+//!
+//! A technician who works in the file explorer asks for the drives and for one
+//! folder after another, and for a large folder page after page. Shown one by
+//! one, those requests would bury everything else. A feed therefore keeps them
+//! as **one** item that follows along ([`ActivityFeed::look`]): it names the
+//! folder that is being looked at now, with the real operation, and starts
+//! when the first of them was made.
+//!
+//! The item covers only what follows directly: it is the newest entry of the
+//! feed for as long as it is updated. Anything else that happens in between —
+//! a change, a transfer, a command, an action of the AI, a gap — is an entry
+//! of its own, and the next look starts a new item after it, so the feed stays
+//! in the order things happened. A look that the customer computer refused is
+//! not part of it either: it is a failed item of its own and is never replaced
+//! by a later look (REQ-N-008).
+//!
+//! Only the technician's own looks are folded this way, on both surfaces. A
+//! look of the AI carries its stated purpose and stays an item of its own
+//! (REQ-F-026).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -212,6 +233,35 @@ pub const UNKNOWN_RESULT: &str = "the result is not known";
 /// The reason shown for an action still running when the session ended.
 pub const SESSION_ENDED: &str = "the session ended before this finished";
 
+/// The plain description of the item that stands for the technician looking
+/// through files and folders (ST-M010-002, [`ActivityFeed::look`]).
+pub const BROWSED: &str = "Looked through files and folders";
+
+/// The real operation of a look at the drives, in the words
+/// [`crate::describe_operation`] has for the request.
+pub const LOOK_AT_DRIVES: &str = "list the drives";
+
+/// How the real operation of a look at a folder begins; the folder follows.
+const LOOK_AT_FOLDER: &str = "list the folder ";
+
+/// The real operation of a look at the folder `path`, in the words
+/// [`crate::describe_operation`] has for the request, bounded like them.
+#[must_use]
+pub fn look_at_folder(path: &str) -> String {
+    bounded(format!("{LOOK_AT_FOLDER}{path}"))
+}
+
+/// Whether one handled request is a look of the technician that the customer
+/// computer answered: the drive list or a page of a folder, asked for by the
+/// technician and not by the AI. Read from what the agent reports about the
+/// request, so nothing about the request itself has to change.
+fn is_look(origin: Origin, kind: ActivityKind, operation: &str, outcome: ActionOutcome) -> bool {
+    origin == Origin::Console
+        && kind == ActivityKind::FileOperation
+        && outcome == ActionOutcome::Succeeded
+        && (operation == LOOK_AT_DRIVES || operation.starts_with(LOOK_AT_FOLDER))
+}
+
 /// One activity item, identical on both surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -384,6 +434,19 @@ pub struct ActivityFeed {
     /// Entries evicted at the front, and when the first of them was dropped.
     evicted: Option<(u64, String)>,
     capacity: usize,
+    /// The item of the technician's looks that may still be going on
+    /// ([`Self::look`]): it goes on only while it is the newest entry.
+    browsing: Option<Browsing>,
+    /// How many such items this feed has opened.
+    browsed: u64,
+}
+
+/// The item that stands for the technician looking through folders.
+#[derive(Debug, Clone)]
+struct Browsing {
+    id: String,
+    /// When its first look was made, in Unix milliseconds.
+    started: i64,
 }
 
 impl Default for ActivityFeed {
@@ -406,7 +469,73 @@ impl ActivityFeed {
             entries: VecDeque::new(),
             evicted: None,
             capacity: capacity.max(1),
+            browsing: None,
+            browsed: 0,
         }
+    }
+
+    /// Records one look of the technician at the drives or at a folder that
+    /// the customer computer answered, at `now_unix_millis` (ST-M010-002).
+    ///
+    /// `operation` is the real operation ([`LOOK_AT_DRIVES`],
+    /// [`look_at_folder`]) and `path` the folder, when there is one. While the
+    /// item of the looks before it is still the newest entry of the feed, that
+    /// item moves on to this look: one item follows the technician from
+    /// folder to folder. Otherwise something else has happened since, and this
+    /// look starts a new item after it. See the module documentation.
+    ///
+    /// Returns the entry to emit, or `None` when the item already names this
+    /// look: a further page of the same folder shows nothing new.
+    pub fn look(
+        &mut self,
+        operation: String,
+        path: Option<String>,
+        now_unix_millis: i64,
+    ) -> Option<ActivityEntry> {
+        let going_on = self
+            .browsing
+            .take()
+            .filter(|browsing| self.newest_is(&browsing.id));
+        let browsing = match going_on {
+            Some(browsing) => {
+                let named = self
+                    .item(&browsing.id)
+                    .is_some_and(|item| item.operation == operation && item.path == path);
+                if named {
+                    self.browsing = Some(browsing);
+                    return None;
+                }
+                browsing
+            }
+            None => {
+                self.browsed += 1;
+                Browsing {
+                    id: format!("browse-{}", self.browsed),
+                    started: now_unix_millis,
+                }
+            }
+        };
+        let entry = self.upsert(ActivityItem {
+            id: browsing.id.clone(),
+            source: ActivitySource::Technician,
+            client_label: None,
+            purpose: None,
+            description: BROWSED.to_owned(),
+            kind: ActivityKind::FileOperation,
+            operation,
+            path,
+            bytes: None,
+            state: ActivityState::Done { exit_code: None },
+            started_at: format_rfc3339_millis(browsing.started),
+            duration_ms: u64::try_from(now_unix_millis.saturating_sub(browsing.started)).ok(),
+        });
+        self.browsing = Some(browsing);
+        Some(entry)
+    }
+
+    /// Whether the newest entry of the feed is the item with `id`.
+    fn newest_is(&self, id: &str) -> bool {
+        matches!(self.entries.back(), Some(ActivityEntry::Item { item }) if item.id == id)
     }
 
     /// Inserts `item`, or replaces the item with the same id in place, and
@@ -489,7 +618,9 @@ impl ActivityFeed {
 /// A started command becomes a running item that its `ExecFinished` updates in
 /// place; a handled request becomes an item keyed by its id, so a file leaving
 /// the computer is shown when sending starts and updated when it ends; shed
-/// events become a gap at the place they were dropped. When the session ends,
+/// events become a gap at the place they were dropped. The technician's looks
+/// through the file explorer are one item that follows along
+/// ([`ActivityFeed::look`], ST-M010-002). When the session ends,
 /// an item still running is shown as failed because the session ended, never
 /// as done (REQ-N-008). The client label never exists on this side: the AI is
 /// shown as the AI assistant.
@@ -568,6 +699,15 @@ impl CustomerActivity {
                 outcome,
                 duration_ms,
             } => {
+                // The technician looking through folders is one item that
+                // follows along, not one item per request (ST-M010-002).
+                if is_look(*origin, *kind, operation, *outcome) {
+                    return self
+                        .feed
+                        .look(operation.clone(), path.clone(), now_unix_millis)
+                        .into_iter()
+                        .collect();
+                }
                 let id = format!("req-{id}");
                 let source = ActivitySource::from(*origin);
                 let state = ActivityState::of_outcome(*outcome);

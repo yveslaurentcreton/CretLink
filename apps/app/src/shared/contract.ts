@@ -209,6 +209,69 @@ export interface BridgeStatus {
   clients: string[];
 }
 
+// --- The file explorer of the live session (ST-M010-002) ---
+
+// One drive of the customer computer (`explorer_drives`). A value the
+// customer computer could not read is absent, never zero.
+export type ExplorerDriveKind =
+  | "fixed"
+  | "removable"
+  | "network"
+  | "optical"
+  | "ram_disk"
+  | "unknown";
+
+export interface ExplorerDrive {
+  // The drive's root folder, such as `C:\`.
+  root: string;
+  kind: ExplorerDriveKind;
+  label?: string;
+  totalBytes?: number;
+  freeBytes?: number;
+}
+
+// One entry of a folder. A link is described and never followed. Every text
+// is the customer computer's own: written as text, never as markup.
+export type ExplorerEntryKind = "file" | "dir" | "symlink" | "other";
+
+export interface ExplorerEntry {
+  name: string;
+  kind: ExplorerEntryKind;
+  // Size in bytes.
+  len: number;
+  // Last modified, in Unix milliseconds, when the customer computer says.
+  modifiedMs?: number;
+  readonly: boolean;
+}
+
+// One step of a listing on the `console-explorer` event, while
+// `explorer_open` runs. `listing` is the number the window gave the listing.
+// `opened` comes once, first, with the folder as the customer computer names
+// it and the first page; `page` brings each further page. `end` says that the
+// folder ends with this page.
+export type ExplorerEvent =
+  | {
+      kind: "opened";
+      listing: number;
+      path: string;
+      // The file that the asked path named, in that folder.
+      select?: string;
+      entries: ExplorerEntry[];
+      end: boolean;
+    }
+  | { kind: "page"; listing: number; entries: ExplorerEntry[]; end: boolean };
+
+// How a listing ended: the answer of `explorer_open`. Only `complete` is the
+// whole folder: `cancelled` was left for another place, `limit` stopped at
+// the most entries the explorer lists.
+export interface ExplorerListing {
+  listing: number;
+  // Absent when the listing was left before the folder was found.
+  path?: string;
+  entries: number;
+  state: "complete" | "cancelled" | "limit";
+}
+
 // --- The network the technician waits on (ST-M009-016) ---
 
 // `get_listen_networks`: this computer's private addresses, each with the

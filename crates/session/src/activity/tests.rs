@@ -791,3 +791,381 @@ fn a_folder_removal_cut_short_by_the_end_of_the_session_is_not_done() {
     assert_eq!(ended.id, "req-5");
     assert_eq!(ended.state, ActivityState::failed(SESSION_ENDED));
 }
+
+// --- The technician looking through folders (ST-M010-002) ---
+
+/// One request of the technician as the agent reports it: its kind, its
+/// words and its path derived from the request itself, the way the session
+/// runtime derives them.
+fn technician(id: u64, op: &Operation, outcome: ActionOutcome) -> SessionEvent {
+    SessionEvent::RequestHandled {
+        id,
+        origin: Origin::Console,
+        purpose: None,
+        kind: ActivityKind::of(op),
+        operation: crate::describe_operation(op),
+        path: path_of(op),
+        bytes: bytes_of(op),
+        outcome,
+        duration_ms: Some(3),
+    }
+}
+
+/// A page of the folder `path`, continued after `after`.
+fn page(path: &str, after: Option<&str>) -> Operation {
+    Operation::FsList {
+        path: abs(path),
+        continue_after: after.map(str::to_owned),
+    }
+}
+
+fn items(fold: &CustomerActivity) -> Vec<ActivityItem> {
+    fold.entries()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            ActivityEntry::Item { item } => Some(item),
+            ActivityEntry::Gap { .. } => None,
+        })
+        .collect()
+}
+
+/// What makes a request a look is read from the words the agent reports for
+/// it. Those words are the ones `describe_operation` writes: were they
+/// changed there, this test fails before a look is shown as something else.
+#[test]
+fn the_words_of_a_look_are_those_of_the_real_request() {
+    assert_eq!(
+        crate::describe_operation(&Operation::FsDrives {}),
+        LOOK_AT_DRIVES
+    );
+    for after in [None, Some("m.txt")] {
+        assert_eq!(
+            crate::describe_operation(&page("C:\\Users\\ann\\Documents", after)),
+            look_at_folder("C:\\Users\\ann\\Documents")
+        );
+    }
+    let looks = [Operation::FsDrives {}, page("C:\\Users\\ann", None)];
+    for op in &looks {
+        assert!(
+            is_look(
+                Origin::Console,
+                ActivityKind::of(op),
+                &crate::describe_operation(op),
+                ActionOutcome::Succeeded
+            ),
+            "{op:?}"
+        );
+    }
+    // Every other file request of the technician stays what it is: a change,
+    // a transfer, a lookup, the staging area.
+    let digest = B64Bytes::new(vec![0; 32]);
+    let others = [
+        Operation::FsStat {
+            path: abs("C:\\Users\\ann"),
+        },
+        Operation::CreateDir {
+            path: abs("C:\\Users\\ann\\New folder"),
+        },
+        Operation::FsMove {
+            from: abs("C:\\a"),
+            to: abs("C:\\b"),
+            overwrite: false,
+        },
+        Operation::FsDelete { path: abs("C:\\a") },
+        Operation::RemoveDir { path: abs("C:\\a") },
+        Operation::RemoveTree {
+            path: abs("C:\\a"),
+            stop: false,
+            folder_id: None,
+        },
+        Operation::FsRead {
+            path: abs("C:\\a"),
+            offset: 0,
+            len: 1,
+        },
+        Operation::FsCommit {
+            dest: abs("C:\\a"),
+            len: 1,
+            algo: DigestAlgo::Sha256,
+            digest,
+            overwrite: false,
+            source: None,
+            cleanup: CleanupPolicy::Keep,
+        },
+        Operation::ListStaged {},
+        Operation::StagingCleanup {
+            trigger: CleanupTrigger::All,
+        },
+        Operation::SystemInfo {},
+        Operation::ListJobs {},
+    ];
+    for op in &others {
+        assert!(
+            !is_look(
+                Origin::Console,
+                ActivityKind::of(op),
+                &crate::describe_operation(op),
+                ActionOutcome::Succeeded
+            ),
+            "{op:?}"
+        );
+    }
+}
+
+/// The technician opens the drives and one folder after another, a large one
+/// page by page: the customer sees one item, which names the folder that is
+/// being looked at now and began with the first look.
+#[test]
+fn looking_through_folders_is_one_item_that_follows_along() {
+    let mut fold = CustomerActivity::new();
+    let drives = only_item(fold.apply(
+        &technician(1, &Operation::FsDrives {}, ActionOutcome::Succeeded),
+        T0,
+    ));
+    assert_eq!(drives.id, "browse-1");
+    assert_eq!(drives.source, ActivitySource::Technician);
+    assert_eq!(drives.kind, ActivityKind::FileOperation);
+    assert_eq!(drives.description, "Looked through files and folders");
+    assert_eq!(drives.operation, "list the drives");
+    assert_eq!(drives.path, None);
+    assert_eq!(drives.purpose, None);
+    assert_eq!(drives.state, ActivityState::Done { exit_code: None });
+    assert_eq!(drives.started_at, format_rfc3339_millis(T0));
+
+    let users = only_item(fold.apply(
+        &technician(2, &page("C:\\Users", None), ActionOutcome::Succeeded),
+        T0 + 4_000,
+    ));
+    assert_eq!(users.id, "browse-1", "the same item moved on");
+    assert_eq!(users.operation, "list the folder C:\\Users");
+    assert_eq!(users.path.as_deref(), Some("C:\\Users"));
+    assert_eq!(users.started_at, drives.started_at);
+    assert_eq!(users.duration_ms, Some(4_000));
+
+    // A folder of thousands of entries is many requests and one look: the
+    // further pages show nothing new.
+    let documents = "C:\\Users\\ann\\Documents";
+    let first = fold.apply(
+        &technician(3, &page(documents, None), ActionOutcome::Succeeded),
+        T0 + 9_000,
+    );
+    assert_eq!(only_item(first).path.as_deref(), Some(documents));
+    for (id, after) in [(4, "file-0255.txt"), (5, "file-0511.txt")] {
+        let further = fold.apply(
+            &technician(id, &page(documents, Some(after)), ActionOutcome::Succeeded),
+            T0 + 9_000 + i64::try_from(id).unwrap(),
+        );
+        assert!(further.is_empty(), "{further:?}");
+    }
+
+    let all = items(&fold);
+    assert_eq!(all.len(), 1, "one item, not one per folder: {all:?}");
+    assert_eq!(all[0].operation, look_at_folder(documents));
+    assert_eq!(all[0].started_at, format_rfc3339_millis(T0));
+}
+
+/// A change or a transfer stays an item of its own, and the looks after it
+/// are a new item behind it: the feed keeps the order things happened in.
+#[test]
+fn a_change_between_two_looks_is_its_own_item_and_the_next_look_a_new_one() {
+    let mut fold = CustomerActivity::new();
+    fold.apply(
+        &technician(1, &page("C:\\Temp", None), ActionOutcome::Succeeded),
+        T0,
+    );
+    let deleted = only_item(fold.apply(
+        &technician(
+            2,
+            &Operation::FsDelete {
+                path: abs("C:\\Temp\\old.log"),
+            },
+            ActionOutcome::Succeeded,
+        ),
+        T0 + 1_000,
+    ));
+    assert_eq!(deleted.id, "req-2");
+    assert_eq!(deleted.description, "Worked with files and folders");
+    assert_eq!(deleted.operation, "delete the file C:\\Temp\\old.log");
+
+    // The explorer lists the folder again after the change.
+    let again = only_item(fold.apply(
+        &technician(3, &page("C:\\Temp", None), ActionOutcome::Succeeded),
+        T0 + 1_100,
+    ));
+    assert_eq!(again.id, "browse-2");
+    assert_eq!(again.started_at, format_rfc3339_millis(T0 + 1_100));
+
+    let ids: Vec<String> = items(&fold).into_iter().map(|item| item.id).collect();
+    assert_eq!(ids, ["browse-1", "req-2", "browse-2"]);
+}
+
+/// What the AI does, what the terminal does, and items that were not shown
+/// all lie between two looks in the same way.
+#[test]
+fn an_action_of_the_ai_or_a_gap_between_two_looks_starts_a_new_item() {
+    let mut fold = CustomerActivity::new();
+    let look = |fold: &mut CustomerActivity, id, at| {
+        fold.apply(
+            &technician(id, &page("C:\\Users\\ann", None), ActionOutcome::Succeeded),
+            at,
+        )
+    };
+    assert_eq!(only_item(look(&mut fold, 1, T0)).id, "browse-1");
+    fold.apply(
+        &handled(
+            2,
+            ActivityKind::SystemInformation,
+            ActionOutcome::Succeeded,
+            None,
+        ),
+        T0 + 10,
+    );
+    // The same folder as before, and still a new item: the one before it is
+    // no longer the newest entry.
+    assert_eq!(only_item(look(&mut fold, 3, T0 + 20)).id, "browse-2");
+    fold.apply(&SessionEvent::ActivityShed { count: 4 }, T0 + 30);
+    assert_eq!(only_item(look(&mut fold, 4, T0 + 40)).id, "browse-3");
+    fold.apply(
+        &SessionEvent::CommandStarted {
+            job: JobId(7),
+            shell: Shell::PowerShell,
+            command: "Get-Date".to_owned(),
+            origin: Origin::Terminal,
+            purpose: None,
+        },
+        T0 + 50,
+    );
+    assert_eq!(only_item(look(&mut fold, 5, T0 + 60)).id, "browse-4");
+    assert_eq!(fold.entries().len(), 7, "four looks, two actions, one gap");
+}
+
+/// A folder the customer computer refused to list is a failed item with its
+/// reason. It is never part of the item of the looks, so no later look
+/// replaces it (REQ-N-008).
+#[test]
+fn a_look_that_was_refused_is_a_failed_item_of_its_own() {
+    let mut fold = CustomerActivity::new();
+    fold.apply(
+        &technician(1, &page("C:\\Users", None), ActionOutcome::Succeeded),
+        T0,
+    );
+    let refused = only_item(fold.apply(
+        &technician(
+            2,
+            &page("C:\\Users\\jdoe", None),
+            ActionOutcome::Failed {
+                code: ErrorCode::AccessDenied,
+            },
+        ),
+        T0 + 500,
+    ));
+    assert_eq!(refused.id, "req-2");
+    assert_eq!(refused.state, ActivityState::failed("access was denied"));
+    assert_eq!(refused.operation, "list the folder C:\\Users\\jdoe");
+    assert_eq!(refused.description, "Worked with files and folders");
+
+    // An answer that never came is not a look either.
+    let unknown = only_item(fold.apply(
+        &technician(3, &page("C:\\Users\\ann", None), ActionOutcome::Unknown),
+        T0 + 600,
+    ));
+    assert_eq!(unknown.id, "req-3");
+    assert_eq!(unknown.state, ActivityState::failed(UNKNOWN_RESULT));
+
+    fold.apply(
+        &technician(4, &page("C:\\Users\\ann", None), ActionOutcome::Succeeded),
+        T0 + 700,
+    );
+    let all = items(&fold);
+    let shown: Vec<(&str, &str)> = all
+        .iter()
+        .map(|item| (item.id.as_str(), item.operation.as_str()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("browse-1", "list the folder C:\\Users"),
+            ("req-2", "list the folder C:\\Users\\jdoe"),
+            ("req-3", "list the folder C:\\Users\\ann"),
+            ("browse-2", "list the folder C:\\Users\\ann"),
+        ]
+    );
+    assert_eq!(all[1].state, ActivityState::failed("access was denied"));
+}
+
+/// A look of the AI carries the purpose the AI stated for it and stays an
+/// item of its own, one for each request (REQ-F-026).
+#[test]
+fn a_look_of_the_ai_stays_an_item_with_its_stated_purpose() {
+    let mut fold = CustomerActivity::new();
+    for id in [1, 2] {
+        let op = page("C:\\Users\\ann\\Documents", None);
+        let item = only_item(fold.apply(
+            &SessionEvent::RequestHandled {
+                id,
+                origin: Origin::Mcp,
+                purpose: Purpose::new("Looking for the invoice").ok(),
+                kind: ActivityKind::of(&op),
+                operation: crate::describe_operation(&op),
+                path: path_of(&op),
+                bytes: None,
+                outcome: ActionOutcome::Succeeded,
+                duration_ms: Some(3),
+            },
+            T0,
+        ));
+        assert_eq!(item.id, format!("req-{id}"));
+        assert_eq!(item.source, ActivitySource::Ai);
+        assert_eq!(item.purpose.as_deref(), Some("Looking for the invoice"));
+        assert_eq!(item.description, "Worked with files and folders");
+    }
+    assert_eq!(fold.entries().len(), 2);
+}
+
+/// The item of the looks is finished from its first look on, so the end of
+/// the session leaves it as it is: it is never shown as cut short.
+#[test]
+fn the_end_of_the_session_leaves_the_looks_as_they_are() {
+    let mut fold = CustomerActivity::new();
+    fold.apply(
+        &technician(1, &page("C:\\Users\\ann", None), ActionOutcome::Succeeded),
+        T0,
+    );
+    let ended = fold.apply(
+        &SessionEvent::Revoked {
+            reason: RevokeReason::TechnicianRequested,
+        },
+        T0 + 100,
+    );
+    assert!(ended.is_empty(), "{ended:?}");
+    assert_eq!(
+        items(&fold)[0].state,
+        ActivityState::Done { exit_code: None }
+    );
+}
+
+/// The feed itself: a look moves the item on only while that item is the
+/// newest entry, and the same look again changes nothing.
+#[test]
+fn the_feed_keeps_the_looks_in_the_newest_entry_only() {
+    let mut feed = ActivityFeed::with_capacity(3);
+    let first = feed.look(LOOK_AT_DRIVES.to_owned(), None, T0);
+    assert!(matches!(&first, Some(ActivityEntry::Item { item }) if item.id == "browse-1"));
+    assert_eq!(feed.look(LOOK_AT_DRIVES.to_owned(), None, T0 + 1), None);
+    let moved = feed.look(look_at_folder("C:\\"), Some("C:\\".to_owned()), T0 + 2);
+    assert!(matches!(&moved, Some(ActivityEntry::Item { item }) if item.id == "browse-1"));
+    assert_eq!(feed.len(), 1);
+
+    feed.upsert(item("job-1", ActivityState::Running));
+    let after = feed.look(look_at_folder("C:\\"), Some("C:\\".to_owned()), T0 + 3);
+    assert!(matches!(&after, Some(ActivityEntry::Item { item }) if item.id == "browse-2"));
+
+    // An item of the looks that the bound of the feed evicted is gone, and
+    // the next look after something else is still a new item.
+    feed.upsert(item("job-2", ActivityState::Running));
+    feed.upsert(item("job-3", ActivityState::Running));
+    let late = feed.look(LOOK_AT_DRIVES.to_owned(), None, T0 + 4);
+    assert!(matches!(&late, Some(ActivityEntry::Item { item }) if item.id == "browse-3"));
+    assert_eq!(feed.len(), 3);
+    assert!(feed.item("browse-1").is_none());
+}

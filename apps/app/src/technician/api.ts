@@ -14,6 +14,8 @@ import type {
   AuditEntryView,
   BridgeStatus,
   ClientId,
+  ExplorerDrive,
+  ExplorerListing,
   ListenNetwork,
   SessionSummary,
 } from "../shared/contract";
@@ -152,6 +154,14 @@ export const api = {
   termResize: (term: number, cols: number, rows: number) =>
     invoke<void>("term_resize", { term, cols, rows }),
   termClose: (term: number) => invoke<void>("term_close", { term }),
+  // The file explorer of the live session (ST-M010-002). Both fail closed
+  // with `no_consented_session` outside full control. `explorer_open` takes
+  // a path on the customer computer and a number for this listing; the folder
+  // arrives on the `"console-explorer"` event, and the answer says how the
+  // listing ended. A place that is refused rejects, and nothing arrives.
+  explorerDrives: () => invoke<ExplorerDrive[]>("explorer_drives"),
+  explorerOpen: (path: string, listing: number) =>
+    invoke<ExplorerListing>("explorer_open", { path, listing }),
 
   // The interfaces of ST-M009-008, ST-M009-006 and ST-M009-012. A command
   // the backend does not offer yet rejects; the controller then shows the
@@ -190,6 +200,10 @@ export const CONSOLE_ACTIVITY_EVENT = "console-activity";
 // The local MCP bridge's status for the rail (ST-M009-008): one
 // `BridgeStatus` of the shared contract per change.
 export const CONSOLE_BRIDGE_EVENT = "console-bridge";
+
+// The pages of a folder the file explorer opened (ST-M010-002): one
+// `ExplorerEvent` of the shared contract per step of a listing.
+export const CONSOLE_EXPLORER_EVENT = "console-explorer";
 
 // The raw terminal frame channel (ST-M008-001). Distinct again so high-frequency
 // VT output never re-renders state or the activity feed; the terminal panel

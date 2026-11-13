@@ -1,9 +1,10 @@
-//! The technician's own file actions, audited (ST-M010-001, REQ-F-017,
-//! REQ-S-017).
+//! The technician's own file actions, audited (ST-M010-001, ST-M010-002,
+//! REQ-F-017, REQ-S-017).
 //!
-//! [`ConsoleSessionService`] offers the three operations the technician's file
-//! explorer adds: the drive list, the removal of a folder with its content, and
-//! a file sent into a folder. [`TechnicianFiles`] is their audited front. It
+//! [`ConsoleSessionService`] offers the operations of the technician's file
+//! explorer: the drive list, the listing of a folder, the removal of a folder
+//! with its content, and a file sent into a folder. [`TechnicianFiles`] is
+//! their audited front. It
 //! runs each one on the service and records it in the console's audit trail
 //! the way the IPC server records a routed AI call: a capture-time start
 //! record before anything reaches the target, then a completion record with
@@ -19,6 +20,7 @@
 //! | Start, completion | Arguments |
 //! |---|---|
 //! | `console_fs_drives_start`, `console_fs_drives` | `drives`: how many were listed |
+//! | `console_fs_list_start`, `console_fs_list` | `path`: the place as it was asked for, then the folder that was listed, as the target names it; `entries`: how many entries were listed; `more` when the listing stopped at its bound and the folder holds more |
 //! | `console_remove_tree_start`, `console_remove_tree` | `path`; `removed_files`, `removed_dirs`; `not_removed` when entries were left behind |
 //! | `console_send_start`, `console_send` | `path`: where the file goes, then the path the target committed it at; `overwrite` when a replacement was asked for; `len`; the digest `sha256` |
 //!
@@ -29,7 +31,14 @@
 //! a cancelled action is `cancelled`, and one whose session was lost before
 //! the answer is `unknown`, never `ok` (REQ-N-008). A send refused before it
 //! began (a name that is not one name, a folder that is not a rooted path) is
-//! one failed `console_send_start` record: nothing reached the target.
+//! one failed `console_send_start` record: nothing reached the target. The
+//! same holds for a folder whose path is no remote path: one failed
+//! `console_fs_list_start` record.
+//!
+//! One listing is one pair of records, however many pages the folder takes
+//! and however many requests it took to find it (ST-M010-002). A listing the
+//! technician left for another place is `cancelled`, with what had been
+//! listed until then.
 //!
 //! The local path of a file being sent is not recorded, as for an AI upload;
 //! no file content ever is (REQ-S-018).
@@ -47,6 +56,7 @@ use cretlink_session::{
 };
 use cretlink_shared::{Actor, AuditArgs, AuditValue, Outcome, truncate_field};
 
+use crate::explorer::{self, FolderEvent, FolderReport, ListingEnd};
 use crate::ipc_server::{
     AuditEntry, IpcAudit, elapsed_ms, job_outcome_to_audit, len_value, remote_path_value,
     transfer_detail,
@@ -98,6 +108,117 @@ impl<'a> TechnicianFiles<'a> {
             entry.args.insert("drives", len_value(drives.len() as u64));
         }
         self.audit.record(entry);
+        result
+    }
+
+    /// Opens the place that the path `asked` names and lists it, for the
+    /// technician's file explorer, and records it (ST-M010-002).
+    ///
+    /// The place is found in the target's own names, whatever the spelling of
+    /// `asked`: the root of its drive as the drive list gives it, and each
+    /// further name as a listing of the folder above it gives it. A path that
+    /// names a file leads to the folder that holds it. The folder is then
+    /// listed page by page until its end. `sink` gets the pages as they
+    /// arrive, the first one with the folder's real location
+    /// ([`FolderEvent`]); nothing is delivered unless the folder was found
+    /// and the target answered its first page. See [`crate::explorer`].
+    ///
+    /// Setting `cancel` ends the listing between two requests; a revoke or a
+    /// stop ends it with the session.
+    ///
+    /// # Errors
+    ///
+    /// A [`TargetError`]: a path that is no remote path (nothing is asked of
+    /// the target), a name the folder above it does not list, a link on the
+    /// way, a refusal of the target, or the end of the session. The error is
+    /// recorded, with what had been listed until then.
+    pub async fn open_folder(
+        &self,
+        asked: &str,
+        cancel: CancelToken,
+        sink: &mut (dyn FnMut(FolderEvent) + Send),
+    ) -> Result<FolderReport, TargetError> {
+        if let Err(error) = explorer::spell(asked) {
+            // Refused before it began: one failed start record, with the
+            // path as it was asked for. Nothing reached the target.
+            let mut entry = AuditEntry::event(
+                Actor::Console,
+                Some(self.service.session()),
+                "console_fs_list_start",
+                Outcome::Failed,
+            );
+            entry.args = AuditArgs::new()
+                .with("path", truncate_field(asked))
+                .with("reason", truncate_field(&error.to_string()));
+            self.audit.record(entry);
+            return Err(error);
+        }
+        let action = self.begin(
+            "console_fs_list_start",
+            "console_fs_list",
+            AuditArgs::new().with("path", truncate_field(asked)),
+        );
+        let mut seen = Listed::default();
+        let result = {
+            let mut tap = |event: FolderEvent| {
+                seen.note(&event);
+                sink(event);
+            };
+            explorer::open(
+                self.service,
+                self.service.browsed(),
+                asked,
+                &cancel,
+                &mut tap,
+            )
+            .await
+        };
+        self.audit.record(listing_record(action, &result, &seen));
+        result
+    }
+
+    /// Lists the folder `path` of the target page by page until its end, and
+    /// records it (ST-M010-002). Unlike [`Self::open_folder`] it takes the
+    /// folder as it is named, a staged folder included, and looks nothing up.
+    ///
+    /// # Errors
+    ///
+    /// A [`TargetError`]: a refusal of the target, or the end of the session.
+    /// The error is recorded, with what had been listed until then.
+    pub async fn list_folder(
+        &self,
+        path: RemotePath,
+        cancel: CancelToken,
+        sink: &mut (dyn FnMut(FolderEvent) + Send),
+    ) -> Result<FolderReport, TargetError> {
+        let action = self.begin(
+            "console_fs_list_start",
+            "console_fs_list",
+            AuditArgs::new().with("path", remote_path_value(&path)),
+        );
+        let mut seen = Listed::default();
+        let result = {
+            let mut tap = |event: FolderEvent| {
+                seen.note(&event);
+                sink(event);
+            };
+            explorer::list(
+                self.service,
+                self.service.browsed(),
+                &path,
+                None,
+                &cancel,
+                &mut tap,
+            )
+            .await
+            .map(|(entries, end)| FolderReport {
+                folder: Some(path),
+                select: None,
+                entries,
+                end,
+            })
+        };
+        self.audit.record(listing_record(action, &result, &seen));
         result
     }
 
@@ -270,6 +391,62 @@ impl Recorded {
     }
 }
 
+/// What a listing delivered so far: the folder it opened and how many
+/// entries. Kept beside the listing so that one the session did not carry to
+/// its end is still recorded with what it had listed.
+#[derive(Debug, Default)]
+struct Listed {
+    folder: Option<RemotePath>,
+    entries: u64,
+}
+
+impl Listed {
+    fn note(&mut self, event: &FolderEvent) {
+        let delivered = match event {
+            FolderEvent::Opened {
+                folder, entries, ..
+            } => {
+                self.folder = Some(folder.clone());
+                entries.len()
+            }
+            FolderEvent::Page { entries, .. } => entries.len(),
+        };
+        self.entries = self.entries.saturating_add(delivered as u64);
+    }
+}
+
+/// The completion record of a listing that returned `result` after delivering
+/// `seen`: the folder that was listed, as the target names it, and the number
+/// of entries. Its outcome is `ok` for a listing that reached the end of the
+/// folder or its bound (then with `more`), `cancelled` for one the technician
+/// left, and never `ok` for one that failed or lost its session (REQ-N-008).
+fn listing_record(
+    action: Recorded,
+    result: &Result<FolderReport, TargetError>,
+    seen: &Listed,
+) -> AuditEntry {
+    let mut entry = action.complete(result);
+    let (folder, entries) = match result {
+        Ok(report) => (report.folder.as_ref(), report.entries),
+        Err(_) => (seen.folder.as_ref(), seen.entries),
+    };
+    if let Some(folder) = folder {
+        // The folder as the target names it supersedes the path as asked.
+        entry.args.insert("path", remote_path_value(folder));
+        entry.args.insert("entries", len_value(entries));
+    }
+    if let Ok(report) = result {
+        match report.end {
+            ListingEnd::Complete => {}
+            ListingEnd::Cancelled => entry.outcome = Outcome::Cancelled,
+            ListingEnd::Limit => {
+                entry.args.insert("more", AuditValue::Bool(true));
+            }
+        }
+    }
+    entry
+}
+
 /// Fills the completion record of a folder removal from its honest report:
 /// what was removed, how many entries were left behind and the first of them
 /// with its reason, and the mapped outcome — `ok` only for a folder that is
@@ -429,6 +606,138 @@ mod tests {
             text(&entry, "reason"),
             "PathNotFound: the folder does not exist"
         );
+    }
+
+    // --- A folder listed for the explorer (ST-M010-002) ---
+
+    fn listing_action() -> Recorded {
+        Recorded {
+            session: cretlink_protocol::SessionId::new(),
+            action: "console_fs_list",
+            args: AuditArgs::new()
+                .with("action_id", len_value(4))
+                .with("path", truncate_field("c:/users/ANN/documents")),
+            started: Instant::now(),
+        }
+    }
+
+    fn documents() -> RemotePath {
+        RemotePath::Absolute {
+            path: "C:\\Users\\ann\\Documents".to_owned(),
+        }
+    }
+
+    fn listed(end: ListingEnd, entries: u64) -> Result<FolderReport, TargetError> {
+        Ok(FolderReport {
+            folder: Some(documents()),
+            select: None,
+            entries,
+            end,
+        })
+    }
+
+    /// A listing that reached the end of its folder is recorded as `ok`,
+    /// with the folder as the target names it and the number of entries.
+    #[test]
+    fn a_listing_is_recorded_with_the_real_folder_and_its_entries() {
+        let seen = Listed::default();
+        let done = listing_record(listing_action(), &listed(ListingEnd::Complete, 4321), &seen);
+        assert_eq!(done.outcome, Outcome::Ok);
+        assert_eq!(done.action, "console_fs_list");
+        assert_eq!(text(&done, "path"), "C:\\Users\\ann\\Documents");
+        assert_eq!(int(&done, "entries"), Some(4321));
+        assert_eq!(int(&done, "action_id"), Some(4));
+        assert!(!done.args.0.contains_key("more"));
+        assert!(!done.args.0.contains_key("reason"));
+        assert!(done.duration_ms.is_some());
+
+        // An empty folder was listed too: none of its entries, to its end.
+        let empty = listing_record(listing_action(), &listed(ListingEnd::Complete, 0), &seen);
+        assert_eq!(empty.outcome, Outcome::Ok);
+        assert_eq!(int(&empty, "entries"), Some(0));
+    }
+
+    /// A listing that stopped at its bound says that the folder holds more;
+    /// one the technician left is `cancelled`, also before the folder was
+    /// found, when the record keeps the path as it was asked for.
+    #[test]
+    fn a_listing_that_is_not_the_whole_folder_says_so() {
+        let seen = Listed::default();
+        let bound = listing_record(listing_action(), &listed(ListingEnd::Limit, 100_100), &seen);
+        assert_eq!(bound.outcome, Outcome::Ok);
+        assert_eq!(bound.args.0.get("more"), Some(&AuditValue::Bool(true)));
+        assert_eq!(int(&bound, "entries"), Some(100_100));
+
+        let left = listing_record(listing_action(), &listed(ListingEnd::Cancelled, 512), &seen);
+        assert_eq!(left.outcome, Outcome::Cancelled);
+        assert_eq!(int(&left, "entries"), Some(512));
+        assert_eq!(text(&left, "path"), "C:\\Users\\ann\\Documents");
+
+        let never_found = Ok(FolderReport {
+            folder: None,
+            select: None,
+            entries: 0,
+            end: ListingEnd::Cancelled,
+        });
+        let left = listing_record(listing_action(), &never_found, &seen);
+        assert_eq!(left.outcome, Outcome::Cancelled);
+        assert_eq!(text(&left, "path"), "c:/users/ANN/documents");
+        assert_eq!(int(&left, "entries"), None);
+    }
+
+    /// A listing that failed or lost its session is never `ok`. It is
+    /// recorded with what it had delivered until then, and a refusal before
+    /// anything was listed with the path as it was asked for.
+    #[test]
+    fn a_listing_that_failed_is_recorded_with_what_it_had_listed() {
+        let mut seen = Listed::default();
+        seen.note(&FolderEvent::Opened {
+            folder: documents(),
+            select: None,
+            entries: vec![entry("a.txt"), entry("b.txt")],
+            end: false,
+        });
+        seen.note(&FolderEvent::Page {
+            entries: vec![entry("c.txt")],
+            end: false,
+        });
+        let lost = listing_record(listing_action(), &Err(TargetError::Disconnected), &seen);
+        assert_eq!(lost.outcome, Outcome::Unknown);
+        assert_eq!(text(&lost, "path"), "C:\\Users\\ann\\Documents");
+        assert_eq!(int(&lost, "entries"), Some(3));
+        assert!(text(&lost, "reason").contains("outcome unknown"));
+
+        let stopped = listing_record(
+            listing_action(),
+            &Err(TargetError::NoConsentedSession),
+            &seen,
+        );
+        assert_eq!(stopped.outcome, Outcome::Failed);
+        assert_eq!(int(&stopped, "entries"), Some(3));
+
+        let refused = listing_record(
+            listing_action(),
+            &Err(TargetError::Remote {
+                code: cretlink_protocol::ErrorCode::AccessDenied,
+                message: "failed to open the directory".to_owned(),
+                stage: cretlink_protocol::ErrorStage::Execution,
+            }),
+            &Listed::default(),
+        );
+        assert_eq!(refused.outcome, Outcome::Failed);
+        assert_eq!(text(&refused, "path"), "c:/users/ANN/documents");
+        assert_eq!(int(&refused, "entries"), None);
+        assert!(text(&refused, "reason").contains("AccessDenied"));
+    }
+
+    fn entry(name: &str) -> cretlink_protocol::FileEntry {
+        cretlink_protocol::FileEntry {
+            name: name.to_owned(),
+            kind: cretlink_protocol::FileKind::File,
+            len: 1,
+            modified_ms: None,
+            readonly: false,
+        }
     }
 
     /// The outcome of a call that returned no answer: a lost session is

@@ -116,6 +116,20 @@ export const ICONS = {
     ["path", { d: "M12 14l4-4" }],
     ["path", { d: "M3.3 17a9 9 0 1 1 17.4 0" }],
   ],
+  // The file explorer (ST-M010-002).
+  back: [["path", { d: "M19 12H5M11 6l-6 6 6 6" }]],
+  forward: [["path", { d: "M5 12h14M13 6l6 6-6 6" }]],
+  up: [["path", { d: "M12 19V5M6 11l6-6 6 6" }]],
+  drive: [
+    ["path", { d: "M5.5 13 8 5h8l2.5 8" }],
+    ["rect", { x: "3", y: "13", width: "18", height: "7", rx: "2" }],
+    ["path", { d: "M17 16.5v.01" }],
+  ],
+  file: [
+    ["path", { d: "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" }],
+    ["path", { d: "M14 3v5h5" }],
+  ],
+  pencil: [["path", { d: "M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4" }]],
 } as const satisfies Record<string, readonly IconPart[]>;
 
 export type IconName = keyof typeof ICONS;
