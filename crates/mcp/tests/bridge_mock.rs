@@ -549,6 +549,52 @@ async fn remote_exec_says_that_its_processes_end_with_the_command() {
     client.cancel().await.ok();
 }
 
+/// The AI is told that the four tools that change one entry refuse a path
+/// that leads through a link, and that nothing changes then, so it names the
+/// real location instead of trying again (ST-M010-004). Their inputs are as
+/// they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tools_that_change_one_entry_say_that_a_path_through_a_link_is_refused() {
+    let (client, _session) = connect().await;
+    let tools = client.list_all_tools().await.expect("list tools");
+
+    for (name, inputs) in [
+        ("remote_make_dir", vec!["path", "purpose"]),
+        ("remote_move", vec!["from", "overwrite", "purpose", "to"]),
+        ("remote_delete", vec!["path", "purpose"]),
+        ("remote_remove_dir", vec!["path", "purpose"]),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("{name} listed"));
+        let description = tool.description.as_deref().unwrap_or_default();
+        for statement in [
+            "A path through a link is refused",
+            "a junction or a symbolic link",
+            "`subst` or network drive",
+            "`invalid_path`",
+            "real location",
+        ] {
+            assert!(
+                description.contains(statement),
+                "the {name} description must say {statement:?}: {description:?}"
+            );
+        }
+        let schema = serde_json::to_value(tool.input_schema.as_ref()).expect("schema is json");
+        let mut properties: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name} has properties: {schema}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        properties.sort_unstable();
+        assert_eq!(properties, inputs, "the inputs of {name} are unchanged");
+    }
+
+    client.cancel().await.ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn system_info_embeds_session_and_simulated_target() {
     let (client, session) = connect().await;

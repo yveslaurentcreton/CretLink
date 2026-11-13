@@ -515,7 +515,15 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         continue_after: Option<String>,
     },
-    /// Create a directory. Fails `AlreadyExists` if the path is taken.
+    /// Create a directory: one level, in a folder that exists. Fails
+    /// `AlreadyExists` if the path is taken, also by a link, and
+    /// `PathNotFound` if the folder above it is missing.
+    ///
+    /// On a Windows target the folder it is created in is the one that lies
+    /// at the path: an absolute path that reaches it through a link (a
+    /// junction or a symbolic link), or that lies on a substituted or a
+    /// network drive, yields `InvalidPath` and nothing is created
+    /// (ST-M010-004).
     CreateDir {
         /// The directory to create.
         path: RemotePath,
@@ -585,6 +593,12 @@ pub enum Operation {
     /// Rename or move within the same volume (an atomic rename, never a
     /// copy-and-delete). A cross-volume request yields `Unsupported`; the
     /// console composes read + write + delete when it truly wants a copy.
+    ///
+    /// On a Windows target both folders are the ones that lie at the paths:
+    /// an absolute path that reaches the folder of the source or of the
+    /// destination through a link, or that lies on a substituted or a network
+    /// drive, yields `InvalidPath` and nothing moves. A link that is itself
+    /// the source is moved as the link (ST-M010-004).
     FsMove {
         /// The source path.
         from: RemotePath,
@@ -595,12 +609,23 @@ pub enum Operation {
     },
     /// Delete one file, using `lstat` semantics (a reparse point is removed, not
     /// followed). A directory yields `WrongPathKind`.
+    ///
+    /// On a Windows target the folder that holds the file is the one that
+    /// lies at the path: an absolute path that reaches it through a link, or
+    /// that lies on a substituted or a network drive, yields `InvalidPath`
+    /// and nothing is deleted (ST-M010-004).
     FsDelete {
         /// The file to delete.
         path: RemotePath,
     },
     /// Remove one empty directory. A non-empty directory yields `DirNotEmpty`;
     /// a directory with its content is removed by [`Operation::RemoveTree`].
+    /// A link is not a directory and yields `WrongPathKind`.
+    ///
+    /// On a Windows target the folder that holds the directory is the one
+    /// that lies at the path: an absolute path that reaches it through a
+    /// link, or that lies on a substituted or a network drive, yields
+    /// `InvalidPath` and nothing is removed (ST-M010-004).
     RemoveDir {
         /// The directory to remove.
         path: RemotePath,
@@ -1136,7 +1161,10 @@ pub enum ErrorCode {
     /// The path is in use by another process and cannot be opened as requested.
     FileInUse,
     /// The path failed a structural safety check (also produced by
-    /// [`crate::Message::validate`] via [`ProtocolError::InvalidPath`]).
+    /// [`crate::Message::validate`] via [`ProtocolError::InvalidPath`]). An
+    /// agent also answers it for a path that does not name the real location
+    /// of what it changes: one that leads through a link, or that lies on a
+    /// substituted or a network drive (ST-M010-001, ST-M010-004).
     InvalidPath,
     /// The destination already exists and `overwrite` was not set.
     AlreadyExists,
