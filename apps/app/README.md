@@ -239,7 +239,11 @@ copying to this computer, deleting and renaming are not offered yet.
   therefore shows its real names. A name the folder above does not list, a
   short name such as `PROGRA~1` included, is not found; a link is shown and
   not followed; a path to a file opens the folder that holds it, with the file
-  selected.
+  selected. A name is looked for among at most 100 000 entries of a folder.
+  Spelled as the folder lists it, it is asked for at its place in the folder's
+  order and normally found with one request; in another letter case the
+  folder is read from its start. When the search stops at that bound, the
+  refusal says so, never that the name does not exist.
 - **Stays where it was.** A place that is refused is shown as that refusal in
   the explorer, the folder that was open stays on screen, and a typed path
   comes back into its field to be corrected.

@@ -27,7 +27,10 @@
 //!
 //! - the folder above lists no entry of that name ([`ErrorCode::PathNotFound`]).
 //!   That covers a name that does not exist and a second spelling the listing
-//!   does not show, such as a short name (`PROGRA~1`);
+//!   does not show, such as a short name (`PROGRA~1`). A folder with more
+//!   entries than the explorer reads is not read to its end for a name in
+//!   another letter case: the refusal then says that, as
+//!   [`ErrorCode::LimitExceeded`], and never that the name is not there;
 //! - the entry is a link ([`ErrorCode::InvalidPath`]). A listing describes a
 //!   link and never follows it, and a place that lies behind one has another
 //!   real location than its path says;
@@ -334,8 +337,8 @@ pub(crate) fn join(folder: &str, name: &str) -> String {
 /// # Errors
 ///
 /// A [`TargetError`]: the refusal of a spelling, of a name the folder above
-/// does not list, of a link, or of a file with names behind it; or whatever
-/// the target answered a request with.
+/// does not list or was not read far enough to show, of a link, or of a file
+/// with names behind it; or whatever the target answered a request with.
 pub(crate) async fn locate<S: FolderSource + ?Sized>(
     source: &S,
     memory: &Mutex<Browsed>,
@@ -400,6 +403,17 @@ pub(crate) async fn locate<S: FolderSource + ?Sized>(
                     format!("{folder} lists no entry named {name}"),
                 ));
             }
+            // Not the same as not there: the folder was not read to its end.
+            Looked::NotReached => {
+                return Err(refused(
+                    ErrorCode::LimitExceeded,
+                    format!(
+                        "{folder} holds more than {MAX_FOLDER_ENTRIES} entries, and the \
+                         search for {name} stopped there without finding it; type the name \
+                         exactly as the folder lists it"
+                    ),
+                ));
+            }
         };
         let real = join(&folder, &entry.name);
         match entry.kind {
@@ -440,12 +454,21 @@ enum Looked {
     Found(FileEntry),
     /// The folder lists no such entry.
     Missing,
+    /// The folder holds more entries than the search reads, and the name was
+    /// not among those it read: whether the folder lists it is not known.
+    NotReached,
     /// The search was cancelled.
     Cancelled,
 }
 
 /// Looks for the entry `name` in `folder`: first spelled as given, then in
 /// any letter case. See "Finding one name" in the module documentation.
+///
+/// # Errors
+///
+/// Whatever the target answered a page request with, or
+/// [`TargetError::Unexpected`] for a folder that keeps answering with an
+/// empty page that says more follows.
 async fn find<S: FolderSource + ?Sized>(
     source: &S,
     folder: &str,
@@ -463,6 +486,11 @@ async fn find<S: FolderSource + ?Sized>(
     before.pop();
     let mut after = (!before.is_empty()).then_some(before);
     let mut read = 0u64;
+    // The two ways this search ends without an answer: it stopped at the most
+    // entries it reads, or a page said that more follows and held nothing to
+    // continue after.
+    let mut at_bound = false;
+    let mut unanswered = false;
     'spelled: loop {
         if cancel.is_cancelled() {
             return Ok(Looked::Cancelled);
@@ -477,19 +505,29 @@ async fn find<S: FolderSource + ?Sized>(
                 break 'spelled;
             }
         }
+        if page.end {
+            break;
+        }
         let Some(last) = page.entries.last() else {
+            unanswered = true;
             break;
         };
-        if page.end || read >= MAX_FOLDER_ENTRIES {
+        if read >= MAX_FOLDER_ENTRIES {
+            at_bound = true;
             break;
         }
         after = Some(last.name.clone());
     }
 
     // In another letter case: the folder from its start. A name without a
-    // letter has no other case.
-    if !name.chars().any(char::is_alphabetic) {
-        return Ok(Looked::Missing);
+    // letter has no other case, so what the search above came to stands; only
+    // a page that gave no answer is asked for again below.
+    if !unanswered && !name.chars().any(char::is_alphabetic) {
+        return Ok(if at_bound {
+            Looked::NotReached
+        } else {
+            Looked::Missing
+        });
     }
     let wanted = name.to_lowercase();
     let mut after: Option<String> = None;
@@ -515,8 +553,15 @@ async fn find<S: FolderSource + ?Sized>(
             }
             None => empty += 1,
         }
-        if page.end || read >= MAX_FOLDER_ENTRIES || empty > MAX_EMPTY_PAGES {
+        if page.end {
             return Ok(Looked::Missing);
+        }
+        if read >= MAX_FOLDER_ENTRIES {
+            return Ok(Looked::NotReached);
+        }
+        if empty > MAX_EMPTY_PAGES {
+            // As in a listing: a folder that keeps answering so is given up.
+            return Err(TargetError::Unexpected);
         }
     }
 }

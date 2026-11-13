@@ -2070,6 +2070,9 @@ customer must still be able to follow. Mitigations:
   and that is what the window shows, what later requests carry and what the
   audit record names. A name the folder above does not list is not found —
   a second spelling such as a short name included — and nothing is opened.
+  The search for a name reads at most as many entries as a listing does; when
+  it stops there, the refusal says so and does not claim that the name is
+  absent (REQ-N-008).
 - *A link is shown, not followed.* A listing describes a link and never
   follows it. The explorer does not open one, and refuses a typed path that
   ends in one or leads through one, before anything behind it is asked. So

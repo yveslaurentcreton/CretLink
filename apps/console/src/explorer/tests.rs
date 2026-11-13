@@ -520,6 +520,109 @@ async fn a_name_the_folder_does_not_list_is_not_found() {
     assert_eq!(target.pages_of("C:\\Program Files"), 1);
 }
 
+/// A folder with more entries than the explorer reads is not read to its end
+/// for a name in another letter case. The refusal says that the search
+/// stopped, never that the name is not there; spelled as listed, the name is
+/// found with one request.
+#[tokio::test]
+async fn a_name_beyond_what_is_read_is_not_said_to_be_missing() {
+    let mut target = Target::empty();
+    target.drives = vec![drive("C:\\")];
+    let count = usize::try_from(MAX_FOLDER_ENTRIES).unwrap() + 300;
+    let mut entries: Vec<FileEntry> = (0..count).map(|n| file(&format!("f{n:07}"))).collect();
+    // The last name of the folder, behind everything that is read.
+    entries.push(dir("zz-last"));
+    target.folder("C:\\", entries);
+    target.folder("C:\\zz-last", Vec::new());
+
+    let (code, message, stage) = refusal(&target, "C:\\ZZ-LAST").await;
+    assert_eq!(code, ErrorCode::LimitExceeded);
+    assert_eq!(stage, ErrorStage::Validation);
+    assert_eq!(
+        message,
+        "C:\\ holds more than 100000 entries, and the search for ZZ-LAST stopped there \
+         without finding it; type the name exactly as the folder lists it"
+    );
+
+    target.forget_asked();
+    assert_eq!(
+        located(&target, &memory(), "C:\\zz-last").await.folder,
+        "C:\\zz-last"
+    );
+    assert_eq!(target.pages_of("C:\\"), 1);
+
+    // A name without a letter has no other letter case: the folder is read
+    // once up to the bound, not a second time from its start.
+    target.forget_asked();
+    let (code, message, _) = refusal(&target, "C:\\~").await;
+    assert_eq!(code, ErrorCode::LimitExceeded);
+    assert!(
+        message.starts_with("C:\\ holds more than 100000 entries, and the search for ~ stopped"),
+        "{message}"
+    );
+    assert_eq!(
+        target.pages_of("C:\\"),
+        usize::try_from(MAX_FOLDER_ENTRIES).unwrap().div_ceil(256)
+    );
+}
+
+/// A page that is empty and says more follows is no answer to the search for
+/// a name: the folder is asked again, and a folder that keeps answering so is
+/// given up, never said not to list the name.
+#[tokio::test]
+async fn a_search_that_gets_no_answer_is_not_said_to_be_missing() {
+    let empty_pages = |target: &Target, count: u32| {
+        target
+            .empty_pages
+            .lock()
+            .unwrap()
+            .insert("C:\\Program Files".to_owned(), count);
+    };
+
+    // One page without an answer for the name as spelled, then as many as a
+    // search asks again for: the name is found.
+    let target = Target::windows();
+    empty_pages(&target, 1 + MAX_EMPTY_PAGES);
+    assert_eq!(
+        located(&target, &memory(), "C:\\Program Files\\cretlink")
+            .await
+            .folder,
+        "C:\\Program Files\\CretLink"
+    );
+
+    // One more, and the search is given up.
+    let target = Target::windows();
+    empty_pages(&target, 2 + MAX_EMPTY_PAGES);
+    let result = locate(
+        &target,
+        &memory(),
+        "C:\\Program Files\\cretlink",
+        &CancelToken::new(),
+    )
+    .await;
+    assert_eq!(result, Err(TargetError::Unexpected));
+
+    // A name without a letter is looked for again too, in the whole folder,
+    // before it is said not to be there.
+    let target = Target::windows();
+    empty_pages(&target, 1);
+    let (code, message, _) = refusal(&target, "C:\\Program Files\\2026").await;
+    assert_eq!(code, ErrorCode::PathNotFound);
+    assert_eq!(message, "C:\\Program Files lists no entry named 2026");
+    assert_eq!(target.pages_of("C:\\Program Files"), 2);
+
+    let target = Target::windows();
+    empty_pages(&target, 2 + MAX_EMPTY_PAGES);
+    let result = locate(
+        &target,
+        &memory(),
+        "C:\\Program Files\\2026",
+        &CancelToken::new(),
+    )
+    .await;
+    assert_eq!(result, Err(TargetError::Unexpected));
+}
+
 /// A link is shown and never followed: a path that ends in one, or that
 /// leads through one, is refused and nothing behind it is asked for.
 #[tokio::test]
