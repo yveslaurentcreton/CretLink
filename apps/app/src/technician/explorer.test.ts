@@ -37,6 +37,7 @@ import {
   mergeEntries,
   modifiedWords,
   moveFocus,
+  notOpened,
   openTarget,
   opening,
   parentPlace,
@@ -449,6 +450,25 @@ describe("selection", () => {
     // A link is shown and never followed.
     const linked = open(initialExplorer(), "C:\\", [[link("Documents and Settings")]], 1);
     expect(openTarget(linked, "Documents and Settings")).toBeNull();
+  });
+
+  it("says why a row does not open, and takes the words away with the next step", () => {
+    expect(notOpened(s, "Invoices")).toBeUndefined();
+    expect(notOpened(s, "gone")).toBeUndefined();
+    expect(notOpened(s, undefined)).toBeUndefined();
+    expect(notOpened(s, "a.txt")).toBe("a.txt is a file. Folders open here, a file does not.");
+    const linked = open(initialExplorer(), "C:\\", [[link("Documents and Settings")]], 1);
+    expect(notOpened(linked, "Documents and Settings")).toBe(
+      "Documents and Settings is a link. A link is shown here, not followed.",
+    );
+    const told: ExplorerState = { ...selectOnly(s, "a.txt"), hint: notOpened(s, "a.txt") };
+    expect(statusWords(told)).toBe(
+      "5 items · 1 selected · a.txt is a file. Folders open here, a file does not.",
+    );
+    expect(selectOnly(told, "b.txt").hint).toBeUndefined();
+    expect(moveFocus(told, "down").hint).toBeUndefined();
+    expect(clearSelection(told).hint).toBeUndefined();
+    expect(opening(told, { listing: 9, place: DRIVES, how: "push" }).hint).toBeUndefined();
   });
 });
 

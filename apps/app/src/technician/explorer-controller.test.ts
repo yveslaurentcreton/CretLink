@@ -287,13 +287,22 @@ describe("navigation", () => {
     expect($("#announce").textContent).toBe(
       "pagefile.sys is a file. Folders open here, a file does not.",
     );
+    // It is said under the list too, where the technician looks.
+    expect(status()).toBe(
+      "4 items · 1 selected · pagefile.sys is a file. Folders open here, a file does not.",
+    );
     doubleClick(row("Documents and Settings"));
     await flush();
     expect($("#announce").textContent).toBe(
       "Documents and Settings is a link. A link is shown here, not followed.",
     );
+    expect(status()).toContain("A link is shown here, not followed.");
     expect(opened()).toHaveLength(before);
     expect(crumbs()).toEqual(["ACME-PC-07", "C:\\"]);
+    // The next step takes the words away.
+    click(row("Users"));
+    await flush();
+    expect(status()).toBe("4 items · 1 selected");
   });
 
   it("takes a typed path and shows the place as the customer computer names it", async () => {
@@ -347,6 +356,8 @@ describe("navigation", () => {
     click('[data-action="xp-dismiss"]');
     await flush();
     expect($("#xp-alert").textContent).toBe("");
+    // The button went with the refusal: the list has the keyboard.
+    expect(document.activeElement).toBe($("#xp-grid"));
   });
 
   it("puts a typed path that was refused back into the field to be corrected", async () => {

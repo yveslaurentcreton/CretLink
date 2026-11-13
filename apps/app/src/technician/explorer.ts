@@ -140,6 +140,9 @@ export interface ExplorerState {
   menu?: Menu;
   // The path field is open for typing, starting from this text.
   editing?: string;
+  // Why the last thing the technician tried did nothing, in words: a file
+  // does not open here. Gone with the next step.
+  hint?: string;
 }
 
 export function initialExplorer(): ExplorerState {
@@ -509,7 +512,7 @@ export function withViewport(s: ExplorerState, viewport: Partial<Viewport>): Exp
 // --- Selection and the keyboard ---
 
 function withFocus(s: ExplorerState, key: string): ExplorerState {
-  return brought({ ...s, focus: key }, indexOfKey(s, key));
+  return brought({ ...s, focus: key, hint: undefined }, indexOfKey(s, key));
 }
 
 /** A click: this row alone. */
@@ -549,7 +552,8 @@ export function selectAll(s: ExplorerState): ExplorerState {
 }
 
 export function clearSelection(s: ExplorerState): ExplorerState {
-  return s.selected.size === 0 ? s : { ...s, selected: new Set(), anchor: undefined };
+  if (s.selected.size === 0 && s.hint === undefined) return s;
+  return { ...s, selected: new Set(), anchor: undefined, hint: undefined };
 }
 
 export type Move = "up" | "down" | "left" | "right" | "home" | "end" | "pageup" | "pagedown";
@@ -658,7 +662,20 @@ function trimmed(places: Place[]): Place[] {
 
 /** The technician asked for a place: it is pending until it is open. */
 export function opening(s: ExplorerState, pending: Pending): ExplorerState {
-  return { ...s, pending, menu: undefined, editing: undefined };
+  return { ...s, pending, menu: undefined, editing: undefined, hint: undefined };
+}
+
+/**
+ * Why a row does not open, in words: a folder and a drive open, a file does
+ * not, and a link is shown and never followed. Nothing for a row that opens.
+ */
+export function notOpened(s: ExplorerState, key: string | undefined): string | undefined {
+  if (key === undefined || openTarget(s, key) !== null) return undefined;
+  const entry = entryOf(s, key);
+  if (entry === undefined) return undefined;
+  return entry.kind === "symlink"
+    ? `${entry.name} is a link. A link is shown here, not followed.`
+    : `${entry.name} is a file. Folders open here, a file does not.`;
 }
 
 /** The history once the place of `pending` is open. */
@@ -967,6 +984,7 @@ export function statusWords(s: ExplorerState): string {
   if (s.selected.size > 0) parts.push(`${s.selected.size} selected`);
   if (s.fresh) parts.push("refreshing…");
   if (s.pending) parts.push(`opening ${placeWords(s.pending.place)}…`);
+  if (s.hint !== undefined) parts.push(s.hint);
   return parts.join(" · ");
 }
 

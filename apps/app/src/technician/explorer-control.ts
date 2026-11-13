@@ -34,7 +34,6 @@ import {
   applyListing,
   clearSelection,
   crumbs,
-  entryOf,
   folder,
   indexOfKey,
   isExplorerDrive,
@@ -42,6 +41,7 @@ import {
   isExplorerListing,
   menuItems,
   moveFocus,
+  notOpened,
   openTarget,
   opening,
   parentPlace,
@@ -261,11 +261,11 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
       go(target, "push");
       return;
     }
-    const entry = entryOf(s, key);
-    if (entry?.kind === "symlink") {
-      host.announce(`${entry.name} is a link. A link is shown here, not followed.`);
-    } else if (entry) {
-      host.announce(`${entry.name} is a file. Folders open here, a file does not.`);
+    // Said where the technician looks, and to a screen reader.
+    const why = notOpened(s, key);
+    if (why !== undefined) {
+      host.set({ ...s, hint: why }, "panel");
+      host.announce(why);
     }
   }
 
@@ -493,6 +493,8 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
         }
         break;
       case "xp-dismiss":
+        // The button goes with the refusal: the list takes the focus.
+        focusNext = "grid";
         host.set({ ...state(), refusal: undefined }, "window");
         break;
       case "xp-menu-open":
