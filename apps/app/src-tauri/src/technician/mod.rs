@@ -57,6 +57,8 @@ mod history;
 mod host_os;
 // The network the technician waits on (ST-M009-016).
 mod network;
+// Make a customer copy, from Settings → Relay (ST-M007-016).
+mod customer_copy;
 // Settings → Relay (ST-M007-011).
 mod relay_settings;
 mod session_driver;
@@ -116,6 +118,9 @@ pub struct AppState {
     /// The certificate authority file the technician chose in Settings →
     /// Relay and has not saved yet (ST-M007-011).
     relay_ca: relay_settings::PendingCa,
+    /// What the technician chose for a customer copy, and the copy that was
+    /// made last, so that the window names them by a number (ST-M007-016).
+    customer_copy: customer_copy::Picks,
     /// The task of the session that is live or was live last, so that a
     /// change of network can wait until the old listener is gone before it
     /// starts the new one (ST-M009-016).
@@ -159,6 +164,7 @@ impl AppState {
             bridge: bridge::BridgeSlot::default(),
             network: network::NetworkChoice::of_this_copy(),
             relay_ca: relay_settings::PendingCa::default(),
+            customer_copy: customer_copy::Picks::default(),
             pump: PumpSlot::default(),
             listings: explorer::Listings::default(),
             transfers: explorer::Transfers::default(),
@@ -183,6 +189,7 @@ impl AppState {
             bridge: bridge::BridgeSlot::default(),
             network: network::NetworkChoice::of_this_copy(),
             relay_ca: relay_settings::PendingCa::default(),
+            customer_copy: customer_copy::Picks::default(),
             pump: PumpSlot::default(),
             listings: explorer::Listings::default(),
             transfers: explorer::Transfers::default(),
@@ -1148,7 +1155,13 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         relay_settings::choose_relay_ca,
         relay_settings::save_relay,
         relay_settings::test_relay,
-        relay_settings::remove_relay
+        relay_settings::remove_relay,
+        customer_copy::customer_copy_options,
+        customer_copy::choose_customer_program,
+        customer_copy::choose_customer_place,
+        customer_copy::generate_customer_key,
+        customer_copy::make_customer_copy,
+        customer_copy::show_customer_copy
     ]);
     #[cfg(not(feature = "dev-simulate"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -1195,7 +1208,13 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         relay_settings::choose_relay_ca,
         relay_settings::save_relay,
         relay_settings::test_relay,
-        relay_settings::remove_relay
+        relay_settings::remove_relay,
+        customer_copy::customer_copy_options,
+        customer_copy::choose_customer_program,
+        customer_copy::choose_customer_place,
+        customer_copy::generate_customer_key,
+        customer_copy::make_customer_copy,
+        customer_copy::show_customer_copy
     ]);
     builder
 }

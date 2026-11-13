@@ -1175,6 +1175,79 @@ async fn a_wait_that_cannot_start_after_a_relayed_session_names_no_relay() {
     assert_eq!(technician.console().relay, None);
 }
 
+// --- A customer copy (ST-M007-016) ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_customer_copy_is_all_a_customer_needs_to_reach_the_technician() {
+    let relay = keyed_relay().await;
+    let technician = technician_at(&relay, "copy", Some(TECHNICIAN_KEY));
+    let program = technician.folder().path("cretlink");
+
+    // The technician makes a copy for this customer, with the key the
+    // relay's operator listed for them.
+    let release = technician.folder().write(
+        "release/cretlink.exe",
+        b"MZ: the program of a release, as far as a copy looks at it",
+    );
+    let place = technician.folder().path("handed-out");
+    std::fs::create_dir_all(&place).unwrap();
+    let made =
+        technician.make_customer_copy(&program, "acme", Some(CUSTOMER_KEY), &release, &place);
+    assert_eq!(made, place.join("CretLink-Support-acme"));
+
+    // The folder is carried to the customer's computer, and nothing else is.
+    let carried = Folder::new("copy-carried");
+    let folder = carried.path("CretLink-Support-acme");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut written = String::new();
+    for entry in std::fs::read_dir(&made).unwrap() {
+        let entry = entry.unwrap();
+        let bytes = std::fs::read(entry.path()).unwrap();
+        written.push_str(&String::from_utf8_lossy(&bytes));
+        std::fs::write(folder.join(entry.file_name()), bytes).unwrap();
+    }
+    // It holds this customer's key, and not the technician's.
+    assert!(written.contains(CUSTOMER_KEY));
+    assert!(!written.contains(TECHNICIAN_KEY));
+
+    // The support program of that folder knows the technician's relay
+    // before any code is typed, as the technician's own copy names it.
+    let mut customer = Customer::at(&folder.join("CretLink-Support.exe"));
+    assert_eq!(customer.view().relay_of_copy, through(&relay));
+
+    // And a relay code is all it takes from there.
+    let (code, _, _) = waiting_on(&use_relay(&technician).await);
+    technician
+        .wait_for("that the relay holds the code", relay_holds_the_code)
+        .await;
+    customer.connect(&code).expect("the code is taken");
+    let on_console = technician
+        .wait_for("the approval code", |state| {
+            matches!(state.phase, SessionPhase::AwaitingApprovalCode { .. })
+        })
+        .await;
+    let on_customer = customer
+        .wait_for("the approval code", |view| view.approval_code.is_some())
+        .await;
+    let SessionPhase::AwaitingApprovalCode { code: approval } = &on_console.phase else {
+        unreachable!();
+    };
+    assert_eq!(
+        on_customer.approval_code.as_deref(),
+        Some(approval.as_str())
+    );
+    // The relay admitted both copies, each by a key of its own, and refused
+    // nobody. The key admitted the copy and nothing more: nobody has control.
+    let metrics = relay.control.metrics();
+    assert_eq!(metrics.denied_auth, 0, "{metrics:?}");
+    assert!(!technician.has_control());
+    assert!(!on_customer.status.control_active);
+
+    technician.stop().expect("stop");
+    technician.finished().await;
+    customer.settled().await;
+}
+
 // --- A relay that cannot be used ---
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -208,6 +208,31 @@ impl Technician {
         self.console()
     }
 
+    /// **Make a customer copy**, as the technician copy `program` makes one
+    /// (ST-M007-016): the folder for `label` in `place`, with the relay of
+    /// this technician's profile, `key` as the customer's key and `release`
+    /// as the program. Answers the folder.
+    pub(crate) fn make_customer_copy(
+        &self,
+        program: &std::path::Path,
+        label: &str,
+        key: Option<&str>,
+        release: &std::path::Path,
+        place: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let relay = self.relay_of(program).expect("a relay profile");
+        super::customer_copy::make(super::customer_copy::Plan {
+            relay: &relay,
+            label,
+            key,
+            program: release,
+            place,
+            replace: false,
+        })
+        .expect("the customer copy is made")
+        .folder
+    }
+
     /// What the commands send the session's task through: **Codes match**,
     /// **Stop**. It is closed once that task has ended.
     pub(crate) fn intents(&self) -> IntentSender {
