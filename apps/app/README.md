@@ -112,7 +112,73 @@ Windows the folder is removed once the window closes.
 | --- | --- | --- | --- |
 | Program | `%LOCALAPPDATA%\Programs\CretLink\cretlink.exe` | `~/Applications/CretLink.app/Contents/MacOS/cretlink` | `~/.local/bin/cretlink` |
 | Record | `…\CretLink\install.json` | `…/Contents/Resources/install.json` | `~/.local/share/CretLink/install.json` |
+| Settings | `settings.toml` and `relay-ca.pem` next to the record (ST-M007-011) | the same | the same |
 | Entry | Start-menu `CretLink.lnk`, HKCU uninstall entry | the bundle | `~/.local/share/applications/cretlink.desktop` |
+
+## The relay of this copy (ST-M007-011)
+
+When the two computers are not on one network, their copies meet on a relay
+that the technician hosts. A **relay profile** tells a copy which one: the
+relay's `address`, an optional admission `key`, an optional certificate
+authority file `ca` and an optional `name` in the certificate
+([`docs/relay-server.md`](../../docs/relay-server.md), section 3).
+
+| Read from | By | Rules |
+| --- | --- | --- |
+| `cretlink.toml` next to the program | both roles | the one place the customer role reads; nothing is written there |
+| `settings.toml` next to the install record | the installed technician copy | written by **Settings → Relay**; removed by `cretlink uninstall` |
+
+- **The lookup** is `relay::TechnicianRelays::active` for Give help and
+  `relay::next_to_program` for Get help (`src-tauri/src/relay.rs`). A file
+  next to the program wins over the settings, also when that file cannot be
+  used: a profile that is wrong is explained and never passed over for
+  another relay. A copy that runs once reads no settings. Without a profile
+  nothing about a relay is offered or dialled (REQ-N-003).
+- **The file is input that somebody else may have written**
+  (`cretlink_cli::relay_profile`): a small form of TOML, read up to 16 KiB,
+  with every unknown section and setting refused. A problem names the line and
+  the setting in plain words and never repeats text from the file.
+- **The key never comes back.** It is held as an admission token
+  (`cretlink_relay::AdmissionToken`: erased when dropped, redacted in
+  `Debug`). No view sent to the window holds it — `RelayView.keySet` says
+  only whether there is one — and a form that leaves the key alone says
+  `keep`. It is not logged and is no argument of any audit record.
+- **Always TLS** (`relay::EndpointDial`). A relay is reached over `wss` only,
+  with its certificate checked against the system's authorities or the
+  profile's `ca` file, for the profile's `name` or else the host of its
+  address. A check that fails ends the dial before anything is sent; nothing
+  falls back to a connection without TLS.
+- **Addressing only** (ADR-0016 §2, §4). A profile grants nothing. Saving one
+  opens no connection.
+
+| Command (Give help) | What it does |
+| --- | --- |
+| `get_relay_settings` | which relay this copy uses and where it comes from (`RelaySettings` in `src/shared/contract.ts`): the file next to the program and, in the installed copy, the settings; a profile that cannot be used with its file, setting and what is wrong |
+| `choose_relay_ca` | the system's dialog for the certificate authority file, opened from Rust; the file is read, checked and kept under a number (`ChosenCa`), so the window names no path of this computer |
+| `save_relay` `{ form }` | keeps the relay of the form (`RelayForm`) in the settings, and a copy of a chosen certificate file next to them; refuses in a copy that runs once |
+| `test_relay` `{ form? }` | reaches the relay once and answers in words (`RelayTest`): the relay of the form as it stands, or without a form the one this copy uses. It presents a ticket of its own, meets nobody and saves nothing |
+| `remove_relay` | removes the relay from the settings, with its key and its certificate file |
+
+**Settings → Relay** (`src/technician/views/relay.ts`) shows the form in the
+installed copy, the relay of the file when a file wins (with what the settings
+hold as the relay that is not used), and in a copy that runs once where its
+relay goes. The key field is always empty; after **Save** the form is drawn
+anew so that no typed key stays in a field, and the keyboard focus is put back
+where it was. **Remove** asks first. A refusal names the setting it is about
+and moves the focus there.
+
+On the customer's side a relay code typed into a copy whose profile cannot be
+used is answered with the file and what is wrong with it, before anything is
+dialled (`customer::typed_target`, stage `relay_profile`).
+
+The settings file is created for this user only where the system has file
+modes (`0600` on macOS and Linux); on Windows it has the access rules of the
+user's `%LOCALAPPDATA%` folder.
+
+To try the screen without a backend, run `npx vite` and open
+`/dev/relay.html` (`?copy=installed|kept|file|file-problem|run-once`,
+`?relay=admit|key|down`): the real controller against a copy and a relay held
+in memory.
 
 ## Live by default
 
@@ -145,9 +211,12 @@ waiting screen (`#t-wait`) names its adapter.
 - With more than one network the waiting screen offers the others under
   **Wait on another network**. While the listener moves it shows no code. The
   first Escape closes the open list; Escape then cancels as always.
-- The choice is kept for the later sessions of the same run, by adapter name
-  and in memory only (`src-tauri/src/technician/network.rs`): nothing is
-  written to disk.
+- The choice is kept for the later sessions, by adapter name
+  (`src-tauri/src/technician/network.rs`). The installed copy writes it to its
+  settings, next to the relay, so that it holds after the program is closed
+  (ST-M007-011); when that cannot be written the window says so (the
+  `console-notice` event). A copy that runs once keeps it in memory only and
+  writes nothing to disk.
 - Discovery announces the bound address alone, on its adapter alone
   (`cretlink_discovery::Advertiser`), so the customer's list never holds an
   address that nobody listens on.
@@ -475,6 +544,8 @@ apps/app/
   dev/gallery.html every screen of both roles from its fixtures (development only)
   dev/explorer.html the file explorer against a simulated customer computer
                     (development only)
+  dev/relay.html   Settings → Relay against a simulated copy and relay
+                   (development only)
   vitest.config.ts frontend tests (jsdom)
   src-tauri/
     Cargo.toml     detached crate; binary `cretlink`
@@ -484,7 +555,10 @@ apps/app/
     src/lib.rs     window per screen, process start and elevated relaunch
     src/start.rs   get_role, choose_role
     src/opener.rs  opens a validated file or folder with the platform opener
-    src/technician/  console state, commands, live-session driver, the
+    src/relay.rs   the relay of this copy, for both roles: where its profile
+                   comes from, the dial over wss, and the words of a failure
+    src/technician/  console state, commands, live-session driver, Settings →
+                     Relay (relay_settings.rs), the
                      session history (history.rs) and the file explorer
                      (explorer.rs; in explorer/: commands.rs, the queue in
                      transfers.rs, rename and delete in changes.rs, the rules

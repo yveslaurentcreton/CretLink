@@ -3170,6 +3170,38 @@ metadata rather than content.
   relay's log, events and metrics name the label and never the key, and a key
   file that breaks a rule is refused as a whole, so a typing error neither
   opens the relay nor locks everybody out.
+- *A relay profile is addressing, and its file is untrusted input.* A copy
+  learns its relay from a relay profile: the relay's address, an optional
+  admission key, an optional certificate authority file and an optional name
+  in the certificate (ST-M007-011). It is read from `cretlink.toml` next to
+  the program, by both roles, or from the settings of the installed technician
+  copy; the customer role reads the file next to its program and nothing
+  else, and writes nothing. Nothing in a profile grants control (ADR-0016 §2,
+  §4). Somebody who can write next to the program or into the settings can
+  point a copy at a relay of their own, which is then the hostile relay this
+  section already models: it sees metadata and can deny service, and the
+  approval codes differ when it puts itself in between. The file may have
+  been written by somebody else, so it is read up to a fixed size in a small,
+  strict form: every unknown section and setting is refused, every setting is
+  bounded, the certificate file must be a plain name next to the profile, and
+  a file that cannot be used is explained before any connection and never
+  passed over for another relay. An explanation names the line and the
+  setting and never repeats text from the file.
+- *The application speaks only `wss` to a relay.* A profile has no setting
+  that turns TLS off and an address with a scheme is refused. The relay's
+  certificate is validated against the system's authorities, or against the
+  profile's certificate file and nothing else when it names one, for the
+  profile's name or else the host of its address. A certificate that is not
+  trusted, or that carries another name, ends the dial before the rendezvous
+  preamble is written, so neither the admission key nor the ticket leaves the
+  computer, and the application never falls back to a connection without TLS.
+- *The admission key stays where it is needed.* It is held in a type that is
+  erased when dropped and redacted in debug output. The application never
+  shows it again once it is saved, never logs it, puts it in no audit record
+  and in no error text; a form that leaves the key alone tells the backend to
+  keep it instead of sending it back. The test of a relay in Settings
+  presents a ticket of its own, meets nobody and carries nothing of a
+  session.
 - *A relay code grants nothing.* It holds a random seed of 64 bits and a
   typing check, no address and no key. Someone who overhears or guesses a code
   can at most reach the rendezvous before the customer does: the approval
@@ -3207,6 +3239,14 @@ metadata rather than content.
 - Availability is not defended. A hostile relay can always refuse, delay, or
   degrade service. The guarantee is fail-closed denial of control, not
   liveness.
+- The admission key stands in readable form on disk: in `cretlink.toml` next
+  to a copy, and in the settings of the installed technician copy. The
+  settings file is created for the user only where the system has file modes
+  (`0600` on macOS and Linux) and has the access rules of the user's
+  `%LOCALAPPDATA%` folder on Windows; a customer copy is a folder that is
+  handed over, and whoever has it has its key. A key admits to the forwarder
+  and nothing else, and one key per customer bounds what a leaked one is
+  worth until its line is deleted.
 - Third-party relay deployments. As MIT-licensed software, relay code can be
   self-hosted by anyone; the project cannot police hostile or negligent
   deployments beyond making endpoint security independent of relay honesty.

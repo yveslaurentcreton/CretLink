@@ -297,15 +297,120 @@ On Windows, run the verified `.exe` under a dedicated low-privilege service
 account (for example via a Scheduled Task or a service wrapper); the binary
 itself needs no elevation.
 
-## 3. Point the endpoints at the relay
+## 3. Tell a copy of CretLink which relay to use
 
-Both the console and the support agent dial the relay outbound and must present
-the **same** single-use rendezvous ticket. Give each side a relay address, that
-ticket, and — if the relay requires one — the shared admission token, through
-their CLI flags or environment. Today these options exist only in the headless
-development tools `cretlink-console` and `cretlink-support-agent`, built from
-the source tree (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)); the released
-application `cretlink` does not use a relay yet (M007, ST-M009-010):
+A copy of the application learns its relay from a **relay profile**
+(ST-M007-011). A profile has four settings:
+
+| Setting | Meaning |
+| --- | --- |
+| `address` | The relay's host name and port, such as `relay.example.org:443`. An IPv6 address stands in square brackets: `[2001:db8::1]:443`. |
+| `key` | The admission key of this copy, when the relay asks for one ([§2](#one-key-per-customer)). Leave it out for a relay without keys. |
+| `ca` | The name of a PEM file next to the profile: the certificate of the authority that signed the relay's certificate. Only for a certificate from an authority of your own. |
+| `name` | The name in the relay's certificate, when it differs from the host of `address`. |
+
+A profile is **addressing and nothing else**. It says where two copies meet,
+and its key only admits a copy to the forwarder. It gives nobody control:
+pairing, the approval code that two people compare and the customer's consent
+decide about a session, exactly as on one network (ADR-0016 §2, §4). Without
+a profile no relay is offered and nothing changes for a session on one
+network.
+
+A profile is not yet enough to run a session through the relay: the
+application reads it, shows it and tests it, and the session itself follows
+with ST-M007-013.
+
+### A file next to the program
+
+Both roles read a file named `cretlink.toml` next to the program. This is how
+a copy that runs once, and every copy you hand to a customer
+(`CretLink-Support.exe`), learn your relay:
+
+```toml
+# cretlink.toml, in the same folder as the program
+[relay]
+address = "relay.example.org:443"
+key = "9a41c7b3…"
+```
+
+With a certificate from an authority of your own, put that authority's
+certificate next to it and name it:
+
+```toml
+[relay]
+address = "192.0.2.1:9970"
+name = "relay.example.org"
+ca = "relay-ca.pem"
+```
+
+- The file is a small form of TOML: one section `[relay]`, one setting on a
+  line, each text in double quotes (or in single quotes, taken as written).
+  Lines that start with `#` are comments.
+- **An unknown section or setting is an error**, and so is an address without
+  a port, an empty key, or a `ca` that names a folder. A file that cannot be
+  used is explained in plain words with its line and its setting, before
+  anything is connected to, and never passed over for another relay. The
+  explanation never repeats what the file holds, so a key that was typed in
+  the wrong place does not appear on a screen.
+- The file is read up to 16 KiB and the certificate file up to 256 KiB.
+- The customer role reads this file and nothing else, and writes nothing.
+- **The key stands in the file in readable form.** Give every customer copy a
+  key of its own, so that you can withdraw one by deleting its line from the
+  relay's key file. A key that leaks lets a stranger use the forwarder until
+  then; it shows no session and controls none.
+
+### Settings, in the installed copy
+
+The installed technician copy has **Settings → Relay** with the same four
+settings:
+
+- **Save** keeps the relay for your user account, next to the install record:
+  `settings.toml`, and `relay-ca.pem` when you chose a certificate file. On
+  macOS and Linux the file can be read and written by your account only (mode
+  `0600`); on Windows it lies in your own `%LOCALAPPDATA%` folder and has the
+  access rules of that folder. `cretlink uninstall` removes both files and
+  says so before it does.
+- The **key is never shown** again once it is saved: the screen says only
+  that a key is set. Leave the field empty to keep it.
+- **Test** reaches the relay once, with what stands in the form, and says in
+  words what came of it: the relay admits this copy, or it could not be
+  reached, its certificate is not trusted, it asks for a key, it does not
+  know the key, or it comes from another release. It meets nobody and saves
+  nothing.
+- **Remove** removes the relay, its key and its certificate file, after
+  asking.
+
+**A file next to the program wins over Settings**, and the screen says so: it
+then shows the relay of the file, and what Settings holds as the relay that is
+not used. A copy that runs once keeps no settings; its relay goes in the file.
+
+The installed copy keeps one more thing in the same file: the network it
+waits on when your computer is on several (ST-M009-016).
+
+### Always TLS
+
+The application speaks `wss` to the relay and nothing else. A profile has no
+setting that turns TLS off, and an address with `ws://`, `wss://` or a path is
+refused. The relay's certificate is checked against the certificate
+authorities of the computer, or against the `ca` file when the profile names
+one, and it must carry the relay's name: the `name` of the profile, or else
+the host of its `address`. When that check fails nothing is sent to the relay,
+not even the rendezvous preamble, and the application never falls back to a
+connection without TLS.
+
+That name is the relay's host name for everything else too: it is what both
+people are shown, and what the relay code is tied to
+([§7](#the-relay-code-and-the-ticket)). Give every copy of one relay the same
+`name`, or leave it out in all of them.
+
+### The development tools
+
+The headless development tools `cretlink-console` and
+`cretlink-support-agent`, built from the source tree (see
+[`CONTRIBUTING.md`](../CONTRIBUTING.md)), take the relay on their command line
+instead. Both must present the **same** single-use rendezvous ticket. Give
+each side a relay address, that ticket, and — if the relay requires one — the
+shared admission token, through their CLI flags or environment:
 
 | Variable | Flag | Used by | Meaning |
 | --- | --- | --- | --- |
@@ -513,10 +618,12 @@ ticket      HKDF-SHA256(salt = "CretLink relay rendezvous ticket v1",
 ```
 
 The code carries no address: each program takes the relay from its own
-settings. The host name is part of the derivation, so two programs that name
-different relays never meet. The canonical form is the host name in lower case
-without a trailing dot, or an IP address in its standard text form; the port
-is not part of it. An address in another spelling, such as one with leading
+relay profile ([§3](#3-tell-a-copy-of-cretlink-which-relay-to-use)). The host
+name is part of the derivation, so two programs that name different relays
+never meet. It is the name the relay's certificate must carry: the `name` of
+the profile, or else the host of its `address`. The canonical form is the host
+name in lower case without a trailing dot, or an IP address in its standard
+text form; the port is not part of it. An address in another spelling, such as one with leading
 zeros, is refused instead of taken for a name. The alphabet has no `I`, `L`, `O` or `U`; input in any case
 is accepted, `I` and `L` read as `1`, `O` as `0`, and hyphens and spaces are
 ignored. The checksum rejects every mistyped character and every swap of two
@@ -539,7 +646,7 @@ any such tampering, permanently poisoning the channel (REQ-S-008, REQ-S-009).
 posture), REQ-N-016 through REQ-N-019 (provenance, honest failure, versioned
 artifacts), REQ-N-023 (the container image). Stories: ST-M007-005
 (deployment), ST-M007-007 (server binary), ST-M007-009 (built-in wss/TLS
-transport), ST-M007-012 (the relay's answer and the relay code), ST-M007-014
-(one key per customer), ST-M007-015 (the container image and the relay behind
-a proxy). Architecture: ADR-0016 §2 (rendezvous is addressing), §3
+transport), ST-M007-011 (the relay profile), ST-M007-012 (the relay's answer
+and the relay code), ST-M007-014 (one key per customer), ST-M007-015 (the
+container image and the relay behind a proxy). Architecture: ADR-0016 §2 (rendezvous is addressing), §3
 (shipped wss transport), §5 (opaque rendezvous forwarder).*
