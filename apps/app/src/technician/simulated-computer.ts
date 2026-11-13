@@ -463,7 +463,7 @@ export class SimulatedComputer {
         if (choice === undefined) {
           leave(
             name,
-            "A name that is taken needs your choice: replace, keep both or skip. It was not copied.",
+            "A name that is taken needs your choice: replace, keep both or skip. It was not sent.",
           );
           continue;
         }

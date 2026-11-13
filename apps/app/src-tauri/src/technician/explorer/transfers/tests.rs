@@ -322,11 +322,11 @@ async fn a_name_that_is_taken_is_replaced_kept_beside_or_skipped_as_chosen() {
     assert_eq!(state("skip.txt"), None, "a skipped item has no row");
     assert_eq!(
         state("unasked.txt"),
-        Some((TransferState::LeftOut, Some(NEEDS_A_CHOICE.to_owned())))
+        Some((TransferState::LeftOut, Some(not_sent(NEEDS_A_CHOICE))))
     );
     assert_eq!(
         state("is-a-file"),
-        Some((TransferState::LeftOut, Some(KINDS_DIFFER.to_owned())))
+        Some((TransferState::LeftOut, Some(not_sent(KINDS_DIFFER))))
     );
     // An empty folder that goes into one that is there: nothing to make.
     assert_eq!(state("Photos"), Some((TransferState::Done, None)));
@@ -1410,7 +1410,7 @@ async fn a_name_that_is_taken_here_is_replaced_kept_beside_or_skipped_as_chosen(
     };
     assert_eq!(
         state("unasked.txt"),
-        Some((TransferState::LeftOut, Some(NEEDS_A_CHOICE.to_owned())))
+        Some((TransferState::LeftOut, Some(not_copied(NEEDS_A_CHOICE))))
     );
     let late = state("late.txt").unwrap();
     assert_eq!(late.0, TransferState::Failed);
@@ -1434,6 +1434,62 @@ async fn a_name_that_is_taken_here_is_replaced_kept_beside_or_skipped_as_chosen(
     assert_eq!(
         row(&transfers, "both.txt").local,
         root.join("both (3).txt").display().to_string()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file never replaces a folder on this computer, whatever the window
+/// asks for: the folder and what it holds stay, and nothing is asked of the
+/// customer computer for it.
+#[tokio::test]
+async fn a_file_never_replaces_a_folder_on_this_computer() {
+    let dir = scratch("download-kinds");
+    let root = dir.join("to");
+    // On this computer the name is a folder that holds a file.
+    file(&root.join("notes.txt"), "kept.txt", 3);
+    let fake = Fake::new();
+    fake.put(&format!("{DOCUMENTS}\\notes.txt"), Node::File(vec![5; 8]));
+
+    let names = selected(&[("notes.txt", EntryKind::File)]);
+    let check = check_download(&root, &names);
+    assert_eq!(
+        check
+            .conflicts
+            .iter()
+            .map(|conflict| (conflict.name.as_str(), conflict.replace))
+            .collect::<Vec<_>>(),
+        [("notes.txt", false)],
+        "replacing is not offered"
+    );
+    // The window asks for it all the same.
+    let choices: HashMap<String, Choice> = [("notes.txt".to_owned(), Choice::Replace)]
+        .into_iter()
+        .collect();
+    let transfers = Transfers::default();
+    let delivered = Delivered::default();
+    transfers
+        .queue_download(DOCUMENTS, &names, &root, &choices)
+        .unwrap();
+    carry(&transfers, &fake, &delivered).await;
+
+    assert_eq!(
+        rows(&transfers),
+        [(
+            "notes.txt".to_owned(),
+            TransferState::Failed,
+            Some(not_copied(KINDS_DIFFER))
+        )]
+    );
+    assert_eq!(
+        std::fs::read(root.join("notes.txt").join("kept.txt")).unwrap(),
+        vec![b'x'; 3]
+    );
+    assert!(
+        !fake
+            .asked()
+            .iter()
+            .any(|asked| asked.starts_with("download")),
+        "the file was not asked for"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -23,9 +23,10 @@
 //! Every command that asks something of the customer computer, or that
 //! prepares to, refuses with `no_consented_session` outside a session under
 //! full control with an open audit trail, before anything else: no dialog
-//! opens and nothing is kept. The four that only look at what this side
-//! holds — the queue, a cancel, the folder of a copy — work whenever the
-//! window asks, and reach nothing on the customer computer.
+//! opens and nothing is kept, and what a dialog gave is not kept either when
+//! the session ended while it was open. The five that only look at or cancel
+//! what this side holds — the queue, the three cancels, the folder of a copy —
+//! work whenever the window asks, and reach nothing on the customer computer.
 //!
 //! # What the window can name
 //!
@@ -435,6 +436,8 @@ pub(in super::super) async fn explorer_choose_folder(
         .set_title("Copy to this folder")
         .pick_folder()
         .await;
+    // The session may have ended while the dialog was open.
+    state.files().ok_or_else(no_session)?;
     Ok(chosen.map(|folder| {
         let path = folder.path().to_path_buf();
         ChosenFolder {

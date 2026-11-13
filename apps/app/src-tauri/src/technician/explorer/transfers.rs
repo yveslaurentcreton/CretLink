@@ -475,11 +475,21 @@ fn local_kind(path: &Path) -> Option<FileKind> {
     })
 }
 
-const NEEDS_A_CHOICE: &str =
-    "A name that is taken needs your choice: replace, keep both or skip. It was not copied.";
-const KINDS_DIFFER: &str =
-    "A file cannot replace a folder, and a folder cannot replace a file. It was not copied.";
-const NO_FREE_NAME: &str = "No free name was found for a second copy. It was not copied.";
+// What stood in the way of an item whose name is taken. A row says it for
+// the way the item goes: [`not_sent`] or [`not_copied`].
+const NEEDS_A_CHOICE: &str = "A name that is taken needs your choice: replace, keep both or skip.";
+const KINDS_DIFFER: &str = "A file cannot replace a folder, and a folder cannot replace a file.";
+const NO_FREE_NAME: &str = "No free name was found to keep both.";
+
+/// `why`, as the reason of an item that was not sent to the customer computer.
+fn not_sent(why: &str) -> String {
+    format!("{why} It was not sent.")
+}
+
+/// `why`, as the reason of an item that was not copied to this computer.
+fn not_copied(why: &str) -> String {
+    format!("{why} It was not copied.")
+}
 const NOT_A_FILE_OR_FOLDER: &str = "It is neither a file nor a folder.";
 const QUEUE_FULL: &str = "CretLink keeps at most 100,000 transfers of one session in its list. \
      Wait until some have run, or end the session and start a new one.";
@@ -874,7 +884,7 @@ impl Transfers {
             if used.contains(&name.to_lowercase()) {
                 leave(
                     kind,
-                    "Another item of this drop has the same name. It was not copied.",
+                    &not_sent("Another item of this drop has the same name."),
                     &mut planned,
                 );
                 queued.left_out += 1;
@@ -885,7 +895,7 @@ impl Transfers {
                 None => (name.to_owned(), false),
                 Some(existing) => match choices.get(name) {
                     None => {
-                        leave(kind, NEEDS_A_CHOICE, &mut planned);
+                        leave(kind, &not_sent(NEEDS_A_CHOICE), &mut planned);
                         queued.left_out += 1;
                         continue;
                     }
@@ -895,7 +905,7 @@ impl Transfers {
                     }
                     Some(Choice::Replace) if can_replace(kind, existing) => (name.to_owned(), true),
                     Some(Choice::Replace) => {
-                        leave(kind, KINDS_DIFFER, &mut planned);
+                        leave(kind, &not_sent(KINDS_DIFFER), &mut planned);
                         queued.left_out += 1;
                         continue;
                     }
@@ -907,7 +917,7 @@ impl Transfers {
                         match local::kept_beside(name, kind == EntryKind::Folder, &taken) {
                             Some(free) => (free, false),
                             None => {
-                                leave(kind, NO_FREE_NAME, &mut planned);
+                                leave(kind, &not_sent(NO_FREE_NAME), &mut planned);
                                 queued.left_out += 1;
                                 continue;
                             }
@@ -1088,7 +1098,7 @@ impl Transfers {
                         name.clone(),
                         remote,
                         dest.display().to_string(),
-                        NEEDS_A_CHOICE,
+                        &not_copied(NEEDS_A_CHOICE),
                     ));
                     queued.left_out += 1;
                     continue;
@@ -1944,7 +1954,7 @@ async fn selected<T: FileTarget>(
     };
     let dest = local
         .as_deref()
-        .ok_or_else(|| NO_FREE_NAME.to_owned())
+        .ok_or_else(|| not_copied(NO_FREE_NAME))
         .and_then(|local| local::beside(root, local).map_err(unusable));
     let dest = match dest {
         Ok(dest) => dest,
@@ -1956,6 +1966,18 @@ async fn selected<T: FileTarget>(
     let merge = choice == Some(Choice::Replace);
     let source = join(folder, name);
     if !is_folder {
+        // A file replaces a file only, whatever was chosen and whatever lay
+        // there when the technician was asked.
+        if merge && !matches!(local_kind(&dest), None | Some(FileKind::File)) {
+            end(
+                transfers,
+                emit,
+                id,
+                TransferState::Failed,
+                Some(not_copied(KINDS_DIFFER)),
+            );
+            return Step::Next;
+        }
         deliver(
             emit,
             transfers.update(id, |entry| {
