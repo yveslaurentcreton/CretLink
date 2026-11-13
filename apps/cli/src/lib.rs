@@ -12,7 +12,9 @@
 //!   (ST-M008-002), see [`shell`].
 //! - `cretlink-cli version` prints the release version (ST-M006-014).
 //! - `cretlink-cli uninstall` removes the per-user install of the technician
-//!   role, after showing what it removes (ST-M009-006), see [`install`].
+//!   role, with the settings of the installed copy ([`settings`],
+//!   ST-M007-011), after showing what it removes (ST-M009-006), see
+//!   [`install`].
 //! - `cretlink-cli recover [--remove]` lists, or removes, what CretLink left on
 //!   a customer computer (ST-M006-003, ST-M009-010): the report and the
 //!   fail-closed exit codes of the support agent's recovery verb, which it
@@ -26,6 +28,7 @@
 pub mod install;
 pub mod process;
 pub mod relay_profile;
+pub mod settings;
 pub mod setup;
 pub mod shell;
 
@@ -427,10 +430,11 @@ Commands:
   mcp status          Show where CretLink is registered.
   shell [OPTIONS]     Open a terminal on the consented session
                       (see '{program} shell --help').
-  uninstall [--yes]   Remove CretLink installed for this user: its files, menu
-                      entry, uninstall entry and the AI client registrations it
-                      made. Shows what it removes and asks first, unless --yes.
-                      The audit trail stays.
+  uninstall [--yes]   Remove CretLink installed for this user: its files, its
+                      settings (the relay and its key), menu entry, uninstall
+                      entry and the AI client registrations it made. Shows
+                      what it removes and asks first, unless --yes. The audit
+                      trail stays.
   recover [--remove]  List what CretLink left on this computer (staged files,
                       reboot-resume tickets); with --remove, remove it. Exits
                       with an error when something could not be removed.
@@ -589,6 +593,9 @@ mod tests {
         let plan = install::UninstallPlan {
             location: std::path::PathBuf::from("/home/ann/.local/bin"),
             files: vec![std::path::PathBuf::from("/home/ann/.local/bin/cretlink")],
+            settings: vec![std::path::PathBuf::from(
+                "/home/ann/.local/share/CretLink/settings.toml",
+            )],
             after_exit: false,
             entry: None,
             uninstall_entry: false,
@@ -599,6 +606,14 @@ mod tests {
         let text = uninstall_plan_text(&plan);
         assert!(
             text.contains("This removes:\n  - /home/ann/.local/bin/cretlink\n"),
+            "{text}"
+        );
+        // The settings hold the relay's key: the plan says that they go too.
+        assert!(
+            text.contains(
+                "  - Your settings (the relay with its key, the network to wait on): \
+                 /home/ann/.local/share/CretLink/settings.toml\n"
+            ),
             "{text}"
         );
         assert!(text.contains("  - The Codex CLI registration, which now starts /x mcp\n"));
