@@ -180,6 +180,19 @@ pub fn pinned_roots(cas: Vec<CertificateDer<'static>>) -> Result<RootCertStore, 
 /// malformed anchors in the OS store are skipped so one bad entry cannot deny
 /// the whole set.
 ///
+/// # The environment can replace the store
+///
+/// The anchors are read by `rustls-native-certs`. When the environment
+/// variable `SSL_CERT_FILE` or `SSL_CERT_DIR` is set for the process, that
+/// library reads the certificates named there **instead of** the operating
+/// system's store, on every platform, and it offers no way to read the
+/// system's store without them (its platform loaders are private). Whoever
+/// sets the environment of the program therefore chooses the authorities that
+/// vouch for a relay without a pinned certificate. It is recorded as a
+/// residual risk of the relay in the threat model; a caller that pins a
+/// certificate ([`pinned_roots`]) is not affected, because the environment is
+/// then not read at all.
+///
 /// # Errors
 ///
 /// Returns [`WssError::NoSystemRoots`] if the OS exposes no usable anchors.

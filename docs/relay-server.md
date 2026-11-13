@@ -410,6 +410,15 @@ the host of its `address`. When that check fails nothing is sent to the relay,
 not even the rendezvous preamble, and the application never falls back to a
 connection without TLS.
 
+A `ca` file **replaces** the certificate authorities of the computer, it does
+not add to them: with it, no public authority can vouch for a server under
+the relay's name. Without it, one thing can change what "the certificate
+authorities of the computer" are: when the environment variable
+`SSL_CERT_FILE` or `SSL_CERT_DIR` is set for the program, the certificates
+named there are used instead of the operating system's store. Leave both
+unset for CretLink, or give the profile a `ca` file, which is then the only
+authority and is not affected by the environment.
+
 That name is the relay's host name for everything else too: it is what both
 people are shown, and what the relay code is tied to
 ([§7](#the-relay-code-and-the-ticket)). Give every copy of one relay the same

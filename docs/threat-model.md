@@ -3332,6 +3332,24 @@ metadata rather than content.
   handed over, and whoever has it has its key. A key admits to the forwarder
   and nothing else, and one key per customer bounds what a leaked one is
   worth until its line is deleted.
+- The environment can replace the system's authorities. A copy whose
+  profile names no certificate file checks the relay's certificate against
+  the authorities of the operating system, which it reads with
+  `rustls-native-certs`. When the environment variable `SSL_CERT_FILE` or
+  `SSL_CERT_DIR` is set for the program, that library reads the certificates
+  named there instead of the operating system's store, on Windows, macOS and
+  Linux alike, and it offers no way to read the system's store without them.
+  Whoever can set the environment a copy starts with can therefore choose
+  the authorities that vouch for a relay, as somebody who can write the
+  profile file can with `ca`; the screens then still speak of the
+  certificate authorities of this computer, because the copy cannot tell the
+  two apart. What they gain is the place of a hostile relay: they see
+  ciphertext, sizes and timing and can deny service, and the approval codes
+  differ when they put themselves in between. A profile with a certificate
+  file is not affected: its file replaces every other authority, and the
+  environment is not read at all. A technician who wants a relay checked
+  against one authority and nothing else gives the profile that authority's
+  certificate file.
 - The relay code is read over the same call as the approval code. Somebody
   who listens to that call learns the relay code; to use it they also need a
   copy that the relay admits. If they join before the customer, the

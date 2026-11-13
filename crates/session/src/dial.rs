@@ -50,7 +50,7 @@ use cretlink_relay::{
     AdmissionToken, Preamble, PreambleError, RelayAnswer, RelayRefusal, RendezvousTicket,
     read_answer, write_preamble,
 };
-use cretlink_wss::{WssClientStream, WssConnector, WssError};
+use cretlink_wss::{TrustStore, WssClientStream, WssConnector, WssError};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -574,15 +574,28 @@ impl WssRelayDial {
     /// the pinned PEM holds no usable certificate, if the OS exposes no trust
     /// anchors, or if the TLS client configuration is rejected (REQ-S-020).
     pub fn connector(pinned_ca_pem: Option<&[u8]>) -> Result<WssConnector, SessionError> {
-        let roots = match pinned_ca_pem {
-            Some(pem) => {
-                let cas = cretlink_wss::certs_from_pem(pem).map_err(map_trust_error)?;
-                cretlink_wss::pinned_roots(cas).map_err(map_trust_error)?
-            }
-            None => cretlink_wss::system_roots().map_err(map_trust_error)?,
-        };
+        let roots = Self::trust_store(pinned_ca_pem)?;
         let config = cretlink_wss::client_config(roots).map_err(map_trust_error)?;
         Ok(cretlink_wss::connector(config))
+    }
+
+    /// The authorities a relay's certificate is checked against, by the
+    /// endpoint's deployment choice.
+    ///
+    /// With `pinned_ca_pem` they are the certificates of that text **and
+    /// nothing else**: a certificate file replaces the operating system's
+    /// authorities, it does not add to them. An operator who runs a relay
+    /// under an authority of their own thereby also decides that no public
+    /// authority can vouch for a server under the relay's name. Without it
+    /// they are the operating system's store.
+    fn trust_store(pinned_ca_pem: Option<&[u8]>) -> Result<TrustStore, SessionError> {
+        match pinned_ca_pem {
+            Some(pem) => {
+                let cas = cretlink_wss::certs_from_pem(pem).map_err(map_trust_error)?;
+                cretlink_wss::pinned_roots(cas).map_err(map_trust_error)
+            }
+            None => cretlink_wss::system_roots().map_err(map_trust_error),
+        }
     }
 }
 
@@ -1121,5 +1134,55 @@ mod tests {
             .expect("the refusal is the source of the failure")
             .to_string();
         assert!(reason.contains("too many attempts"), "{reason}");
+    }
+    #[test]
+    fn a_certificate_file_replaces_the_systems_authorities_and_does_not_add_to_them() {
+        let (ours, _) = cretlink_wss::testcert::self_signed("relay.example.org").unwrap();
+        let (theirs, _) = cretlink_wss::testcert::self_signed("host-01.example.org").unwrap();
+        let subjects = |store: &TrustStore| -> Vec<Vec<u8>> {
+            store
+                .roots
+                .iter()
+                .map(|anchor| anchor.subject.as_ref().to_vec())
+                .collect()
+        };
+
+        // One certificate in the file: one authority, and it is that one.
+        let one = cretlink_wss::certs_to_pem(std::slice::from_ref(&ours));
+        let pinned = WssRelayDial::trust_store(Some(one.as_bytes())).unwrap();
+        assert_eq!(pinned.len(), 1);
+        let only_ours = cretlink_wss::pinned_roots(vec![ours.clone()]).unwrap();
+        assert_eq!(subjects(&pinned), subjects(&only_ours));
+        // Two in the file: those two.
+        let two = cretlink_wss::certs_to_pem(&[ours.clone(), theirs.clone()]);
+        let both = WssRelayDial::trust_store(Some(two.as_bytes())).unwrap();
+        assert_eq!(both.len(), 2);
+
+        // Where this computer has authorities of its own, none of them is
+        // among those of the file, and the file's certificate is not among
+        // the system's: the two stores are apart.
+        if let Ok(system) = WssRelayDial::trust_store(None) {
+            assert!(!system.is_empty());
+            let of_the_system = subjects(&system);
+            for subject in subjects(&both) {
+                assert!(!of_the_system.contains(&subject));
+            }
+            for subject in &of_the_system {
+                assert!(!subjects(&pinned).contains(subject));
+            }
+        }
+
+        // A file without a certificate that can be used gives no store at
+        // all: it never falls back to the system's authorities.
+        for unusable in [
+            &b""[..],
+            b"-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n",
+        ] {
+            assert!(matches!(
+                WssRelayDial::trust_store(Some(unusable)),
+                Err(SessionError::Relay(RelayFailure::Settings(_)))
+            ));
+            assert!(WssRelayDial::connector(Some(unusable)).is_err());
+        }
     }
 }
