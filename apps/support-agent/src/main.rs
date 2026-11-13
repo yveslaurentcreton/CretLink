@@ -443,6 +443,7 @@ fn outcome_label(outcome: ActionOutcome) -> String {
         ActionOutcome::InProgress => "in progress".to_string(),
         ActionOutcome::Succeeded => "done".to_string(),
         ActionOutcome::Failed { code } => format!("refused or failed ({code:?})"),
+        ActionOutcome::Cancelled => "cancelled by the technician".to_string(),
         ActionOutcome::Unknown => "result unknown".to_string(),
     }
 }
@@ -523,6 +524,10 @@ fn print_reboot_resume_disclosure() {
 /// - `fs.v1` — always. The [`FileStore`] backend is cross-platform (ADR-0012,
 ///   ST-M003-004/005). Its gate is advisory (file ops are served regardless),
 ///   but advertising it lets a peer negotiate honestly.
+/// - `fs.v2` — always. The drive list and the removal of a folder with its
+///   content are served by the same file store on every platform; the runtime
+///   enforces this gate, so they answer `Unsupported` unless it is advertised
+///   here (ST-M010-001).
 /// - `term.v1` — Windows only. The ConPTY interactive backend exists solely on
 ///   Windows; off Windows the broker answers `InteractiveUnsupported`, so
 ///   advertising a terminal there would be a lie (ADR-0013, ST-M003-009).
@@ -534,10 +539,11 @@ fn print_reboot_resume_disclosure() {
 ///   persisting a single-use ticket (ADR-0014, ST-M006-001); elsewhere
 ///   reboot-resume stays off and nothing can be armed.
 fn build_reboot_resume() -> (Arc<dyn RebootResumeArmer>, Vec<String>, bool) {
-    use cretlink_protocol::CAP_FS_V1;
+    use cretlink_protocol::{CAP_FS_V1, CAP_FS_V2};
 
-    // Cross-platform base: file operations are always available.
-    let mut capabilities = vec![CAP_FS_V1.to_string()];
+    // Cross-platform base: file operations are always available, the drive
+    // list and the folder removal of the file explorer among them.
+    let mut capabilities = vec![CAP_FS_V1.to_string(), CAP_FS_V2.to_string()];
 
     // The interactive terminal is served only where a pseudo-console backend
     // exists (Windows). Gate the advertisement on the same condition the broker

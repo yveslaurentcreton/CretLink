@@ -628,6 +628,7 @@ name = "cretlink-exec"
 version = "0.0.0"
 dependencies = [
  "cretlink-protocol",
+ "nix",
  "png 0.18.1",
  "process-wrap",
  "serde",

@@ -9,11 +9,14 @@
 //! - [`Actor::Mcp`]: every AI tool call, including read-only ones, with the AI
 //!   client's label ([`client_label`]) and its stated purpose;
 //! - [`Actor::Terminal`]: the technician terminal opening and closing;
-//! - [`Actor::Console`]: manual console commands and cancellations.
+//! - [`Actor::Console`]: manual console commands and cancellations, and the
+//!   technician's own file actions — the drive list, the removal of a folder
+//!   with its content, a file sent into a folder (ST-M010-001).
 //!
 //! A call's `_start` record opens a running item and its completion record
-//! (sharing the `call_id`, or the `job_id` for a manual command) updates the
-//! same item in place with the honest state and the duration. Session
+//! (sharing the `call_id`, the `job_id` for a manual command, or the
+//! `action_id` for a file action of the technician) updates the same item in
+//! place with the honest state and the duration. Session
 //! lifecycle records (pairing, consent, cleanup) and purely local registry
 //! records (a terminal consumer attaching) are not actions on the customer
 //! computer and produce no item.
@@ -228,12 +231,20 @@ impl TechnicianActivity {
     }
 
     /// The item id of one record: the console-minted `call_id` of a routed
-    /// call, the `job_id` of a manual command, or a fresh local id for a
-    /// one-shot completion record. A start record without a correlation id
-    /// cannot be paired with its completion and produces no item.
+    /// call, the `action_id` of a file action of the technician, the `job_id`
+    /// of a manual command, or a fresh local id for a one-shot completion
+    /// record. A start record without a correlation id cannot be paired with
+    /// its completion and produces no item.
     fn id_for(&mut self, entry: &RecordView<'_>, base: &str, is_start: bool) -> Option<String> {
         if let Some(call) = arg_u64(entry, "call_id") {
             return Some(format!("call-{call}"));
+        }
+        // A technician action is numbered apart from the routed calls, so the
+        // two never share an item (ST-M010-001).
+        if entry.actor == Actor::Console
+            && let Some(action) = arg_u64(entry, "action_id")
+        {
+            return Some(format!("action-{action}"));
         }
         // A manual command's start and finish share its job id.
         if entry.actor == Actor::Console
@@ -296,6 +307,23 @@ fn action_of(entry: &RecordView<'_>, base: &str) -> Option<Action> {
                 "console_cancel" => (
                     ActivityKind::JobControl,
                     format!("stop job {}", arg(entry, "job_id")),
+                ),
+                // The technician's file explorer (ST-M010-001), in the words
+                // the customer's own feed uses for the same actions.
+                "console_fs_drives" => (ActivityKind::FileOperation, "list the drives".to_owned()),
+                "console_remove_tree" => (
+                    ActivityKind::FileOperation,
+                    format!(
+                        "delete the folder {} and everything in it",
+                        path_text(&arg(entry, "path"))
+                    ),
+                ),
+                "console_send" => (
+                    ActivityKind::FileReceived,
+                    format!(
+                        "copy a file to the customer computer at {}",
+                        path_text(&arg(entry, "path"))
+                    ),
                 ),
                 // Lifecycle records (pairing, compare, consent, revoke) are
                 // session events, not actions on the customer computer.

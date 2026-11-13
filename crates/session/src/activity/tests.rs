@@ -282,6 +282,23 @@ fn every_operation_has_its_kind() {
             },
             ActivityKind::FileOperation,
         ),
+        (Operation::FsDrives {}, ActivityKind::FileOperation),
+        (
+            Operation::RemoveTree {
+                path: abs("C:\\d"),
+                stop: false,
+                folder_id: None,
+            },
+            ActivityKind::FileOperation,
+        ),
+        (
+            Operation::RemoveTree {
+                path: abs("C:\\d"),
+                stop: true,
+                folder_id: None,
+            },
+            ActivityKind::FileOperation,
+        ),
         (
             Operation::DesktopCapture {
                 display: 0,
@@ -384,6 +401,21 @@ fn path_and_bytes_come_from_the_request() {
     );
     assert_eq!(path_of(&Operation::SystemInfo {}), None);
     assert_eq!(bytes_of(&Operation::SystemInfo {}), None);
+    // A folder removal acts on its folder, with or without the stop; the
+    // drive list acts on no path (ST-M010-001).
+    for stop in [false, true] {
+        let removal = Operation::RemoveTree {
+            path: abs("C:\\Users\\ann\\Downloads\\old-setup"),
+            stop,
+            folder_id: None,
+        };
+        assert_eq!(
+            path_of(&removal).as_deref(),
+            Some("C:\\Users\\ann\\Downloads\\old-setup")
+        );
+        assert_eq!(bytes_of(&removal), None);
+    }
+    assert_eq!(path_of(&Operation::FsDrives {}), None);
 }
 
 #[test]
@@ -414,6 +446,11 @@ fn states_never_turn_an_unknown_outcome_into_success() {
             code: ErrorCode::AccessDenied
         }),
         ActivityState::failed("access was denied")
+    );
+    // A removal the technician cancelled is cancelled, not done and not failed.
+    assert_eq!(
+        ActivityState::of_outcome(ActionOutcome::Cancelled),
+        ActivityState::Cancelled
     );
     assert_eq!(
         ActivityState::of_outcome(ActionOutcome::InProgress),
@@ -680,4 +717,77 @@ fn running_items_fail_honestly_when_the_session_ends() {
             other => panic!("unexpected {other:?}"),
         }
     }
+}
+
+// --- A folder removal on the customer's side (ST-M010-001) ---
+
+fn removal(id: u64, outcome: ActionOutcome) -> SessionEvent {
+    SessionEvent::RequestHandled {
+        id,
+        origin: Origin::Console,
+        purpose: None,
+        kind: ActivityKind::FileOperation,
+        operation: "delete the folder C:\\Users\\ann\\Downloads\\old-setup and everything in it"
+            .to_owned(),
+        path: Some("C:\\Users\\ann\\Downloads\\old-setup".to_owned()),
+        bytes: None,
+        outcome,
+        duration_ms: (outcome != ActionOutcome::InProgress).then_some(2400),
+    }
+}
+
+/// A folder removal is one item with its kind and path: running from its
+/// first step, and updated in place when it ends, with the state the folder
+/// is really in.
+#[test]
+fn a_folder_removal_is_one_item_from_its_first_step_to_its_end() {
+    for (ended, state) in [
+        (
+            ActionOutcome::Succeeded,
+            ActivityState::Done { exit_code: None },
+        ),
+        (ActionOutcome::Cancelled, ActivityState::Cancelled),
+        (
+            ActionOutcome::Failed {
+                code: ErrorCode::FileInUse,
+            },
+            ActivityState::failed("the file is in use"),
+        ),
+    ] {
+        let mut fold = CustomerActivity::new();
+        let running = only_item(fold.apply(&removal(5, ActionOutcome::InProgress), T0));
+        assert_eq!(running.id, "req-5");
+        assert_eq!(running.source, ActivitySource::Technician);
+        assert_eq!(running.kind, ActivityKind::FileOperation);
+        assert_eq!(running.description, "Worked with files and folders");
+        assert_eq!(
+            running.path.as_deref(),
+            Some("C:\\Users\\ann\\Downloads\\old-setup")
+        );
+        assert_eq!(running.state, ActivityState::Running);
+        assert_eq!(running.duration_ms, None);
+
+        let done = only_item(fold.apply(&removal(5, ended), T0 + 2400));
+        assert_eq!(done.id, "req-5");
+        assert_eq!(done.state, state, "{ended:?}");
+        assert_eq!(done.started_at, running.started_at);
+        assert_eq!(done.duration_ms, Some(2400));
+        assert_eq!(fold.entries().len(), 1, "one item, updated in place");
+    }
+}
+
+/// A removal that the session ends before it finished is shown as failed
+/// because the session ended, never as done (REQ-N-008).
+#[test]
+fn a_folder_removal_cut_short_by_the_end_of_the_session_is_not_done() {
+    let mut fold = CustomerActivity::new();
+    fold.apply(&removal(5, ActionOutcome::InProgress), T0);
+    let ended = only_item(fold.apply(
+        &SessionEvent::Revoked {
+            reason: RevokeReason::CustomerRequested,
+        },
+        T0 + 900,
+    ));
+    assert_eq!(ended.id, "req-5");
+    assert_eq!(ended.state, ActivityState::failed(SESSION_ENDED));
 }

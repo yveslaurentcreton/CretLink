@@ -53,7 +53,9 @@ use std::time::Duration;
 use cretlink_discovery::{
     Browser, DiscoveredConsole, DiscoveryError, ManualEntry, parse_entry, parse_manual_entry,
 };
-use cretlink_protocol::{CAP_FS_V1, PROTOCOL_V1, RevokeReason, SessionId, TargetIdentity};
+use cretlink_protocol::{
+    CAP_FS_V1, CAP_FS_V2, PROTOCOL_V1, RevokeReason, SessionId, TargetIdentity,
+};
 use cretlink_session::{ActivityEntry, CustomerActivity, DisclosureSummary, SessionJoiner};
 use cretlink_support_agent::{AgentPhase, AgentState, VisibleStatus, current_identity, sysinfo};
 use serde::Serialize;
@@ -993,21 +995,29 @@ fn honest_target_identity() -> TargetIdentity {
 /// - **desktop** — this crate has no `cretlink-exec` dependency to back
 ///   screenshots and computer actions, so it does not offer the capability.
 ///
-/// `fs.v1` is always served by the session runtime; `term.v1` only where the
-/// ConPTY backend exists (Windows). The advertised set must match what the
-/// runtime actually serves, because the runtime *enforces* the capability
-/// gates — the interactive terminal is refused unless `term.v1` is advertised,
-/// so the technician console's Terminal panel is reachable against this GUI
-/// customer only when we advertise it here (REQ-N-012, REQ-F-023).
+/// `fs.v1` and `fs.v2` are always served by the session runtime, which owns
+/// the file store: `fs.v2` is the drive list and the removal of a folder with
+/// its content that the technician's file explorer uses (ST-M010-001).
+/// `term.v1` is served only where the ConPTY backend exists (Windows). The
+/// advertised set must match what the runtime actually serves, because the
+/// runtime *enforces* the capability gates — the interactive terminal is
+/// refused unless `term.v1` is advertised, and the explorer operations are
+/// answered `Unsupported` unless `fs.v2` is — so the technician console's
+/// Terminal panel and file explorer are reachable against this GUI customer
+/// only when we advertise them here (REQ-N-012, REQ-F-023).
 fn honest_capabilities() -> Vec<String> {
     #[cfg(windows)]
     {
         use cretlink_protocol::CAP_TERM_V1;
-        vec![CAP_FS_V1.to_string(), CAP_TERM_V1.to_string()]
+        vec![
+            CAP_FS_V1.to_string(),
+            CAP_FS_V2.to_string(),
+            CAP_TERM_V1.to_string(),
+        ]
     }
     #[cfg(not(windows))]
     {
-        vec![CAP_FS_V1.to_string()]
+        vec![CAP_FS_V1.to_string(), CAP_FS_V2.to_string()]
     }
 }
 
@@ -1237,15 +1247,17 @@ mod tests {
     #[test]
     fn honest_capabilities_advertise_only_what_this_build_serves() {
         let caps = honest_capabilities();
-        // `fs.v1` is always served by the session runtime.
+        // `fs.v1` is always served by the session runtime, and so is `fs.v2`,
+        // the explorer's drive list and folder removal (ST-M010-001).
         assert!(caps.iter().any(|c| c == CAP_FS_V1));
+        assert!(caps.iter().any(|c| c == CAP_FS_V2));
         // The interactive terminal is gated on `term.v1`; it is advertised
         // exactly where the ConPTY backend exists, so the technician console's
         // Terminal panel is reachable against this GUI customer on Windows.
         #[cfg(windows)]
         assert!(caps.iter().any(|c| c == cretlink_protocol::CAP_TERM_V1));
         #[cfg(not(windows))]
-        assert_eq!(caps.len(), 1);
+        assert_eq!(caps.len(), 2);
         // We never advertise what this window cannot honestly back: no
         // reboot-resume (plain `join` installs `NoRebootResume`) and no desktop
         // (no `cretlink-exec` dependency here). Guard against a

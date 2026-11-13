@@ -45,10 +45,10 @@ use cretlink_exec::{
     Admission, Broker, BrokerEvent, CaptureReject, CaptureRequest, FileStore, JobSpec,
 };
 use cretlink_protocol::{
-    B64Bytes, CAP_DESKTOP_V1, CAP_TERM_V1, CleanupTrigger, ControlMessage, DesktopAccess,
-    ErrorCode, ErrorStage, EventKind, JobId, JobOutcome, JobSummary, Message, OpResult, Operation,
-    OutputStream, ProtocolVersion, RequestId, RevokeReason, SessionId, TargetIdentity,
-    canonical_capabilities, limits,
+    B64Bytes, CAP_DESKTOP_V1, CAP_FS_V2, CAP_TERM_V1, CleanupTrigger, ControlMessage,
+    DesktopAccess, ErrorCode, ErrorStage, EventKind, JobId, JobOutcome, JobSummary, Message,
+    OpResult, Operation, OutputStream, ProtocolVersion, RequestId, RevokeReason, SessionId,
+    TargetIdentity, TreeState, canonical_capabilities, limits,
 };
 use cretlink_shared::{Actor, Outcome};
 use cretlink_transport::{Pairing, Role, SecureChannel, SecureChannelError};
@@ -243,6 +243,35 @@ struct ActivityTap {
     /// last reported request, so the in-flight chunks of one refused transfer
     /// yield one item rather than one each.
     refused_steps: HashSet<String>,
+    /// Folder removals that have begun and not ended, keyed by the remote
+    /// path text (ST-M010-001). Bounded by [`MAX_OPEN_REMOVALS`].
+    removing: HashMap<String, Removing>,
+}
+
+/// The most folder removals one session keeps open at once in its activity
+/// bookkeeping (REQ-N-006). A console removes one folder at a time; one that
+/// opened more would have its oldest closed as "result not known".
+const MAX_OPEN_REMOVALS: usize = 64;
+
+/// One folder removal that has begun: its first step removed something and
+/// said that more remains.
+#[derive(Debug)]
+struct Removing {
+    id: u64,
+    attribution: Attribution,
+    operation: String,
+    path: Option<String>,
+    started: Instant,
+}
+
+/// What the agent's answer to one step of a folder removal says about the
+/// removal (ST-M010-001).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemovalStep {
+    /// Where the removal stands after the step.
+    state: TreeState,
+    /// The reason of the first entry the step could not remove.
+    first_failure: Option<ErrorCode>,
 }
 
 /// One file that has started to leave the customer computer.
@@ -453,6 +482,174 @@ impl ActivityTap {
         }
     }
 
+    /// Reports one step of a folder removal, and records the removal in the
+    /// audit trail (ST-M010-001, REQ-F-017, REQ-S-017).
+    ///
+    /// A removal is one item for the customer, however many steps it takes:
+    /// the first step that leaves more to do opens it as in progress (and
+    /// audits `fs_remove_tree_start`), the steps in between are not reported,
+    /// and the step that ends it gives the item its final state (and audits
+    /// `fs_remove_tree`): done only when the folder is gone, cancelled when
+    /// the caller stopped it, failed with the first reason when something
+    /// could not be removed or the step was refused. Never done for a folder
+    /// that is still there (REQ-N-008).
+    #[allow(clippy::too_many_arguments)]
+    fn removal(
+        &mut self,
+        tx: &mpsc::Sender<SessionEvent>,
+        audit: &dyn SessionAudit,
+        attribution: Attribution,
+        operation: String,
+        path: Option<String>,
+        outcome: ActionOutcome,
+        step: Option<RemovalStep>,
+        started: Instant,
+    ) {
+        let key = path.clone().unwrap_or_default();
+        let ended = match (outcome, step) {
+            (ActionOutcome::Succeeded, Some(step)) => match step.state {
+                // More remains and the caller is expected to go on.
+                TreeState::More => {
+                    if !self.removing.contains_key(&key) {
+                        self.begin_removal(tx, audit, key, attribution, operation, path, started);
+                    }
+                    return;
+                }
+                TreeState::Removed => ActionOutcome::Succeeded,
+                TreeState::Stopped => ActionOutcome::Cancelled,
+                TreeState::Incomplete | TreeState::Blocked => ActionOutcome::Failed {
+                    code: step.first_failure.unwrap_or(ErrorCode::DirNotEmpty),
+                },
+            },
+            // An answer that is not a removal step says nothing about the
+            // folder: the result is not known.
+            (ActionOutcome::Succeeded, None) => ActionOutcome::Unknown,
+            (other, _) => other,
+        };
+        audit.record(
+            Actor::Console,
+            "fs_remove_tree",
+            match ended {
+                ActionOutcome::Succeeded => Outcome::Ok,
+                ActionOutcome::Cancelled => Outcome::Cancelled,
+                ActionOutcome::Failed { .. } => Outcome::Failed,
+                ActionOutcome::InProgress | ActionOutcome::Unknown => Outcome::Unknown,
+            },
+        );
+        // The step that ends a removal closes the item its first step opened;
+        // a removal of one step is opened and closed here.
+        let (id, attribution, operation, path, started) = match self.removing.remove(&key) {
+            Some(open) => (
+                open.id,
+                open.attribution,
+                open.operation,
+                open.path,
+                open.started,
+            ),
+            None => (self.mint(), attribution, operation, path, started),
+        };
+        self.settle(path.as_deref());
+        self.emit(
+            tx,
+            SessionEvent::RequestHandled {
+                id,
+                origin: attribution.origin,
+                purpose: attribution.purpose,
+                kind: ActivityKind::FileOperation,
+                operation,
+                path,
+                bytes: None,
+                outcome: ended,
+                duration_ms: Some(elapsed_ms(started)),
+            },
+        );
+    }
+
+    /// Opens the item of a folder removal whose first step left more to do.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_removal(
+        &mut self,
+        tx: &mpsc::Sender<SessionEvent>,
+        audit: &dyn SessionAudit,
+        key: String,
+        attribution: Attribution,
+        operation: String,
+        path: Option<String>,
+        started: Instant,
+    ) {
+        // Keep the bookkeeping bounded: the oldest open removal gives way and
+        // is closed as "result not known", never as done.
+        if self.removing.len() >= MAX_OPEN_REMOVALS
+            && let Some(oldest) = self
+                .removing
+                .iter()
+                .min_by_key(|(_, open)| open.started)
+                .map(|(key, _)| key.clone())
+            && let Some(open) = self.removing.remove(&oldest)
+        {
+            audit.record(Actor::Console, "fs_remove_tree", Outcome::Unknown);
+            self.end_removal(tx, open, ActionOutcome::Unknown);
+        }
+        let id = self.mint();
+        audit.record(Actor::Console, "fs_remove_tree_start", Outcome::Ok);
+        self.emit(
+            tx,
+            SessionEvent::RequestHandled {
+                id,
+                origin: attribution.origin,
+                purpose: attribution.purpose.clone(),
+                kind: ActivityKind::FileOperation,
+                operation: operation.clone(),
+                path: path.clone(),
+                bytes: None,
+                outcome: ActionOutcome::InProgress,
+                duration_ms: None,
+            },
+        );
+        self.removing.insert(
+            key,
+            Removing {
+                id,
+                attribution,
+                operation,
+                path,
+                started,
+            },
+        );
+    }
+
+    /// Gives the item of an open folder removal its final state.
+    fn end_removal(
+        &mut self,
+        tx: &mpsc::Sender<SessionEvent>,
+        open: Removing,
+        outcome: ActionOutcome,
+    ) {
+        self.emit(
+            tx,
+            SessionEvent::RequestHandled {
+                id: open.id,
+                origin: open.attribution.origin,
+                purpose: open.attribution.purpose,
+                kind: ActivityKind::FileOperation,
+                operation: open.operation,
+                path: open.path,
+                bytes: None,
+                outcome,
+                duration_ms: Some(elapsed_ms(open.started)),
+            },
+        );
+    }
+
+    /// Records, when the session ends, every folder removal that had begun
+    /// and never ended: its result is not known (REQ-N-008). The customer's
+    /// own feed marks the item as ended with the session.
+    fn close_removals(&mut self, audit: &dyn SessionAudit) {
+        for _ in self.removing.drain() {
+            audit.record(Actor::Console, "fs_remove_tree", Outcome::Unknown);
+        }
+    }
+
     fn end_sending(
         &mut self,
         tx: &mpsc::Sender<SessionEvent>,
@@ -601,6 +798,10 @@ struct ReplyTap<'a, C> {
     /// What a successful file read answered, so a file leaving the computer is
     /// reported with its byte count (ST-M009-011).
     read: Option<ReadData>,
+    /// What a step of a folder removal answered, so the removal is reported
+    /// by where it stands and not by the mere fact that the step was answered
+    /// (ST-M010-001).
+    removal: Option<RemovalStep>,
 }
 
 impl<'a, C: FrameSink> ReplyTap<'a, C> {
@@ -610,6 +811,7 @@ impl<'a, C: FrameSink> ReplyTap<'a, C> {
             request,
             outcome: None,
             read: None,
+            removal: None,
         }
     }
 
@@ -634,6 +836,12 @@ impl<C: FrameSink> FrameSink for ReplyTap<'_, C> {
                         len: data.len() as u64,
                         eof: *eof,
                         file_len: *file_len,
+                    });
+                }
+                if let OpResult::TreeRemoval { state, failed, .. } = result {
+                    self.removal = Some(RemovalStep {
+                        state: *state,
+                        first_failure: failed.first().map(|failure| failure.code),
                     });
                 }
             }
@@ -865,6 +1073,7 @@ async fn agent_active_finish<T: AsyncRead + AsyncWrite + Unpin>(
     actor: Actor,
     ending: Ending,
 ) {
+    activity.close_removals(audit);
     let fs = sweep_staging_on_exit(file_store, audit).await;
     let report = teardown_report(ending, fs);
     // A lost or faulted channel cannot carry the report; the console then
@@ -933,10 +1142,16 @@ async fn sweep_staging_on_exit(file_store: &FileStore, audit: &dyn SessionAudit)
         }
         Err(error) => {
             audit.record(Actor::System, "fs_cleanup", Outcome::Failed);
-            FsCleanup {
-                ok: false,
-                notes: vec![format!("{TEARDOWN_FAILED_NOTE_PREFIX}{}", error.message)],
-            }
+            // A cleanup that fails as a whole has removed the parts of
+            // unfinished transfers to a folder first. The ones it could not
+            // remove are named beside its failure.
+            let mut notes = vec![format!("{TEARDOWN_FAILED_NOTE_PREFIX}{}", error.message)];
+            notes.extend(file_store.unfinished_parts().into_iter().map(|part| {
+                format!(
+                    "{RESIDUAL_NOTE_PREFIX}{part} (the part of an unfinished transfer; not removed)"
+                )
+            }));
+            FsCleanup { ok: false, notes }
         }
     }
 }
@@ -1978,6 +2193,12 @@ pub(crate) async fn join_task<S>(
     // operation with `Unsupported` (REQ-N-012, REQ-S-009, ST-M005-001).
     let desktop_enabled = capabilities.iter().any(|c| c == CAP_DESKTOP_V1);
 
+    // Whether this agent advertises the explorer file operations (the drive
+    // list and the removal of a folder with its content, ST-M010-001).
+    // Enforced the same way: both are answered `Unsupported`, before anything
+    // is listed or removed, unless CAP_FS_V2 is advertised (REQ-N-012).
+    let fs_v2_enabled = capabilities.iter().any(|c| c == CAP_FS_V2);
+
     // Prologue binds the version-canonical set (see the responder side in
     // `host_task`): both peers must hash an identical set or the downgrade
     // tripwire fires on every honest asymmetric pair. The agent's served
@@ -2123,7 +2344,7 @@ pub(crate) async fn join_task<S>(
                 emit(&tx, SessionEvent::Active);
                 audit.record(Actor::Agent, "consent_granted", Outcome::Ok);
                 let sysinfo = SystemInfoSource { identity: identity.clone(), reboot_probe };
-                join_active(channel, session, &sysinfo, terminal_enabled, desktop_enabled, &handshake_hash, armer.as_ref(), &shared, &tx, &mut revoke_rx, &mut arm_rx, audit).await;
+                join_active(channel, session, &sysinfo, terminal_enabled, desktop_enabled, fs_v2_enabled, &handshake_hash, armer.as_ref(), &shared, &tx, &mut revoke_rx, &mut arm_rx, audit).await;
             }
             Some(ConsentDecision::Deny(reason)) => {
                 let _ = send_control(&mut channel, session, ControlMessage::ConsentDenied { reason }).await;
@@ -2195,6 +2416,7 @@ async fn join_active<T: AsyncRead + AsyncWrite + Unpin>(
     sysinfo: &SystemInfoSource,
     terminal_enabled: bool,
     desktop_enabled: bool,
+    fs_v2_enabled: bool,
     handshake_hash: &[u8; 32],
     armer: &dyn RebootResumeArmer,
     shared: &Shared,
@@ -2268,7 +2490,7 @@ async fn join_active<T: AsyncRead + AsyncWrite + Unpin>(
             frame = recv_frame(&mut channel) => {
                 let step = match frame {
                     Frame::Message(message) => {
-                        handle_agent_frame(&mut channel, session, &broker, &file_store, &desktop, &mut capture_governor, &mut input_governor, sysinfo, terminal_enabled, desktop_enabled, shared, message, tx, &mut activity, audit).await
+                        handle_agent_frame(&mut channel, session, &broker, &file_store, &desktop, &mut capture_governor, &mut input_governor, sysinfo, terminal_enabled, desktop_enabled, fs_v2_enabled, shared, message, tx, &mut activity, audit).await
                     }
                     Frame::Disconnected => AgentStep::Disconnected,
                     Frame::ChannelFault => {
@@ -2503,6 +2725,7 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
     sysinfo: &SystemInfoSource,
     terminal_enabled: bool,
     desktop_enabled: bool,
+    fs_v2_enabled: bool,
     shared: &Shared,
     message: Message,
     tx: &mpsc::Sender<SessionEvent>,
@@ -2552,6 +2775,9 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                 _ => None,
             };
             let is_exec = matches!(op, Operation::Exec { .. });
+            // A step of a folder removal this agent serves. One it does not
+            // serve is refused like any other request and reported as such.
+            let is_removal = fs_v2_enabled && matches!(op, Operation::RemoveTree { .. });
             let started = Instant::now();
             let attribution = Attribution::new(origin, purpose);
             let mut tap = ReplyTap::new(channel, id);
@@ -2566,6 +2792,7 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                 sysinfo,
                 terminal_enabled,
                 desktop_enabled,
+                fs_v2_enabled,
                 id,
                 attribution.clone(),
                 op,
@@ -2576,7 +2803,21 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
             .await;
             let outcome = tap.outcome();
             let read = tap.read;
-            if let Some(offset) = read_offset {
+            let removal = tap.removal;
+            if is_removal {
+                // A folder removal: one item from its first step to its last,
+                // with the state the folder is really in (ST-M010-001).
+                activity.removal(
+                    tx,
+                    audit,
+                    attribution,
+                    operation,
+                    path,
+                    outcome,
+                    removal,
+                    started,
+                );
+            } else if let Some(offset) = read_offset {
                 // A file read: reported when the file starts to leave the
                 // computer and again when sending ends (ST-M009-011).
                 activity.read(
@@ -2718,6 +2959,7 @@ async fn handle_agent_request<C: FrameSink>(
     sysinfo: &SystemInfoSource,
     terminal_enabled: bool,
     desktop_enabled: bool,
+    fs_v2_enabled: bool,
     id: RequestId,
     attribution: Attribution,
     op: Operation,
@@ -3347,7 +3589,26 @@ async fn handle_agent_request<C: FrameSink>(
         | Operation::FsDelete { .. }
         | Operation::RemoveDir { .. }
         | Operation::ListStaged {}
-        | Operation::StagingCleanup { .. } => {
+        | Operation::StagingCleanup { .. }
+        | Operation::FsDrives {}
+        | Operation::RemoveTree { .. } => {
+            // The drive list and the removal of a folder with its content
+            // (ST-M010-001) are served only by an agent that advertises
+            // CAP_FS_V2: a peer that never saw the capability is answered
+            // `Unsupported` before anything is listed or removed (REQ-N-012).
+            if !fs_v2_enabled && matches!(op, Operation::FsDrives {} | Operation::RemoveTree { .. })
+            {
+                let _ = send_error(
+                    channel,
+                    Some(id),
+                    Some(session),
+                    ErrorCode::Unsupported,
+                    "explorer file capability (fs.v2) is not advertised by this agent",
+                    ErrorStage::Execution,
+                )
+                .await;
+                return AgentStep::Continue;
+            }
             let audit_action = fs_audit_action(&op);
             match file_store.perform(op).await {
                 Ok(result) => {
@@ -3393,6 +3654,11 @@ async fn handle_agent_request<C: FrameSink>(
 /// read-only inspection. Only operations with a visible filesystem side effect
 /// (or a staging purge) are audited, mirroring how command starts — not stdin
 /// writes — are recorded on the exec path.
+///
+/// A folder removal ([`Operation::RemoveTree`]) is not in this table: it takes
+/// several requests, and one answered request says nothing about the folder.
+/// It is audited as a whole, by where it ends, in [`ActivityTap::removal`]
+/// (`fs_remove_tree_start` when it begins, `fs_remove_tree` when it ends).
 fn fs_audit_action(op: &Operation) -> Option<&'static str> {
     match op {
         Operation::CreateDir { .. } => Some("fs_create_dir"),
@@ -3539,6 +3805,7 @@ async fn teardown_agent_revoke<T: AsyncRead + AsyncWrite + Unpin>(
     // Sweep and report before the `Revoke`, so the console still reads the
     // report on its way out (protocol minor 11, ST-M009-012).
     let ending = Ending::LocalRevoke(reason);
+    activity.close_removals(audit);
     let fs = sweep_staging_on_exit(file_store, audit).await;
     let report = teardown_report(ending, fs);
     send_cleanup_report(&mut channel, session, &report).await;
@@ -3692,6 +3959,219 @@ mod tests {
         fn record(&self, _actor: Actor, action: &'static str, outcome: Outcome) {
             self.records.lock().unwrap().push((action, outcome));
         }
+    }
+
+    /// One answered step of a folder removal, as the reply tap notes it.
+    fn step(state: TreeState, first_failure: Option<ErrorCode>) -> Option<RemovalStep> {
+        Some(RemovalStep {
+            state,
+            first_failure,
+        })
+    }
+
+    /// Reports one removal step on `path` the way the request handler does.
+    fn report_step(
+        tap: &mut ActivityTap,
+        tx: &mpsc::Sender<SessionEvent>,
+        audit: &RecordingAudit,
+        path: &str,
+        outcome: ActionOutcome,
+        step: Option<RemovalStep>,
+    ) {
+        tap.removal(
+            tx,
+            audit,
+            Attribution::default(),
+            format!("delete the folder {path} and everything in it"),
+            Some(path.to_owned()),
+            outcome,
+            step,
+            Instant::now(),
+        );
+    }
+
+    /// The `(id, outcome)` of every activity item delivered so far.
+    fn handled(rx: &mut mpsc::Receiver<SessionEvent>) -> Vec<(u64, ActionOutcome)> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let SessionEvent::RequestHandled { id, outcome, .. } = event {
+                out.push((id, outcome));
+            }
+        }
+        out
+    }
+
+    // A folder removal is one item however many steps it takes, and it ends
+    // in the state the folder is really in: done only when the folder is gone,
+    // failed with the first reason when something was left, cancelled when the
+    // caller stopped it (ST-M010-001, REQ-N-008). The audit trail records its
+    // start once and its end once.
+    #[tokio::test]
+    async fn a_folder_removal_is_one_item_that_ends_in_its_honest_state() {
+        for (last, ended, audited) in [
+            (
+                step(TreeState::Removed, None),
+                ActionOutcome::Succeeded,
+                Outcome::Ok,
+            ),
+            (
+                step(TreeState::Incomplete, Some(ErrorCode::FileInUse)),
+                ActionOutcome::Failed {
+                    code: ErrorCode::FileInUse,
+                },
+                Outcome::Failed,
+            ),
+            (
+                step(TreeState::Blocked, Some(ErrorCode::AccessDenied)),
+                ActionOutcome::Failed {
+                    code: ErrorCode::AccessDenied,
+                },
+                Outcome::Failed,
+            ),
+            (
+                step(TreeState::Stopped, None),
+                ActionOutcome::Cancelled,
+                Outcome::Cancelled,
+            ),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<SessionEvent>(SESSION_EVENT_CHANNEL_CAPACITY);
+            let audit = RecordingAudit::default();
+            let mut tap = ActivityTap::default();
+            let more = step(TreeState::More, None);
+            // Three steps that leave more to do, then the one that ends it.
+            for _ in 0..3 {
+                report_step(
+                    &mut tap,
+                    &tx,
+                    &audit,
+                    "C:\\old",
+                    ActionOutcome::Succeeded,
+                    more,
+                );
+            }
+            report_step(
+                &mut tap,
+                &tx,
+                &audit,
+                "C:\\old",
+                ActionOutcome::Succeeded,
+                last,
+            );
+
+            assert_eq!(
+                handled(&mut rx),
+                vec![(1, ActionOutcome::InProgress), (1, ended)],
+                "{last:?}"
+            );
+            assert_eq!(
+                *audit.records.lock().unwrap(),
+                vec![
+                    ("fs_remove_tree_start", Outcome::Ok),
+                    ("fs_remove_tree", audited)
+                ],
+                "{last:?}"
+            );
+            assert!(tap.removing.is_empty(), "an ended removal is forgotten");
+        }
+    }
+
+    // A step the agent refused, or one whose answer never left, ends the
+    // removal as failed or as not known: never as done.
+    #[tokio::test]
+    async fn a_refused_or_unanswered_removal_step_never_ends_as_done() {
+        for (outcome, audited) in [
+            (
+                ActionOutcome::Failed {
+                    code: ErrorCode::PathNotFound,
+                },
+                Outcome::Failed,
+            ),
+            (ActionOutcome::Unknown, Outcome::Unknown),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<SessionEvent>(SESSION_EVENT_CHANNEL_CAPACITY);
+            let audit = RecordingAudit::default();
+            let mut tap = ActivityTap::default();
+            report_step(
+                &mut tap,
+                &tx,
+                &audit,
+                "C:\\old",
+                ActionOutcome::Succeeded,
+                step(TreeState::More, None),
+            );
+            report_step(&mut tap, &tx, &audit, "C:\\old", outcome, None);
+
+            assert_eq!(
+                handled(&mut rx),
+                vec![(1, ActionOutcome::InProgress), (1, outcome)]
+            );
+            assert_eq!(
+                audit.records.lock().unwrap().last(),
+                Some(&("fs_remove_tree", audited))
+            );
+        }
+
+        // An answer that is not a removal step says nothing about the folder.
+        let (tx, mut rx) = mpsc::channel::<SessionEvent>(SESSION_EVENT_CHANNEL_CAPACITY);
+        let audit = RecordingAudit::default();
+        let mut tap = ActivityTap::default();
+        report_step(
+            &mut tap,
+            &tx,
+            &audit,
+            "C:\\old",
+            ActionOutcome::Succeeded,
+            None,
+        );
+        assert_eq!(handled(&mut rx), vec![(1, ActionOutcome::Unknown)]);
+    }
+
+    // The removals the agent keeps open are bounded: one more than the bound
+    // closes the oldest as "result not known", and a session that ends records
+    // every removal still open the same way (REQ-N-006, REQ-N-008).
+    #[tokio::test]
+    async fn open_folder_removals_are_bounded_and_closed_honestly() {
+        // Room for every item: the bound under test is the bookkeeping's.
+        let (tx, mut rx) = mpsc::channel::<SessionEvent>(4 * MAX_OPEN_REMOVALS);
+        let audit = RecordingAudit::default();
+        let mut tap = ActivityTap::default();
+        let more = step(TreeState::More, None);
+        for n in 0..=MAX_OPEN_REMOVALS {
+            report_step(
+                &mut tap,
+                &tx,
+                &audit,
+                &format!("C:\\folder-{n}"),
+                ActionOutcome::Succeeded,
+                more,
+            );
+        }
+
+        assert_eq!(tap.removing.len(), MAX_OPEN_REMOVALS);
+        assert!(
+            !tap.removing.contains_key("C:\\folder-0"),
+            "the oldest gave way"
+        );
+        let items = handled(&mut rx);
+        assert_eq!(
+            items.iter().filter(|(id, _)| *id == 1).collect::<Vec<_>>(),
+            vec![
+                &(1, ActionOutcome::InProgress),
+                &(1, ActionOutcome::Unknown)
+            ],
+            "it is closed as not known, never as done"
+        );
+
+        audit.records.lock().unwrap().clear();
+        tap.close_removals(&audit);
+        assert!(tap.removing.is_empty());
+        let records = audit.records.lock().unwrap();
+        assert_eq!(records.len(), MAX_OPEN_REMOVALS);
+        assert!(
+            records
+                .iter()
+                .all(|record| *record == ("fs_remove_tree", Outcome::Unknown))
+        );
     }
 
     // The agent must autonomously sweep its own staging area when the session

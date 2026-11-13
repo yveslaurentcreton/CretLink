@@ -34,6 +34,9 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
+# The technician's file actions are tested against the agent's real file store
+# (ST-M010-001): the tests plant folders in the staging area it reports.
+cretlink-exec.workspace = true
 cretlink-simulator.workspace = true
 # The full-chain MCP e2e test (ST-M004-*) drives a real rmcp client against the
 # bridge, decodes base64 tool output, and needs the net-backed IPC transport.

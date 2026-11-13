@@ -223,10 +223,113 @@ pub struct StagedEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CleanupFailure {
-    /// The artifact that could not be removed.
+    /// The artifact that could not be removed (at most
+    /// [`limits::MAX_PATH_BYTES`] bytes, one line). A longer path is cut and
+    /// ends in `…`. Untrusted input: the name is the target's.
     pub canonical_path: String,
     /// Why removal failed (at most [`limits::MAX_REASON_BYTES`] bytes).
     pub reason: String,
+}
+
+// --- Drives and folder removal (ADR-0012, ST-M010-001, CAP_FS_V2) ---
+
+/// The kind of a drive of the target ([`DriveEntry`]). Further kinds are an
+/// additive (minor-bump) change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriveKind {
+    /// A drive that stays in the computer: a hard disk or a solid-state drive.
+    Fixed,
+    /// A drive whose medium can be taken out: a USB stick, a card reader.
+    Removable,
+    /// A drive on another computer, reached over the network.
+    Network,
+    /// A CD, DVD or Blu-ray drive.
+    Optical,
+    /// A drive held in memory.
+    RamDisk,
+    /// The target could not tell what the drive is.
+    Unknown,
+}
+
+/// One drive of the target, as [`OpResult::Drives`] lists it (ST-M010-001).
+///
+/// The label and the two sizes are absent when the target cannot read them:
+/// a card reader without a card, a drive on the network, a host that reports
+/// no sizes. An absent value means "not known", never zero (REQ-N-008). Every
+/// text is the target's own and is untrusted input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriveEntry {
+    /// The drive's root folder, such as `C:\` (at most
+    /// [`limits::MAX_DRIVE_ROOT_BYTES`] bytes, one line). On a Windows target
+    /// it is a valid [`RemotePath::Absolute`] for the other file operations. A
+    /// host without drive letters reports its own root, so the text is
+    /// bounded rather than shape-validated.
+    pub root: String,
+    /// What the drive is.
+    pub kind: DriveKind,
+    /// The volume label, when the drive has one that can be read (at most
+    /// [`limits::MAX_DRIVE_LABEL_BYTES`] bytes, one line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The size of the drive in bytes, when known (at most
+    /// [`limits::MAX_FILE_OFFSET`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    /// The bytes free for the account the agent runs as, when known (never
+    /// more than `total_bytes` when both are present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+}
+
+/// Where the removal of a folder stands after one [`Operation::RemoveTree`]
+/// step (ST-M010-001).
+///
+/// Only [`TreeState::Removed`] is a success. Every other state says plainly
+/// that the folder is still there, so a partial removal can never be read as a
+/// complete one (REQ-N-008).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TreeState {
+    /// The folder and everything in it are gone: this step removed the
+    /// folder itself. A folder that is gone for another reason — renamed away
+    /// or removed by someone else — is never reported this way.
+    Removed,
+    /// The step reached its bound after removing something: the folder is
+    /// still there and the next step gets further. The answer names the
+    /// folder for that next step (`folder_id`).
+    More,
+    /// The whole folder was walked and the entries the step names could not be
+    /// removed, so the folder remains with them in it. The answer names at
+    /// least one entry; when the folder itself is no longer at its path, it
+    /// names the folder as not found.
+    Incomplete,
+    /// The step reached its bound without removing anything, and what lies
+    /// beyond was not tried. The answer names at least one entry: those the
+    /// step could not remove, or — when it met only entries that were gone by
+    /// the time it reached for them, or folders it entered — the folder it
+    /// stood in, with [`ErrorCode::LimitExceeded`].
+    Blocked,
+    /// The removal was stopped before the folder was gone, on the caller's
+    /// request (`stop`): nothing more was removed.
+    Stopped,
+}
+
+/// One entry a folder removal could not remove, named in an
+/// [`OpResult::TreeRemoval`] (ST-M010-001).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TreeFailure {
+    /// The path of the entry on the target (at most
+    /// [`limits::MAX_TREE_FAILURE_PATH_BYTES`] bytes, one line). A longer path
+    /// is cut and ends in `…`. Untrusted input: the names are the target's.
+    pub path: String,
+    /// Why it could not be removed, in the wire vocabulary: for example
+    /// [`ErrorCode::FileInUse`], [`ErrorCode::AccessDenied`], or
+    /// [`ErrorCode::InvalidPath`] for an entry that turned out to lie outside
+    /// the folder.
+    pub code: ErrorCode,
 }
 
 /// The encoding of a captured desktop frame image (ADR-0015).
@@ -495,8 +598,7 @@ pub enum Operation {
         path: RemotePath,
     },
     /// Remove one empty directory. A non-empty directory yields `DirNotEmpty`;
-    /// recursive deletion is composed console-side from individually audited
-    /// deletes, never an agent primitive.
+    /// a directory with its content is removed by [`Operation::RemoveTree`].
     RemoveDir {
         /// The directory to remove.
         path: RemotePath,
@@ -508,6 +610,57 @@ pub enum Operation {
     StagingCleanup {
         /// Which artifacts to remove.
         trigger: CleanupTrigger,
+    },
+    // --- Drives and folder removal (ADR-0012, ST-M010-001, CAP_FS_V2) ---
+    /// List the drives of the target, answered [`OpResult::Drives`] with each
+    /// drive's root, kind, label and total and free space (ST-M010-001). It
+    /// reads nothing but those facts. Answered [`ErrorCode::Unsupported`] by a
+    /// peer that does not advertise [`crate::CAP_FS_V2`] (REQ-N-012).
+    FsDrives {},
+    /// Remove a folder and everything in it, **one bounded step at a time**,
+    /// answered [`OpResult::TreeRemoval`] (ST-M010-001).
+    ///
+    /// One step meets at most [`limits::MAX_TREE_STEP_ENTRIES`] entries and
+    /// answers after about [`limits::MAX_TREE_STEP_MS`] milliseconds, whatever
+    /// it finds and whether or not it removes anything; while the answer is
+    /// [`TreeState::More`] the caller sends the request again,
+    /// with the `folder_id` of that answer. The agent keeps nothing between
+    /// two steps, so it stays free to serve a stop, a revocation or any other
+    /// request in between, and a caller that wants to cancel simply stops
+    /// asking.
+    ///
+    /// **One removal is about one folder.** The folder is the one that lies
+    /// at `path` when the first step opens it: a path that leads to it
+    /// through a link (a junction or a symbolic link in a folder above it)
+    /// yields `InvalidPath` and nothing is removed. Every later step names
+    /// that folder by its `folder_id`, and a step that finds another folder
+    /// at the path — one that was put there in the meantime — yields
+    /// `InvalidPath` before it removes anything.
+    ///
+    /// The step never leaves the folder: a symbolic link, a junction or any
+    /// other entry that stands for another place is removed as a link and
+    /// never walked, and nothing is removed that does not lie in the folder.
+    /// The files are deleted, not moved to a recycle bin. A drive root is not
+    /// a folder and yields `InvalidPath`; a file yields `WrongPathKind`.
+    /// Answered [`ErrorCode::Unsupported`] by a peer that does not advertise
+    /// [`crate::CAP_FS_V2`] (REQ-N-012).
+    RemoveTree {
+        /// The folder to remove.
+        path: RemotePath,
+        /// Ends a removal the caller began and will not continue, without
+        /// removing anything: the answer is [`TreeState::Stopped`]. It exists
+        /// so that the agent, and with it the attended customer, learns that
+        /// the removal was cancelled rather than left running (REQ-F-017,
+        /// REQ-N-008). Omitted when `false`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        stop: bool,
+        /// The folder this removal began with: the `folder_id` of the
+        /// previous answer of this removal ([`OpResult::TreeRemoval`]), given
+        /// back unchanged. Absent in the first request of a removal, which
+        /// takes the folder that lies at `path`. From 1 to
+        /// [`limits::MAX_FOLDER_ID_BYTES`] bytes; omitted when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_id: Option<B64Bytes>,
     },
     // --- Interactive terminal (ADR-0013, ST-M003-009, CAP_TERM_V1) ---
     /// Open an interactive pseudo-console terminal. **A terminal is a job**: the
@@ -760,6 +913,43 @@ pub enum OpResult {
         /// [`limits::MAX_DIR_PAGE`]).
         failed: Vec<CleanupFailure>,
     },
+    /// Result of [`Operation::FsDrives`] (ST-M010-001).
+    Drives {
+        /// At most [`limits::MAX_DRIVES`] drives, in the target's own order.
+        drives: Vec<DriveEntry>,
+    },
+    /// Result of one [`Operation::RemoveTree`] step: what the step removed,
+    /// what it could not remove, and where the removal stands (ST-M010-001).
+    ///
+    /// The two counts and the failures are those of this step only; the
+    /// caller adds the counts up over the steps. A step that follows another
+    /// walks the folder again from its top, so the failures of the last step
+    /// are the ones that still hold.
+    TreeRemoval {
+        /// Where the removal stands. Only [`TreeState::Removed`] is a success.
+        state: TreeState,
+        /// Files and links this step removed.
+        removed_files: u64,
+        /// Folders this step removed, the folder itself included once it is
+        /// gone.
+        removed_dirs: u64,
+        /// The first entries this step could not remove, each with its reason
+        /// (at most [`limits::MAX_TREE_FAILURES`]). Omitted when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failed: Vec<TreeFailure>,
+        /// How many more entries this step could not remove, beyond `failed`.
+        /// Omitted when zero.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        failed_more: u64,
+        /// What identifies the folder being removed, for the next step: the
+        /// caller gives it back in [`Operation::RemoveTree`], so that the
+        /// removal goes on with this folder and no other. Present **exactly
+        /// when** `state` is [`TreeState::More`]; from 1 to
+        /// [`limits::MAX_FOLDER_ID_BYTES`] bytes, whose meaning is the
+        /// agent's own. Omitted when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_id: Option<B64Bytes>,
+    },
     /// Result of [`Operation::TermOpen`]: the interactive terminal job started.
     /// Its merged output arrives as [`EventKind::JobOutput`] and its exit as
     /// [`EventKind::JobExited`] — a terminal is a job (ST-M003-009).
@@ -928,8 +1118,9 @@ pub enum ErrorCode {
     /// The session was revoked; all further work fails closed.
     SessionRevoked,
     /// The operation or capability is not supported by the receiver (also used
-    /// for a cross-volume `FsMove` and for a file operation when the peer did
-    /// not advertise [`crate::CAP_FS_V1`]).
+    /// for a cross-volume `FsMove`, for a file operation when the peer did
+    /// not advertise [`crate::CAP_FS_V1`], and for `FsDrives` or `RemoveTree`
+    /// when it did not advertise [`crate::CAP_FS_V2`]).
     Unsupported,
     /// A path does not exist (for an operation that requires it).
     PathNotFound,
@@ -952,7 +1143,8 @@ pub enum ErrorCode {
     /// A commit's declared length or digest did not match the part contents, or
     /// a resume prefix digest did not match; the file was not published.
     IntegrityMismatch,
-    /// The operation would exceed a staging or storage quota.
+    /// The operation would exceed a staging or storage quota, or the disk it
+    /// writes to is full.
     StorageExhausted,
     /// A resolved path escaped the session staging root.
     OutsideStagingRoot,
@@ -1470,13 +1662,10 @@ fn validate_control(control: &ControlMessage) -> Result<(), ProtocolError> {
                     note.len() as u64,
                     limits::MAX_CLEANUP_NOTE_BYTES as u64,
                 )?;
-                if !is_single_line(note) {
-                    return Err(ProtocolError::Malformed(
-                        <serde_json::Error as serde::de::Error>::custom(
-                            "a cleanup report note must be one line without control characters",
-                        ),
-                    ));
-                }
+                require_single_line(
+                    note,
+                    "a cleanup report note must be one line without control characters",
+                )?;
             }
             Ok(())
         }
@@ -1565,11 +1754,22 @@ fn validate_operation(op: &Operation) -> Result<(), ProtocolError> {
             data.len() as u64,
             limits::MAX_CHUNK_BYTES as u64,
         ),
-        Operation::ListStaged {} | Operation::StagingCleanup { .. } => Ok(()),
+        Operation::ListStaged {} | Operation::StagingCleanup { .. } | Operation::FsDrives {} => {
+            Ok(())
+        }
         Operation::FsStat { path }
         | Operation::CreateDir { path }
         | Operation::FsDelete { path }
         | Operation::RemoveDir { path } => validate_remote_path("path", path),
+        Operation::RemoveTree {
+            path, folder_id, ..
+        } => {
+            validate_remote_path("path", path)?;
+            if let Some(id) = folder_id {
+                check_folder_id("remove_tree folder_id length", id)?;
+            }
+            Ok(())
+        }
         Operation::FsAbort { dest } => validate_remote_path("dest", dest),
         Operation::FsList {
             path,
@@ -1778,10 +1978,89 @@ fn validate_result(result: &OpResult) -> Result<(), ProtocolError> {
             )?;
             for failure in failed {
                 check_limit(
+                    "cleanup failure canonical_path length",
+                    failure.canonical_path.len() as u64,
+                    limits::MAX_PATH_BYTES as u64,
+                )?;
+                require_single_line(
+                    &failure.canonical_path,
+                    "a cleanup failure path must be one line",
+                )?;
+                check_limit(
                     "cleanup failure reason length",
                     failure.reason.len() as u64,
                     limits::MAX_REASON_BYTES as u64,
                 )?;
+            }
+            Ok(())
+        }
+        OpResult::Drives { drives } => {
+            check_limit(
+                "drives count",
+                drives.len() as u64,
+                limits::MAX_DRIVES as u64,
+            )?;
+            for drive in drives {
+                validate_drive_entry(drive)?;
+            }
+            Ok(())
+        }
+        OpResult::TreeRemoval {
+            state,
+            removed_files,
+            removed_dirs,
+            failed,
+            failed_more,
+            folder_id,
+        } => {
+            // A removal that goes on names the folder it goes on with, and
+            // only such a removal does: an answer that ends a removal has no
+            // next step to bind.
+            match (state, folder_id) {
+                (TreeState::More, Some(id)) => {
+                    check_folder_id("tree_removal folder_id length", id)?;
+                }
+                (TreeState::More, None) => {
+                    return Err(malformed(
+                        "a folder removal that continues must name its folder",
+                    ));
+                }
+                (_, Some(_)) => {
+                    return Err(malformed(
+                        "only a folder removal that continues names its folder",
+                    ));
+                }
+                (_, None) => {}
+            }
+            // One step meets at most `MAX_TREE_STEP_ENTRIES` entries, so no
+            // count of one step can be larger.
+            check_limit(
+                "tree_removal removed_files",
+                *removed_files,
+                limits::MAX_TREE_STEP_ENTRIES,
+            )?;
+            check_limit(
+                "tree_removal removed_dirs",
+                *removed_dirs,
+                limits::MAX_TREE_STEP_ENTRIES,
+            )?;
+            check_limit(
+                "tree_removal failed count",
+                failed.len() as u64,
+                limits::MAX_TREE_FAILURES as u64,
+            )?;
+            check_limit(
+                "tree_removal failed_more",
+                *failed_more,
+                limits::MAX_TREE_STEP_ENTRIES,
+            )?;
+            for failure in failed {
+                check_limit(
+                    "tree_failure path length",
+                    failure.path.len() as u64,
+                    limits::MAX_TREE_FAILURE_PATH_BYTES as u64,
+                )?;
+                require_single_line(&failure.path, "a tree failure path must be one line")?;
             }
             Ok(())
         }
@@ -1833,6 +2112,18 @@ fn validate_event(event: &EventKind) -> Result<(), ProtocolError> {
         | EventKind::Disconnected { .. }
         | EventKind::DesktopActivity { .. } => Ok(()),
     }
+}
+
+/// Whether a flag is at its default `false`. Such a flag is omitted on the
+/// wire, so a message without it keeps the form it had before the flag
+/// existed (REQ-N-012).
+fn is_false(flag: &bool) -> bool {
+    !*flag
+}
+
+/// Whether a count is zero and therefore omitted on the wire.
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 /// Whether `text` is one line of plain text: no control character and no
@@ -2148,6 +2439,20 @@ fn check_digest_len(field: &'static str, digest: &B64Bytes) -> Result<(), Protoc
     check_limit(field, digest.len() as u64, limits::DIGEST_LEN as u64)
 }
 
+/// Bounds what identifies a folder between two steps of its removal: from 1
+/// to [`limits::MAX_FOLDER_ID_BYTES`] bytes. An empty one identifies nothing.
+fn check_folder_id(field: &'static str, id: &B64Bytes) -> Result<(), ProtocolError> {
+    if id.is_empty() {
+        return Err(malformed("a folder id is never empty"));
+    }
+    check_limit(field, id.len() as u64, limits::MAX_FOLDER_ID_BYTES as u64)
+}
+
+/// A message that breaks a rule of its schema that the types do not express.
+fn malformed(rule: &'static str) -> ProtocolError {
+    ProtocolError::Malformed(<serde_json::Error as serde::de::Error>::custom(rule))
+}
+
 /// Validates a [`FileEntry`] carried in a result.
 fn validate_file_entry(entry: &FileEntry) -> Result<(), ProtocolError> {
     check_limit(
@@ -2155,6 +2460,47 @@ fn validate_file_entry(entry: &FileEntry) -> Result<(), ProtocolError> {
         entry.name.len() as u64,
         limits::MAX_NAME_BYTES as u64,
     )
+}
+
+/// Validates a [`DriveEntry`] carried in a result: every text bounded and one
+/// line, every size within the JSON-safe range, and never more free space
+/// than the drive holds.
+fn validate_drive_entry(drive: &DriveEntry) -> Result<(), ProtocolError> {
+    check_limit(
+        "drive root length",
+        drive.root.len() as u64,
+        limits::MAX_DRIVE_ROOT_BYTES as u64,
+    )?;
+    require_single_line(&drive.root, "a drive root must be one line")?;
+    if let Some(label) = &drive.label {
+        check_limit(
+            "drive label length",
+            label.len() as u64,
+            limits::MAX_DRIVE_LABEL_BYTES as u64,
+        )?;
+        require_single_line(label, "a drive label must be one line")?;
+    }
+    if let Some(total) = drive.total_bytes {
+        check_limit("drive total_bytes", total, limits::MAX_FILE_OFFSET)?;
+    }
+    if let Some(free) = drive.free_bytes {
+        check_limit(
+            "drive free_bytes",
+            free,
+            drive.total_bytes.unwrap_or(limits::MAX_FILE_OFFSET),
+        )?;
+    }
+    Ok(())
+}
+
+/// Rejects a text that is not one line (see [`is_single_line`]), so a peer
+/// cannot forge extra lines in a log, a report or a list.
+fn require_single_line(text: &str, rule: &'static str) -> Result<(), ProtocolError> {
+    if is_single_line(text) {
+        Ok(())
+    } else {
+        Err(malformed(rule))
+    }
 }
 
 /// Validates a [`StagedEntry`] carried in a result.

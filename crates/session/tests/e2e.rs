@@ -3881,3 +3881,960 @@ async fn shed_activity_events_are_counted_and_reported_where_they_were_dropped()
     host.stop().expect("stop");
     drain_until_end!(host);
 }
+
+// --- The file operations an explorer needs (ST-M010-001) ---------------------
+//
+// The drive list and the removal of a folder with its content run over the
+// real session against the in-process agent. A folder to remove is planted in
+// that agent's own staging area and named by its staging name: the wire takes
+// absolute paths in the Windows form only, so a staging name is the one way to
+// name a real folder on every platform these tests run on. Sending a file to
+// a folder by an absolute path is covered where such a path exists, on
+// Windows.
+
+/// The default capabilities plus the explorer file capability, so the agent
+/// serves the drive list and the folder removal instead of answering
+/// `Unsupported` (REQ-N-012).
+fn caps_with_explorer() -> Vec<String> {
+    let mut capabilities = caps();
+    capabilities.push(cretlink_session::CAP_FS_V2.to_string());
+    capabilities
+}
+
+/// An audit sink that keeps every record the agent's runtime writes, with its
+/// outcome.
+#[derive(Debug, Default)]
+struct OutcomeAudit {
+    records: std::sync::Mutex<Vec<(Actor, &'static str, Outcome)>>,
+}
+
+impl OutcomeAudit {
+    /// The outcomes recorded for `action`, in order.
+    fn of(&self, action: &str) -> Vec<Outcome> {
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, recorded, _)| *recorded == action)
+            .map(|(_, _, outcome)| *outcome)
+            .collect()
+    }
+}
+
+impl SessionAudit for OutcomeAudit {
+    fn record(&self, actor: Actor, action: &'static str, outcome: Outcome) {
+        self.records.lock().unwrap().push((actor, action, outcome));
+    }
+}
+
+/// A connected console/agent pair whose agent advertises the explorer file
+/// capability and records its audit stream into `audit`.
+async fn connected_pair_explorer(audit: Arc<OutcomeAudit>) -> (HostHandle, JoinHandle) {
+    let host = SessionHost::host(
+        loopback(),
+        console_hints(),
+        PROTOCOL_V1,
+        caps_with_explorer(),
+    )
+    .await
+    .expect("bind console");
+    let addr = host
+        .local_addr()
+        .expect("a LAN-bound console reports its local listener address");
+    let joiner = SessionJoiner::join_with_audit(
+        addr,
+        agent_identity(),
+        PROTOCOL_V1,
+        caps_with_explorer(),
+        audit,
+    )
+    .await
+    .expect("dial agent");
+    (host, joiner)
+}
+
+/// Plants the folder `name` in the staging area of the session's in-process
+/// agent and returns its real path. The agent roots its store under
+/// `FileStore::for_session(session)`, so a second instance for the same id
+/// yields the identical staging root.
+fn staged_folder(host: &HostHandle, name: &str) -> PathBuf {
+    let session = host.session().expect("session id once active");
+    let folder = FileStore::for_session(session).staging_root().join(name);
+    std::fs::create_dir_all(&folder).expect("plant the folder");
+    folder
+}
+
+/// The wire name of a folder planted with [`staged_folder`].
+fn staged(name: &str) -> RemotePath {
+    RemotePath::Staging {
+        name: name.to_string(),
+    }
+}
+
+/// Writes `count` small files into `folder`.
+fn plant_files(folder: &Path, count: u64) {
+    for n in 0..count {
+        std::fs::write(folder.join(format!("file-{n:05}.txt")), b"x").expect("plant a file");
+    }
+}
+
+/// How many entries `folder` holds directly.
+fn entries_in(folder: &Path) -> u64 {
+    std::fs::read_dir(folder).map_or(0, |entries| entries.count() as u64)
+}
+
+/// The text under which the agent names the existing entry `path` in the
+/// answer of a removal. On Windows that is where the entry really lies — the
+/// long name of every part, in the letter case the disk has, without the
+/// prefix of a verbatim path — whatever spelling the request used. Elsewhere
+/// it is the path as it was asked.
+fn reported_location(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let real = std::fs::canonicalize(path).expect("the entry exists");
+        let real = real.display().to_string();
+        real.strip_prefix(r"\\?\").unwrap_or(&real).to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
+}
+
+/// The words the agent describes the removal of the staged folder `name` in.
+fn removal_of(name: &str) -> String {
+    format!("delete the folder {name} (CretLink staging folder) and everything in it")
+}
+
+/// The drives are listed over the session, and the customer sees that the
+/// technician asked for them, as a file operation without a path.
+#[tokio::test]
+async fn the_drives_are_listed_over_the_session() {
+    use cretlink_session::{ActionOutcome, ActivityKind, Origin};
+
+    let (mut host, mut joiner) = connected_pair_explorer(Arc::default()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    let drives = host.list_drives().await.expect("the drives are listed");
+    assert!(!drives.is_empty(), "a computer has at least one drive");
+    for drive in &drives {
+        assert!(!drive.root.is_empty());
+        if let (Some(total), Some(free)) = (drive.total_bytes, drive.free_bytes) {
+            assert!(free <= total, "{drive:?}");
+        }
+    }
+    // Off Windows the one drive is the root file system.
+    #[cfg(unix)]
+    assert_eq!(
+        drives.iter().map(|d| d.root.as_str()).collect::<Vec<_>>(),
+        ["/"]
+    );
+
+    assert_eq!(
+        handled_parts(next_handled(&mut joiner).await),
+        (
+            Origin::Console,
+            None,
+            ActivityKind::FileOperation,
+            "list the drives".to_string(),
+            None,
+            None,
+            ActionOutcome::Succeeded,
+        )
+    );
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+}
+
+/// An agent that does not advertise the explorer file capability answers the
+/// drive list and the folder removal with `Unsupported` before anything is
+/// listed or removed. The customer still sees the refused requests, nothing is
+/// recorded as a removal, and the session stays usable (REQ-N-012).
+#[tokio::test]
+async fn without_the_capability_the_explorer_operations_are_unsupported() {
+    use cretlink_session::{ActionOutcome, ActivityKind};
+
+    let audit = Arc::new(OutcomeAudit::default());
+    let host = SessionHost::host(loopback(), console_hints(), PROTOCOL_V1, caps())
+        .await
+        .expect("bind console");
+    let addr = host.local_addr().expect("listener address");
+    // caps() omits fs.v2.
+    let joiner =
+        SessionJoiner::join_with_audit(addr, agent_identity(), PROTOCOL_V1, caps(), audit.clone())
+            .await
+            .expect("dial agent");
+    let (mut host, mut joiner) = (host, joiner);
+    drive_to_active(&mut host, &mut joiner).await;
+    let folder = staged_folder(&host, "kept");
+    plant_files(&folder, 3);
+
+    match host.list_drives().await {
+        Err(SessionError::Remote { code, .. }) => assert_eq!(code, ErrorCode::Unsupported),
+        other => panic!("expected an Unsupported remote error, got {other:?}"),
+    }
+    let (_, _, kind, operation, _, _, outcome) = handled_parts(next_handled(&mut joiner).await);
+    assert_eq!(kind, ActivityKind::FileOperation);
+    assert_eq!(operation, "list the drives");
+    assert_eq!(
+        outcome,
+        ActionOutcome::Failed {
+            code: ErrorCode::Unsupported
+        }
+    );
+
+    // The removal is a failed report that names the refusal, never an error
+    // of the session and never a success.
+    let report = host
+        .remove_tree(staged("kept"), &CancelToken::new(), |_| {})
+        .await
+        .expect("a refused removal is a report");
+    assert_eq!(report.outcome, JobOutcome::Failed);
+    assert_eq!(
+        report.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::Unsupported)
+    );
+    assert_eq!((report.removed_files, report.removed_dirs), (0, 0));
+    assert_eq!(entries_in(&folder), 3, "nothing was removed");
+    let (_, _, _, operation, path, _, outcome) = handled_parts(next_handled(&mut joiner).await);
+    assert_eq!(operation, removal_of("kept"));
+    assert_eq!(path.as_deref(), Some("kept (CretLink staging folder)"));
+    assert_eq!(
+        outcome,
+        ActionOutcome::Failed {
+            code: ErrorCode::Unsupported
+        }
+    );
+
+    assert_the_session_still_runs_a_command(&mut host).await;
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+    assert!(
+        audit.of("fs_remove_tree").is_empty() && audit.of("fs_remove_tree_start").is_empty(),
+        "a request refused at the capability gate is not a removal"
+    );
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// One call removes a folder with everything in it. The customer sees it as
+/// one action with its kind and path, and the agent's audit trail records it.
+#[tokio::test]
+async fn a_folder_is_removed_with_its_content_over_the_session() {
+    use cretlink_session::{ActionOutcome, ActivityKind, Origin, TreeRemovalProgress};
+
+    let audit = Arc::new(OutcomeAudit::default());
+    let (mut host, mut joiner) = connected_pair_explorer(audit.clone()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let folder = staged_folder(&host, "old-setup");
+    plant_files(&folder, 5);
+    std::fs::create_dir_all(folder.join("sub").join("deeper")).expect("plant");
+    plant_files(&folder.join("sub").join("deeper"), 2);
+
+    let mut progress: Vec<TreeRemovalProgress> = Vec::new();
+    let report = host
+        .remove_tree(staged("old-setup"), &CancelToken::new(), |p| {
+            progress.push(p)
+        })
+        .await
+        .expect("the removal runs");
+
+    assert_eq!(report.outcome, JobOutcome::Completed);
+    assert_eq!(report.removed_files, 7);
+    assert_eq!(report.removed_dirs, 3, "deeper, sub and the folder itself");
+    assert!(report.failed.is_empty() && report.failed_more == 0);
+    assert!(report.error.is_none() && !report.blocked);
+    assert!(!folder.exists(), "the folder is gone");
+    assert_eq!(
+        progress.last(),
+        Some(&TreeRemovalProgress {
+            removed_files: 7,
+            removed_dirs: 3
+        })
+    );
+
+    assert_eq!(
+        handled_parts(next_handled(&mut joiner).await),
+        (
+            Origin::Console,
+            None,
+            ActivityKind::FileOperation,
+            removal_of("old-setup"),
+            Some("old-setup (CretLink staging folder)".to_string()),
+            None,
+            ActionOutcome::Succeeded,
+        )
+    );
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+    assert_eq!(audit.of("fs_remove_tree"), vec![Outcome::Ok]);
+}
+
+/// A folder with more entries than one step settles is removed by several
+/// requests, which the engine issues on its own. The customer sees one action:
+/// in progress from the first step, done with the last, under one id.
+#[tokio::test]
+async fn a_large_folder_is_removed_in_steps_as_one_action() {
+    use cretlink_protocol::limits::MAX_TREE_STEP_ENTRIES;
+    use cretlink_session::{ActionOutcome, Attribution, Origin, Purpose};
+
+    let audit = Arc::new(OutcomeAudit::default());
+    let (mut host, mut joiner) = connected_pair_explorer(audit.clone()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let folder = staged_folder(&host, "node_modules");
+    let files = MAX_TREE_STEP_ENTRIES + 300;
+    plant_files(&folder, files);
+
+    // Attributed to its origin with the caller's stated purpose, like any
+    // other request (REQ-F-017, REQ-F-026).
+    let purpose = Purpose::new("Removing the broken package folder").unwrap();
+    let mut steps = 0;
+    let report = host
+        .remove_tree_as(
+            staged("node_modules"),
+            Attribution::new(Origin::Mcp, Some(purpose.clone())),
+            &CancelToken::new(),
+            |_| steps += 1,
+        )
+        .await
+        .expect("the removal runs");
+
+    assert_eq!(report.outcome, JobOutcome::Completed);
+    assert_eq!(report.removed_files, files);
+    assert_eq!(report.removed_dirs, 1);
+    assert!(steps >= 2, "more entries than one step settles: {steps}");
+    assert!(!folder.exists());
+
+    let (first_id, first) = match next_handled(&mut joiner).await {
+        SessionEvent::RequestHandled {
+            id,
+            origin,
+            purpose: stated,
+            outcome,
+            duration_ms,
+            ..
+        } => {
+            assert_eq!(origin, Origin::Mcp);
+            assert_eq!(stated, Some(purpose.clone()));
+            assert_eq!(duration_ms, None, "a removal in progress has no duration");
+            (id, outcome)
+        }
+        other => panic!("expected RequestHandled, got {other:?}"),
+    };
+    assert_eq!(first, ActionOutcome::InProgress);
+    match next_handled(&mut joiner).await {
+        SessionEvent::RequestHandled {
+            id,
+            origin,
+            purpose: stated,
+            operation,
+            outcome,
+            duration_ms,
+            ..
+        } => {
+            assert_eq!(id, first_id, "the same action, now ended");
+            assert_eq!(origin, Origin::Mcp);
+            assert_eq!(stated, Some(purpose));
+            assert_eq!(operation, removal_of("node_modules"));
+            assert_eq!(outcome, ActionOutcome::Succeeded);
+            assert!(duration_ms.is_some());
+        }
+        other => panic!("expected RequestHandled, got {other:?}"),
+    }
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+    assert_eq!(audit.of("fs_remove_tree_start"), vec![Outcome::Ok]);
+    assert_eq!(audit.of("fs_remove_tree"), vec![Outcome::Ok]);
+}
+
+/// A removal that is cancelled ends between two steps: nothing more is
+/// removed, the report says what was removed until then and is never a
+/// success, and the customer sees the action end as cancelled rather than
+/// keep running (REQ-N-008).
+#[tokio::test]
+async fn a_cancelled_removal_stops_between_steps_and_says_so_on_both_sides() {
+    use cretlink_protocol::limits::MAX_TREE_STEP_ENTRIES;
+    use cretlink_session::ActionOutcome;
+
+    let audit = Arc::new(OutcomeAudit::default());
+    let (mut host, mut joiner) = connected_pair_explorer(audit.clone()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let folder = staged_folder(&host, "half");
+    let files = MAX_TREE_STEP_ENTRIES + 300;
+    plant_files(&folder, files);
+
+    // Cancel as soon as the first step has been answered.
+    let cancel = CancelToken::new();
+    let report = host
+        .remove_tree(staged("half"), &cancel, |_| cancel.cancel())
+        .await
+        .expect("a cancelled removal is a report");
+
+    assert_eq!(report.outcome, JobOutcome::Cancelled, "never a success");
+    assert!(report.removed_files > 0, "the first step removed something");
+    assert!(
+        report.removed_files < files,
+        "and the cancel stopped the rest"
+    );
+    assert_eq!(report.removed_dirs, 0);
+    assert_eq!(
+        entries_in(&folder),
+        files - report.removed_files,
+        "what was not removed is still there"
+    );
+
+    let first_id = match next_handled(&mut joiner).await {
+        SessionEvent::RequestHandled { id, outcome, .. } => {
+            assert_eq!(outcome, ActionOutcome::InProgress);
+            id
+        }
+        other => panic!("expected RequestHandled, got {other:?}"),
+    };
+    match next_handled(&mut joiner).await {
+        SessionEvent::RequestHandled {
+            id,
+            operation,
+            outcome,
+            ..
+        } => {
+            assert_eq!(id, first_id, "the same action, now ended");
+            assert_eq!(operation, removal_of("half"));
+            assert_eq!(outcome, ActionOutcome::Cancelled);
+        }
+        other => panic!("expected RequestHandled, got {other:?}"),
+    }
+
+    // A removal cancelled before it began sends nothing at all.
+    let cancelled = CancelToken::new();
+    cancelled.cancel();
+    let report = host
+        .remove_tree(staged("half"), &cancelled, |_| {})
+        .await
+        .expect("a report");
+    assert_eq!(report.outcome, JobOutcome::Cancelled);
+    assert_eq!((report.removed_files, report.removed_dirs), (0, 0));
+
+    assert_the_session_still_runs_a_command(&mut host).await;
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+    assert_eq!(audit.of("fs_remove_tree_start"), vec![Outcome::Ok]);
+    assert_eq!(audit.of("fs_remove_tree"), vec![Outcome::Cancelled]);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// One removal is about one folder. A folder that is swapped for another one
+/// between two steps — moved away, with a new folder under its name — is not
+/// removed in its place: the agent refuses the step that would continue,
+/// nothing is removed from the new folder, and the removal ends as failed on
+/// both sides with what it had removed until then (REQ-N-008).
+#[tokio::test]
+async fn a_folder_swapped_between_two_steps_is_not_removed_in_its_place() {
+    use cretlink_protocol::limits::MAX_TREE_STEP_ENTRIES;
+    use cretlink_session::ActionOutcome;
+
+    let audit = Arc::new(OutcomeAudit::default());
+    let (mut host, mut joiner) = connected_pair_explorer(audit.clone()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let folder = staged_folder(&host, "swapped");
+    let files = MAX_TREE_STEP_ENTRIES + 300;
+    plant_files(&folder, files);
+    let moved = folder.with_file_name("swapped-moved");
+
+    // As soon as the first step has been answered, the folder is moved away
+    // and another one takes over its name. How much that step removed depends
+    // on the disk: a step ends at its bound in entries or at its bound in
+    // time, whichever comes first.
+    let mut swapped = false;
+    let mut first_step = 0;
+    let report = host
+        .remove_tree(staged("swapped"), &CancelToken::new(), |progress| {
+            if !swapped {
+                swapped = true;
+                first_step = progress.removed_files;
+                std::fs::rename(&folder, &moved).expect("move the folder away");
+                std::fs::create_dir(&folder).expect("another folder of that name");
+                plant_files(&folder, 3);
+            }
+        })
+        .await
+        .expect("a refused step is a report");
+
+    assert!(swapped, "the folder was swapped after the first step");
+    assert_eq!(report.outcome, JobOutcome::Failed, "never a success");
+    assert_eq!(
+        report.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::InvalidPath),
+        "{report:?}"
+    );
+    assert!(
+        first_step > 0 && first_step <= MAX_TREE_STEP_ENTRIES,
+        "the first step removed something and kept to its bound: {first_step}"
+    );
+    assert_eq!(
+        report.removed_files, first_step,
+        "what the first step removed, and nothing after it"
+    );
+    assert_eq!(entries_in(&folder), 3, "the other folder keeps everything");
+    assert_eq!(
+        entries_in(&moved),
+        files - first_step,
+        "and so does the rest of the folder that was moved away"
+    );
+
+    // The customer sees one action: in progress, then failed with the reason.
+    let first_id = match next_handled(&mut joiner).await {
+        SessionEvent::RequestHandled { id, outcome, .. } => {
+            assert_eq!(outcome, ActionOutcome::InProgress);
+            id
+        }
+        other => panic!("expected RequestHandled, got {other:?}"),
+    };
+    match next_handled(&mut joiner).await {
+        SessionEvent::RequestHandled { id, outcome, .. } => {
+            assert_eq!(id, first_id, "the same action, now ended");
+            assert_eq!(
+                outcome,
+                ActionOutcome::Failed {
+                    code: ErrorCode::InvalidPath
+                }
+            );
+        }
+        other => panic!("expected RequestHandled, got {other:?}"),
+    }
+
+    assert_the_session_still_runs_a_command(&mut host).await;
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+    assert_eq!(audit.of("fs_remove_tree_start"), vec![Outcome::Ok]);
+    assert_eq!(audit.of("fs_remove_tree"), vec![Outcome::Failed]);
+    let _ = std::fs::remove_dir_all(&folder);
+    let _ = std::fs::remove_dir_all(&moved);
+}
+
+/// Something that keeps an entry of `folder` from being removed, for as long
+/// as it lives, and the reason the agent gives for it.
+struct Held {
+    #[cfg(windows)]
+    _open: std::fs::File,
+    #[cfg(unix)]
+    sealed: PathBuf,
+}
+
+impl Held {
+    /// Plants `folder/held/kept.bin` and makes it unremovable. `None` when
+    /// this account cannot be held back (it is the superuser).
+    #[cfg(unix)]
+    fn plant(folder: &Path) -> Option<(Self, PathBuf, ErrorCode)> {
+        use std::os::unix::fs::PermissionsExt;
+        let sealed = folder.join("held");
+        std::fs::create_dir_all(&sealed).expect("plant");
+        let kept = sealed.join("kept.bin");
+        std::fs::write(&kept, b"kept").expect("plant");
+        // Without write access to the folder nothing in it can be removed.
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o555)).expect("seal");
+        if std::fs::write(sealed.join(".probe"), b"").is_ok() {
+            let _ = std::fs::remove_file(sealed.join(".probe"));
+            eprintln!("skipped: this account is not held back by permissions");
+            return None;
+        }
+        Some((Self { sealed }, kept, ErrorCode::AccessDenied))
+    }
+
+    /// Plants `folder/held/kept.bin` and holds it open the way a program
+    /// does that does not let others delete its file.
+    #[cfg(windows)]
+    fn plant(folder: &Path) -> Option<(Self, PathBuf, ErrorCode)> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        std::fs::create_dir_all(folder.join("held")).expect("plant");
+        let kept = folder.join("held").join("kept.bin");
+        std::fs::write(&kept, b"kept").expect("plant");
+        let open = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&kept)
+            .expect("hold the file open");
+        Some((Self { _open: open }, kept, ErrorCode::FileInUse))
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.sealed, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
+/// A removal that cannot remove everything removes the rest, names what it
+/// left with the reason, and is a failure on both sides: the folder is still
+/// there, so nothing reports it as removed (REQ-N-008).
+#[tokio::test]
+async fn a_removal_that_leaves_something_behind_is_a_failure_with_its_reasons() {
+    use cretlink_session::ActionOutcome;
+
+    let audit = Arc::new(OutcomeAudit::default());
+    let (mut host, mut joiner) = connected_pair_explorer(audit.clone()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let folder = staged_folder(&host, "in-use");
+    plant_files(&folder, 4);
+    let Some((held, kept, reason)) = Held::plant(&folder) else {
+        return;
+    };
+
+    let report = host
+        .remove_tree(staged("in-use"), &CancelToken::new(), |_| {})
+        .await
+        .expect("a partial removal is a report");
+
+    assert_eq!(report.outcome, JobOutcome::Failed, "never a success");
+    assert_eq!(report.removed_files, 4, "everything else was removed");
+    assert_eq!(
+        report.removed_dirs, 0,
+        "the folders that hold the entry stay"
+    );
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].path, reported_location(&kept));
+    assert_eq!(report.failed[0].code, reason);
+    assert_eq!(report.failed_more, 0);
+    assert!(!report.blocked && report.error.is_none());
+    assert!(kept.exists() && folder.exists());
+
+    let (_, _, _, operation, _, _, outcome) = handled_parts(next_handled(&mut joiner).await);
+    assert_eq!(operation, removal_of("in-use"));
+    assert_eq!(outcome, ActionOutcome::Failed { code: reason });
+
+    // Once the entry is free, the same call removes the rest and the folder.
+    drop(held);
+    let report = host
+        .remove_tree(staged("in-use"), &CancelToken::new(), |_| {})
+        .await
+        .expect("the removal runs");
+    assert_eq!(report.outcome, JobOutcome::Completed);
+    assert_eq!((report.removed_files, report.removed_dirs), (1, 2));
+    assert!(!folder.exists());
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+    assert_eq!(
+        audit.of("fs_remove_tree"),
+        vec![Outcome::Failed, Outcome::Ok]
+    );
+}
+
+/// A folder that is not there, and a file where a folder was expected, are
+/// failed reports with the agent's reason. Neither is an error of the session,
+/// which stays usable, and nothing is removed.
+#[tokio::test]
+async fn removing_what_is_not_a_folder_is_a_failed_report() {
+    let (mut host, mut joiner) = connected_pair_explorer(Arc::default()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let folder = staged_folder(&host, "holder");
+    let file = folder.join("a-file.txt");
+    std::fs::write(&file, b"a file").expect("plant");
+    // The file lies directly in the staging area, where a staging name finds it.
+    let staged_file = folder.with_file_name("just-a-file.txt");
+    std::fs::write(&staged_file, b"a file").expect("plant");
+
+    for (name, expected) in [
+        ("not-there", ErrorCode::PathNotFound),
+        ("just-a-file.txt", ErrorCode::WrongPathKind),
+    ] {
+        let report = host
+            .remove_tree(staged(name), &CancelToken::new(), |_| {})
+            .await
+            .expect("a refused removal is a report");
+        assert_eq!(report.outcome, JobOutcome::Failed, "{name}");
+        assert_eq!(
+            report.error.as_ref().map(|error| error.code),
+            Some(expected),
+            "{name}"
+        );
+        assert_eq!((report.removed_files, report.removed_dirs), (0, 0));
+    }
+    assert!(staged_file.exists() && file.exists(), "nothing was removed");
+
+    assert_the_session_still_runs_a_command(&mut host).await;
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    let _ = std::fs::remove_file(&staged_file);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A path that breaks the path rules never leaves the console: the call fails
+/// locally with the typed reason and the session stays healthy.
+#[tokio::test]
+async fn an_adversarial_folder_path_is_refused_before_it_is_sent() {
+    let (mut host, mut joiner) = connected_pair_explorer(Arc::default()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    for bad in [
+        RemotePath::Absolute {
+            path: "C:\\Users\\..\\Windows".to_string(),
+        },
+        RemotePath::Absolute {
+            path: "\\\\server\\share\\folder".to_string(),
+        },
+        RemotePath::Staging {
+            name: "..\\outside".to_string(),
+        },
+    ] {
+        let error = host
+            .remove_tree(bad.clone(), &CancelToken::new(), |_| {})
+            .await
+            .expect_err("an adversarial path must be refused");
+        match error {
+            SessionError::Invalid { code, .. } => {
+                assert_eq!(code, ErrorCode::InvalidPath, "{bad:?}");
+            }
+            other => panic!("expected a local Invalid rejection for {bad:?}, got {other:?}"),
+        }
+    }
+
+    assert_the_session_still_runs_a_command(&mut host).await;
+    host.stop().expect("stop");
+    drain_until_end!(host);
+}
+
+/// A removal step bound to another session is refused and removes nothing
+/// (REQ-S-012, REQ-S-014).
+#[tokio::test]
+async fn a_removal_bound_to_another_session_removes_nothing() {
+    let (mut host, mut joiner) = connected_pair_explorer(Arc::default()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let folder = staged_folder(&host, "theirs");
+    plant_files(&folder, 3);
+
+    let error = host
+        .file_op_with_session(
+            SessionId::new(),
+            Operation::RemoveTree {
+                path: staged("theirs"),
+                stop: false,
+                folder_id: None,
+            },
+        )
+        .await
+        .expect_err("a request for another session is refused");
+    match error {
+        SessionError::Remote { code, .. } => assert_eq!(code, ErrorCode::UnknownSession),
+        other => panic!("expected UnknownSession, got {other:?}"),
+    }
+    assert_eq!(entries_in(&folder), 3, "nothing was removed");
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A session that is revoked while a folder is being removed ends the removal:
+/// the call does not report a success, no further step runs, and the agent's
+/// audit trail records the removal as begun with a result that is not known,
+/// never as done (REQ-S-004, REQ-N-008).
+#[tokio::test]
+async fn a_revoke_during_a_removal_never_reads_as_a_success() {
+    use cretlink_protocol::limits::MAX_TREE_STEP_ENTRIES;
+
+    let audit = Arc::new(OutcomeAudit::default());
+    let (mut host, mut joiner) = connected_pair_explorer(audit.clone()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+    let folder = staged_folder(&host, "interrupted");
+    let files = MAX_TREE_STEP_ENTRIES + 300;
+    plant_files(&folder, files);
+
+    // The customer stops the session the moment the first step is answered.
+    let mut fired = false;
+    let result = host
+        .remove_tree(staged("interrupted"), &CancelToken::new(), |_| {
+            if !fired {
+                fired = true;
+                joiner.stop().expect("the customer stops the session");
+            }
+        })
+        .await;
+
+    assert!(fired, "the stop was fired after the first step");
+    // An error of the session, or a report that is not a success.
+    if let Ok(report) = &result {
+        assert_ne!(report.outcome, JobOutcome::Completed, "{report:?}");
+    }
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+    assert!(folder.exists(), "the removal did not run to its end");
+    assert!(entries_in(&folder) > 0);
+    assert_eq!(audit.of("fs_remove_tree_start"), vec![Outcome::Ok]);
+    assert_eq!(
+        audit.of("fs_remove_tree"),
+        vec![Outcome::Unknown],
+        "a removal the session cut short is not known to have ended"
+    );
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A file is sent to a folder by its absolute path: it appears there under
+/// its name, verified, and the customer sees it as a received file with its
+/// path and size. An existing file is replaced only on request. Windows only:
+/// the wire accepts drive-qualified paths only.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_file_is_sent_to_a_folder_and_replaced_only_on_request() {
+    use cretlink_session::{ActionOutcome, ActivityKind, Origin};
+    use sha2::{Digest, Sha256};
+
+    let (mut host, mut joiner) = connected_pair_explorer(Arc::default()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    let dir = temp_dir_for("send-to-folder");
+    let documents = dir.join("Documents");
+    std::fs::create_dir_all(&documents).expect("create the folder");
+    let data = windowed_payload();
+    let source = dir.join("source.bin");
+    std::fs::write(&source, &data).expect("write source");
+    let final_path = documents.join("manual.pdf");
+    let dest = RemotePath::Absolute {
+        path: final_path.display().to_string(),
+    };
+    let send = |bytes_from: PathBuf, overwrite: bool| UploadRequest {
+        source: bytes_from,
+        dest: dest.clone(),
+        source_label: String::new(),
+        cleanup: CleanupPolicy::Keep,
+        overwrite,
+    };
+
+    let report = host
+        .upload_file(send(source.clone(), false), &CancelToken::new(), |_| {})
+        .await
+        .expect("the transfer runs");
+    assert_eq!(report.outcome, JobOutcome::Completed, "{:?}", report.error);
+    assert_eq!(report.digest, Sha256::digest(&data).to_vec());
+    assert_eq!(std::fs::read(&final_path).expect("read"), data);
+    let names: Vec<String> = std::fs::read_dir(&documents)
+        .expect("list")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(names, ["manual.pdf"], "no part is left beside the file");
+
+    // The customer sees the file arrive, with its path and size.
+    let received = loop {
+        let parts = handled_parts(next_handled(&mut joiner).await);
+        if parts.2 == ActivityKind::FileReceived {
+            break parts;
+        }
+    };
+    assert_eq!(received.0, Origin::Console);
+    assert_eq!(received.4, Some(final_path.display().to_string()));
+    assert_eq!(received.5, Some(data.len() as u64));
+    assert_eq!(received.6, ActionOutcome::Succeeded);
+
+    // Nothing was staged: the file is the customer's to keep.
+    match host.file_op(Operation::ListStaged {}).await.expect("list") {
+        OpResult::StagedList { entries } => assert!(entries.is_empty()),
+        other => panic!("expected StagedList, got {other:?}"),
+    }
+
+    // An existing file is not replaced unless the caller asks for it.
+    let other = dir.join("other.bin");
+    std::fs::write(&other, b"another file").expect("write");
+    let refused = host
+        .upload_file(send(other.clone(), false), &CancelToken::new(), |_| {})
+        .await
+        .expect("a refused transfer is a report");
+    assert_eq!(refused.outcome, JobOutcome::Failed);
+    assert_eq!(
+        refused.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::AlreadyExists)
+    );
+    assert_eq!(std::fs::read(&final_path).expect("read"), data, "untouched");
+
+    let replaced = host
+        .upload_file(send(other, true), &CancelToken::new(), |_| {})
+        .await
+        .expect("the transfer runs");
+    assert_eq!(replaced.outcome, JobOutcome::Completed);
+    assert_eq!(std::fs::read(&final_path).expect("read"), b"another file");
+
+    host.stop().expect("stop");
+    drain_until_end!(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A session that ends while a file is on its way to a folder leaves nothing
+/// in that folder: the file never appears under its name, and the part that
+/// lay beside it is removed by the agent's own cleanup (REQ-F-019,
+/// REQ-N-007). Windows only, like the test above.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_revoke_during_a_transfer_to_a_folder_leaves_no_part_behind() {
+    let (mut host, mut joiner) = connected_pair_explorer(Arc::default()).await;
+    drive_to_active(&mut host, &mut joiner).await;
+
+    let dir = temp_dir_for("revoke-send-to-folder");
+    let folder = dir.join("Downloads");
+    std::fs::create_dir_all(&folder).expect("create the folder");
+    let source = dir.join("source.bin");
+    std::fs::write(&source, large_payload()).expect("write source");
+    let final_path = folder.join("setup.exe");
+    let entries_now = || entries_in(&folder);
+
+    let mut fired = false;
+    let mut part_seen_mid = false;
+    let report = host
+        .upload_file(
+            UploadRequest {
+                source,
+                dest: RemotePath::Absolute {
+                    path: final_path.display().to_string(),
+                },
+                source_label: String::new(),
+                cleanup: CleanupPolicy::Keep,
+                overwrite: false,
+            },
+            &CancelToken::new(),
+            |p: TransferProgress| {
+                if !fired && p.transferred > 0 {
+                    fired = true;
+                    part_seen_mid = entries_now() == 1;
+                    let _ = host.revoke(RevokeReason::TechnicianRequested);
+                }
+            },
+        )
+        .await;
+
+    assert!(
+        fired,
+        "the revoke was fired from a mid-stream progress callback"
+    );
+    assert!(
+        part_seen_mid,
+        "the part lay beside the destination meanwhile"
+    );
+    // An error of the session, or a report that is not a success.
+    if let Ok(report) = &report {
+        assert_ne!(report.outcome, JobOutcome::Completed, "{report:?}");
+    }
+    drain_until_end!(host);
+    drain_until_end!(joiner);
+    assert!(
+        !final_path.exists(),
+        "the file never appeared under its name"
+    );
+    assert_eq!(entries_in(&folder), 0, "and its part is gone");
+    let _ = std::fs::remove_dir_all(&dir);
+}

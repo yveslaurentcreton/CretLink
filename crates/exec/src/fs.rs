@@ -29,6 +29,43 @@
 //! here); the store adds a resolution-time guard that a staging reference can
 //! never escape its root.
 //!
+//! # A file sent to a folder (ST-M010-001)
+//!
+//! A transfer whose destination is an absolute path keeps its part **beside
+//! the destination**, in the folder the file is meant for. The part is
+//! therefore created with that folder's own permissions and on that folder's
+//! own drive, and the verified commit is a rename inside one folder: it works
+//! on every drive the agent can write, and the file appears under its name
+//! only once its length and SHA-256 are verified. Such a file is the
+//! customer's to keep: it is not recorded in the staging manifest and no
+//! cleanup removes it. What the session does clean up is the **unfinished
+//! part** of such a transfer: the store remembers the parts it began and has
+//! neither committed nor discarded, and removes them with the staging area.
+//!
+//! That folder may belong to an account that is not elevated, and a program
+//! of that account can swap it for a junction between two requests. On
+//! Windows every request of such a transfer — each chunk, the commit, the
+//! discard and the cleanup — therefore **opens the folder once, verifies it,
+//! and does everything inside that opened folder** (see the `anchor` and
+//! `to_folder` modules): the folder must be a real folder that lies where the
+//! request says, the part is opened by its one name relative to the folder's
+//! handle and must be a regular file with a single name, its length and
+//! digest are read through that handle, and it is published by a rename
+//! inside the directory it lies in. A link in the place of the folder, under
+//! the part's name or as a second name of the part is refused: nothing is
+//! written through it and nothing is published.
+//!
+//! Off Windows these requests work on paths, with the part opened without
+//! following a link in the last part of its name: a non-Windows agent is a
+//! development and test tool that is never elevated on a customer computer.
+//!
+//! # Drives and folder removal (ST-M010-001)
+//!
+//! [`Operation::FsDrives`] lists the drives (see the `drives` module), and
+//! [`Operation::RemoveTree`] removes a folder with everything in it, one
+//! bounded step at a time, without ever leaving the folder (see the `tree`
+//! module). It takes up its folder as a verified folder too.
+//!
 //! # The staging area is CretLink's own (ST-M006-020, REQ-S-024)
 //!
 //! A cleanup acts on what a manifest in the staging area names, and a staged
@@ -50,15 +87,26 @@
 //! Every failure is a secret-free [`FsError`] carrying a wire [`ErrorCode`] and
 //! a fixed message — never remote file contents, never the offending path.
 //! Cleanup reports honest per-artifact outcomes rather than a blanket success.
+//! A folder removal names the entries it could not remove: those paths are its
+//! result, bounded in number and length.
 
+mod anchor;
+mod drives;
 mod manifest;
+#[cfg(windows)]
+mod to_folder;
+mod tree;
 
+#[cfg(test)]
+mod testing;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BinaryHeap;
+use std::collections::{BTreeSet, BinaryHeap};
 use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use cretlink_protocol::{
@@ -77,6 +125,13 @@ const PARTS_DIR: &str = ".parts";
 
 /// The read buffer used when hashing a file for a digest or commit.
 const HASH_BUF_BYTES: usize = 128 * 1024;
+
+/// The most unfinished transfers to a folder one session's store remembers for
+/// its cleanup. A transfer that would begin one more is refused
+/// ([`ErrorCode::StorageExhausted`]) rather than left untracked, so the list
+/// stays bounded and every part the session leaves is one it knows of
+/// (REQ-N-006, REQ-F-019).
+const MAX_UNFINISHED_TRANSFERS: usize = 1024;
 
 /// How the reason starts with which a cleanup reports an entry of a manifest
 /// that names a path outside the session's staging folder. Such a path is
@@ -97,6 +152,12 @@ const REASON_FOREIGN: &str = "not made by CretLink; left as it is";
 
 /// Why a sweep did nothing: the staging area could not be made private.
 const REASON_NOT_PRIVATE: &str = "the staging area could not be made private";
+
+/// Why a cleanup could not remove the part of an unfinished transfer to a
+/// folder: the folder is no longer in its place, and whether the part went
+/// with it is not known.
+const REASON_FOLDER_GONE: &str =
+    "its folder is no longer in its place; if the folder was moved, the part is still in it";
 
 /// A secret-free file-operation failure.
 ///
@@ -155,6 +216,23 @@ impl FsError {
         )
     }
 
+    /// A file lies under the name of a transfer's part that this store never
+    /// began: someone else put it there.
+    fn foreign_part() -> Self {
+        Self::new(
+            ErrorCode::WrongPathKind,
+            "a file that this transfer did not write lies under the name of its part",
+        )
+    }
+
+    /// The folder of a part that this store began is no longer in its place.
+    fn folder_gone() -> Self {
+        Self::new(
+            ErrorCode::PathNotFound,
+            "the folder of this transfer is no longer in its place; its part was not removed",
+        )
+    }
+
     /// Maps a raw I/O error onto a wire [`ErrorCode`], preferring the precise
     /// Windows status code and falling back to the portable [`std::io::ErrorKind`]
     /// so the crate maps sensibly on every platform it is tested on.
@@ -166,7 +244,11 @@ impl FsError {
 
 /// Classifies a raw I/O error into the wire vocabulary.
 fn io_error_code(err: &std::io::Error) -> ErrorCode {
-    // Windows surfaces the most precise signal in the raw OS status code.
+    // Windows surfaces the most precise signal in its own error code. The
+    // numbers are Windows error codes: on another system the same number means
+    // something else (17 is "file exists" and 39 "directory not empty" on
+    // Linux), so they are read on Windows only.
+    #[cfg(windows)]
     if let Some(raw) = err.raw_os_error() {
         match raw {
             2 | 3 => return ErrorCode::PathNotFound, // FILE/PATH_NOT_FOUND
@@ -188,22 +270,74 @@ fn io_error_code(err: &std::io::Error) -> ErrorCode {
             ErrorCode::WrongPathKind
         }
         std::io::ErrorKind::CrossesDevices => ErrorCode::Unsupported,
+        // The disk is full, or this account's share of it is used up: said as
+        // such, so that the caller frees space instead of trying again
+        // (ST-M010-001, REQ-N-015).
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => {
+            ErrorCode::StorageExhausted
+        }
+        // Held by another program in a way that excludes this operation.
+        std::io::ErrorKind::ResourceBusy | std::io::ErrorKind::ExecutableFileBusy => {
+            ErrorCode::FileInUse
+        }
         _ => ErrorCode::Internal,
     }
+}
+
+/// Makes `text` fit one line of at most `max_bytes` bytes, for a text field of
+/// a result that the wire requires to be bounded and on one line.
+///
+/// A control character or a line separator — which a file name on some systems
+/// may hold — becomes the replacement character, so the text cannot break a
+/// list or a log into forged lines. A text that is too long is cut on a
+/// character boundary and ends in `…`, so it is never taken for a whole one.
+fn one_line(text: &str, max_bytes: usize) -> String {
+    const CUT: char = '…';
+    debug_assert!(max_bytes >= CUT.len_utf8());
+    let mut line = String::with_capacity(text.len().min(max_bytes));
+    for character in text.chars() {
+        // The same rule as the protocol's own one-line check.
+        let breaks_the_line =
+            character.is_control() || character == '\u{2028}' || character == '\u{2029}';
+        line.push(if breaks_the_line {
+            char::REPLACEMENT_CHARACTER
+        } else {
+            character
+        });
+    }
+    if line.len() <= max_bytes {
+        return line;
+    }
+    let mut end = max_bytes.saturating_sub(CUT.len_utf8());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line.truncate(end);
+    line.push(CUT);
+    line
 }
 
 /// Serves the file-operation schema for one session against a real filesystem.
 ///
 /// A store is bound to one [`SessionId`] and owns a staging root beneath a base
 /// directory. Absolute-path operations touch the target directly; staging
-/// operations resolve under `base/<session>`. The store keeps no in-memory
-/// filesystem state: the part files on disk and the persistent manifest are the
-/// only state, so it is correct across an agent restart and holds no lock a
-/// crash could strand.
+/// operations resolve under `base/<session>`. No operation depends on state in
+/// memory: the part files on disk and the persistent manifest are the only
+/// state an operation reads, so the store is correct across an agent restart
+/// and holds no lock a crash could strand.
+///
+/// The one thing the store remembers is which transfers to a folder it began
+/// and has not finished, so that [`FileStore::cleanup`] can remove their parts
+/// when the session ends (ST-M010-001, REQ-F-019). It is bookkeeping for the
+/// cleanup only, shared by the clones of one store, and gone with the process:
+/// an agent that is killed leaves such a part, visible, beside its destination.
 #[derive(Debug, Clone)]
 pub struct FileStore {
     session: SessionId,
     staging_root: PathBuf,
+    /// The parts, beside their destinations, of the transfers to a folder that
+    /// this store began and has neither committed nor discarded.
+    unfinished: Arc<Mutex<BTreeSet<PathBuf>>>,
     /// The folder the staging root lies in, and whether it must be private.
     base: OwnFolder,
 }
@@ -326,6 +460,7 @@ impl FileStore {
         Self {
             session,
             staging_root,
+            unfinished: Arc::new(Mutex::new(BTreeSet::new())),
             base,
         }
     }
@@ -392,6 +527,15 @@ impl FileStore {
             Operation::RemoveDir { path } => self.remove_dir(&path).await,
             Operation::ListStaged {} => self.list_staged().await,
             Operation::StagingCleanup { trigger } => self.cleanup(trigger).await,
+            Operation::FsDrives {} => self.drives().await,
+            Operation::RemoveTree {
+                path,
+                stop,
+                folder_id,
+            } => {
+                let began = folder_id.map(B64Bytes::into_inner);
+                self.remove_tree(&path, stop, began).await
+            }
             // Not file operations: the session layer routes these to the broker
             // and never here. Answering fail-closed keeps a misroute honest.
             Operation::SystemInfo {}
@@ -446,6 +590,16 @@ impl FileStore {
         let hide_internal = dir == self.staging_root;
         let (entries, end) = list_dir(&dir, continue_after, hide_internal).await?;
         Ok(OpResult::DirEntries { entries, end })
+    }
+
+    /// Lists the drives of this computer (ST-M010-001). The system is asked
+    /// off the async runtime: a drive that is slow to answer must not hold up
+    /// the runtime's other tasks.
+    async fn drives(&self) -> Result<OpResult, FsError> {
+        let drives = tokio::task::spawn_blocking(drives::list)
+            .await
+            .map_err(|_| FsError::internal())?;
+        Ok(OpResult::Drives { drives })
     }
 
     async fn read(&self, path: &RemotePath, offset: u64, len: u32) -> Result<OpResult, FsError> {
@@ -537,11 +691,36 @@ impl FileStore {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<OpResult, FsError> {
+        // A file sent to a folder: inside the opened, verified folder.
+        #[cfg(windows)]
+        if let Some(place) = self.place_in_folder(dest)? {
+            let store = self.clone();
+            return blocking(move || to_folder::write(&store, &place, offset, &data)).await;
+        }
         let part = self.part_path(dest)?;
-        if matches!(dest, RemotePath::Staging { .. }) {
+        let to_folder = matches!(dest, RemotePath::Absolute { .. });
+        if !to_folder {
             self.ensure_staging_dirs().await?;
         }
-        let current = self.part_len(dest).await.unwrap_or(0);
+        // The part is a regular file this store wrote, or it does not exist
+        // yet. Anything else under its name — a link, a folder — was put there
+        // by someone else and is never written to.
+        let current = match tokio::fs::symlink_metadata(&part).await {
+            // A file that lay under the part's name before this store began
+            // the transfer was put there by someone else, who would stay its
+            // owner: it is not written to.
+            Ok(meta) if meta.file_type().is_file() && to_folder && !self.began(&part) => {
+                return Err(FsError::foreign_part());
+            }
+            Ok(meta) if meta.file_type().is_file() => meta.len(),
+            Ok(_) => {
+                return Err(FsError::wrong_kind(
+                    "the part of this transfer is not a regular file",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(FsError::from_io("failed to stat the part file", &e)),
+        };
         if offset != current {
             return Err(FsError::new(
                 ErrorCode::WriteConflict,
@@ -555,28 +734,20 @@ impl FileStore {
                 "the part exceeds the maximum transfer size",
             ));
         }
-        if matches!(dest, RemotePath::Staging { .. }) {
+        if to_folder {
+            // The part lies outside the staging area, so the store remembers
+            // it for its cleanup before the first byte is written.
+            self.remember_unfinished(&part)?;
+        } else {
             self.check_staging_quota(new_len, None).await?;
         }
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&part)
-            .await
-            .map_err(|e| FsError::from_io("failed to open the part file", &e))?;
-        file.write_all(&data)
-            .await
-            .map_err(|e| FsError::from_io("failed to write the part file", &e))?;
-        // `tokio::fs::File` buffers writes and dispatches the actual write to a
-        // background task: `write_all` resolves once the bytes are buffered, not
-        // once they reach the OS file, and dropping the handle does not flush.
-        // Flush now so the appended bytes are visible to the next write's length
-        // check and to the commit's length/digest verification (otherwise a
-        // subsequent stat can race the still-pending write and see a short
-        // file — a genuine integrity hazard, not just a test flake).
-        file.flush()
-            .await
-            .map_err(|e| FsError::from_io("failed to flush the part file", &e))?;
+        if let Err(error) = append_to_part(&part, &data).await {
+            // A part that was never created is nothing to clean up.
+            if to_folder && tokio::fs::symlink_metadata(&part).await.is_err() {
+                self.forget_unfinished(&part);
+            }
+            return Err(error);
+        }
         Ok(OpResult::WriteAccepted { part_len: new_len })
     }
 
@@ -592,45 +763,121 @@ impl FileStore {
         } = args;
         // Only SHA-256 exists today; reject anything else rather than assume.
         let DigestAlgo::Sha256 = algo;
-        let is_staging = matches!(dest, RemotePath::Staging { .. });
-        // A staging commit must record where the artifact came from (REQ-S-017).
-        let source = if is_staging {
-            match source {
-                Some(s) => s,
-                None => {
-                    return Err(FsError::new(
-                        ErrorCode::Unsupported,
-                        "a staging commit requires a source label",
-                    ));
-                }
+        // A staging commit must record where the artifact came from
+        // (REQ-S-017), and it is recorded in the manifest with its policy.
+        let staged = match (&dest, source) {
+            (RemotePath::Staging { .. }, Some(source)) => Some((source, cleanup)),
+            (RemotePath::Staging { .. }, None) => {
+                return Err(FsError::new(
+                    ErrorCode::Unsupported,
+                    "a staging commit requires a source label",
+                ));
             }
-        } else {
-            source.unwrap_or_default()
+            (RemotePath::Absolute { .. }, _) => None,
         };
+
+        // A file sent to a folder: inside the opened, verified folder.
+        #[cfg(windows)]
+        if let Some(place) = self.place_in_folder(&dest)? {
+            let store = self.clone();
+            let digest = digest.into_inner();
+            // If nobody waits for the commit any more — the session task is
+            // gone — it is told so and publishes nothing.
+            let abandoned = Arc::new(AtomicBool::new(false));
+            let _abandon_when_dropped = StopOnDrop(Arc::clone(&abandoned));
+            return blocking(move || {
+                to_folder::commit(&store, &place, len, &digest, overwrite, &|| {
+                    abandoned.load(Ordering::SeqCst)
+                })
+            })
+            .await;
+        }
 
         let final_path = self.resolve(&dest)?;
         let part = self.part_path(&dest)?;
-        if is_staging {
+        if staged.is_some() {
             self.ensure_staging_dirs().await?;
         }
 
         // Materialise a zero-length part if the caller committed without writing.
-        let part_len = match tokio::fs::symlink_metadata(&part).await {
-            Ok(meta) => meta.len(),
+        let (part_len, created) = match tokio::fs::symlink_metadata(&part).await {
+            // A file that lay under the part's name before this store began
+            // the transfer was put there by someone else: it is not published.
+            Ok(meta) if meta.file_type().is_file() && staged.is_none() && !self.began(&part) => {
+                return Err(FsError::foreign_part());
+            }
+            Ok(meta) if meta.file_type().is_file() => (meta.len(), false),
+            // Never publish what is not a regular file this store wrote.
+            Ok(_) => {
+                return Err(FsError::wrong_kind(
+                    "the part of this transfer is not a regular file",
+                ));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if len != 0 {
                     return Err(FsError::integrity(
                         "no staged bytes for the declared length",
                     ));
                 }
-                tokio::fs::File::create(&part)
-                    .await
-                    .map_err(|e| FsError::from_io("failed to create the part file", &e))?;
-                0
+                if staged.is_none() {
+                    self.remember_unfinished(&part)?;
+                }
+                if let Err(error) = create_empty_part(&part).await {
+                    // A part that was never created is nothing to clean up.
+                    if staged.is_none() && tokio::fs::symlink_metadata(&part).await.is_err() {
+                        self.forget_unfinished(&part);
+                    }
+                    return Err(error);
+                }
+                (0, true)
             }
             Err(e) => return Err(FsError::from_io("failed to stat the part file", &e)),
         };
 
+        let to_folder = staged.is_none();
+        let published = self
+            .publish_by_path(PathCommit {
+                final_path: &final_path,
+                part: &part,
+                part_len,
+                len,
+                digest: &digest,
+                overwrite,
+                staged,
+            })
+            .await;
+        if to_folder {
+            match &published {
+                // The part is the file now: nothing is left for a cleanup.
+                Ok(_) => self.forget_unfinished(&part),
+                // A part of bytes that were sent stays for a repeated commit.
+                // An empty one that this commit made holds nothing to resume:
+                // it is removed again, so that a refused commit leaves neither
+                // a file nor a part to remember.
+                Err(_) if created => {
+                    if tokio::fs::remove_file(&part).await.is_ok() {
+                        self.forget_unfinished(&part);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        published
+    }
+
+    /// Verifies the part at a path against the declared length and digest and
+    /// renames it into place: the commit of a staged file, and off Windows of
+    /// a file sent to a folder.
+    async fn publish_by_path(&self, commit: PathCommit<'_>) -> Result<OpResult, FsError> {
+        let PathCommit {
+            final_path,
+            part,
+            part_len,
+            len,
+            digest,
+            overwrite,
+            staged,
+        } = commit;
         // Verify length, then digest, before anything is published.
         if part_len != len {
             return Err(FsError::integrity("the staged length does not match"));
@@ -638,7 +885,7 @@ impl FileStore {
         if digest.as_bytes().len() != limits::DIGEST_LEN {
             return Err(FsError::integrity("the declared digest is malformed"));
         }
-        let (computed, hashed) = sha256_file(&part, None)
+        let (computed, hashed) = sha256_file(part, None)
             .await
             .map_err(|e| FsError::from_io("failed to read the part file", &e))?;
         if hashed != len || computed.as_slice() != digest.as_bytes() {
@@ -651,7 +898,7 @@ impl FileStore {
         {
             let file = tokio::fs::OpenOptions::new()
                 .write(true)
-                .open(&part)
+                .open(part)
                 .await
                 .map_err(|e| FsError::from_io("failed to open the part file", &e))?;
             file.sync_all()
@@ -660,7 +907,7 @@ impl FileStore {
         }
 
         // Resolve the overwrite decision against the final path.
-        let replaced = match tokio::fs::symlink_metadata(&final_path).await {
+        let replaced = match tokio::fs::symlink_metadata(final_path).await {
             Ok(meta) => {
                 if !overwrite {
                     return Err(FsError::new(
@@ -679,7 +926,7 @@ impl FileStore {
 
         let canonical_path = final_path.to_string_lossy().into_owned();
 
-        if is_staging {
+        if let Some((source, cleanup)) = staged {
             // Record the artifact before publishing it, so a crash can leave a
             // recorded-but-absent entry (harmless: cleanup treats it as gone)
             // but never a published-but-untracked one.
@@ -704,7 +951,7 @@ impl FileStore {
             });
             self.store_manifest(&manifest).await?;
 
-            if let Err(e) = tokio::fs::rename(&part, &final_path).await {
+            if let Err(e) = tokio::fs::rename(part, final_path).await {
                 // Publishing failed; retract the record we just wrote.
                 let mut manifest = self.load_manifest().await.unwrap_or_default();
                 if manifest.remove(&canonical_path) {
@@ -713,7 +960,7 @@ impl FileStore {
                 return Err(FsError::from_io("failed to publish the file", &e));
             }
         } else {
-            tokio::fs::rename(&part, &final_path)
+            tokio::fs::rename(part, final_path)
                 .await
                 .map_err(|e| FsError::from_io("failed to publish the file", &e))?;
         }
@@ -728,13 +975,30 @@ impl FileStore {
     }
 
     async fn abort(&self, dest: &RemotePath) -> Result<OpResult, FsError> {
+        // A file sent to a folder: inside the opened, verified folder.
+        #[cfg(windows)]
+        if let Some(place) = self.place_in_folder(dest)? {
+            let store = self.clone();
+            return blocking(move || to_folder::discard(&store, &place)).await;
+        }
         let part = self.part_path(dest)?;
         match tokio::fs::remove_file(&part).await {
-            Ok(()) => Ok(OpResult::Ack {}),
-            // Idempotent: the desired state (no part) is already reached.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(OpResult::Ack {}),
-            Err(e) => Err(FsError::from_io("failed to discard the part file", &e)),
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The folder of a part that this store began is no longer in
+                // its place: whether the part went with it is not known. It
+                // stays remembered, and the cleanup names it.
+                if self.began(&part) && folder_is_gone(&part).await {
+                    return Err(FsError::folder_gone());
+                }
+                // Otherwise idempotent: the desired state (no part) is
+                // already reached.
+            }
+            // The part is still there, and stays remembered for the cleanup.
+            Err(e) => return Err(FsError::from_io("failed to discard the part file", &e)),
         }
+        self.forget_unfinished(&part);
+        Ok(OpResult::Ack {})
     }
 
     // --- mutation ---------------------------------------------------------
@@ -845,6 +1109,48 @@ impl FileStore {
         Ok(OpResult::Ack {})
     }
 
+    /// One step of removing a folder with everything in it (ST-M010-001), or,
+    /// with `stop`, the end of a removal the caller will not continue.
+    /// `began` is the identity of the folder a removal began with, which a
+    /// step that continues it gives back.
+    async fn remove_tree(
+        &self,
+        path: &RemotePath,
+        stop: bool,
+        began: Option<Vec<u8>>,
+    ) -> Result<OpResult, FsError> {
+        if stop {
+            // Nothing is touched: the request only says that the removal ended.
+            return Ok(tree::StepReport::stopped().into_result());
+        }
+        self.remove_tree_step(path, began, tree::StepBounds::protocol())
+            .await
+            .map(tree::StepReport::into_result)
+    }
+
+    /// Runs one removal step within `bounds`, off the async runtime.
+    ///
+    /// If this future is dropped while the step runs — the session task is
+    /// aborted — the step is told to stop and ends at its next entry instead
+    /// of working on unobserved until its bounds.
+    async fn remove_tree_step(
+        &self,
+        path: &RemotePath,
+        began: Option<Vec<u8>>,
+        bounds: tree::StepBounds,
+    ) -> Result<tree::StepReport, FsError> {
+        let root = self.resolve(path)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let _stop_when_dropped = StopOnDrop(Arc::clone(&stop));
+        tokio::task::spawn_blocking(move || {
+            tree::remove_step(&root, began.as_deref(), bounds, &|| {
+                stop.load(Ordering::SeqCst)
+            })
+        })
+        .await
+        .map_err(|_| FsError::internal())?
+    }
+
     // --- staging ----------------------------------------------------------
 
     async fn list_staged(&self) -> Result<OpResult, FsError> {
@@ -872,20 +1178,28 @@ impl FileStore {
     /// entry that names another place is reported and kept; the purge drops
     /// it.
     ///
+    /// The parts of unfinished transfers to a folder lie beside their
+    /// destinations and are removed first, also when the staging area cannot
+    /// be used (ST-M010-001): the cleanup then fails as a whole, and
+    /// [`Self::unfinished_parts`] names the ones that are still there.
+    ///
     /// # Errors
     ///
     /// When something in the session's folder is not CretLink's
     /// ([`ErrorCode::AccessDenied`]; nothing was read or removed), or the
     /// manifest cannot be read or written.
     pub async fn cleanup(&self, trigger: CleanupTrigger) -> Result<OpResult, FsError> {
+        // Regardless of trigger: the parts of unfinished transfers to a folder
+        // are transient, and they do not lie in the staging area.
+        let mut failed: Vec<CleanupFailure> = Vec::new();
+        let mut removed = self.sweep_unfinished(&mut failed).await;
+
         self.prepare_base().await?;
         if self.session_standing().await == Standing::Foreign {
             return Err(FsError::not_ours());
         }
         let mut manifest = self.load_manifest().await?;
         let selected = manifest.selected(trigger);
-        let mut removed: u32 = 0;
-        let mut failed: Vec<CleanupFailure> = Vec::new();
 
         for canonical_path in selected {
             let Some(artifact) = self.own_artifact(&canonical_path) else {
@@ -896,10 +1210,10 @@ impl FileStore {
                     REASON_OUTSIDE
                 };
                 if failed.len() < limits::MAX_DIR_PAGE {
-                    failed.push(CleanupFailure {
-                        canonical_path,
-                        reason: reason.to_string(),
-                    });
+                    // What a manifest says is text that anybody may have
+                    // written: bounded and on one line, like every path in an
+                    // answer.
+                    failed.push(cleanup_failure(&canonical_path, reason));
                 }
                 continue;
             };
@@ -913,10 +1227,7 @@ impl FileStore {
                     manifest.remove(&canonical_path);
                 }
                 Err(e) if failed.len() < limits::MAX_DIR_PAGE => {
-                    failed.push(CleanupFailure {
-                        canonical_path,
-                        reason: cleanup_reason(&e).to_string(),
-                    });
+                    failed.push(cleanup_failure(&canonical_path, cleanup_reason(&e)));
                 }
                 Err(_) => {}
             }
@@ -927,6 +1238,29 @@ impl FileStore {
 
         self.store_manifest(&manifest).await?;
         Ok(OpResult::CleanupReport { removed, failed })
+    }
+
+    /// Removes the part of every transfer to a folder that this store began
+    /// and never finished, and reports the ones it could not remove. A part
+    /// that is removed, or already gone, is forgotten; one that could not be
+    /// removed stays remembered, so a later cleanup tries again.
+    async fn sweep_unfinished(&self, failed: &mut Vec<CleanupFailure>) -> u32 {
+        let parts: Vec<PathBuf> = self.unfinished().iter().cloned().collect();
+        let mut removed: u32 = 0;
+        for part in parts {
+            match remove_unfinished_part(&part).await {
+                Ok(true) => removed = removed.saturating_add(1),
+                Ok(false) => {}
+                Err(reason) => {
+                    if failed.len() < limits::MAX_DIR_PAGE {
+                        failed.push(cleanup_failure(&part.to_string_lossy(), reason));
+                    }
+                    continue;
+                }
+            }
+            self.forget_unfinished(&part);
+        }
+        removed
     }
 
     async fn sweep_parts(&self, failed: &mut Vec<CleanupFailure>) -> u32 {
@@ -946,10 +1280,9 @@ impl FileStore {
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => removed = removed.saturating_add(1),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) if failed.len() < limits::MAX_DIR_PAGE => failed.push(CleanupFailure {
-                    canonical_path: path.to_string_lossy().into_owned(),
-                    reason: cleanup_reason(&e).to_string(),
-                }),
+                Err(e) if failed.len() < limits::MAX_DIR_PAGE => {
+                    failed.push(cleanup_failure(&path.to_string_lossy(), cleanup_reason(&e)));
+                }
                 Err(_) => {}
             }
         }
@@ -1404,6 +1737,31 @@ impl FileStore {
         }
     }
 
+    /// Where a file with the destination `dest` goes when it is sent to a
+    /// folder, or `None` for a destination in the staging area.
+    #[cfg(windows)]
+    fn place_in_folder(&self, dest: &RemotePath) -> Result<Option<to_folder::Place>, FsError> {
+        if matches!(dest, RemotePath::Staging { .. }) {
+            return Ok(None);
+        }
+        let asked = self.resolve(dest)?;
+        let (Some(folder), Some(name)) =
+            (asked.parent(), asked.file_name().and_then(|n| n.to_str()))
+        else {
+            return Err(FsError::wrong_kind(
+                "the destination has no parent directory",
+            ));
+        };
+        let part_name = self.part_name_for(&asked);
+        Ok(Some(to_folder::Place {
+            folder: folder.to_path_buf(),
+            name: name.to_owned(),
+            part: folder.join(&part_name),
+            part_name,
+            asked: asked.to_string_lossy().into_owned(),
+        }))
+    }
+
     fn part_name_for(&self, final_path: &Path) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.session.to_string().as_bytes());
@@ -1465,6 +1823,58 @@ impl FileStore {
             return Err(FsError::not_ours());
         }
         Ok(())
+    }
+
+    /// The parts of the unfinished transfers to a folder. A poisoned lock is
+    /// read as it is: the set holds plain paths, and no panic can leave it
+    /// half-changed.
+    fn unfinished(&self) -> std::sync::MutexGuard<'_, BTreeSet<PathBuf>> {
+        self.unfinished
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Remembers `part` as the part of an unfinished transfer to a folder, so
+    /// that the cleanup removes it if the transfer never finishes. Refuses a
+    /// new one beyond [`MAX_UNFINISHED_TRANSFERS`].
+    fn remember_unfinished(&self, part: &Path) -> Result<(), FsError> {
+        let mut unfinished = self.unfinished();
+        if unfinished.contains(part) {
+            return Ok(());
+        }
+        if unfinished.len() >= MAX_UNFINISHED_TRANSFERS {
+            return Err(FsError::new(
+                ErrorCode::StorageExhausted,
+                "too many unfinished transfers; finish or discard some first",
+            ));
+        }
+        unfinished.insert(part.to_path_buf());
+        Ok(())
+    }
+
+    /// Forgets `part`: its transfer was committed, or the part was discarded.
+    fn forget_unfinished(&self, part: &Path) {
+        self.unfinished().remove(part);
+    }
+
+    /// Whether this store began the part at `part` and has neither committed
+    /// nor discarded it. A file that lies under the name of a part the store
+    /// did not begin was put there by someone else.
+    fn began(&self, part: &Path) -> bool {
+        self.unfinished().contains(part)
+    }
+
+    /// The parts of unfinished transfers to a folder that this store still
+    /// remembers after a cleanup: the ones that could not be removed, each
+    /// bounded and on one line. A cleanup that fails as a whole reports
+    /// nothing of its own, so whoever reports its failure names these.
+    #[must_use]
+    pub fn unfinished_parts(&self) -> Vec<String> {
+        self.unfinished()
+            .iter()
+            .take(limits::MAX_DIR_PAGE)
+            .map(|part| one_line(&part.to_string_lossy(), limits::MAX_PATH_BYTES))
+            .collect()
     }
 
     fn manifest_path(&self) -> PathBuf {
@@ -1532,6 +1942,142 @@ struct CommitArgs {
     overwrite: bool,
     source: Option<String>,
     cleanup: cretlink_protocol::CleanupPolicy,
+}
+
+/// What a commit that works on paths publishes, and how.
+struct PathCommit<'a> {
+    /// The path the file gets.
+    final_path: &'a Path,
+    /// The part that becomes the file.
+    part: &'a Path,
+    /// The length the part was found to have.
+    part_len: u64,
+    /// The declared length.
+    len: u64,
+    /// The declared digest.
+    digest: &'a B64Bytes,
+    /// Whether a file at the final path is replaced.
+    overwrite: bool,
+    /// For a staged file: its source label and cleanup policy, recorded in
+    /// the manifest. `None` for a file sent to a folder.
+    staged: Option<(String, cretlink_protocol::CleanupPolicy)>,
+}
+
+/// Runs blocking file work off the async runtime.
+#[cfg(windows)]
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, FsError> + Send + 'static,
+) -> Result<T, FsError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| FsError::internal())?
+}
+
+/// Removes the part of an unfinished transfer to a folder for the cleanup.
+/// `Ok(true)` when it was removed, `Ok(false)` when it was already gone, and
+/// the short reason when it is still there, or when its folder is no longer
+/// in its place and nobody can say.
+///
+/// On Windows the part is removed inside its opened, verified folder: a
+/// folder that was swapped for a link since is not followed, the part there
+/// is reported as not removed, and it stays remembered.
+async fn remove_unfinished_part(part: &Path) -> Result<bool, &'static str> {
+    #[cfg(windows)]
+    {
+        let part = part.to_path_buf();
+        match blocking(move || to_folder::remove_part(&part)).await {
+            Ok(to_folder::Removal::Removed) => Ok(true),
+            Ok(to_folder::Removal::Absent) => Ok(false),
+            Ok(to_folder::Removal::FolderGone) => Err(REASON_FOLDER_GONE),
+            Err(error) => Err(reason_for(error.code)),
+        }
+    }
+    #[cfg(not(windows))]
+    match tokio::fs::remove_file(part).await {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if folder_is_gone(part).await {
+                Err(REASON_FOLDER_GONE)
+            } else {
+                Ok(false)
+            }
+        }
+        Err(e) => Err(cleanup_reason(&e)),
+    }
+}
+
+/// Whether the folder of `part` is no longer at its place. A part that is not
+/// found then is not known to be gone: a folder that was moved took it along.
+async fn folder_is_gone(part: &Path) -> bool {
+    let Some(folder) = part.parent() else {
+        return false;
+    };
+    matches!(
+        tokio::fs::symlink_metadata(folder).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Creates the empty part of a file that is committed without a chunk. The
+/// name must be free: nothing that lies under it is opened, and a link there
+/// is not followed.
+async fn create_empty_part(part: &Path) -> Result<(), FsError> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(part)
+        .await
+        .map(drop)
+        .map_err(|e| FsError::from_io("failed to create the part file", &e))
+}
+
+/// Tells blocking work — a folder-removal step, a commit to a folder — to
+/// stop when it is dropped, which happens when the future that waits for the
+/// work is dropped.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Appends `data` to the part file at `part`, creating it if needed, and makes
+/// sure the bytes have reached the operating system before it returns.
+///
+/// The part is opened **without following a link**: if the last part of its
+/// name is a link, nothing is written through it. A full disk is reported as
+/// [`ErrorCode::StorageExhausted`], whichever of the two calls meets it.
+async fn append_to_part(part: &Path, data: &[u8]) -> Result<(), FsError> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).append(true);
+    // Refuse a symbolic link as the part itself (ELOOP) instead of opening
+    // what it points at.
+    #[cfg(unix)]
+    options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+    // FILE_FLAG_OPEN_REPARSE_POINT: open a link itself, never what it points
+    // at. It has no effect on a regular file.
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000);
+    let mut file = options
+        .open(part)
+        .await
+        .map_err(|e| FsError::from_io("failed to open the part file", &e))?;
+    file.write_all(data)
+        .await
+        .map_err(|e| FsError::from_io("failed to write the part file", &e))?;
+    // `tokio::fs::File` buffers writes and dispatches the actual write to a
+    // background task: `write_all` resolves once the bytes are buffered, not
+    // once they reach the OS file, and dropping the handle does not flush.
+    // Flush now so the appended bytes are visible to the next write's length
+    // check and to the commit's length/digest verification (otherwise a
+    // subsequent stat can race the still-pending write and see a short
+    // file — a genuine integrity hazard, not just a test flake). The flush is
+    // also where the error of that background write surfaces, a full disk
+    // included.
+    file.flush()
+        .await
+        .map_err(|e| FsError::from_io("failed to flush the part file", &e))
 }
 
 /// Lists one bounded, name-ordered page of `dir`.
@@ -1673,14 +2219,33 @@ fn drive_letter(path: &Path) -> Option<char> {
     None
 }
 
+/// The report of one artifact a cleanup could not remove, within the bounds
+/// of the wire: the path is the target's own text, so it is cut to the length
+/// of a path and kept on one line, and the answer that carries it can always
+/// be sent.
+fn cleanup_failure(path: &str, reason: &'static str) -> CleanupFailure {
+    CleanupFailure {
+        canonical_path: one_line(path, limits::MAX_PATH_BYTES),
+        reason: reason.to_string(),
+    }
+}
+
 /// A short, secret-free reason for a cleanup failure, drawn from the error kind.
 fn cleanup_reason(err: &std::io::Error) -> &'static str {
-    match io_error_code(err) {
+    reason_for(io_error_code(err))
+}
+
+/// A short, secret-free reason for a cleanup failure of the category `code`.
+fn reason_for(code: ErrorCode) -> &'static str {
+    match code {
         ErrorCode::AccessDenied => "access denied",
         ErrorCode::FileInUse => "in use",
         ErrorCode::PathNotFound => "not found",
         ErrorCode::WrongPathKind => "wrong kind",
         ErrorCode::DirNotEmpty => "not empty",
+        // The folder of a part was swapped for a link, or is reached through
+        // one: the part is not removed where that path leads now.
+        ErrorCode::InvalidPath => "its folder is a link or no longer in its place",
         _ => "i/o error",
     }
 }
@@ -1706,7 +2271,8 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Whether `op` works in a staging area: on a staging path, or on the
-/// staging area as a whole.
+/// staging area as a whole. Every operation is named, so that a new one does
+/// not build before it is decided on which side it stands.
 fn touches_staging(op: &Operation) -> bool {
     let staged = |path: &RemotePath| matches!(path, RemotePath::Staging { .. });
     match op {
@@ -1716,13 +2282,31 @@ fn touches_staging(op: &Operation) -> bool {
         | Operation::FsRead { path, .. }
         | Operation::FsDigest { path, .. }
         | Operation::FsDelete { path }
-        | Operation::RemoveDir { path } => staged(path),
+        | Operation::RemoveDir { path }
+        | Operation::RemoveTree { path, .. } => staged(path),
         Operation::FsWrite { dest, .. }
         | Operation::FsCommit { dest, .. }
         | Operation::FsAbort { dest } => staged(dest),
         Operation::FsMove { from, to, .. } => staged(from) || staged(to),
         Operation::ListStaged {} | Operation::StagingCleanup { .. } => true,
-        _ => false,
+        // The drives are no path, and the others are not file operations.
+        Operation::FsDrives {}
+        | Operation::SystemInfo {}
+        | Operation::Exec { .. }
+        | Operation::WriteStdin { .. }
+        | Operation::ListJobs {}
+        | Operation::TermOpen { .. }
+        | Operation::TermResize { .. }
+        | Operation::TermClose { .. }
+        | Operation::DesktopCapture { .. }
+        | Operation::DesktopPointer { .. }
+        | Operation::DesktopScroll { .. }
+        | Operation::DesktopKey { .. }
+        | Operation::DesktopType { .. }
+        | Operation::DesktopHotkey { .. }
+        | Operation::DesktopWait { .. }
+        | Operation::ClipboardGet {}
+        | Operation::ClipboardSet { .. } => false,
     }
 }
 

@@ -383,6 +383,7 @@ dependencies = [
  "async-trait",
  "base64",
  "cretlink-discovery",
+ "cretlink-exec",
  "cretlink-mcp",
  "cretlink-protocol",
  "cretlink-session",
@@ -414,6 +415,7 @@ name = "cretlink-exec"
 version = "0.0.0"
 dependencies = [
  "cretlink-protocol",
+ "nix",
  "png",
  "process-wrap",
  "serde",

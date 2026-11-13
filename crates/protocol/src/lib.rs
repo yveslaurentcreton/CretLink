@@ -23,7 +23,9 @@
 //! base64 strings via [`B64Bytes`] and are capped at
 //! [`limits::MAX_CHUNK_BYTES`]. File transfer reuses these bounded chunks in
 //! the commit-gated request/response schema (ADR-0012, [`CAP_FS_V1`]) rather
-//! than adding dedicated binary frames.
+//! than adding dedicated binary frames. The drives of the target and the
+//! removal of a folder with its content follow the same bounded
+//! request/response model ([`CAP_FS_V2`], ST-M010-001).
 //!
 //! # Compatibility policy (REQ-N-012)
 //!
@@ -71,10 +73,10 @@ pub use error::ProtocolError;
 pub use ids::{JobId, RequestId, SessionId};
 pub use message::{
     CleanupFailure, CleanupPolicy, CleanupTrigger, ControlMessage, DesktopAccess, DesktopFrameMeta,
-    DesktopState, DigestAlgo, ErrorCode, ErrorStage, EventKind, FileEntry, FileKind, ImageFormat,
-    JobOutcome, JobSummary, KeyAction, Message, OpResult, Operation, Origin, OutputStream,
-    PairingMessage, PointerAction, PointerButton, RemotePath, RevokeReason, Role, Shell,
-    StagedEntry, TargetIdentity, validate_remote_absolute_path,
+    DesktopState, DigestAlgo, DriveEntry, DriveKind, ErrorCode, ErrorStage, EventKind, FileEntry,
+    FileKind, ImageFormat, JobOutcome, JobSummary, KeyAction, Message, OpResult, Operation, Origin,
+    OutputStream, PairingMessage, PointerAction, PointerButton, RemotePath, RevokeReason, Role,
+    Shell, StagedEntry, TargetIdentity, TreeFailure, TreeState, validate_remote_absolute_path,
 };
 pub use pairing::{
     PAIRING_PROLOGUE_MAGIC, SAC_COMMITMENT_LEN, SAC_DIGITS, SAC_HKDF_SALT, SAC_MODULUS,
@@ -142,6 +144,21 @@ pub const CAP_REBOOT_RESUME_V1: &str = "reboot_resume.v1";
 /// (REQ-S-002, REQ-S-009).
 pub const CAP_DESKTOP_V1: &str = "desktop.v1";
 
+/// Capability string advertising the additive file operations a file explorer
+/// needs (ADR-0012, ST-M010-001, protocol minor `12`).
+///
+/// An agent lists this in its served capabilities when it can service
+/// [`Operation::FsDrives`] and [`Operation::RemoveTree`]. An agent that
+/// receives one of them without advertising it answers
+/// [`ErrorCode::Unsupported`] (REQ-N-012). Like [`CAP_TERM_V1`], this gate is
+/// **enforced** by the agent runtime (`cretlink-session`): nothing is listed
+/// and nothing is removed unless the capability was advertised. A peer on an
+/// older minor does not get as far as a request: the pairing prologue commits
+/// both endpoints to the identical version. The capability adds to
+/// [`CAP_FS_V1`] and does not replace it; an agent that serves this one serves
+/// that one too.
+pub const CAP_FS_V2: &str = "fs.v2";
+
 /// The frozen, version-canonical capability set that **both** endpoints hash
 /// into the pairing prologue ([`pairing_prologue`]).
 ///
@@ -165,11 +182,11 @@ pub const CAP_DESKTOP_V1: &str = "desktop.v1";
 /// The returned set contains every capability defined up to `version.minor`
 /// within protocol major `1` (each capability was added by exactly one minor:
 /// [`CAP_FS_V1`] at `1`, [`CAP_TERM_V1`] at `4`, [`CAP_REBOOT_RESUME_V1`] at
-/// `5`, [`CAP_DESKTOP_V1`] at `6`). Because a capability maps one-to-one to a
-/// minor and the prologue also binds the full version, this set never
-/// contradicts the version already committed there. Order is the frozen order
-/// below; [`pairing_prologue`] additionally sorts and dedupes, so order is not
-/// load-bearing.
+/// `5`, [`CAP_DESKTOP_V1`] at `6`, [`CAP_FS_V2`] at `12`). Because a capability
+/// maps one-to-one to a minor and the prologue also binds the full version,
+/// this set never contradicts the version already committed there. Order is
+/// the frozen order below; [`pairing_prologue`] additionally sorts and
+/// dedupes, so order is not load-bearing.
 #[must_use]
 pub fn canonical_capabilities(version: ProtocolVersion) -> Vec<String> {
     // Capabilities are a major-1 concept; a future major would define its own
@@ -190,6 +207,9 @@ pub fn canonical_capabilities(version: ProtocolVersion) -> Vec<String> {
     }
     if version.minor >= 6 {
         caps.push(CAP_DESKTOP_V1.to_string());
+    }
+    if version.minor >= 12 {
+        caps.push(CAP_FS_V2.to_string());
     }
     caps
 }

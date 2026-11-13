@@ -35,6 +35,18 @@
 //! (ST-M003-003, REQ-F-009). The simulator emits plain text only;
 //! VT-sequence pass-through (ADR-0010) concerns real ConPTY output.
 //!
+//! # Files, drives and folders (ADR-0012, ST-M003-005, ST-M010-001)
+//!
+//! File and staging operations run the real file engine of the agent
+//! (`cretlink_exec::FileStore`). A staging name resolves in a private temporary
+//! tree that the connection removes when it ends, so a staged file, and a
+//! folder removed with `RemoveTree`, never leave that tree. `FsDrives` reports
+//! the drives of the computer the simulator runs on, as that engine sees them:
+//! the drive letters on Windows, the root file system elsewhere. An absolute
+//! path is the host's own path, as for a real agent; the wire accepts the
+//! Windows form only, so off Windows a test names real folders by a staging
+//! name.
+//!
 //! # Interactive terminal grammar (ADR-0013, ST-M003-009)
 //!
 //! `TermOpen` registers an interactive terminal job (a terminal is a job),
@@ -274,7 +286,7 @@ impl Connection {
         // A unique, per-connection temp root. `with_base` only computes paths —
         // no directory is created until the first write — so this stays cheap for
         // the many connections that never touch the filesystem.
-        let vfs_root = std::env::temp_dir().join(format!("cretlink-sim-vfs-{session}"));
+        let vfs_root = vfs_root(session);
         let vfs = FileStore::with_base(session, vfs_root.clone());
         Self {
             misbehaviour,
@@ -601,6 +613,10 @@ impl Connection {
             // FileStore engine against this connection's private temp tree, so a
             // simulated target enforces the same staging root, verified-commit,
             // resume, and cleanup discipline as a real agent (ST-M003-004/005).
+            // The drive list and the removal of a folder with its content
+            // (CAP_FS_V2, ST-M010-001) are served by the same engine: the
+            // simulated target removes a folder in the same bounded steps, with
+            // the same honest states, as a real one.
             fs_op @ (Operation::FsStat { .. }
             | Operation::FsList { .. }
             | Operation::CreateDir { .. }
@@ -613,7 +629,9 @@ impl Connection {
             | Operation::FsDelete { .. }
             | Operation::RemoveDir { .. }
             | Operation::ListStaged {}
-            | Operation::StagingCleanup { .. }) => self.handle_file_op(framed, id, fs_op).await,
+            | Operation::StagingCleanup { .. }
+            | Operation::FsDrives {}
+            | Operation::RemoveTree { .. }) => self.handle_file_op(framed, id, fs_op).await,
         }
     }
 
@@ -1074,6 +1092,13 @@ impl Drop for Connection {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.vfs_root);
     }
+}
+
+/// The private temporary directory that holds the simulated file system of the
+/// connection that serves `session`. The staging area of that session lies in
+/// it, under the session id.
+fn vfs_root(session: SessionId) -> PathBuf {
+    std::env::temp_dir().join(format!("cretlink-sim-vfs-{session}"))
 }
 
 /// A negotiation-stage error: no session exists yet, so none is claimed.
