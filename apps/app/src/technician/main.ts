@@ -5,6 +5,9 @@
 // patches the live DOM (`morph`), so focus, scroll positions, the live regions
 // and the embedded terminal survive every update. User intents arrive as
 // `data-action` clicks and keys and become the narrow command set of `api`.
+// The file explorer of the Files tab has a controller of its own
+// (`./explorer-control`, ST-M010-002), which reads and writes its part of the
+// snapshot through this one.
 
 import "./styles.css";
 import { listen } from "@tauri-apps/api/event";
@@ -14,11 +17,13 @@ import { morph } from "../shared/morph";
 import {
   CONSOLE_ACTIVITY_EVENT,
   CONSOLE_BRIDGE_EVENT,
+  CONSOLE_EXPLORER_EVENT,
   CONSOLE_STATE_EVENT,
   type ConsoleState,
   api,
   isCommandError,
 } from "./api";
+import { createExplorer } from "./explorer-control";
 import {
   type LiveTab,
   type NavPage,
@@ -36,10 +41,12 @@ import {
   screenFor,
   sessionCounts,
   summaryFor,
+  targetName,
   trimFeed,
   upsertActivity,
 } from "./model";
 import { ConsoleTerminal } from "./terminal";
+import { explorerPanel, explorerRows } from "./views/explorer";
 import { renderTechnician } from "./views/shell";
 
 /** What the bootstrap knows about this process (`get_role`). */
@@ -65,9 +72,33 @@ let snap: TechnicianSnapshot = initialSnapshot(placeholderConsole(), Date.now())
 let lastScreen = "";
 // An element to focus after the next render (a confirm step that just opened).
 let focusNext: string | null = null;
-let renderQueued = false;
+// What the drawing that is queued covers: the whole window, or the Files tab
+// alone, which a folder that arrives in pages changes often (ST-M010-002).
+let renderQueued: "window" | "panel" | null = null;
 let ticker: number | null = null;
 const terminal = new ConsoleTerminal();
+
+/** Whether the Files tab of the live session is on screen. */
+function explorerShown(): boolean {
+  return screenFor(snap) === "live" && snap.tab === "files";
+}
+
+// The file explorer of the Files tab (ST-M010-002).
+const explorer = createExplorer({
+  get: () => snap.explorer,
+  set: (next, draw) => {
+    if (next === snap.explorer) return;
+    snap = { ...snap, explorer: next };
+    if (draw === "window") scheduleRender();
+    else if (draw === "panel") scheduleRender("panel");
+    // The rows alone are drawn at once, unless more is about to be drawn.
+    else if (draw === "rows" && renderQueued === null) renderRows();
+  },
+  shown: explorerShown,
+  root: () => root,
+  announce: (text) => set({ notice: text }),
+  host: () => targetName(snap),
+});
 
 // Bumped every time the live pump pushes a snapshot over `"console-state"`.
 // A command's return value is adopted only if no push arrived while it was in
@@ -81,13 +112,33 @@ function set(patch: Partial<TechnicianSnapshot>): void {
   scheduleRender();
 }
 
-function scheduleRender(): void {
-  if (renderQueued) return;
-  renderQueued = true;
+function scheduleRender(scope: "window" | "panel" = "window"): void {
+  const queued = renderQueued !== null;
+  if (scope === "window" || renderQueued === null) renderQueued = scope;
+  if (queued) return;
   queueMicrotask(() => {
-    renderQueued = false;
-    render();
+    const queuedScope = renderQueued;
+    renderQueued = null;
+    if (queuedScope === "panel") renderPanel();
+    else render();
   });
+}
+
+/** Draws the Files tab alone; the rest of the window is as it was. */
+function renderPanel(): void {
+  const panel = explorerShown() ? live?.querySelector("#xp") : null;
+  if (!panel) {
+    render();
+    return;
+  }
+  morph(panel, explorerPanel(snap));
+  explorer.afterRender();
+}
+
+/** Draws the rows of the explorer's list alone, as it scrolls. */
+function renderRows(): void {
+  const rows = live?.querySelector("#xp-rows");
+  if (rows) morph(rows, explorerRows(snap.explorer));
 }
 
 function render(): void {
@@ -119,6 +170,7 @@ function render(): void {
     focusNext = null;
     target?.focus();
   }
+  explorer.afterRender();
   updateTicker();
 }
 
@@ -181,6 +233,11 @@ function adoptConsole(next: ConsoleState): void {
     // Leaving full control tears the terminal down: the remote pty is closed
     // and the shell never outlives its session.
     terminal.dispose();
+  }
+  if (wasFull !== (next.phase.phase === "full_control")) {
+    // The explorer belongs to one session's full control (`applyConsole`
+    // dropped what it listed): nothing of it is waited for any more.
+    explorer.reset();
   }
   scheduleRender();
   if (ended) void refreshSessionsAfterEnd();
@@ -419,6 +476,7 @@ function onAction(event: ActionEvent): void {
         set({ tab: arg as LiveTab });
         if (arg === "terminal") requestAnimationFrame(() => terminal.refit());
         if (arg === "audit") void loadAudit();
+        if (arg === "files") explorer.shown();
       }
       break;
     case "open-report":
@@ -480,6 +538,8 @@ function onAction(event: ActionEvent): void {
       void uninstall();
       break;
     default:
+      // The controls of the file explorer.
+      if (action.startsWith("xp-")) explorer.onAction(event);
       break;
   }
 }
@@ -600,6 +660,11 @@ function onKeydown(event: KeyboardEvent): void {
       queueMicrotask(() => document.getElementById("net-toggle")?.focus());
       return;
     }
+    // So do the explorer's open menu and its path field (ST-M010-002).
+    if (explorerShown() && explorer.escape()) {
+      event.preventDefault();
+      return;
+    }
     // Escape is the always-available stop in every live phase (REQ-F-018).
     if (canStop(snap.console)) {
       event.preventDefault();
@@ -611,6 +676,8 @@ function onKeydown(event: KeyboardEvent): void {
     }
     return;
   }
+  // The keys of the file explorer, while its tab is on screen.
+  if (explorerShown() && explorer.onKeydown(event)) return;
   // Arrow keys move between the session tabs.
   const target = event.target;
   if (target instanceof HTMLElement && target.getAttribute("role") === "tab") {
@@ -626,6 +693,7 @@ function onKeydown(event: KeyboardEvent): void {
       set({ tab });
       queueMicrotask(() => document.getElementById(`tab-${tab}`)?.focus());
       if (tab === "terminal") requestAnimationFrame(() => terminal.refit());
+      if (tab === "files") explorer.shown();
     }
   }
 }
@@ -652,6 +720,8 @@ export async function start(options: StartOptions = {}): Promise<void> {
   const listeners = new AbortController();
   store[LISTENERS] = listeners;
   document.addEventListener("keydown", onKeydown, { signal: listeners.signal });
+  // The mouse on the explorer's list, and its scrolling.
+  explorer.bind(root, listeners.signal);
   // Subscribe before the first state so no live transition is missed.
   await listen<ConsoleState>(CONSOLE_STATE_EVENT, (event) => {
     pushGeneration += 1;
@@ -671,6 +741,8 @@ export async function start(options: StartOptions = {}): Promise<void> {
       set({ bridge: event.payload });
     }
   });
+  // The pages of a folder the explorer opened (ST-M010-002).
+  await listen<unknown>(CONSOLE_EXPLORER_EVENT, (event) => explorer.onEvent(event.payload));
   try {
     adoptConsole(await api.getState());
   } catch (error) {
