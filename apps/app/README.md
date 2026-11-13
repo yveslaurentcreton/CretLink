@@ -175,6 +175,15 @@ name, else the user name) is in `ConsoleState.technician.display_name`; the
 customer view carries it as `technician`, labelled as what the technician's
 computer says.
 
+The technician looking through files in the explorer (ST-M010-002) is one
+item on both sides, "Looked through files and folders", which names the
+folder that is being looked at and follows along
+(`cretlink_session::ActivityFeed::look`). It goes on only while it is the
+newest entry: a change, a transfer, a command, an action of the AI or a gap
+is an entry of its own, and the next look starts a new item after it. A look
+that was refused is a failed item of its own and is never replaced. A look of
+the AI keeps its stated purpose and stays an item of its own.
+
 The rail of the live session (`#t-live`, **ST-M009-008**) asks
 `get_bridge_status` and follows the `console-bridge` event for the local MCP
 bridge (`BridgeStatus` in the contract): whether its IPC endpoint is `ready`
@@ -196,6 +205,78 @@ the record — an action as the feed words it, any other record from its
 arguments with the audit's own rendering (`[REDACTED]`, digests) — never a
 payload or a chain field. The frontend asks again, at most once a second,
 when the feed or the phase changes, and when the tab opens.
+
+## The file explorer (ST-M010-002)
+
+The **Files** tab of the live session is a file explorer for the customer
+computer: the drives, folders in a **Details** and a **List** view, a path bar,
+back, forward, up and refresh. The files sent and received this session stay
+under it as its transfers panel. This is its first part, browsing; sending,
+copying to this computer, deleting and renaming are not offered yet.
+
+| Command | What it does |
+| --- | --- |
+| `explorer_drives` | the drives of the customer computer (`ExplorerDrive` in `src/shared/contract.ts`): root, kind, label, total and free space; a value the customer computer could not read is absent, never zero |
+| `explorer_open` `{ path, listing }` | opens the place `path` names and lists it. The folder arrives on the `console-explorer` event while the command runs (`ExplorerEvent`): `opened` once, with the folder as the customer computer names it and the first page, then a `page` for each further page. The answer says how the listing ended (`ExplorerListing`): `complete`, `cancelled` (left for another place) or `limit` |
+
+- **No authority of its own.** Both commands exist in a technician process
+  only and work only while a session is under full control: without one, or
+  without its open audit trail, they refuse with `no_consented_session` before
+  anything is asked (`src-tauri/src/technician/explorer.rs`). Nothing is asked
+  of the customer computer before the technician opens the tab. A stop or a
+  revocation ends a listing with the session, and what was listed is dropped
+  with the session: the next one starts with an empty explorer.
+- **Every look is the technician's, and recorded.** The commands go through
+  `cretlink_console::TechnicianFiles`: requests carry the origin `console`,
+  and each look is a pair of audit records, `console_fs_drives` or
+  `console_fs_list`, one pair for one folder however many pages it takes.
+- **The real location.** `path` is a path on the customer computer, never one
+  on this computer. A text that is no rooted path on a drive is refused before
+  anything is asked. What is shown and sent afterwards is the place as the
+  customer computer names it, built from its own answers: the root as the
+  drive list gives it, each further name as a listing of the folder above it
+  gives it (`cretlink_console::explorer`). A path typed in another letter case
+  therefore shows its real names. A name the folder above does not list, a
+  short name such as `PROGRA~1` included, is not found; a link is shown and
+  not followed; a path to a file opens the folder that holds it, with the file
+  selected.
+- **Stays where it was.** A place that is refused is shown as that refusal in
+  the explorer, the folder that was open stays on screen, and a typed path
+  comes back into its field to be corrected.
+- **Thousands of entries.** A page is as long as the customer computer makes
+  it (ST-M010-005); the first page is on screen at once and the rest fills in
+  while the technician works. Only the rows in view are drawn, each at its
+  place in a box as tall as the whole list (`src/technician/explorer.ts`,
+  `views/explorer.ts`). Pages are sorted into what is listed — folders first,
+  names without regard to case and digits by their value, or by date, type or
+  size — while the selection stays on its entries and the row in focus, or
+  else the first row in view, stays where it is. A listing stops at 100 000
+  entries and says that the folder holds more.
+- **Honest states.** Opening, loading, an empty folder, a list that is not the
+  whole folder (with why), a place that was refused and a session that ended
+  each have their own words. Nothing reads as an empty folder that is not one.
+- **Selection and keys.** Click, `Ctrl` and `Shift` click, `Ctrl+A`; the arrow
+  keys, `Home`, `End`, `Page Up` and `Page Down`, with `Shift` to extend and
+  `Ctrl` to move without selecting; letters go to the row that starts with
+  them. `Enter` or a double click opens a folder or a drive, `Backspace` or
+  `Alt+Up` goes up, `Alt+Left` and `Alt+Right` go back and forward, `F5`
+  refreshes, `Ctrl+L` opens the path field. The context menu (right click,
+  `Shift+F10` or the menu key) offers **Open** and **Refresh**; it is one
+  list of actions (`menuItems` in `explorer.ts`), so an action that is added
+  there appears in it with its key.
+- **Escape.** An open context menu or the path field takes the first
+  `Escape`; `Escape` then stops the session, as always.
+- **A grid for a screen reader.** The list is a `grid` with rows and cells,
+  the number of all rows and the place of each, the column that sorts
+  (`aria-sort`), the selected rows and the row the keyboard is on
+  (`aria-activedescendant`). The grid itself takes the keyboard; changes of
+  place are announced politely, a refusal assertively.
+
+To try the explorer without a customer computer, run `npx vite` and open
+`/dev/explorer.html`: the real controller and views against a customer
+computer held in memory (`src/technician/simulated-computer.ts`), with Tauri
+replaced by its own mocks. It has a folder of five thousand entries and one of
+sixty thousand. The controller's tests drive the same simulated computer.
 
 ## Session history and end reports (ST-M009-012)
 
@@ -266,11 +347,16 @@ apps/app/
     start/         the start screen
     technician/    Give help: api.ts (commands), model.ts (snapshot), views/
                    (one pure function per screen), terminal.ts (xterm),
-                   main.ts (controller), fixtures.ts, *.test.ts
+                   main.ts (controller), fixtures.ts, *.test.ts; the file
+                   explorer in explorer.ts (state), views/explorer.ts,
+                   explorer-control.ts (controller) and simulated-computer.ts
+                   (development and tests only)
     customer/      Get help: api.ts (commands), model.ts (snapshot), views/
                    (one pure function per screen, and the compact bar),
                    main.ts (controller of both windows), fixtures.ts, *.test.ts
   dev/gallery.html every screen of both roles from its fixtures (development only)
+  dev/explorer.html the file explorer against a simulated customer computer
+                    (development only)
   vitest.config.ts frontend tests (jsdom)
   src-tauri/
     Cargo.toml     detached crate; binary `cretlink`
@@ -280,8 +366,9 @@ apps/app/
     src/lib.rs     window per screen, process start and elevated relaunch
     src/start.rs   get_role, choose_role
     src/opener.rs  opens a validated file or folder with the platform opener
-    src/technician/  console state, commands, live-session driver and the
-                     session history (history.rs)
+    src/technician/  console state, commands, live-session driver, the
+                     session history (history.rs) and the file explorer
+                     (explorer.rs)
     src/customer/    agent state, commands, live-session driver, the end
                      report (report.rs), the admin step (admin.rs), and the
                      compact bar and closing (windows.rs)
@@ -360,6 +447,9 @@ one, and the live session starts with its full-control band.
   survives tab switches and the end of the session, and is cleared only when
   the next session starts. Items shed under load show as "N items were not
   shown".
+- The Files tab is the file explorer (ST-M010-002, above). Its state is part
+  of the snapshot for one session's full control; a folder that arrives in
+  pages redraws the tab alone, and scrolling redraws only the rows.
 - The end report and the history come from `list_sessions` (ST-M009-012).
   Until the sealed audit file is read, the end screen says it is preparing the
   report; unknown cleanup is never shown as success.
@@ -472,3 +562,10 @@ filter and the end report.
 - A manual walk-through of the technician interface on Windows and macOS, and
   a keyboard and screen-reader pass (Narrator, VoiceOver), are manual checks
   of ST-M009-008.
+- The file explorer has not been run against a customer computer on real
+  hardware, and no screen reader has read its grid yet: the browsing steps of
+  scenario MT-14 in `docs/manual-tests.md` (ST-M010-002). Its frontend was
+  tested in jsdom and looked at in Chromium through `dev/explorer.html`, not in
+  the application's own window. Off Windows a customer computer lists its root
+  file system as its one drive, which no path the wire accepts can name, so the
+  explorer shows that drive and a refusal there.

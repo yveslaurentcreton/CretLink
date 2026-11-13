@@ -695,19 +695,21 @@ with the customer computer on the local network.
    - Expected: the first Escape closes the list and the session keeps
      waiting; the second cancels it (REQ-F-018).
 
-### MT-14 — The file operations of the explorer on Windows (ST-M010-001, ST-M010-004)
+### MT-14 — The file explorer and its file operations on Windows (ST-M010-001, ST-M010-002, ST-M010-004)
 
-The list of drives, the removal of a folder with its content, a file sent
-into a folder on any drive, and a change to one entry — a delete, the removal
-of an empty folder, a new folder, a move — against a real elevated agent on
-Windows. The automated tests cover the same points on the Windows CI runner;
-this run adds real drives, the customer's own folders and a real stop.
+Browsing in the Files tab, the list of drives, the removal of a folder with
+its content, a file sent into a folder on any drive, and a change to one
+entry — a delete, the removal of an empty folder, a new folder, a move —
+against a real elevated agent on Windows. The automated tests cover the same
+points on the Windows CI runner; this run adds the application's own window,
+real drives, the customer's own folders and a real stop.
 
-The technician starts these operations from the file explorer of the live
-session (ST-M010-002). A build without that screen has no control for them:
-this scenario waits for the first build that has it. Steps 15 to 17 are the
-exception: the AI tools reach those operations in every build. The customer
-computer
+The technician works from the file explorer in the Files tab of the live
+session (ST-M010-002). Its first part browses: steps 1 and 18 to 25 can be
+run with a build whose Files tab is the explorer. It has no control yet for
+the operations of steps 2 to 14, which wait for the build that can delete and
+send from the explorer. Steps 15 to 17 are the exception: the AI tools reach
+those operations in every build. The customer computer
 needs a second drive that may be written to and emptied, such as a spare USB
 stick; the steps call it `E:`. Never point a step at a folder whose content
 matters.
@@ -727,7 +729,7 @@ cmd /c mklink C:\CretLinkTest\tree\file-link C:\CretLinkTest\outside\keep.txt
 cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
 ```
 
-1. **Drives.** List the drives.
+1. **Drives.** List the drives: open the Files tab of the live session.
    - Expected: every drive letter of the customer computer with its kind, its
      label and its total and free space, as *This PC* shows them in Windows. A
      card reader without a card, or an optical drive without a disc, is listed
@@ -912,7 +914,92 @@ cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
       not see `X:` and answers that the path does not exist; the file stays
       then too.) By its real path, `C:\CretLinkTest\elsewhere\two.txt`, the
       file is deleted.
-18. **Afterwards.** End the session and look again.
+18. **Nothing before the tab is opened (ST-M010-002).** Start a new session
+    and reach full control. Do not open the Files tab yet; look at the
+    customer's activity. Then open the tab.
+    - Expected: before the tab is opened the customer's activity shows no item
+      about files. Opening it lists the drives as in step 1, and the customer
+      now sees one item of the technician, *Looked through files and folders*,
+      with *list the drives*.
+19. **From folder to folder, and one item that follows along.** Open `C:\`
+    with a double click, `Users` with Enter, the customer's account folder
+    and `Documents`. Go up with Backspace, back and forward with the buttons
+    and with Alt+Left and Alt+Right, and to a folder further up by clicking
+    its name in the path bar.
+    - Expected: each folder is there at once. The path bar names the place
+      under the customer computer's name, and going up selects the folder that
+      was left. Folders come first; `file2` comes before `file10`.
+    - Expected: the customer's activity still shows **one** item of the
+      technician's looks. It names the folder that is open now, and it is not
+      repeated for each folder. The technician's activity shows the same one
+      item. The Audit tab lists one `console_fs_list` for each folder that was
+      opened, with its path and the number of entries (REQ-F-017, REQ-S-017).
+20. **A typed path under its real name.** Press Ctrl+L and type the path of
+    the customer's `Documents` folder in small letters and with forward
+    slashes, such as `c:/users/ann/documents`. Then type `C:\PROGRA~1`, then a
+    path that does not exist, then `C:\Windows\explorer.exe`.
+    - Expected: the first opens the folder, and the path bar and the Audit tab
+      name it as Windows does (`C:\Users\ann\Documents`), not as it was
+      typed.
+    - Expected: `C:\PROGRA~1` and the path that does not exist are refused in
+      the explorer with the words that `C:\` (or the folder above) lists no
+      entry of that name. The folder that was open stays on screen and the
+      typed path is back in its field. The path to the file opens
+      `C:\Windows` with `explorer.exe` selected.
+21. **A link is shown, not followed.** Look at `C:\`, where Windows keeps the
+    junction `Documents and Settings`, and at `C:\CretLinkTest`, where the
+    preparation made the junction `via`. Press Enter on each. Then type
+    `C:\CretLinkTest\via\inner`.
+    - Expected: both are listed with the type *Link*. Enter opens neither and
+      says that a link is shown, not followed. The typed path is refused with
+      the words that `C:\CretLinkTest\via` is a link; nothing behind it is
+      listed, and the customer's activity names no folder behind it.
+22. **A folder that the customer computer refuses.** Open
+    `C:\System Volume Information`, or another folder that Windows does not
+    let an administrator list.
+    - Expected: the refusal is shown in the explorer in plain words (*access
+      was denied*), and the folder that was open stays on screen. The
+      customer's activity shows the refused look as a failed item of its own,
+      with the folder and the reason; it stays there when the technician
+      browses on. The Audit tab lists that `console_fs_list` as failed.
+23. **A folder with thousands of entries.** Open `C:\Windows\System32`, or
+    a folder of 20 000 files as step 5 makes one. While it is still arriving,
+    scroll, select two files with Ctrl, and sort by **Size** and by **Date
+    modified**. Then scroll to the end and back.
+    - Expected: the first entries are there without a noticeable wait and the
+      status line counts up while the rest arrives. Scrolling is smooth while
+      the folder arrives and afterwards. The two files stay selected, and the
+      row that was clicked last stays where it is on screen while entries are
+      sorted in above it (REQ-F-028).
+    - Expected: when the status line stops counting, its number is the number
+      of entries `(Get-ChildItem -Force C:\Windows\System32).Count` gives in
+      the administrator PowerShell on the customer computer. The customer saw
+      one item for the whole folder, however many pages it took.
+24. **Views, selection, keys and the context menu.** Switch to **List** and
+    back to **Details**. Select with a click, with Ctrl, with Shift and with
+    Ctrl+A; move with the arrow keys, Home, End and the page keys; type the
+    first letters of a name. Create a file in the open folder on the customer
+    computer and press F5. Open the context menu with the right mouse button
+    and with Shift+F10, choose **Open** on a folder, and close the menu once
+    with Escape.
+    - Expected: the List view shows the names in columns, and the choice of
+      view holds for the session, also after a look at another tab. The new
+      file appears after F5, with the list where it was. The context menu
+      offers **Open** and **Refresh**; **Open** is greyed for a file. Escape
+      closes the menu and does not stop the session.
+    - Expected, with Narrator on the technician computer: the list is read as
+      a table, each row with its name, date, type and size and its place among
+      all rows; a selected row is read as selected; a refusal is read at once
+      (REQ-N-014).
+25. **Stop while a folder is arriving.** Open the large folder of step 23
+    again and press **Stop now** on the customer computer before the status
+    line has stopped counting. Then start a new session.
+    - Expected: the session ends at once on both sides, and the technician's
+      window says who ended it. Nothing more is asked of the customer
+      computer. In the new session the Files tab is empty and asks nothing
+      until it is opened: no name of a file from the session before is on
+      screen (REQ-S-004, REQ-F-018).
+26. **Afterwards.** End the session and look again.
     - Expected: the files sent in steps 9, 10 and 12 are still in their
       folders: they are the customer's to keep, and the list of staged files
       never named them. `C:\CretLinkTest` can be deleted by hand.
@@ -1012,4 +1099,4 @@ hardware.
 | _pending_ | | | MT-11 steps 2, 4, 5 and 7 to 9 on Windows, and all of it on macOS (ST-M009-006) | not yet recorded on hardware |
 | _pending_ | | | MT-12 step 10 (files left from an earlier session and `cretlink recover`) and the Narrator pass (ST-M009-009, ST-M009-010) | not yet recorded on hardware |
 | _pending_ | | | MT-13 (a technician's computer on several networks, ST-M009-016) | not yet recorded on hardware |
-| _pending_ | | | MT-14 (the file operations of the explorer: the drives, a folder with links / through a junction / a held file / cancel and stop / swapped while it is removed, a file sent to a folder on two drives and refused for a junction, ST-M010-001; a delete, a folder removal, a new folder and a move refused through a junction, after a swap and on a substituted drive, ST-M010-004) | not yet recorded on hardware |
+| _pending_ | | | MT-14 (the file operations of the explorer: the drives, a folder with links / through a junction / a held file / cancel and stop / swapped while it is removed, a file sent to a folder on two drives and refused for a junction, ST-M010-001; browsing in the Files tab: nothing before the tab is opened, from folder to folder with one item for the customer, a typed path under its real name, links, a refused folder, a folder of thousands of entries, views, selection, keys and the context menu, a stop while a folder arrives, and the Narrator pass of the grid, ST-M010-002; a delete, a folder removal, a new folder and a move refused through a junction, after a swap and on a substituted drive, ST-M010-004) | not yet recorded on hardware |
