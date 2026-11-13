@@ -1194,8 +1194,10 @@ has the relay in **Settings → Relay**; the customer's copy has a
      this technician.
 4. **The code.** On the customer computer open Get help and type the relay
    code into the code field, in lower case and with blanks instead of dashes.
-   - Expected: the screen says **Connecting through the relay** with the
-     relay's host name and that the relay only passes encrypted traffic on.
+   - Expected: before anything is typed, a line under the code field names
+     the relay this copy connects through. After **Connect** the screen says
+     **Connecting through the relay** with the relay's host name and that the
+     relay only passes encrypted traffic on.
      Then both screens show the same six-digit approval code, drawn unlike
      the relay code, and each names the relay.
 5. **Consent and the session.** Confirm the code, allow full control, run a

@@ -419,10 +419,11 @@ one step (ST-M007-013). Both copies need a profile for the **same** relay.
    screen shows the relay's host name, a **relay code** in four groups
    (`53ST-A71D-JKKV-0VGH`) with **Copy**, and in words whether the relay holds
    the code yet. The technician reads the code to the customer.
-3. **The customer** opens their copy, chooses **Get help** and types the code
-   into the field that also takes a connection code. The screen says
-   **Connecting through the relay** with the relay's host name, and that the
-   relay only passes encrypted traffic on.
+3. **The customer** opens their copy and chooses **Get help**. Under the code
+   field, a copy with a profile names the relay it would connect through. The
+   customer types the code into that field, which also takes a connection
+   code. The screen says **Connecting through the relay** with the relay's
+   host name, and that the relay only passes encrypted traffic on.
 4. From here everything is as on one network: both read the same six-digit
    approval code, the technician confirms it, the customer allows full
    control, and either side stops the session. Every screen says through

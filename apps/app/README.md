@@ -221,7 +221,10 @@ cannot be used is said with its file (`relayOffer` in
   `SessionSummary.relay` carries it into the history.
 
 **Get help.** The code field (`#c-find`) takes a connection code, an address
-and a relay code and tells them apart (`customer::typed_target`). A relay
+and a relay code and tells them apart (`customer::typed_target`). In a copy
+with a profile that can be used, a line under the field names the relay a
+relay code would connect through (`ConsentView.relay_of_copy`), so the
+customer sees its host name before connecting. A relay
 code joins the rendezvous on the relay of the profile next to the program
 (`JoiningDial`), which gives the technician ten seconds to be heard. The
 connecting screen then reads **Connecting through the relay** with the

@@ -141,7 +141,7 @@ impl AppState {
     /// The initial window of a copy whose profile file says `relay`.
     fn with_relay(relay: relay::Lookup) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ConsentSession::idle())),
+            inner: Arc::new(Mutex::new(ConsentSession::resting(&relay))),
             saved_reports: report::SavedReports::default(),
             startup: startup::StartupSweep::default(),
             relay: Arc::new(relay),
@@ -250,6 +250,13 @@ pub(crate) struct ConsentSession {
     /// What the customer can do about the failure this dial ended with, when
     /// the failure has a next step of its own (ST-M007-013, REQ-N-015).
     failure_next: Option<String>,
+    /// The relay this copy is set up for, by its host name: what the profile
+    /// file next to the program says (ST-M007-011). The window names it
+    /// beside the code field, so that the customer sees through which relay
+    /// a relay code would connect before typing one. It belongs to the
+    /// process, not to one session, so it is carried into every new session
+    /// state ([`Self::replace_with`]).
+    copy_relay: Option<RelayUseView>,
 }
 
 /// The generation of the next live dial (see [`ConsentSession::generation`]).
@@ -284,7 +291,19 @@ impl ConsentSession {
             generation: 0,
             relay: None,
             failure_next: None,
+            copy_relay: None,
         }
+    }
+
+    /// The resting window of a copy whose profile file says `relay`: with a
+    /// profile that can be used, the window names the relay this copy is set
+    /// up for (ST-M007-011). Nothing is dialled.
+    pub(crate) fn resting(relay: &relay::Lookup) -> Self {
+        let mut session = Self::idle();
+        session.copy_relay = relay.relay().map(|relay| RelayUseView {
+            host: relay.host().to_owned(),
+        });
+        session
     }
 
     /// A fresh, clearly-labelled simulated consent session, driven to
@@ -319,6 +338,7 @@ impl ConsentSession {
             generation: 0,
             relay: None,
             failure_next: None,
+            copy_relay: None,
         }
     }
 
@@ -351,6 +371,7 @@ impl ConsentSession {
             generation: next_generation(),
             relay: None,
             failure_next: None,
+            copy_relay: None,
         }
     }
 
@@ -376,9 +397,11 @@ impl ConsentSession {
     }
 
     /// Replaces this state with `next`, a new session's, keeping what belongs
-    /// to the process: the startup sweep's notice.
+    /// to the process: the startup sweep's notice, and the relay this copy
+    /// is set up for.
     pub(crate) fn replace_with(&mut self, mut next: Self) {
         next.startup_cleanup = self.startup_cleanup.take();
+        next.copy_relay = self.copy_relay.take();
         *self = next;
     }
 
@@ -458,6 +481,7 @@ impl ConsentSession {
             startup_cleanup: self.startup_cleanup.clone(),
             relay: self.relay.clone(),
             failure_next: self.failure_next.clone(),
+            relay_of_copy: self.copy_relay.clone(),
         }
     }
 }
@@ -557,6 +581,11 @@ pub struct ConsentView {
     /// put right in another way than a key that the relay refuses
     /// (ST-M007-013, REQ-N-015). `None` otherwise.
     pub failure_next: Option<String>,
+    /// The relay this copy is set up for, by its host name; `None` for a
+    /// copy without a relay profile that can be used (ST-M007-011). The
+    /// window shows it beside the code field: both people see the relay's
+    /// host name before they connect through it.
+    pub relay_of_copy: Option<RelayUseView>,
 }
 
 /// One console the customer may pick from the discovered list (ADR-0007).
@@ -1817,5 +1846,67 @@ mod tests {
         let json = serde_json::to_value(session.view()).unwrap();
         assert!(json["relay"].is_null());
         assert!(json["failure_next"].is_null());
+        assert!(json["relay_of_copy"].is_null());
+    }
+
+    #[test]
+    fn the_resting_window_names_the_relay_this_copy_is_set_up_for() {
+        use crate::relay::testing::Folder;
+
+        // Without a profile, and with one that cannot be used, the window
+        // names no relay: nothing is offered that would not work.
+        assert_eq!(
+            ConsentSession::resting(&relay::Lookup::None)
+                .view()
+                .relay_of_copy,
+            None
+        );
+        let folder = Folder::new("customer-resting");
+        folder.write(
+            "cretlink.toml",
+            "[relay]\naddress = \"relay.example.org\"\n",
+        );
+        let unusable = relay_next_to(Some(&folder.path("CretLink-Support.exe")));
+        assert!(matches!(unusable, relay::Lookup::Unusable(_)));
+        assert_eq!(
+            ConsentSession::resting(&unusable).view().relay_of_copy,
+            None
+        );
+
+        // With a profile, the customer sees the relay's host name before
+        // typing a code, and nothing is dialled for it.
+        folder.write(
+            "cretlink.toml",
+            format!("[relay]\naddress = \"relay.example.org:443\"\nkey = \"{KEY}\"\n"),
+        );
+        let lookup = relay_next_to(Some(&folder.path("CretLink-Support.exe")));
+        let mut session = ConsentSession::resting(&lookup);
+        let view = session.view();
+        assert_eq!(
+            view.relay_of_copy,
+            Some(RelayUseView {
+                host: "relay.example.org".to_owned()
+            })
+        );
+        // It says what this copy could use, not that a session uses it.
+        assert_eq!(view.relay, None);
+        assert!(!view.session_active);
+        assert!(matches!(session.agent.phase(), AgentPhase::Idle));
+        assert!(!serde_json::to_string(&view).unwrap().contains(KEY));
+
+        // It belongs to the process: a dial on one network keeps it, and
+        // names no relay for that session.
+        let (tx, _rx) = session_driver::intent_channel();
+        session.replace_with(ConsentSession::live_dialing(tx, None));
+        let dialing = session.view();
+        assert_eq!(dialing.relay, None);
+        assert_eq!(
+            dialing.relay_of_copy.map(|relay| relay.host),
+            Some("relay.example.org".to_owned())
+        );
+        // The state that was replaced gave it away: the window has one.
+        let (tx, _rx) = session_driver::intent_channel();
+        session.replace_with(ConsentSession::live_dialing(tx, None));
+        assert!(session.view().relay_of_copy.is_some());
     }
 }

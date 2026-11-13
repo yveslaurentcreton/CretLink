@@ -41,7 +41,9 @@ const pause = Number(params.get("pause") ?? 600);
 
 /** Counts the dials, so that a late step of an old one is dropped. */
 let generation = 0;
-let view: ConsentView = viewIn({ phase: "idle" });
+/** What the profile next to the program says, for a copy that has a relay. */
+const relayOfCopy = copy === "relay" ? VIA_RELAY : null;
+let view: ConsentView = viewIn({ phase: "idle" }, { relay_of_copy: relayOfCopy });
 
 /** A refusal as the backend words one. */
 function refuse(stage: string, message: string): never {
@@ -50,9 +52,10 @@ function refuse(stage: string, message: string): never {
 
 /** Sets the view and pushes it to the window, as the session's task does. */
 function show(next: ConsentView): ConsentView {
-  view = next;
-  void emit("agent-view", next);
-  return next;
+  // What the copy is set up for belongs to the process, not to one session.
+  view = { ...next, relay_of_copy: relayOfCopy };
+  void emit("agent-view", view);
+  return view;
 }
 
 /** Runs `step` after a pause, unless the dial it belongs to is over. */
@@ -175,7 +178,10 @@ mockIPC(
       case "decline_consent":
       case "stop_session":
         generation += 1;
-        view = viewIn({ phase: "stopped", reason: "customer_requested" }, { relay: view.relay });
+        view = viewIn(
+          { phase: "stopped", reason: "customer_requested" },
+          { relay: view.relay, relay_of_copy: relayOfCopy },
+        );
         return view;
       case "get_end_report":
         return null;

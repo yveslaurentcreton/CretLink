@@ -214,6 +214,13 @@ async fn a_relay_code_leads_to_a_session_like_on_one_network_and_the_technician_
         .wait_for("that the relay holds the code", relay_holds_the_code)
         .await;
 
+    // Before anything is typed, the customer's window names the relay this
+    // copy is set up for, and no session exists.
+    let resting = customer.view();
+    assert_eq!(resting.relay_of_copy, through_the_test_relay());
+    assert_eq!(resting.relay, None);
+    assert!(!resting.session_active);
+
     // The customer types the code as people type what is read to them.
     let typed = code.to_lowercase().replace('-', " ");
     let reaching = customer.connect(&typed).expect("the code is taken");

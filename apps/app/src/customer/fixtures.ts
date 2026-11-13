@@ -45,6 +45,7 @@ export function viewIn(phase: AgentPhase, patch: Partial<ConsentView> = {}): Con
     startup_cleanup: null,
     relay: null,
     failure_next: null,
+    relay_of_copy: null,
     ...patch,
   };
 }
@@ -271,6 +272,12 @@ export const FIXTURES: Record<string, CustomerSnapshot> = {
     { discovery: { state: "done", consoles: CONSOLES } },
   ),
   "find-searching": base(idle, { discovery: { state: "searching", consoles: [] } }),
+  // A copy that is set up for a relay names it beside the code field
+  // (ST-M007-011, ST-M007-013).
+  "find-relay-ready": base(
+    { ...idle, relay_of_copy: VIA_RELAY },
+    { discovery: { state: "done", consoles: [] } },
+  ),
   "find-none": base(idleUnelevated, {
     discovery: {
       state: "done",

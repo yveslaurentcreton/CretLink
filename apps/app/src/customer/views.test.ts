@@ -225,6 +225,28 @@ describe("choose your technician (#c-find)", () => {
 describe("a relay code (ST-M007-013)", () => {
   const alert = (root: HTMLElement): HTMLElement | null => root.querySelector("#alert");
 
+  it("names the relay of this copy beside the code field, before any code is typed", () => {
+    const root = show("find-relay-ready");
+    expect(root.dataset.screen).toBe("find");
+    const line = root.querySelector("#relay-ready");
+    expect(text(line)).toBe(
+      "If your technician is not on this network, they give you a longer relay code. This copy then connects through the relay relay.example.org , which only passes encrypted traffic on.",
+    );
+    // It is read with the field, and the field is the one of every code.
+    const field = root.querySelector<HTMLInputElement>("#code");
+    expect(field?.getAttribute("aria-describedby")).toBe("code-hint relay-ready");
+    expect(text(root.querySelector("#code-hint"))).toBe(
+      "The code only says where to connect. It grants nothing.",
+    );
+    expect(buttons(root).filter((b) => b.dataset.action === "connect-code")).toHaveLength(1);
+    expect(band(root)).toContain("NO ACCESS");
+    // A copy without a relay says nothing about one.
+    const plain = show("find");
+    expect(plain.querySelector("#relay-ready")).toBeNull();
+    expect(plain.querySelector("#code")?.getAttribute("aria-describedby")).toBe("code-hint");
+    expect(text(plain).toLowerCase()).not.toContain("relay");
+  });
+
   it("says Connecting through the relay, by its host name, and what a relay is", () => {
     const root = show("relay-connecting");
     expect(root.dataset.screen).toBe("connecting");

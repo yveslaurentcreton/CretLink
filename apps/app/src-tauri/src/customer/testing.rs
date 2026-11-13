@@ -57,7 +57,7 @@ impl Customer {
     /// says `relay`.
     pub(crate) fn new(relay: relay::Lookup) -> Self {
         Self {
-            shared: Arc::new(Mutex::new(ConsentSession::idle())),
+            shared: Arc::new(Mutex::new(ConsentSession::resting(&relay))),
             window: Arc::new(Window {
                 latest: watch::Sender::new(None),
                 all: Mutex::new(Vec::new()),
