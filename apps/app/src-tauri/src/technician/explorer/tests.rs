@@ -30,16 +30,16 @@ const STEP: Duration = Duration::from_secs(10);
 /// A session under full control, as the pump publishes it: the application
 /// state with the session's service and audit sink, the agent's side of the
 /// session, and the records the commands write.
-struct Live {
-    state: AppState,
-    service: ConsoleSessionService,
+pub(super) struct Live {
+    pub(super) state: AppState,
+    pub(super) service: ConsoleSessionService,
     _agent: JoinHandle,
     records: AuditReceiver,
 }
 
 impl Live {
     /// Every audit record written until now, in order.
-    fn recorded(&mut self) -> Vec<AuditEntry> {
+    pub(super) fn recorded(&mut self) -> Vec<AuditEntry> {
         let mut all = Vec::new();
         while let Ok(entry) = self.records.try_recv() {
             all.push(entry);
@@ -57,7 +57,7 @@ async fn next_event(host: &mut HostHandle) -> SessionEvent {
 
 /// Pairs a console with a consenting in-process agent and publishes the
 /// session the way the pump does at full control.
-async fn live() -> Live {
+pub(super) async fn live() -> Live {
     let hints = ConsoleHints {
         label: "This computer (technician)".to_string(),
         display_name: None,
@@ -130,7 +130,7 @@ async fn opened(
     (result, events)
 }
 
-fn failure(result: Result<impl std::fmt::Debug, CommandError>) -> (String, String) {
+pub(super) fn failure(result: Result<impl std::fmt::Debug, CommandError>) -> (String, String) {
     match result {
         Err(error) => (error.stage, error.message),
         Ok(other) => panic!("expected a failure, got {other:?}"),
