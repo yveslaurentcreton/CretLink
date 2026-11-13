@@ -11,7 +11,13 @@
 
 import "./styles.css";
 import { listen } from "@tauri-apps/api/event";
-import type { ActivityEntry, AiClientStatus, ClientId } from "../shared/contract";
+import type {
+  ActivityEntry,
+  AiClientStatus,
+  ClientId,
+  RelayForm,
+  RelaySettings,
+} from "../shared/contract";
 import { type ActionEvent, bindActions } from "../shared/dom";
 import { morph } from "../shared/morph";
 import {
@@ -19,6 +25,7 @@ import {
   CONSOLE_BRIDGE_EVENT,
   CONSOLE_EXPLORER_DROP_EVENT,
   CONSOLE_EXPLORER_EVENT,
+  CONSOLE_NOTICE_EVENT,
   CONSOLE_REMOVAL_EVENT,
   CONSOLE_STATE_EVENT,
   CONSOLE_TRANSFERS_EVENT,
@@ -35,13 +42,19 @@ import {
   type UiError,
   applyConsole,
   canStop,
+  initialRelayDraft,
   initialSnapshot,
   isActivityEvent,
   isAuditEntry,
   isBridgeStatus,
+  isChosenCa,
+  isConsoleNotice,
   isListenNetwork,
+  isRelaySettings,
+  isRelayTest,
   listenHost,
   placeholderConsole,
+  relayForm,
   screenFor,
   sessionCounts,
   summaryFor,
@@ -304,6 +317,152 @@ async function loadAppInfo(): Promise<void> {
   }
 }
 
+// --- Settings → Relay (ST-M007-011) ---
+
+// The newest answer about the relay wins: a save, a removal and a look at
+// the settings may be on their way at once.
+let relayGeneration = 0;
+
+/** Which relay this copy uses, as the backend reads it now. */
+async function loadRelay(): Promise<void> {
+  relayGeneration += 1;
+  const generation = relayGeneration;
+  try {
+    const relay = await api.relaySettings();
+    if (generation === relayGeneration) set({ relay: isRelaySettings(relay) ? relay : null });
+  } catch {
+    // Not offered: the card says that it is not available yet.
+    if (generation === relayGeneration) set({ relay: null });
+  }
+}
+
+// The field of the form that a refusal of the backend is about.
+const RELAY_FIELDS: Record<string, string> = {
+  relay_address: "#relay-address",
+  relay_key: "#relay-key",
+  relay_ca: "#relay-ca-choose",
+  relay_name: "#relay-name",
+};
+
+/** A refusal about the relay: its words, and the field they are about. */
+function relayRefused(error: unknown, title: string, otherwise: string): void {
+  const field = isCommandError(error) ? RELAY_FIELDS[error.stage] : undefined;
+  if (field) focusNext = field;
+  set({
+    busy: undefined,
+    error: {
+      title,
+      // The backend's sentence stands alone: it names the setting already.
+      message: isCommandError(error) ? error.message : describe(error),
+      next: field ? "Correct it, then try again." : otherwise,
+    },
+  });
+}
+
+/** The form of Settings → Relay as it stands; none when no form is shown. */
+function readRelayForm(): RelayForm | undefined {
+  const input = (id: string): HTMLInputElement | null | undefined =>
+    live?.querySelector<HTMLInputElement>(`#${id}`);
+  const address = input("relay-address");
+  if (!address) return undefined;
+  return relayForm(
+    {
+      address: address.value,
+      key: input("relay-key")?.value ?? "",
+      removeKey: input("relay-key-remove")?.checked ?? false,
+      name: input("relay-name")?.value ?? "",
+    },
+    snap.relayDraft,
+    snap.relay?.stored?.relay,
+  );
+}
+
+/** Adopts what the backend says the settings hold now, with an empty form. */
+function relayChanged(relay: RelaySettings, notice: string): void {
+  relayGeneration += 1;
+  set({
+    busy: undefined,
+    relay,
+    // A new form: no typed key stays in a field.
+    relayDraft: initialRelayDraft(snap.relayDraft.round + 1),
+    notice,
+  });
+}
+
+async function saveRelay(): Promise<void> {
+  const form = readRelayForm();
+  if (!form || snap.busy !== undefined) return;
+  set({ busy: "relay-save", error: undefined });
+  try {
+    const relay = await api.saveRelay(form);
+    if (!isRelaySettings(relay)) throw new Error("The settings could not be read back.");
+    const host = relay.stored?.relay?.host;
+    relayChanged(relay, host ? `The relay ${host} was saved.` : "The relay was saved.");
+  } catch (error) {
+    relayRefused(error, "The relay was not saved", "Nothing was changed. Try again.");
+  }
+}
+
+async function removeRelay(): Promise<void> {
+  if (snap.busy !== undefined) return;
+  set({ busy: "relay-remove", error: undefined });
+  try {
+    const relay = await api.removeRelay();
+    if (!isRelaySettings(relay)) throw new Error("The settings could not be read back.");
+    relayChanged(relay, "The relay was removed from the settings.");
+  } catch (error) {
+    relayRefused(error, "The relay was not removed", "Try again.");
+  }
+}
+
+/** Reaches the relay of the form as it stands, or the one this copy uses. */
+async function testRelay(): Promise<void> {
+  if (snap.busy !== undefined || snap.relayDraft.test?.state === "running") return;
+  const form = readRelayForm();
+  const round = snap.relayDraft.round;
+  set({ relayDraft: { ...snap.relayDraft, test: { state: "running" } }, error: undefined });
+  try {
+    const result = await api.testRelay(form);
+    // The form was saved or removed meanwhile: the result is of another relay.
+    if (snap.relayDraft.round !== round) return;
+    if (!isRelayTest(result)) throw new Error("The test gave no result.");
+    set({ relayDraft: { ...snap.relayDraft, test: { state: "done", result } } });
+  } catch (error) {
+    if (snap.relayDraft.round !== round) return;
+    set({ relayDraft: { ...snap.relayDraft, test: undefined } });
+    relayRefused(error, "The relay could not be tested", "Check the relay settings.");
+  }
+}
+
+/** The system's dialog for the certificate authority file of the relay. */
+async function chooseRelayCa(): Promise<void> {
+  if (snap.busy !== undefined) return;
+  set({ busy: "relay-ca", error: undefined });
+  try {
+    const chosen = await api.chooseRelayCa();
+    if (chosen === null) {
+      set({ busy: undefined });
+      return;
+    }
+    if (!isChosenCa(chosen)) throw new Error("The file could not be read.");
+    set({
+      busy: undefined,
+      relayDraft: {
+        ...snap.relayDraft,
+        ca: { mode: "chosen", pick: chosen.pick, name: chosen.name },
+        test: undefined,
+      },
+      notice: `${chosen.name} is chosen. It is kept when you save.`,
+    });
+  } catch (error) {
+    relayRefused(
+      error,
+      "That certificate file cannot be used",
+      "Choose the PEM file of the authority that signed the relay's certificate.",
+    );
+  }
+}
+
 // Bumped by every `console-bridge` event and every new session, so an older
 // `get_bridge_status` answer never overwrites a newer status.
 let bridgeGeneration = 0;
@@ -489,7 +648,10 @@ function onAction(event: ActionEvent): void {
           endDismissed: true,
           confirm: undefined,
           uninstall: undefined,
+          relayDraft: { ...snap.relayDraft, removing: false },
         });
+        // A profile file may have been put next to the program meanwhile.
+        if (arg === "settings") void loadRelay();
       }
       break;
     case "tab":
@@ -557,6 +719,28 @@ function onAction(event: ActionEvent): void {
       break;
     case "uninstall-confirm":
       void uninstall();
+      break;
+    case "relay-save":
+      void saveRelay();
+      break;
+    case "relay-test":
+      void testRelay();
+      break;
+    case "relay-ca-choose":
+      void chooseRelayCa();
+      break;
+    case "relay-ca-none":
+      set({ relayDraft: { ...snap.relayDraft, ca: { mode: "none" }, test: undefined } });
+      break;
+    case "relay-remove":
+      focusNext = "#relay-remove-step [data-autofocus]";
+      set({ relayDraft: { ...snap.relayDraft, removing: true } });
+      break;
+    case "relay-remove-cancel":
+      set({ relayDraft: { ...snap.relayDraft, removing: false } });
+      break;
+    case "relay-remove-confirm":
+      void removeRelay();
       break;
     default:
       // The controls of the file explorer.
@@ -695,6 +879,8 @@ function onKeydown(event: KeyboardEvent): void {
       set({ confirm: undefined });
     } else if (snap.uninstall) {
       set({ uninstall: undefined });
+    } else if (snap.relayDraft.removing) {
+      set({ relayDraft: { ...snap.relayDraft, removing: false } });
     }
     return;
   }
@@ -763,6 +949,11 @@ export async function start(options: StartOptions = {}): Promise<void> {
       set({ bridge: event.payload });
     }
   });
+  // What the backend has to say that is not the failure of a command, such
+  // as a network choice that could not be saved (ST-M007-011).
+  await listen<unknown>(CONSOLE_NOTICE_EVENT, (event) => {
+    if (isConsoleNotice(event.payload)) set({ error: event.payload });
+  });
   // The pages of a folder the explorer opened (ST-M010-002).
   await listen<unknown>(CONSOLE_EXPLORER_EVENT, (event) => explorer.onEvent(event.payload));
   // What was dropped on the window, the transfer queue and a delete that runs.
@@ -789,6 +980,7 @@ export async function start(options: StartOptions = {}): Promise<void> {
     loadActivity(),
     loadAudit(),
     loadBridge(),
+    loadRelay(),
     refreshSessions(),
     refreshClients(),
   ]);

@@ -13,6 +13,7 @@ import type {
   AppInfo,
   AuditEntryView,
   BridgeStatus,
+  ChosenCa,
   ChosenFolder,
   ClientId,
   ConflictChoice,
@@ -21,6 +22,9 @@ import type {
   ExplorerEntryKind,
   ExplorerListing,
   ListenNetwork,
+  RelayForm,
+  RelaySettings,
+  RelayTest,
   SessionSummary,
   TransferCheck,
   TransferEntry,
@@ -246,6 +250,17 @@ export const api = {
     invoke<void>("open_audit", session === undefined ? {} : { session }),
   uninstallPlan: () => invoke<string[]>("uninstall_plan"),
   uninstallApp: () => invoke<void>("uninstall_app"),
+  // Settings → Relay (ST-M007-011). Only the installed copy keeps a relay;
+  // `save_relay` and `remove_relay` refuse in a copy that runs once. The
+  // certificate authority file is chosen in the system's dialog, opened by
+  // the backend. `test_relay` reaches the relay of the form as it stands,
+  // or without a form the one this copy uses, and saves nothing.
+  relaySettings: () => invoke<RelaySettings>("get_relay_settings"),
+  chooseRelayCa: () => invoke<ChosenCa | null>("choose_relay_ca"),
+  saveRelay: (form: RelayForm) => invoke<RelaySettings>("save_relay", { form }),
+  testRelay: (form?: RelayForm) =>
+    invoke<RelayTest>("test_relay", form === undefined ? {} : { form }),
+  removeRelay: () => invoke<RelaySettings>("remove_relay"),
 };
 
 // The Tauri event name the backend emits a whole `ConsoleState` on during a
@@ -275,6 +290,11 @@ export const CONSOLE_TRANSFERS_EVENT = "console-transfers";
 
 // Where a delete stands (ST-M010-002): one `RemovalProgress` each.
 export const CONSOLE_REMOVAL_EVENT = "console-removal";
+
+// Something the technician should know that is not the failure of a command
+// (ST-M007-011): one `ConsoleNotice` of the shared contract, shown in the
+// window's alert.
+export const CONSOLE_NOTICE_EVENT = "console-notice";
 
 // The raw terminal frame channel (ST-M008-001). Distinct again so high-frequency
 // VT output never re-renders state or the activity feed; the terminal panel

@@ -1,7 +1,24 @@
 import { describe, expect, it } from "vitest";
 import type { ActivityEntry } from "../shared/contract";
-import { AUDIT, FEED, FIXTURES, NETWORKS, NOW, SESSION_ID, TARGET, consoleIn } from "./fixtures";
 import {
+  AUDIT,
+  FEED,
+  FIXTURES,
+  NETWORKS,
+  NOW,
+  RELAY,
+  RELAY_FILE,
+  RELAY_FILE_PROBLEM,
+  RELAY_NONE,
+  RELAY_PRIVATE,
+  RELAY_RUN_ONCE,
+  RELAY_STORED,
+  SESSION_ID,
+  TARGET,
+  consoleIn,
+} from "./fixtures";
+import {
+  activeRelay,
   applyConsole,
   auditActionWords,
   auditOutcomeWords,
@@ -9,13 +26,19 @@ import {
   cleanupWords,
   formatDuration,
   groupCode,
+  initialRelayDraft,
   initialSnapshot,
   isActivityEvent,
   isAuditEntry,
   isBridgeStatus,
+  isChosenCa,
+  isConsoleNotice,
   isListenNetwork,
+  isRelaySettings,
+  isRelayTest,
   listenHost,
   otherNetworks,
+  relayForm,
   screenFor,
   sessionCounts,
   stateWords,
@@ -350,5 +373,109 @@ describe("the network to wait on (ST-M009-016)", () => {
     ]) {
       expect(isListenNetwork(bad)).toBe(false);
     }
+  });
+});
+
+describe("the relay of this copy (ST-M007-011)", () => {
+  const fields = (patch: Partial<Parameters<typeof relayForm>[0]> = {}) => ({
+    address: "relay.example.org:443",
+    key: "",
+    removeKey: false,
+    name: "",
+    ...patch,
+  });
+
+  it("names the relay in use: the file next to the program before the settings", () => {
+    expect(activeRelay(null)).toBeUndefined();
+    expect(activeRelay(RELAY_NONE)).toBeUndefined();
+    expect(activeRelay(RELAY_RUN_ONCE)).toBeUndefined();
+    expect(activeRelay(RELAY_STORED)).toBe(RELAY);
+    expect(activeRelay(RELAY_FILE)).toBe(RELAY_PRIVATE);
+    // A file that cannot be used is not passed over for the settings.
+    expect(activeRelay(RELAY_FILE_PROBLEM)).toBeUndefined();
+  });
+
+  it("keeps the kept key when its field is empty, and never sends a key back", () => {
+    const draft = initialRelayDraft();
+    expect(relayForm(fields(), draft, RELAY)).toEqual({
+      address: "relay.example.org:443",
+      keyMode: "keep",
+      caMode: "none",
+    });
+    // Nothing is kept: an empty field means that the relay asks for no key.
+    expect(relayForm(fields(), draft, undefined).keyMode).toBe("none");
+    expect(relayForm(fields(), draft, { ...RELAY, keySet: false }).keyMode).toBe("none");
+    // The technician asked to remove the key that is kept.
+    expect(relayForm(fields({ removeKey: true }), draft, RELAY).keyMode).toBe("none");
+    // A typed key replaces the kept one, whatever the checkbox says.
+    expect(relayForm(fields({ key: "new-key", removeKey: true }), draft, RELAY)).toMatchObject({
+      keyMode: "set",
+      key: "new-key",
+    });
+  });
+
+  it("takes the key as it was typed and trims the address and the name", () => {
+    const form = relayForm(
+      fields({ address: "  relay.example.org:443 ", key: " a key ", name: " host-01.example.org " }),
+      initialRelayDraft(),
+      undefined,
+    );
+    expect(form.address).toBe("relay.example.org:443");
+    expect(form.name).toBe("host-01.example.org");
+    // Not trimmed: the backend says that a key holds no blank.
+    expect(form.key).toBe(" a key ");
+    expect(relayForm(fields({ name: "   " }), initialRelayDraft(), undefined).name).toBeUndefined();
+  });
+
+  it("keeps, drops or replaces the certificate file", () => {
+    const kept = relayForm(fields(), initialRelayDraft(), RELAY_PRIVATE);
+    expect(kept.caMode).toBe("keep");
+    expect(kept.caPick).toBeUndefined();
+    // Nothing is kept that could be kept.
+    expect(relayForm(fields(), initialRelayDraft(), RELAY).caMode).toBe("none");
+    const none = relayForm(fields(), { ca: { mode: "none" }, round: 0 }, RELAY_PRIVATE);
+    expect(none.caMode).toBe("none");
+    const chosen = relayForm(
+      fields(),
+      { ca: { mode: "chosen", pick: 12, name: "authority.pem" }, round: 0 },
+      RELAY_PRIVATE,
+    );
+    expect(chosen).toMatchObject({ caMode: "chosen", caPick: 12 });
+    // The name of the file is for the words only.
+    expect(JSON.stringify(chosen)).not.toContain("authority.pem");
+  });
+
+  it("takes only values of the contract from the backend", () => {
+    for (const good of [RELAY_NONE, RELAY_STORED, RELAY_FILE, RELAY_FILE_PROBLEM, RELAY_RUN_ONCE]) {
+      expect(isRelaySettings(good)).toBe(true);
+    }
+    for (const bad of [
+      null,
+      "relay",
+      {},
+      { ...RELAY_NONE, editable: "yes" },
+      { ...RELAY_NONE, source: "registry" },
+      { ...RELAY_NONE, file: undefined },
+      { ...RELAY_NONE, file: { path: 1 } },
+      { ...RELAY_STORED, stored: { path: "x", relay: { host: "h" } } },
+      { ...RELAY_STORED, stored: { path: "x", problem: { message: 3 } } },
+    ]) {
+      expect(isRelaySettings(bad)).toBe(false);
+    }
+    expect(isRelayTest({ ok: true, kind: "admitted", message: "m", next: "" })).toBe(true);
+    expect(isRelayTest({ ok: "yes", kind: "admitted", message: "m", next: "" })).toBe(false);
+    expect(isRelayTest({ ok: true, kind: "admitted", message: "m" })).toBe(false);
+    expect(isChosenCa({ pick: 1, name: "authority.pem" })).toBe(true);
+    expect(isChosenCa({ pick: "1", name: "authority.pem" })).toBe(false);
+    expect(isChosenCa(null)).toBe(false);
+    expect(isConsoleNotice({ title: "t", message: "m", next: "n" })).toBe(true);
+    expect(isConsoleNotice({ title: "t", message: "m" })).toBe(false);
+  });
+
+  it("starts every snapshot without a relay and with an empty draft", () => {
+    const s = initialSnapshot(consoleIn({ phase: "idle" }), NOW);
+    expect(s.relay).toBeNull();
+    expect(s.relayDraft).toEqual({ ca: { mode: "keep" }, round: 0 });
+    expect(initialRelayDraft(3).round).toBe(3);
   });
 });

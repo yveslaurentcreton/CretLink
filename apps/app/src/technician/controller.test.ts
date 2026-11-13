@@ -5,7 +5,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActivityEvent } from "../shared/contract";
 import { type TimerTracker, trackTimers } from "../shared/test-timers";
 import type { ConsoleState } from "./api";
-import { AUDIT, CLIENTS, FEED, NETWORKS, SESSIONS, SESSION_ID, consoleIn } from "./fixtures";
+import {
+  AUDIT,
+  CLIENTS,
+  FEED,
+  NETWORKS,
+  RELAY,
+  RELAY_FILE,
+  RELAY_NONE,
+  RELAY_PRIVATE,
+  RELAY_RUN_ONCE,
+  RELAY_STORED,
+  SESSIONS,
+  SESSION_ID,
+  consoleIn,
+} from "./fixtures";
 
 type Handler = (args?: Record<string, unknown>) => unknown;
 
@@ -500,5 +514,327 @@ describe("the network to wait on (ST-M009-016)", () => {
     await flush();
     expect(asked("stop_session")).toBe(1);
     expect(app().querySelector(".conn-code")).toBeNull();
+  });
+});
+
+describe("Settings → Relay (ST-M007-011)", () => {
+  const asked = (cmd: string): number => backend.calls.filter(([name]) => name === cmd).length;
+  const sent = (cmd: string): Record<string, unknown> | undefined =>
+    backend.calls.filter(([name]) => name === cmd).at(-1)?.[1];
+  const escape = (): void => {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+  };
+  const input = (id: string): HTMLInputElement => {
+    const found = app().querySelector<HTMLInputElement>(`#${id}`);
+    if (!found) throw new Error(`no #${id}`);
+    return found;
+  };
+  const type = (id: string, value: string): void => {
+    input(id).value = value;
+  };
+  const alert = (): string => app().querySelector('[role="alert"]')?.textContent ?? "";
+  const announced = (): string => app().querySelector("#announce")?.textContent ?? "";
+  const KEY = "5f2c9d0e7a1b4c3d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5";
+
+  /** Starts with `relay` as what the backend holds, and opens Settings. */
+  async function settings(
+    relay: unknown = RELAY_STORED,
+    handlers: Record<string, Handler> = {},
+  ): Promise<void> {
+    await boot({ get_relay_settings: () => relay, ...handlers });
+    click('nav.side [data-arg="settings"]');
+    await flush();
+  }
+
+  it("asks which relay this copy uses on start, and again when Settings opens", async () => {
+    await settings();
+    expect(asked("get_relay_settings")).toBe(2);
+    expect(input("relay-address").value).toBe("relay.example.org:443");
+  });
+
+  it("says that the relay is not available when the backend does not offer it", async () => {
+    await boot();
+    click('nav.side [data-arg="settings"]');
+    await flush();
+    expect(app().textContent).toContain("The relay of this copy is not available yet.");
+    expect(app().querySelector("#relay-address")).toBeNull();
+  });
+
+  it("saves the form and keeps the kept key when its field is left empty", async () => {
+    const saved = {
+      ...RELAY_STORED,
+      stored: { ...RELAY_STORED.stored, relay: { ...RELAY, address: "host-01.example.org:9970" } },
+    };
+    await settings(RELAY_STORED, { save_relay: () => saved });
+    type("relay-address", "  host-01.example.org:9970 ");
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")).toEqual({
+      form: { address: "host-01.example.org:9970", keyMode: "keep", caMode: "none" },
+    });
+    expect(announced()).toBe("The relay relay.example.org was saved.");
+    expect(input("relay-address").value).toBe("host-01.example.org:9970");
+    expect(alert()).toBe("");
+  });
+
+  it("sends a typed key to the backend and keeps none of it in the window", async () => {
+    await settings(RELAY_NONE, { save_relay: () => RELAY_STORED });
+    type("relay-address", "relay.example.org:443");
+    type("relay-key", KEY);
+    type("relay-name", " relay.example.org ");
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")).toEqual({
+      form: {
+        address: "relay.example.org:443",
+        keyMode: "set",
+        key: KEY,
+        caMode: "none",
+        name: "relay.example.org",
+      },
+    });
+    // The form is drawn anew: the key field is empty, and the key is nowhere.
+    expect(input("relay-key").value).toBe("");
+    expect(app().innerHTML).not.toContain(KEY);
+    expect(app().textContent).toContain("A key is set. It is never shown.");
+  });
+
+  it("uses no key when the field is empty and nothing is kept, or when asked to remove it", async () => {
+    await settings(RELAY_NONE, { save_relay: () => RELAY_NONE });
+    type("relay-address", "relay.example.org:443");
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")).toEqual({
+      form: { address: "relay.example.org:443", keyMode: "none", caMode: "none" },
+    });
+
+    document.body.innerHTML = '<div id="app" aria-busy="true"></div>';
+    vi.resetModules();
+    backend.calls = [];
+    await settings(RELAY_STORED, { save_relay: () => RELAY_STORED });
+    input("relay-key-remove").click();
+    click('[data-action="relay-save"]');
+    await flush();
+    expect((sent("save_relay")?.form as { keyMode: string }).keyMode).toBe("none");
+  });
+
+  it("names the setting a refusal is about, moves the focus there and keeps what was typed", async () => {
+    await settings(RELAY_STORED, {
+      save_relay: () => {
+        throw {
+          stage: "relay_address",
+          message:
+            "`address` needs a port; write the relay's host name and port, like relay.example.org:443.",
+        };
+      },
+    });
+    type("relay-address", "relay.example.org");
+    type("relay-key", KEY);
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(alert()).toContain("The relay was not saved");
+    expect(alert()).toContain("`address` needs a port;");
+    expect(alert()).toContain("Correct it, then try again.");
+    // The sentence stands alone, without the name of a stage.
+    expect(alert()).not.toContain("relay_address");
+    expect(document.activeElement?.id).toBe("relay-address");
+    expect(input("relay-address").value).toBe("relay.example.org");
+    expect(input("relay-key").value).toBe(KEY);
+  });
+
+  it("tests the form as it stands and shows the result in words, without saving", async () => {
+    let answer: (value: unknown) => void = () => undefined;
+    await settings(RELAY_STORED, {
+      test_relay: () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    });
+    type("relay-address", "host-01.example.org:9970");
+    click('[data-action="relay-test"]');
+    await flush();
+    expect(sent("test_relay")).toEqual({
+      form: { address: "host-01.example.org:9970", keyMode: "keep", caMode: "none" },
+    });
+    expect(app().querySelector("#relay-test")?.textContent).toBe("Reaching the relay…");
+    // The button waits for the answer: a second test is not started.
+    expect(app().querySelector<HTMLButtonElement>('[data-action="relay-test"]')?.disabled).toBe(
+      true,
+    );
+
+    answer({
+      ok: false,
+      kind: "unreachable",
+      message: "CretLink could not connect to the relay at host-01.example.org:9970.",
+      next: "Check that the relay is running.",
+    });
+    await flush();
+    const region = app().querySelector("#relay-test")?.textContent ?? "";
+    expect(region).toContain("The relay cannot be used");
+    expect(region).toContain("CretLink could not connect to the relay at host-01.example.org:9970.");
+    expect(region).toContain("Check that the relay is running.");
+    // A relay that cannot be reached is the result of the test, not a failed command.
+    expect(alert()).toBe("");
+    expect(asked("test_relay")).toBe(1);
+    expect(asked("save_relay")).toBe(0);
+    // What was typed is still there to be corrected.
+    expect(input("relay-address").value).toBe("host-01.example.org:9970");
+  });
+
+  it("drops the result of a test when the relay was removed meanwhile", async () => {
+    let answer: (value: unknown) => void = () => undefined;
+    await settings(RELAY_STORED, {
+      test_relay: () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+      remove_relay: () => RELAY_NONE,
+    });
+    click('[data-action="relay-test"]');
+    await flush();
+    click('[data-action="relay-remove"]');
+    await flush();
+    click('[data-action="relay-remove-confirm"]');
+    await flush();
+    expect(announced()).toBe("The relay was removed from the settings.");
+    // The answer comes late: it is about a relay that is no longer there.
+    answer({ ok: true, kind: "admitted", message: "Admitted.", next: "" });
+    await flush();
+    expect(app().querySelector("#relay-test")?.textContent).toBe("");
+  });
+
+  it("chooses the certificate file through the backend and names it by its number", async () => {
+    let picked: unknown = null;
+    await settings(RELAY_STORED, {
+      choose_relay_ca: () => picked,
+      save_relay: () => ({
+        ...RELAY_STORED,
+        stored: { ...RELAY_STORED.stored, relay: RELAY_PRIVATE },
+      }),
+    });
+    // The dialog was closed: nothing changes.
+    click('[data-action="relay-ca-choose"]');
+    await flush();
+    expect(app().querySelector("#relay-ca")?.textContent).toBe(
+      "The certificate authorities of this computer",
+    );
+
+    picked = { pick: 7, name: "authority.pem" };
+    click('[data-action="relay-ca-choose"]');
+    await flush();
+    expect(app().querySelector("#relay-ca")?.textContent).toBe(
+      "authority.pem · chosen, not saved yet",
+    );
+    expect(announced()).toBe("authority.pem is chosen. It is kept when you save.");
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")?.form).toMatchObject({ caMode: "chosen", caPick: 7 });
+    // Saved: the kept file is named, and the next save leaves it alone.
+    expect(app().querySelector("#relay-ca")?.textContent).toBe(
+      "relay-ca.pem · kept with your settings",
+    );
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")?.form).toMatchObject({ caMode: "keep" });
+    expect((sent("save_relay")?.form as Record<string, unknown>).caPick).toBeUndefined();
+
+    // Back to the authorities of this computer.
+    click('[data-action="relay-ca-none"]');
+    await flush();
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")?.form).toMatchObject({ caMode: "none" });
+  });
+
+  it("says why a chosen file cannot be used", async () => {
+    await settings(RELAY_STORED, {
+      choose_relay_ca: () => {
+        throw { stage: "relay_ca", message: "The certificate file holds no certificate." };
+      },
+    });
+    click('[data-action="relay-ca-choose"]');
+    await flush();
+    expect(alert()).toContain("That certificate file cannot be used");
+    expect(alert()).toContain("The certificate file holds no certificate.");
+    expect(document.activeElement?.id).toBe("relay-ca-choose");
+  });
+
+  it("asks before it removes the relay; Cancel and Escape leave it", async () => {
+    await settings(RELAY_STORED, { remove_relay: () => RELAY_NONE });
+    click('[data-action="relay-remove"]');
+    await flush();
+    expect(app().querySelector("#relay-remove-step")).not.toBeNull();
+    // The safe answer has the focus.
+    expect(document.activeElement?.textContent).toBe("Cancel");
+    escape();
+    await flush();
+    expect(app().querySelector("#relay-remove-step")).toBeNull();
+    expect(asked("remove_relay")).toBe(0);
+
+    click('[data-action="relay-remove"]');
+    await flush();
+    click('[data-action="relay-remove-cancel"]');
+    await flush();
+    expect(asked("remove_relay")).toBe(0);
+    expect(input("relay-address").value).toBe("relay.example.org:443");
+
+    click('[data-action="relay-remove"]');
+    await flush();
+    click('[data-action="relay-remove-confirm"]');
+    await flush();
+    expect(asked("remove_relay")).toBe(1);
+    expect(announced()).toBe("The relay was removed from the settings.");
+    expect(input("relay-address").value).toBe("");
+    expect(app().querySelector('[data-action="relay-remove"]')).toBeNull();
+  });
+
+  it("tests the relay of the file next to the program, which has no form", async () => {
+    await settings(RELAY_FILE, {
+      test_relay: () => ({ ok: true, kind: "admitted", message: "Admitted.", next: "" }),
+      remove_relay: () => ({ ...RELAY_FILE, stored: { path: RELAY_FILE.stored?.path ?? "" } }),
+    });
+    expect(app().textContent).toContain("That file wins over what Settings holds.");
+    click('[data-action="relay-test"]');
+    await flush();
+    // Without a form: the backend tests the relay this copy uses.
+    expect(sent("test_relay")).toEqual({});
+    expect(app().querySelector("#relay-test")?.textContent).toContain("Admitted.");
+    expect(asked("save_relay")).toBe(0);
+
+    // The relay of the settings can still be removed.
+    click('[data-action="relay-remove"]');
+    await flush();
+    click('[data-action="relay-remove-confirm"]');
+    await flush();
+    expect(asked("remove_relay")).toBe(1);
+    expect(app().querySelector(".relay-unused")).toBeNull();
+  });
+
+  it("keeps nothing in a copy that runs once", async () => {
+    await settings(RELAY_RUN_ONCE);
+    expect(app().textContent).toContain("This copy runs once and keeps no settings.");
+    expect(app().querySelector('[data-action="relay-save"]')).toBeNull();
+    expect(asked("save_relay")).toBe(0);
+  });
+
+  it("shows what the backend has to say in the alert, with its next step", async () => {
+    await boot({ get_relay_settings: () => RELAY_NONE });
+    backend.listeners["console-notice"]?.({
+      payload: {
+        title: "The network choice could not be saved",
+        message: "The settings could not be written: disk full.",
+        next: "It holds until CretLink closes.",
+      },
+    });
+    await flush();
+    expect(alert()).toContain("The network choice could not be saved");
+    expect(alert()).toContain("The settings could not be written: disk full.");
+    expect(alert()).toContain("It holds until CretLink closes.");
+    // Anything else on that channel is not shown.
+    click('[data-action="dismiss-error"]');
+    await flush();
+    backend.listeners["console-notice"]?.({ payload: { title: 1 } });
+    await flush();
+    expect(alert()).toBe("");
   });
 });

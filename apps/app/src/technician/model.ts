@@ -19,9 +19,16 @@ import type {
   AuditOutcome,
   BridgeStatus,
   CleanupResult,
+  ChosenCa,
   ClientId,
+  ConsoleNotice,
   EndedBy,
   ListenNetwork,
+  RelayForm,
+  RelayPlace,
+  RelaySettings,
+  RelayTest,
+  RelayView,
   SessionSummary,
 } from "../shared/contract";
 import {
@@ -85,6 +92,26 @@ export interface AiConfirm {
   replace: boolean;
 }
 
+/**
+ * What the form of Settings → Relay holds beside its typed fields: which
+ * certificate authority file the relay is checked against, the result of the
+ * last test, and the question before a relay is removed (ST-M007-011).
+ */
+export interface RelayDraft {
+  // `keep` the file the settings hold, use `none`, or the file just `chosen`.
+  ca: { mode: "keep" } | { mode: "none" } | { mode: "chosen"; pick: number; name: string };
+  test?: { state: "running" } | { state: "done"; result: RelayTest };
+  // "Remove the relay?" is being asked.
+  removing?: boolean;
+  // Counts what was saved or removed: a new number draws the form anew, so
+  // that no typed key stays in a field.
+  round: number;
+}
+
+export function initialRelayDraft(round = 0): RelayDraft {
+  return { ca: { mode: "keep" }, round };
+}
+
 export interface TechnicianSnapshot {
   console: ConsoleState;
   // The feed of the current or last session, oldest first.
@@ -120,6 +147,10 @@ export interface TechnicianSnapshot {
   // The uninstall plan, shown before anything is removed; `null` while loading.
   uninstall?: { plan: string[] | null };
   uninstalled?: boolean;
+  // Which relay this copy uses and where that comes from (ST-M007-011);
+  // `null` until the backend has said.
+  relay: RelaySettings | null;
+  relayDraft: RelayDraft;
   // The file explorer of the Files tab (ST-M010-002): where it stands in the
   // customer computer's files, and what is listed there. It belongs to one
   // session: it starts empty with full control and is dropped when that ends.
@@ -163,6 +194,8 @@ export function initialSnapshot(console: ConsoleState, now: number): TechnicianS
     tab: "overview",
     endDismissed: false,
     reportPending: false,
+    relay: null,
+    relayDraft: initialRelayDraft(),
     explorer: initialExplorer(),
     now,
   };
@@ -645,6 +678,111 @@ export function isListenNetwork(value: unknown): value is ListenNetwork {
     typeof network.adapter === "string" &&
     typeof network.pointToPoint === "boolean"
   );
+}
+
+// --- The relay of this copy (ST-M007-011) ---
+
+/** The relay this copy uses, when its profile can be used. */
+export function activeRelay(relay: RelaySettings | null): RelayView | undefined {
+  if (!relay) return undefined;
+  if (relay.source === "file") return relay.file.relay;
+  if (relay.source === "settings") return relay.stored?.relay;
+  return undefined;
+}
+
+/**
+ * Reads the form of Settings → Relay as the backend takes it. An empty key
+ * field keeps the key that is kept, unless the technician asked to remove
+ * it; without a kept key it means that the relay asks for none.
+ */
+export function relayForm(
+  fields: { address: string; key: string; removeKey: boolean; name: string },
+  draft: RelayDraft,
+  stored: RelayView | undefined,
+): RelayForm {
+  const form: RelayForm = {
+    address: fields.address.trim(),
+    keyMode: "none",
+    caMode: draft.ca.mode,
+  };
+  if (fields.key !== "") {
+    form.keyMode = "set";
+    form.key = fields.key;
+  } else if (stored?.keySet && !fields.removeKey) {
+    form.keyMode = "keep";
+  }
+  if (draft.ca.mode === "chosen") form.caPick = draft.ca.pick;
+  // Nothing is kept that could be kept: the system's authorities.
+  if (draft.ca.mode === "keep" && !stored?.ca) form.caMode = "none";
+  const name = fields.name.trim();
+  if (name !== "") form.name = name;
+  return form;
+}
+
+function isText(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function isRelayView(value: unknown): value is RelayView {
+  if (typeof value !== "object" || value === null) return false;
+  const view = value as Record<string, unknown>;
+  return (
+    isText(view.host) &&
+    isText(view.address) &&
+    typeof view.keySet === "boolean" &&
+    (view.ca === undefined || isText(view.ca)) &&
+    (view.name === undefined || isText(view.name))
+  );
+}
+
+function isRelayPlace(value: unknown): value is RelayPlace {
+  if (typeof value !== "object" || value === null) return false;
+  const place = value as Record<string, unknown>;
+  const problem = place.problem as Record<string, unknown> | undefined;
+  return (
+    isText(place.path) &&
+    (place.relay === undefined || isRelayView(place.relay)) &&
+    (problem === undefined ||
+      (typeof problem === "object" &&
+        problem !== null &&
+        isText(problem.file) &&
+        isText(problem.message)))
+  );
+}
+
+/** Whether a value is a `RelaySettings` of the contract (ST-M007-011). */
+export function isRelaySettings(value: unknown): value is RelaySettings {
+  if (typeof value !== "object" || value === null) return false;
+  const settings = value as Record<string, unknown>;
+  return (
+    typeof settings.editable === "boolean" &&
+    (settings.source === "file" || settings.source === "settings" || settings.source === "none") &&
+    isRelayPlace(settings.file) &&
+    (settings.stored === undefined || isRelayPlace(settings.stored))
+  );
+}
+
+/** Whether a value is a `RelayTest` of the contract (ST-M007-011). */
+export function isRelayTest(value: unknown): value is RelayTest {
+  if (typeof value !== "object" || value === null) return false;
+  const test = value as Record<string, unknown>;
+  return (
+    typeof test.ok === "boolean" && isText(test.kind) && isText(test.message) && isText(test.next)
+  );
+}
+
+/** Whether a value is a `ChosenCa` of the contract (ST-M007-011). */
+export function isChosenCa(value: unknown): value is ChosenCa {
+  if (typeof value !== "object" || value === null) return false;
+  const chosen = value as Record<string, unknown>;
+  return typeof chosen.pick === "number" && isText(chosen.name);
+}
+
+/** Whether a value is a `ConsoleNotice` of the contract (ST-M007-011). */
+export function isConsoleNotice(value: unknown): value is ConsoleNotice {
+  if (typeof value !== "object" || value === null) return false;
+  const notice = value as Record<string, unknown>;
+  return isText(notice.title) && isText(notice.message) && isText(notice.next);
 }
 
 /** Whether a value is a `BridgeStatus` of the contract (ST-M009-008). */

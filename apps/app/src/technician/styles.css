@@ -389,6 +389,26 @@ table.audit tr.gap td { color: var(--warn); font-weight: 600; }
 .settings .card p { margin: 0; }
 .settings .card .btn { align-self: flex-start; }
 
+/* Settings → Relay (ST-M007-011) */
+.relay-form { display: flex; flex-direction: column; gap: 14px; }
+.field { display: flex; flex-direction: column; gap: 5px; max-width: 560px; }
+.field > label, .field-label { font-weight: 600; font-size: 13.5px; }
+.field-input {
+  border: 1px solid #cbd5e1; border-radius: var(--r); padding: 8px 11px; font: 14px var(--mono);
+  color: var(--ink); background: #fff; min-width: 0;
+}
+.field-input::placeholder { color: var(--faint); }
+.field-input:focus-visible { outline: 2.5px solid var(--role); outline-offset: 1px; }
+.field .check { display: flex; gap: 8px; align-items: center; font-weight: 500; font-size: 13px; }
+.relay-ca { font-size: 13.5px; overflow-wrap: anywhere; }
+.relay-test:empty { display: none; }
+.relay-result { border: 1px solid var(--line); border-radius: var(--r-md); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.relay-result.bad { border-color: var(--bad-line); background: var(--bad-soft); }
+.relay-result .next { font-weight: 600; }
+.relay-unused { border-top: 1px solid var(--line); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.relay-example { margin: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); font: 12.5px var(--mono); overflow: auto; }
+.relay-where { overflow-wrap: anywhere; font-size: 12.5px; }
+
 /* ---------- Narrow windows ---------- */
 @media (max-width: 1000px) {
   .t-live { grid-template-columns: minmax(0, 1fr) 290px; }

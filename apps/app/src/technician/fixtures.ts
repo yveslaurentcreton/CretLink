@@ -10,6 +10,8 @@ import type {
   ExplorerDrive,
   ExplorerEntry,
   ListenNetwork,
+  RelaySettings,
+  RelayView,
   SessionSummary,
   TransferEntry,
 } from "../shared/contract";
@@ -109,6 +111,81 @@ export const APP_RUN_ONCE: AppInfo = {
   ...APP_INSTALLED,
   install: "run_once",
   location: "C:\\Users\\sam\\Downloads",
+};
+
+// --- The relay of this copy (ST-M007-011) ---
+
+/** The relay Sam hosts. Its key is never part of a view. */
+export const RELAY: RelayView = {
+  host: "relay.example.org",
+  address: "relay.example.org:443",
+  keySet: true,
+};
+
+/** A relay with a certificate from an authority of the technician's own. */
+export const RELAY_PRIVATE: RelayView = {
+  host: "host-01.example.org",
+  address: "192.0.2.1:9970",
+  keySet: false,
+  ca: "relay-ca.pem",
+  name: "host-01.example.org",
+};
+
+const SETTINGS_PATH = "C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\settings.toml";
+const PROFILE_PATH = "C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.toml";
+const PORTABLE_PROFILE_PATH = "C:\\Users\\sam\\Downloads\\cretlink.toml";
+
+/** The installed copy without a relay. */
+export const RELAY_NONE: RelaySettings = {
+  editable: true,
+  source: "none",
+  file: { path: PROFILE_PATH },
+  stored: { path: SETTINGS_PATH },
+};
+
+/** The installed copy with a relay in its settings. */
+export const RELAY_STORED: RelaySettings = {
+  ...RELAY_NONE,
+  source: "settings",
+  stored: { path: SETTINGS_PATH, relay: RELAY },
+};
+
+/** A file next to the program, which wins over the relay of the settings. */
+export const RELAY_FILE: RelaySettings = {
+  editable: true,
+  source: "file",
+  file: { path: PROFILE_PATH, relay: RELAY_PRIVATE },
+  stored: { path: SETTINGS_PATH, relay: RELAY },
+};
+
+/** A file next to the program that cannot be used. */
+export const RELAY_FILE_PROBLEM: RelaySettings = {
+  editable: true,
+  source: "file",
+  file: {
+    path: PROFILE_PATH,
+    problem: {
+      file: PROFILE_PATH,
+      field: "address",
+      message:
+        "Line 2: `address` needs a port; write the relay's host name and port, like relay.example.org:443.",
+    },
+  },
+  stored: { path: SETTINGS_PATH },
+};
+
+/** A copy that runs once: no settings, and no file next to it. */
+export const RELAY_RUN_ONCE: RelaySettings = {
+  editable: false,
+  source: "none",
+  file: { path: PORTABLE_PROFILE_PATH },
+};
+
+/** A copy that runs once with a profile file next to it. */
+export const RELAY_RUN_ONCE_FILE: RelaySettings = {
+  editable: false,
+  source: "file",
+  file: { path: PORTABLE_PROFILE_PATH, relay: RELAY },
 };
 
 export const CLIENTS: AiClientStatus[] = [
@@ -732,6 +809,7 @@ function base(console: ConsoleState): TechnicianSnapshot {
     clients: CLIENTS,
     sessions: SESSIONS.slice(0, 3),
     networks: NETWORKS,
+    relay: RELAY_NONE,
   };
 }
 
@@ -986,8 +1064,117 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
       ],
     },
   },
-  "settings-run-once": { ...base(idle), nav: "settings", app: APP_RUN_ONCE },
-  "settings-unavailable": { ...base(idle), nav: "settings", app: null },
+  "settings-run-once": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE,
+  },
+  "settings-unavailable": { ...base(idle), nav: "settings", app: null, relay: null },
+  // Settings → Relay (ST-M007-011).
+  "settings-relay": { ...base(idle), nav: "settings", relay: RELAY_STORED },
+  "settings-relay-private": {
+    ...base(idle),
+    nav: "settings",
+    relay: { ...RELAY_STORED, stored: { path: SETTINGS_PATH, relay: RELAY_PRIVATE } },
+  },
+  "settings-relay-chosen": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: { ca: { mode: "chosen", pick: 4, name: "authority.pem" }, round: 0 },
+  },
+  "settings-relay-testing": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: { ca: { mode: "keep" }, round: 0, test: { state: "running" } },
+  },
+  "settings-relay-admitted": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: {
+      ca: { mode: "keep" },
+      round: 0,
+      test: {
+        state: "done",
+        result: {
+          ok: true,
+          kind: "admitted",
+          message:
+            "The relay relay.example.org answered and admits this copy. Its certificate is valid for relay.example.org, checked against the certificate authorities of this computer.",
+          next: "",
+        },
+      },
+    },
+  },
+  "settings-relay-refused": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: {
+      ca: { mode: "keep" },
+      round: 0,
+      test: {
+        state: "done",
+        result: {
+          ok: false,
+          kind: "key_refused",
+          message:
+            "The relay relay.example.org does not know the admission key of this copy. The key may be mistyped, or it was withdrawn.",
+          next: "Enter the key again, or ask the relay's operator for a new one.",
+        },
+      },
+    },
+  },
+  "settings-relay-removing": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: { ca: { mode: "keep" }, round: 0, removing: true },
+  },
+  "settings-relay-unreadable": {
+    ...base(idle),
+    nav: "settings",
+    relay: {
+      ...RELAY_NONE,
+      source: "settings",
+      stored: {
+        path: SETTINGS_PATH,
+        problem: {
+          file: SETTINGS_PATH,
+          field: "key",
+          message: "Line 3: the value of `key` must be text in double quotes.",
+        },
+      },
+    },
+  },
+  "settings-relay-file": { ...base(idle), nav: "settings", relay: RELAY_FILE },
+  "settings-relay-file-problem": { ...base(idle), nav: "settings", relay: RELAY_FILE_PROBLEM },
+  "settings-relay-run-once-file": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE_FILE,
+  },
+  // A profile's texts come from a file that somebody else may have written.
+  "settings-relay-xss": {
+    ...base(idle),
+    nav: "settings",
+    relay: {
+      editable: true,
+      source: "file",
+      file: {
+        path: `C:\\${XSS_NAME}\\cretlink.toml`,
+        relay: { host: XSS, address: XSS, keySet: true, ca: XSS, name: XSS },
+      },
+      stored: {
+        path: SETTINGS_PATH,
+        problem: { file: XSS, message: XSS },
+      },
+    },
+  },
   error: {
     ...base(idle),
     error: {
