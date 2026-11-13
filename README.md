@@ -131,10 +131,17 @@ CretLink is under active development. Versions are `0.x` pre-releases;
 - **In progress:** sessions over the internet, through a relay that you host
   yourself and that forwards only end-to-end encrypted traffic. The relay
   server is released and [documented](docs/relay-server.md). A copy of
-  CretLink can be told which relay to use, in a file `cretlink.toml` next to
-  the program or in **Settings → Relay** of the installed copy, and can test
-  it ([how](docs/relay-server.md#3-tell-a-copy-of-cretlink-which-relay-to-use));
-  it cannot run a session through the relay yet. Attended reboot-resume has
+  CretLink is told which relay to use in a file `cretlink.toml` next to the
+  program or in **Settings → Relay** of the installed copy, and can test it
+  ([how](docs/relay-server.md#3-tell-a-copy-of-cretlink-which-relay-to-use)).
+  With that, the technician chooses **Use relay** on the waiting screen and
+  reads out a relay code, the customer types it, and from there the session
+  is the one of one network: the same approval code on both screens, the
+  customer's permission, and a stop on either side
+  ([how](docs/relay-server.md#a-session-through-the-relay)). This is covered
+  by automated tests against a relay inside the test; it has not been run
+  between real computers on two networks yet
+  ([MT-15](docs/manual-tests.md)). Attended reboot-resume has
   its building blocks (a customer-armed, single-use, expiring ticket that
   never restores control without fresh consent) but is not wired into an
   actual reboot.

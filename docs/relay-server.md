@@ -316,9 +316,9 @@ decide about a session, exactly as on one network (ADR-0016 §2, §4). Without
 a profile no relay is offered and nothing changes for a session on one
 network.
 
-A profile is not yet enough to run a session through the relay: the
-application reads it, shows it and tests it, and the session itself follows
-with ST-M007-013.
+With a profile in both copies, a session runs through the relay when the
+technician chooses it: see
+[A session through the relay](#a-session-through-the-relay) below.
 
 ### A file next to the program
 
@@ -404,6 +404,69 @@ That name is the relay's host name for everything else too: it is what both
 people are shown, and what the relay code is tied to
 ([§7](#the-relay-code-and-the-ticket)). Give every copy of one relay the same
 `name`, or leave it out in all of them.
+
+### A session through the relay
+
+A session between two networks starts like one on one network and differs in
+one step (ST-M007-013). Both copies need a profile for the **same** relay.
+
+1. **The technician** presses **Start a session**. The waiting screen shows
+   the connection code of this network as before and, under it, **Not on the
+   same network?** with the relay's host name and **Use relay…**. Without a
+   profile the card names **Settings → Relay** instead, and a profile that
+   cannot be used is said there with its file.
+2. **Use relay…** stops waiting on the network and waits on the relay. The
+   screen shows the relay's host name, a **relay code** in four groups
+   (`53ST-A71D-JKKV-0VGH`) with **Copy**, and in words whether the relay holds
+   the code yet. The technician reads the code to the customer.
+3. **The customer** opens their copy, chooses **Get help** and types the code
+   into the field that also takes a connection code. The screen says
+   **Connecting through the relay** with the relay's host name, and that the
+   relay only passes encrypted traffic on.
+4. From here everything is as on one network: both read the same six-digit
+   approval code, the technician confirms it, the customer allows full
+   control, and either side stops the session. Every screen says through
+   which relay the session runs, and the technician's audit log records it
+   (a record `session_route` with the relay's host name).
+
+What to know:
+
+- **The relay code is not the approval code.** It only leads the two copies
+  to each other on the relay: it holds no key and no address, and it grants
+  nothing. It is drawn differently, in four outlined groups, so that nobody
+  takes it for the six digits that both people compare aloud. Those digits
+  are what tie the session to the two people; a relay that puts itself in
+  between makes them differ.
+- **A new code for every session.** A code leads to one session and works for
+  as long as the technician's waiting screen is open: the relay holds a
+  waiting connection for half a minute, and the technician's copy takes the
+  code back to it every time. **Cancel** (`Escape`) ends the wait, and the
+  code then leads nowhere.
+- **Both copies must name the same relay.** The code is tied to the relay's
+  host name ([§7](#the-relay-code-and-the-ticket)): two copies whose profiles
+  give the relay different names never meet.
+- **The network first.** Discovery and the connection code keep working with
+  a profile present. The relay is used only when the technician chooses it
+  and the customer types a relay code.
+- **Nothing connects again by itself.** A relay that stops, or a connection
+  that is lost, ends the session on both sides. Both screens then say that
+  the connection through the relay was lost and that the relay may have
+  stopped. A new session needs a new code and the customer's permission
+  again.
+
+When it does not work, each side says why and what to do:
+
+| The screen says | What happened | What to do |
+| --- | --- | --- |
+| *Nobody is waiting on that code* (customer, after ten seconds) | The code is mistyped or was used already, the technician cancelled, or the two copies name different relays. | Read the code on the technician's screen again; start a new wait for a new code. |
+| *The relay cannot be reached* / *CretLink could not reach the relay* | No connection to the relay's address: it is off, the address or port is wrong, or the network blocks it. | Check that the relay runs and that its port is open; **Settings → Relay → Test** says more. |
+| *The relay's certificate is not trusted* / *This computer does not trust the relay* | The certificate does not chain to an authority the computer knows, is out of date or carries another name. Nothing was sent to the relay. | For a certificate of your own authority, put its `ca` file into the profile; check `name`. |
+| *The relay asks for an admission key* / *The relay refused the admission key* / *The relay did not let this copy in* | The relay asks for a key and the copy has none, or it does not know the copy's key. | Give the copy its key, or add its line to the relay's key file ([§2](#one-key-per-customer)). |
+| *The relay did not answer* | The server at that address is no CretLink relay, or one of an older release. | Check the address and port; update the relay server. |
+| *The connection through the relay was lost* | The relay stopped, or one of the two computers went offline. | Start a new session. Nobody has access any more. |
+
+A code with a typing error is caught before anything is dialled: the last
+characters of a code are a check on the others.
 
 ### The development tools
 
