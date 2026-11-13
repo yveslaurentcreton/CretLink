@@ -8,11 +8,16 @@
 // wants delivered and then lets the queued work run.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ExplorerDrive, ExplorerEntry } from "../shared/contract";
 import { type TimerTracker, trackTimers } from "../shared/test-timers";
 import type { ConsoleState } from "./api";
 import { ROW_HEIGHT } from "./explorer";
 import { consoleIn } from "./fixtures";
+import {
+  SimulatedComputer,
+  simulatedFile,
+  simulatedFiles,
+  simulatedFolder,
+} from "./simulated-computer";
 
 type Handler = (args?: Record<string, unknown>) => unknown;
 
@@ -51,167 +56,30 @@ vi.mock("./terminal", () => ({
 
 const T0 = Date.UTC(2026, 10, 3, 14, 30, 0);
 
-function file(name: string, len = 1024): ExplorerEntry {
-  return { name, kind: "file", len, modifiedMs: T0, readonly: false };
-}
+const file = simulatedFile;
+const dir = simulatedFolder;
+const many = simulatedFiles;
 
-function dir(name: string): ExplorerEntry {
-  return { name, kind: "dir", len: 0, modifiedMs: T0, readonly: false };
-}
-
-function link(name: string): ExplorerEntry {
-  return { name, kind: "symlink", len: 0, modifiedMs: T0, readonly: false };
-}
-
-function many(count: number): ExplorerEntry[] {
-  return Array.from({ length: count }, (_, n) =>
-    file(`driver-${String(n).padStart(5, "0")}.dll`, 1000 + ((n * 7919) % 5000)),
+/** The customer computer of a test, delivering on the event the window listens to. */
+function computer(): SimulatedComputer {
+  return new SimulatedComputer((event) =>
+    backend.listeners["console-explorer"]?.({ payload: event }),
   );
 }
 
-interface Listing {
-  listing: number;
-  path: string;
-  pages: ExplorerEntry[][];
-  sent: number;
-  select?: string;
-  resolve: (answer: unknown) => void;
-}
-
-/** A customer computer held in memory, behind the commands of the backend. */
-class Target {
-  drives: ExplorerDrive[] = [
-    { root: "C:\\", kind: "fixed", label: "Windows", totalBytes: 500e9, freeBytes: 100e9 },
-    { root: "E:\\", kind: "removable" },
-  ];
-  // Every folder by its real path, with its entries in the order it lists them.
-  folders = new Map<string, ExplorerEntry[]>([
-    ["C:\\", [dir("Users"), dir("Windows"), link("Documents and Settings"), file("pagefile.sys")]],
-    ["C:\\Users", [dir("ann"), dir("jdoe")]],
-    ["C:\\Users\\ann", [dir("Documents"), dir("Downloads"), file("NTUSER.DAT")]],
-    [
-      "C:\\Users\\ann\\Documents",
-      [dir("Invoices"), file("a.txt", 30), file("b.txt", 10), file("c.txt", 20), file("report.pdf", 5000)],
-    ],
-    ["C:\\Users\\ann\\Documents\\Invoices", []],
-    ["C:\\Users\\ann\\Downloads", [file("setup.exe")]],
-    ["C:\\Windows", [dir("System32")]],
-    ["C:\\Windows\\System32", many(5000)],
-    ["E:\\", []],
-  ]);
-  refused = new Map<string, { stage: string; message: string }>([
-    ["C:\\Users\\jdoe", { stage: "access_denied", message: "access was denied" }],
-  ]);
-  pageSize = 256;
-  // When set, a listing delivers a page only when the test says so.
-  manual = false;
-  open: Listing[] = [];
-
-  /** The real spelling of a path, whatever its letter case. */
-  private real(asked: string): string | undefined {
-    const wanted = asked.replace(/\//g, "\\").toLowerCase();
-    for (const path of this.folders.keys()) if (path.toLowerCase() === wanted) return path;
-    for (const path of this.refused.keys()) if (path.toLowerCase() === wanted) return path;
-    return undefined;
-  }
-
-  /** A newer place leaves every listing that is still running. */
-  private leave(): void {
-    for (const listing of this.open.splice(0)) {
-      listing.resolve({
-        listing: listing.listing,
-        path: listing.path,
-        entries: listing.pages.slice(0, listing.sent).flat().length,
-        state: "cancelled",
-      });
-    }
-  }
-
-  handlers(): Record<string, Handler> {
-    return {
-      explorer_drives: () => {
-        this.leave();
-        return this.drives;
-      },
-      explorer_open: (args) => {
-        this.leave();
-        const asked = String(args?.path);
-        const listing = Number(args?.listing);
-        let path = this.real(asked);
-        let select: string | undefined;
-        if (path === undefined) {
-          // A path to a file opens the folder that holds it.
-          const cut = asked.lastIndexOf("\\");
-          const parent = this.real(asked.slice(0, cut) || asked);
-          const name = asked.slice(cut + 1);
-          const entry = parent
-            ? this.folders.get(parent)?.find((e) => e.name.toLowerCase() === name.toLowerCase())
-            : undefined;
-          if (!parent || !entry) {
-            throw {
-              stage: "path_not_found",
-              message: `${parent ?? "the customer computer"} lists no entry named ${name}`,
-            };
-          }
-          path = parent;
-          select = entry.name;
-        }
-        const refusal = this.refused.get(path);
-        if (refusal) throw refusal;
-        const entries = this.folders.get(path) ?? [];
-        const pages: ExplorerEntry[][] = [];
-        for (let from = 0; from < entries.length; from += this.pageSize) {
-          pages.push(entries.slice(from, from + this.pageSize));
-        }
-        if (pages.length === 0) pages.push([]);
-        return new Promise((resolve) => {
-          const running: Listing = { listing, path: path as string, pages, sent: 0, resolve };
-          if (select !== undefined) running.select = select;
-          this.open.push(running);
-          if (!this.manual) while (this.open.includes(running)) this.step();
-        });
-      },
-    };
-  }
-
-  /** Delivers the next page of the listing that runs; the last one ends it. */
-  step(): void {
-    const running = this.open[0];
-    if (!running) throw new Error("no listing is running");
-    const entries = running.pages[running.sent] ?? [];
-    running.sent += 1;
-    const end = running.sent === running.pages.length;
-    const emit = backend.listeners["console-explorer"];
-    emit?.({
-      payload:
-        running.sent === 1
-          ? {
-              kind: "opened",
-              listing: running.listing,
-              path: running.path,
-              ...(running.select === undefined ? {} : { select: running.select }),
-              entries,
-              end,
-            }
-          : { kind: "page", listing: running.listing, entries, end },
-    });
-    if (end) {
-      this.open.shift();
-      running.resolve({
-        listing: running.listing,
-        path: running.path,
-        entries: running.pages.flat().length,
-        state: "complete",
-      });
-    }
-  }
+/** The two commands of the backend, answered by `target`. */
+function commands(target: SimulatedComputer): Record<string, Handler> {
+  return {
+    explorer_drives: () => target.listDrives(),
+    explorer_open: (args) => target.openPath(String(args?.path), Number(args?.listing)),
+  };
 }
 
 // --- The window ---
 
 let state: ConsoleState = consoleIn({ phase: "idle" });
 let timers: TimerTracker;
-let target: Target;
+let target: SimulatedComputer;
 
 const FULL = consoleIn({ phase: "full_control" }, { session: true, target: true });
 const LISTENING = consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" });
@@ -288,7 +156,7 @@ async function boot(): Promise<void> {
   backend.handlers = {
     get_state: () => state,
     stop_session: () => consoleIn({ phase: "stopped", reason: "technician_requested" }),
-    ...target.handlers(),
+    ...commands(target),
   };
   const { start } = await import("./main");
   await start({ version: "0.22.0" });
@@ -320,7 +188,7 @@ beforeEach(() => {
   backend.handlers = {};
   backend.listeners = {};
   backend.calls = [];
-  target = new Target();
+  target = computer();
   state = consoleIn({ phase: "idle" });
   document.body.innerHTML = '<div id="app" aria-busy="true"></div>';
 });
@@ -557,7 +425,6 @@ describe("navigation", () => {
   });
 
   it("lists the drives when Refresh is pressed with nothing open", async () => {
-    target.refused.set("drives", { stage: "x", message: "x" });
     await boot();
     backend.handlers.explorer_drives = () => {
       throw { stage: "unsupported", message: "not supported on this computer" };
@@ -708,7 +575,8 @@ describe("a folder with thousands of entries", () => {
     target.step();
     await flush();
     expect(status()).toBe("256 items so far · loading more…");
-    const left = target.open[0] as Listing;
+    const left = target.open[0];
+    if (!left) throw new Error("the listing should still run");
 
     // The technician goes elsewhere before the folder is listed to its end.
     target.manual = false;
@@ -989,7 +857,8 @@ describe("the end of the session", () => {
     target.step();
     await flush();
     expect(status()).toBe("256 items so far · loading more…");
-    const running = target.open[0] as Listing;
+    const running = target.open[0];
+    if (!running) throw new Error("the listing should still run");
 
     // The customer stops the session while the folder is still arriving.
     push(consoleIn({ phase: "stopped", reason: "customer_requested" }));
@@ -1007,8 +876,8 @@ describe("the end of the session", () => {
     );
 
     // The next session starts with an explorer that knows nothing of this one.
-    target = new Target();
-    Object.assign(backend.handlers, target.handlers());
+    target = computer();
+    Object.assign(backend.handlers, commands(target));
     click('[data-action="done"]');
     push(LISTENING);
     push(FULL);

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CretLink file explorer (dev)</title>
+  </head>
+  <body>
+    <!-- Development only (ST-M010-002): the technician's window under full
+         control of a customer computer that is held in memory, with Tauri
+         replaced by its own mocks. The real controller and views run; no
+         backend and no session exist. Not part of the production build,
+         which builds only ../index.html. Serve with `npx vite` and open
+         /dev/explorer.html, then the Files tab. -->
+    <div id="app" aria-busy="true"></div>
+    <script type="module" src="./explorer.ts"></script>
+  </body>
+</html>
