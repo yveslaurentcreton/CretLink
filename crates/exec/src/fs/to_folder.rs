@@ -80,9 +80,12 @@ pub(super) struct Place {
 pub(super) enum Removal {
     /// The part was there and is removed.
     Removed,
-    /// There was no part: it was never written, or its folder is gone and
-    /// took it along.
+    /// The folder is there and holds no part of that name.
     Absent,
+    /// The folder is no longer in its place. If it was removed, the part went
+    /// with it; if it was moved, the part still lies in it, where nothing
+    /// leads this store.
+    FolderGone,
 }
 
 /// Appends one chunk to the part of a transfer ([`cretlink_protocol::Operation::FsWrite`]).
@@ -96,6 +99,7 @@ pub(super) fn write(
     let existing = match open_part(&folder, &place.part_name, Disposition::Open, TO_APPEND) {
         Ok(part) => {
             require_own_part(&part)?;
+            require_begun(store, place)?;
             Some(part)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -152,6 +156,7 @@ pub(super) fn commit(
         match open_part(&folder, &place.part_name, Disposition::Open, TO_PUBLISH) {
             Ok(part) => {
                 require_own_part(&part)?;
+                require_begun(store, place)?;
                 (part, false)
             }
             // An empty file is committed without a chunk: its part is made
@@ -195,8 +200,11 @@ pub(super) fn commit(
 /// Idempotent: a part that is not there is the state that was asked for.
 pub(super) fn discard(store: &FileStore, place: &Place) -> Result<OpResult, FsError> {
     // A part that could not be removed is still there, and stays remembered
-    // for the cleanup.
-    remove_part(&place.part)?;
+    // for the cleanup. So does a part this store began whose folder is no
+    // longer in its place: whether it went with the folder is not known.
+    if remove_part(&place.part)? == Removal::FolderGone && store.began(&place.part) {
+        return Err(FsError::folder_gone());
+    }
     store.forget_unfinished(&place.part);
     Ok(OpResult::Ack {})
 }
@@ -217,8 +225,9 @@ pub(super) fn remove_part(part: &Path) -> Result<Removal, FsError> {
     };
     let folder = match open_folder(folder) {
         Ok(folder) => folder,
-        // The folder is gone, and the part with it.
-        Err(error) if error.code == ErrorCode::PathNotFound => return Ok(Removal::Absent),
+        // The folder is not there. Whether the part went with it is not
+        // known: a folder that was moved took it along.
+        Err(error) if error.code == ErrorCode::PathNotFound => return Ok(Removal::FolderGone),
         Err(error) => return Err(error),
     };
     let entry = match anchor::open_at(&folder, name, TO_REMOVE, SHARED, Disposition::Open, 0) {
@@ -326,6 +335,18 @@ fn require_own_part(part: &File) -> Result<(), FsError> {
         return Err(not_a_part());
     }
     Ok(())
+}
+
+/// Requires that this store began the part that was found. A file that lay
+/// under the part's name before the transfer wrote its first byte was put
+/// there by someone else, who would stay the owner of the published file and
+/// could change it afterwards.
+fn require_begun(store: &FileStore, place: &Place) -> Result<(), FsError> {
+    if store.began(&place.part) {
+        Ok(())
+    } else {
+        Err(FsError::foreign_part())
+    }
 }
 
 /// The length of an opened part.

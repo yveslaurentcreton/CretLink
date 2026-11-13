@@ -170,8 +170,10 @@ pub const MAX_TREE_STEP_ENTRIES: u64 = 4096;
 /// How long one [`crate::Operation::RemoveTree`] step works before it answers,
 /// in milliseconds, once it has met an entry — whether or not it has removed
 /// anything. With [`MAX_TREE_STEP_ENTRIES`] this bounds how long a folder
-/// removal can delay a stop or a cancellation, whatever a program does in the
-/// folder meanwhile.
+/// removal delays a stop or a cancellation by what it does itself, however
+/// many entries a program makes in the folder meanwhile. It is looked at
+/// between two entries and does not end a single request that the operating
+/// system keeps waiting.
 pub const MAX_TREE_STEP_MS: u64 = 1000;
 
 /// The deepest level below the folder being removed that

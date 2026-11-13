@@ -64,13 +64,19 @@
 //!
 //! The agent serves one request at a time, so a step that did not end would
 //! keep everything else waiting, a stop by the customer included. Every step
-//! therefore ends, **whatever it finds and whatever it achieves**: it meets at
+//! is therefore bounded in what it does itself, **whatever it finds and
+//! whatever it achieves**: it meets at
 //! most [`StepBounds::entries`] entries, and once it has met one it answers
 //! after [`StepBounds::time`]. An entry counts when the walk meets it: one it
 //! removes, one it cannot remove, one that is gone by the time the walk
-//! reaches for it, and a folder it enters. Nothing that a program does in the
-//! folder meanwhile — creating and deleting entries in a loop — keeps a step
-//! going beyond that.
+//! reaches for it, and a folder it enters. A program that creates and deletes
+//! entries in the folder in a loop does not keep a step going beyond that.
+//!
+//! The bounds are looked at between two entries. They do not end one request
+//! to the operating system that does not come back: an open that waits for a
+//! program which holds the entry under an opportunistic lock, and does not
+//! answer, keeps the step waiting for as long as that program likes, and the
+//! agent with it.
 //!
 //! A step that ends at a bound says [`TreeState::More`] when it removed
 //! something, so that the next step gets further. One that removed nothing

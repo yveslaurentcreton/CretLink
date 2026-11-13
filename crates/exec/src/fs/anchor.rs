@@ -78,14 +78,12 @@ pub(super) enum Hold {
         )
     )]
     Shared,
-    /// For removing the folder. The right to remove it is asked for with it,
-    /// and for as long as a folder is held with that right nobody else
-    /// renames or removes it. A folder that does not grant the right, or that
-    /// another program has open in a way that excludes it, is taken up
-    /// without it: such a handle keeps nobody from anything, the work inside
-    /// the folder goes through it all the same, and the folder itself is
-    /// removed at the end only if what lies at its path is still the folder
-    /// that was taken up.
+    /// For removing the folder. For as long as it is held nobody else renames
+    /// or removes it. The right to remove it is asked for with it; a folder
+    /// that does not grant that right, or that another program has open in a
+    /// way that excludes it, is held with the right to list it instead and is
+    /// removed at the end through a second open. A folder that can be held in
+    /// neither way is not taken up.
     ForRemoval,
 }
 
@@ -345,11 +343,12 @@ mod sys {
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
         FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
         FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-        FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
-        FileDispositionInfo, FileDispositionInfoEx, FileIdInfo, GETFINALPATHNAMEBYHANDLE_FLAGS,
-        GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-        GetLongPathNameW, SYNCHRONIZE, SetFileInformationByHandle, VOLUME_NAME_DOS, VOLUME_NAME_NT,
+        FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_WRITE_ATTRIBUTES, FileDispositionInfo, FileDispositionInfoEx, FileIdInfo,
+        GETFINALPATHNAMEBYHANDLE_FLAGS, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        GetFinalPathNameByHandleW, GetLongPathNameW, SYNCHRONIZE, SetFileInformationByHandle,
+        VOLUME_NAME_DOS, VOLUME_NAME_NT,
     };
     use windows::Win32::System::IO::IO_STATUS_BLOCK;
     use windows::core::{PCWSTR, PWSTR};
@@ -371,8 +370,14 @@ mod sys {
     /// remove the folder itself: both need the right to delete, which this
     /// share mode keeps from every other handle. Windows applies a share mode
     /// only for a handle that itself may read, write or delete; on a handle
-    /// that may only read attributes it keeps nobody from anything.
+    /// that may only read attributes it keeps nobody from anything, so a
+    /// folder is never held with such a handle.
     const SHARE_HELD: u32 = FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0;
+
+    /// What a folder is held with when the right to remove it is not to be
+    /// had: the right to list it, which the removal of its content needs
+    /// anyway, and with which Windows applies the share mode.
+    const TO_HOLD: u32 = FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0;
 
     // Windows error codes that say the extended form of a removal or a rename
     // is not offered here: by an older Windows, or by a file system such as
@@ -733,22 +738,23 @@ mod sys {
         }
     }
 
-    /// Opens a folder that is to be removed: with the right to remove it
-    /// where that is granted, and then without letting anybody else rename or
-    /// remove it meanwhile. Where the right is not to be had the folder is
-    /// opened without it, and that handle holds nothing: the folder can be
-    /// renamed or removed by others meanwhile, which [`Folder::remove`]
-    /// finds out before it removes anything. Returns the handle and whether
-    /// it carries the right to remove.
+    /// Opens a folder that is to be removed and holds it, so that nobody else
+    /// renames or removes it meanwhile: with the right to remove it where
+    /// that is granted, and otherwise with the right to list it. Returns the
+    /// handle and whether it carries the right to remove.
+    ///
+    /// # Errors
+    ///
+    /// When the folder can be held in neither way: it is not taken up.
     fn open_held(path: &Path) -> io::Result<(File, bool)> {
         match open_for_removal(path, SHARE_HELD) {
             Ok(handle) => Ok((handle, true)),
             // The right to remove is denied, or another program has the
             // folder open in a way that excludes its removal: the folder is
-            // taken up without that right, and its content can still be
-            // removed through the handle.
+            // held with the right to list it, and its content can still be
+            // removed.
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied || excluded(&error) => {
-                open_entry(path, FILE_READ_ATTRIBUTES.0, SHARE_HELD).map(|handle| (handle, false))
+                open_entry(path, TO_HOLD, SHARE_HELD).map(|handle| (handle, false))
             }
             Err(error) => Err(error),
         }

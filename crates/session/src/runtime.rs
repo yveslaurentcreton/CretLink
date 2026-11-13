@@ -1142,10 +1142,16 @@ async fn sweep_staging_on_exit(file_store: &FileStore, audit: &dyn SessionAudit)
         }
         Err(error) => {
             audit.record(Actor::System, "fs_cleanup", Outcome::Failed);
-            FsCleanup {
-                ok: false,
-                notes: vec![format!("{TEARDOWN_FAILED_NOTE_PREFIX}{}", error.message)],
-            }
+            // A cleanup that fails as a whole has removed the parts of
+            // unfinished transfers to a folder first. The ones it could not
+            // remove are named beside its failure.
+            let mut notes = vec![format!("{TEARDOWN_FAILED_NOTE_PREFIX}{}", error.message)];
+            notes.extend(file_store.unfinished_parts().into_iter().map(|part| {
+                format!(
+                    "{RESIDUAL_NOTE_PREFIX}{part} (the part of an unfinished transfer; not removed)"
+                )
+            }));
+            FsCleanup { ok: false, notes }
         }
     }
 }

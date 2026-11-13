@@ -655,4 +655,50 @@ mod windows {
         held.remove().expect("free by now");
         assert!(!folder.exists());
     }
+
+    /// A folder that is held without the right to remove it, because another
+    /// program had it open, is held all the same: once that program lets go,
+    /// nobody renames or removes the folder for as long as the hold lasts.
+    #[test]
+    fn a_folder_held_without_the_right_to_remove_it_is_not_renamed_away() {
+        let sb = Sandbox::new();
+        let folder = sb.dir("held-anyway");
+        let elsewhere = sb.root.join("held-anyway-moved");
+        // As a program opens its working folder: see the test above.
+        let theirs = std::fs::OpenOptions::new()
+            .access_mode(FILE_TRAVERSE)
+            .share_mode(0x0003)
+            .custom_flags(0x0200_0000)
+            .open(&folder)
+            .expect("another program opens the folder");
+        let held = Folder::open(&folder, Hold::ForRemoval).expect("the folder is taken up");
+        drop(theirs);
+
+        std::fs::rename(&folder, &elsewhere).expect_err("renamed away while held");
+        std::fs::remove_dir(&folder).expect_err("removed while held");
+        assert!(folder.exists() && !elsewhere.exists());
+
+        held.remove().expect("removed by the one that held it");
+        assert!(!folder.exists());
+    }
+
+    /// Nobody renames a folder above a held folder either: Windows does not
+    /// rename a folder while something in it is open. So for as long as a
+    /// step holds its folder, the path it reaches the entries by leads where
+    /// it led when the folder was verified.
+    #[test]
+    fn a_folder_above_a_held_folder_is_not_renamed_away() {
+        let sb = Sandbox::new();
+        let above = sb.dir("above");
+        let folder = above.join("held");
+        std::fs::create_dir(&folder).expect("create the folder");
+        let elsewhere = sb.root.join("above-moved");
+        let held = Folder::open(&folder, Hold::ForRemoval).expect("the folder is taken up");
+
+        std::fs::rename(&above, &elsewhere).expect_err("renamed while a folder in it is held");
+        assert!(folder.exists() && !elsewhere.exists());
+
+        drop(held);
+        std::fs::rename(&above, &elsewhere).expect("free once the hold is given up");
+    }
 }

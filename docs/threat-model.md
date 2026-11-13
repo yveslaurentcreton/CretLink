@@ -1735,13 +1735,13 @@ activity view or the audit log. Mitigations:
   symbolic link does not compare equal and is refused as `invalid_path`
   before anything is removed; so is a path on a drive made with `subst` and
   one on a network drive, whose real location is not the path that was asked.
-  A step that is granted the right to remove the folder then holds it: for
-  as long as the step runs, nobody else renames or removes it. A folder that
-  another program has open in a way that excludes its removal, its working
-  folder for example, is taken up without that right and is not held: what
-  the step removes in it is still checked entry by entry, and the folder
-  itself is opened once more at the end and removed only if it is still the
-  folder that was taken up. A link in the place of the folder itself is
+  The step then holds the folder: for as long as it runs, nobody else renames
+  or removes it, nor a folder above it. It asks for the right to remove the
+  folder with that. A folder that another program has open in a way that
+  excludes its removal, its working folder for example, is held with the
+  right to list it instead, and is opened once more at the end and removed
+  only if it is still the folder that was held; a folder that can be held in
+  neither way is not taken up. A link in the place of the folder itself is
   removed as a link, by the first step of a removal only. The root of a drive
   is refused, judged from the path and again from where the opened folder
   lies, and the path of the request passes the same rules as every remote
@@ -1766,14 +1766,16 @@ activity view or the audit log. Mitigations:
   form that Windows does not rewrite, so a name that ends in a dot or a space,
   or the name of a device such as `nul`, names the entry of that very name.
   The folder itself is removed through the hold the step has on it, or,
-  where it could not be held, through a second open that is compared with
-  the folder that was taken up.
+  where it is held without the right to remove it, through a second open
+  that is compared with the folder that was held.
 - *Bounded steps.* One request meets at most `MAX_TREE_STEP_ENTRIES` (4096)
   entries — one it removes, one it cannot remove, one that is gone by the time
   it reaches for it, a folder it enters — and answers after
   `MAX_TREE_STEP_MS` (one second) once it has met an entry, whether or not it
   removed anything. A program that keeps creating and deleting entries in the
-  folder therefore cannot keep a step going. A step that ends at a bound
+  folder therefore cannot keep a step going. The bounds are looked at between
+  two entries: one request that the operating system keeps waiting is not
+  ended by them (see the residual risks). A step that ends at a bound
   without having removed anything says so (`blocked`) and names what stood in
   its way. The console asks again while the answer says that more remains, at
   most a million times; then the removal ends as failed. The agent keeps
@@ -1812,6 +1814,9 @@ Evidence: `links_in_the_folder_are_removed_and_never_followed`,
 `a_folder_reached_through_a_junction_is_refused_and_its_target_keeps_everything`,
 `a_parent_swapped_for_a_junction_between_two_steps_is_refused`,
 `the_folder_cannot_be_renamed_away_while_a_step_holds_it`,
+`a_folder_another_program_holds_is_taken_up_and_reported_in_use`,
+`a_folder_held_without_the_right_to_remove_it_is_not_renamed_away`,
+`a_folder_above_a_held_folder_is_not_renamed_away`,
 `names_that_win32_would_rewrite_are_removed_as_plain_names`,
 `a_junction_in_the_folder_is_removed_and_never_followed`,
 `a_junction_in_the_place_of_the_folder_is_removed_as_a_link` and
@@ -1873,9 +1878,11 @@ reported as something else. Mitigations:
   a rename inside the directory the part lies in. Nothing that happens to a
   path meanwhile changes where the bytes go.
 - *The part is the transfer's own.* The part must be a regular file with
-  exactly one name. A link under its name, a folder, and a second name (a
-  hard link) of a file that lies elsewhere are refused: never written to,
-  never published.
+  exactly one name, and one that this session began. A link under its name, a
+  folder, a second name (a hard link) of a file that lies elsewhere, and a
+  file that lay there before the transfer wrote its first byte are refused:
+  never written to, never published. Whoever put a file there would stay its
+  owner and could change it after it got its name.
 - *The part is cleaned up.* The agent remembers every unfinished part that
   lies outside the staging area (at most 1024 at a time; one more is refused)
   and removes them with every cleanup: the one the session runs by itself
@@ -1883,9 +1890,12 @@ reported as something else. Mitigations:
   console asks for. On Windows the part is removed through its handle inside
   the verified folder; a folder that is a link by then is not followed. A
   part it could not remove is reported like any other cleanup failure and
-  tried again by the next cleanup (REQ-F-019). A commit of an empty file that
-  is refused removes the empty part it made, so refused commits leave nothing
-  to remember.
+  tried again by the next cleanup (REQ-F-019). So is a part whose folder is
+  no longer in its place: a folder that was moved took the part along, and
+  the agent does not call gone what it cannot see. The parts are removed
+  also when the staging area itself cannot be cleaned up. A commit of an
+  empty file that is refused removes the empty part it made, so refused
+  commits leave nothing to remember.
 - *A name is one name.* The technician computer refuses, before anything is
   sent, a name that is a path and a folder that is not a rooted path on a
   drive; the wire validation applies the path rules again on both ends (FT-1).
@@ -1901,6 +1911,10 @@ Evidence: `the_part_lies_beside_the_destination_until_the_verified_commit`,
 `a_file_sent_to_a_folder_is_kept_and_not_staged`,
 `the_part_of_an_unfinished_transfer_to_a_folder_is_removed_by_the_cleanup`,
 `a_part_the_cleanup_cannot_remove_is_reported_and_tried_again`,
+`a_part_whose_folder_is_no_longer_in_its_place_is_named_and_tried_again`,
+`a_cleanup_that_cannot_use_the_staging_area_still_removes_unfinished_parts`,
+`a_file_that_lay_under_the_name_of_a_part_before_the_transfer_is_not_taken_for_it`,
+`a_path_from_a_planted_manifest_fits_the_answer_whatever_it_holds`,
 `a_link_planted_under_the_parts_name_is_never_written_through`,
 `a_folder_under_the_parts_name_is_refused`,
 `a_refused_commit_of_an_empty_file_leaves_no_part_and_no_memory_of_one` and
@@ -1997,7 +2011,12 @@ guessed (REQ-N-006, REQ-N-008). Evidence:
   a bounded time, say that the folder is still there, and go on. It can also
   make the old folder again, so that every elevated start names it until an
   administrator removes it. That delays a cleanup and costs a notice; it
-  gives nothing away.
+  gives nothing away. It can also keep one request of the agent waiting in
+  the operating system, for example by holding an entry of a folder under an
+  opportunistic lock and not answering when the agent opens it. The agent
+  serves one request at a time, so everything else waits with it, a stop by
+  the customer included, until that program lets go or CretLink is ended.
+  This holds for every file operation, not only for the removal of a folder.
 - A process that is elevated without being an administrator, and a computer
   whose `Program Files` is not a folder of the system, get no staging area
   from an elevated CretLink.

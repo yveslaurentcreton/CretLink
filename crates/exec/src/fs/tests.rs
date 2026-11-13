@@ -2199,7 +2199,6 @@ fn a_text_for_the_wire_is_kept_on_one_line_and_within_its_bound() {
 // --- (ST-M010-001) ----------------------------------------------------------
 
 /// The request of one chunk for `dest`.
-#[cfg(windows)]
 fn chunk(dest: &RemotePath, offset: u64, bytes: &[u8]) -> Operation {
     Operation::FsWrite {
         dest: dest.clone(),
@@ -2209,7 +2208,6 @@ fn chunk(dest: &RemotePath, offset: u64, bytes: &[u8]) -> Operation {
 }
 
 /// The request that commits `bytes` as the file `dest`.
-#[cfg(windows)]
 fn commit_of(dest: &RemotePath, bytes: &[u8], overwrite: bool) -> Operation {
     Operation::FsCommit {
         dest: dest.clone(),
@@ -2469,36 +2467,74 @@ async fn a_part_with_a_second_name_is_never_written_to_and_never_published() {
 /// meantime. A commit that nobody waits for any more is told so and publishes
 /// nothing: what happens after a session has ended is not the session's
 /// doing. The part stays as it is.
+///
+/// The commit asks whether somebody still waits while it reads the part, and
+/// once more before the file gets its name. The test first counts the
+/// questions of a commit that goes through, and then answers "nobody" to the
+/// last question alone — the one before the name — and to the first.
 #[cfg(windows)]
 #[tokio::test]
 async fn a_commit_that_nobody_waits_for_any_more_publishes_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let sb = Sandbox::new();
     let store = sb.store();
     let folder = sb.target();
+    let place_of = |dest: &RemotePath| {
+        store
+            .place_in_folder(dest)
+            .expect("the destination resolves")
+            .expect("it lies in a folder")
+    };
+
+    let counted = abs(&folder, "counted.iso");
+    store
+        .perform(chunk(&counted, 0, b"content"))
+        .await
+        .expect("the chunk");
+    let asked = AtomicUsize::new(0);
+    super::to_folder::commit(
+        &store,
+        &place_of(&counted),
+        7,
+        &sha256(b"content"),
+        false,
+        &|| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            false
+        },
+    )
+    .expect("a commit that somebody waits for");
+    let questions = asked.load(Ordering::SeqCst);
+    assert!(
+        questions >= 2,
+        "asked while reading and before the name: {questions}"
+    );
+
     let dest = abs(&folder, "big.iso");
     store
         .perform(chunk(&dest, 0, b"content"))
         .await
         .expect("the chunk");
-    let place = store
-        .place_in_folder(&dest)
-        .expect("the destination resolves")
-        .expect("it lies in a folder");
-
-    let nobody_waits = || true;
-    let abandoned =
-        super::to_folder::commit(&store, &place, 7, &sha256(b"content"), false, &nobody_waits)
+    let place = place_of(&dest);
+    for nobody_from in [questions, 1] {
+        let asked = AtomicUsize::new(0);
+        let abandoned =
+            super::to_folder::commit(&store, &place, 7, &sha256(b"content"), false, &|| {
+                asked.fetch_add(1, Ordering::SeqCst) + 1 >= nobody_from
+            })
             .expect_err("an abandoned commit does not go through");
-    assert_eq!(abandoned.code, ErrorCode::Internal);
-    assert!(!folder.join("big.iso").exists(), "nothing was published");
-    assert_eq!(names_in(&folder).len(), 1, "the part is still there");
+        assert_eq!(abandoned.code, ErrorCode::Internal);
+        assert!(!folder.join("big.iso").exists(), "nothing was published");
+        assert_eq!(names_in(&folder).len(), 2, "the part is still there");
+    }
 
     // Asked for again by a session that waits, the commit goes through.
     store
         .perform(commit_of(&dest, b"content", false))
         .await
         .expect("the commit");
-    assert_eq!(names_in(&folder), vec!["big.iso"]);
+    assert_eq!(names_in(&folder), vec!["big.iso", "counted.iso"]);
 }
 
 /// A file is committed into the root of a drive: the root is a folder like
@@ -3240,6 +3276,22 @@ fn every_staging_operation() -> Vec<Operation> {
         Operation::FsAbort {
             dest: staging("theirs.bin"),
         },
+        Operation::CreateDir {
+            path: staging("made"),
+        },
+        Operation::RemoveDir {
+            path: staging("made"),
+        },
+        Operation::FsMove {
+            from: staging("theirs.bin"),
+            to: staging("moved.bin"),
+            overwrite: false,
+        },
+        Operation::RemoveTree {
+            path: staging("."),
+            stop: false,
+            folder_id: None,
+        },
         Operation::ListStaged {},
         Operation::StagingCleanup {
             trigger: CleanupTrigger::All,
@@ -3303,7 +3355,7 @@ async fn assert_a_base_behind_a_link_is_not_used(
     }
     assert_eq!(
         refusals,
-        vec![Err(ErrorCode::AccessDenied); 8],
+        vec![Err(ErrorCode::AccessDenied); 12],
         "no staging operation goes through the link"
     );
     assert_eq!(
@@ -3583,4 +3635,177 @@ async fn nothing_is_moved_into_a_private_staging_area_from_elsewhere() {
     .await
     .expect("a move into a staging area of the account");
     assert!(own.staging_root().join("tool.bin").exists());
+}
+
+// --- what the review of the corrections asked for (ST-M010-001) --------------
+
+/// What a manifest says is text that anybody may have written. A path in it
+/// that is longer than an answer may carry, or that holds a line break, is
+/// still answered: bounded and on one line, and never touched.
+#[tokio::test]
+async fn a_path_from_a_planted_manifest_fits_the_answer_whatever_it_holds() {
+    use cretlink_protocol::limits::MAX_PATH_BYTES;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let long = format!("{}\nsecond line", "x".repeat(MAX_PATH_BYTES + 1));
+    write_manifest(store.staging_root(), &[record(Path::new(&long))]);
+
+    let report = store
+        .cleanup(CleanupTrigger::SessionEnd)
+        .await
+        .expect("a report");
+
+    assert_on_the_wire(&report);
+    let OpResult::CleanupReport { removed, failed } = report else {
+        panic!("expected a cleanup report");
+    };
+    assert_eq!(removed, 0);
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(failed[0].canonical_path.len() <= MAX_PATH_BYTES);
+    assert!(!failed[0].canonical_path.contains('\n'));
+    assert_eq!(failed[0].reason, "outside the staging area; not touched");
+}
+
+/// A cleanup that cannot use its staging area still removes the parts of
+/// unfinished transfers to a folder, which do not lie there, and the store
+/// names the ones that are left.
+#[tokio::test]
+async fn a_cleanup_that_cannot_use_the_staging_area_still_removes_unfinished_parts() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    for name in ["gone.bin", "stuck.bin"] {
+        store
+            .perform(chunk(&abs(&folder, name), 0, b"half"))
+            .await
+            .expect("the chunk");
+    }
+    let stuck = store
+        .part_path(&abs(&folder, "stuck.bin"))
+        .expect("the part of this transfer");
+    let block = block_removal(&stuck);
+    // A manifest that cannot be read: the cleanup of the staging area fails.
+    std::fs::create_dir_all(store.staging_root()).expect("the session folder");
+    std::fs::write(
+        store.staging_root().join("manifest.json"),
+        b"not a manifest",
+    )
+    .expect("write");
+
+    store
+        .cleanup(CleanupTrigger::SessionEnd)
+        .await
+        .expect_err("the manifest cannot be read");
+
+    assert_eq!(
+        names_in(&folder).len(),
+        1,
+        "the part that could be removed is gone"
+    );
+    assert_eq!(store.unfinished_parts(), vec![text(&stuck)]);
+    release_block(block, &stuck);
+}
+
+/// A file that lies under the name of a transfer's part before the transfer
+/// wrote anything was put there by someone else, who would stay the owner of
+/// the published file. It is not written to and not published; a discard
+/// removes it, and the transfer then goes through.
+#[tokio::test]
+async fn a_file_that_lay_under_the_name_of_a_part_before_the_transfer_is_not_taken_for_it() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    let dest = abs(&folder, "report.pdf");
+    let part = store.part_path(&dest).expect("the part of this transfer");
+    std::fs::write(&part, b"").expect("someone else plants an empty file");
+
+    let refused = store
+        .perform(chunk(&dest, 0, b"content"))
+        .await
+        .expect_err("not written to");
+    assert_eq!(refused.code, ErrorCode::WrongPathKind);
+    assert_eq!(
+        std::fs::read(&part).expect("read"),
+        b"",
+        "nothing was written"
+    );
+    let refused = store
+        .perform(commit_of(&dest, b"", false))
+        .await
+        .expect_err("not published");
+    assert_eq!(refused.code, ErrorCode::WrongPathKind);
+    assert_eq!(names_in(&folder).len(), 1, "nothing was published");
+
+    store
+        .perform(Operation::FsAbort { dest: dest.clone() })
+        .await
+        .expect("the discard removes what lies there");
+    assert!(names_in(&folder).is_empty());
+    transfer(
+        &store,
+        dest,
+        b"content",
+        4,
+        false,
+        None,
+        CleanupPolicy::Keep,
+    )
+    .await
+    .expect("the transfer goes through");
+    assert_eq!(names_in(&folder), vec!["report.pdf"]);
+}
+
+/// A folder that was moved away took the part of an unfinished transfer
+/// along. The cleanup cannot know that the part is gone and does not say so:
+/// it names the part, keeps it in mind, and removes it once the folder is
+/// back in its place. A discard does not claim that it is gone either.
+#[tokio::test]
+async fn a_part_whose_folder_is_no_longer_in_its_place_is_named_and_tried_again() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    let dest = abs(&folder, "half.bin");
+    store
+        .perform(chunk(&dest, 0, b"half of it"))
+        .await
+        .expect("the chunk");
+    let part = store.part_path(&dest).expect("the part of this transfer");
+    let moved = folder.with_file_name("moved-away");
+    std::fs::rename(&folder, &moved).expect("the folder is moved away");
+
+    let report = store
+        .cleanup(CleanupTrigger::SessionEnd)
+        .await
+        .expect("a report");
+    let OpResult::CleanupReport { removed, failed } = report else {
+        panic!("expected a cleanup report");
+    };
+    assert_eq!(removed, 0);
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].canonical_path, text(&part));
+    assert!(
+        failed[0]
+            .reason
+            .starts_with("its folder is no longer in its place"),
+        "{}",
+        failed[0].reason
+    );
+    assert_eq!(
+        names_in(&moved).len(),
+        1,
+        "the part lies where the folder is now"
+    );
+    let refused = store
+        .perform(Operation::FsAbort { dest: dest.clone() })
+        .await
+        .expect_err("not known to be gone");
+    assert_eq!(refused.code, ErrorCode::PathNotFound);
+
+    std::fs::rename(&moved, &folder).expect("back in its place");
+    assert_eq!(
+        cleanup(&store, CleanupTrigger::SessionEnd).await,
+        (1, Vec::new())
+    );
+    assert!(names_in(&folder).is_empty());
 }
