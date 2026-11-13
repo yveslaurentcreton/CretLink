@@ -22,6 +22,17 @@
 //! **closed**: the AEAD record layer rejects any desynchronised read, poisoning
 //! the channel rather than misinterpreting bytes.
 //!
+//! # An answer that cannot be sent (ST-M010-005)
+//!
+//! The secure channel refuses a frame that breaks a bound of the protocol, or
+//! that is larger than one record, before it touches the stream; the channel
+//! is then as it was. The agent's loop tells that refusal from a channel that
+//! is gone (`Unsent`). An answer to a request that is refused this way fails
+//! that one request with the reason (`answer`), and the session goes on: a
+//! folder, a file or a clipboard that somebody filled must not be a way to
+//! end the session. A frame that answers no request — streamed output, a
+//! heartbeat — has no request to fail and ends the session as before.
+//!
 //! # Console output buffering (REQ-N-006)
 //!
 //! The console session task publishes lifecycle and streamed-output
@@ -769,18 +780,77 @@ async fn recv_frame<T: AsyncRead + AsyncWrite + Unpin>(channel: &mut SecureChann
     }
 }
 
+/// Why a frame was not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unsent {
+    /// The frame itself cannot be sent: it is larger than one record of the
+    /// secure channel, or it breaks a bound of the protocol. It was refused
+    /// before anything reached the wire, so the channel is as it was and the
+    /// session goes on.
+    Refused(Refusal),
+    /// The channel failed. It is closed for good.
+    Lost,
+}
+
+/// What is wrong with a frame that cannot be sent, in the wire vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Refusal {
+    /// The category: [`ErrorCode::OversizedMessage`] for a frame that is too
+    /// large, else the category of the bound it breaks.
+    code: ErrorCode,
+    /// The stage that refused the frame.
+    stage: ErrorStage,
+}
+
+impl Unsent {
+    /// Tells apart why a send on the secure channel failed. The channel checks
+    /// a frame against the bounds of the protocol and the size of a record
+    /// before it touches the stream, and such a refusal leaves it unpoisoned;
+    /// every other failure poisons it for good.
+    fn of(error: &SecureChannelError, poisoned: bool) -> Self {
+        if poisoned {
+            return Self::Lost;
+        }
+        match error {
+            SecureChannelError::Oversized { .. } => Self::Refused(Refusal {
+                code: ErrorCode::OversizedMessage,
+                stage: ErrorStage::Transport,
+            }),
+            SecureChannelError::Decode(protocol) => {
+                let code = protocol.code();
+                let stage = if code == ErrorCode::OversizedMessage {
+                    ErrorStage::Transport
+                } else {
+                    ErrorStage::Validation
+                };
+                Self::Refused(Refusal { code, stage })
+            }
+            // A failure on the stream always poisons the channel; one that
+            // did not is still not a refusal of the frame.
+            SecureChannelError::Io(_)
+            | SecureChannelError::Noise(_)
+            | SecureChannelError::Eof
+            | SecureChannelError::Poisoned => Self::Lost,
+        }
+    }
+}
+
 /// Where the agent writes one outbound frame: the secure channel itself, or a
 /// [`ReplyTap`] that also notes how a request was answered (ST-M009-007). Every
 /// agent reply helper is generic over it, so the request handler reports each
 /// request's honest outcome without threading it through every branch.
 trait FrameSink {
-    /// Sends one frame, mapping any channel fault to `()`.
-    async fn send_frame(&mut self, message: &Message) -> Result<(), ()>;
+    /// Sends one frame, and says whether a frame that was not sent was
+    /// refused as it is or lost with the channel.
+    async fn send_frame(&mut self, message: &Message) -> Result<(), Unsent>;
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> FrameSink for SecureChannel<T> {
-    async fn send_frame(&mut self, message: &Message) -> Result<(), ()> {
-        self.send(message).await.map_err(|_| ())
+    async fn send_frame(&mut self, message: &Message) -> Result<(), Unsent> {
+        match self.send(message).await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(Unsent::of(&error, self.is_poisoned())),
+        }
     }
 }
 
@@ -790,7 +860,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> FrameSink for SecureChannel<T> {
 /// the real result beside the stated purpose (REQ-F-026, REQ-N-008). Other
 /// frames (a desktop-activity event) pass through unrecorded. The answer is
 /// noted before the send, because the operation already ran even if the reply
-/// then fails to reach the console.
+/// then fails to reach the console. An answer that could not be sent as it is
+/// (ST-M010-005) is followed by the `Error` that fails the request, and that
+/// is then the answer noted: it is what the console was told.
 struct ReplyTap<'a, C> {
     inner: &'a mut C,
     request: RequestId,
@@ -822,7 +894,7 @@ impl<'a, C: FrameSink> ReplyTap<'a, C> {
 }
 
 impl<C: FrameSink> FrameSink for ReplyTap<'_, C> {
-    async fn send_frame(&mut self, message: &Message) -> Result<(), ()> {
+    async fn send_frame(&mut self, message: &Message) -> Result<(), Unsent> {
         match message {
             Message::Response { id, result, .. } if *id == self.request => {
                 self.outcome = Some(ActionOutcome::Succeeded);
@@ -849,6 +921,10 @@ impl<C: FrameSink> FrameSink for ReplyTap<'_, C> {
                 id: Some(id), code, ..
             } if *id == self.request => {
                 self.outcome = Some(ActionOutcome::Failed { code: *code });
+                // What a response that was not sent said is not what the
+                // console was told.
+                self.read = None;
+                self.removal = None;
             }
             _ => {}
         }
@@ -856,10 +932,88 @@ impl<C: FrameSink> FrameSink for ReplyTap<'_, C> {
     }
 }
 
-/// Sends one already-built message, mapping any channel fault to `()` (the caller
-/// treats a failed send as a terminal disconnect).
-async fn send_message<C: FrameSink>(channel: &mut C, message: Message) -> Result<(), ()> {
+/// Sends one already-built message. A caller that sends anything but an answer
+/// to a request treats every failure as a terminal disconnect; an answer goes
+/// through [`answer`], which tells a refused frame from a lost channel.
+async fn send_message<C: FrameSink>(channel: &mut C, message: Message) -> Result<(), Unsent> {
     channel.send_frame(&message).await
+}
+
+/// What became of the answer to a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// The answer was sent.
+    Sent,
+    /// The answer could not be sent as it is, and the request was failed with
+    /// the reason instead. The session goes on.
+    Failed,
+    /// The channel is gone.
+    Lost,
+}
+
+impl Answer {
+    /// What the agent's active loop does next.
+    fn step(self) -> AgentStep {
+        match self {
+            Self::Sent | Self::Failed => AgentStep::Continue,
+            Self::Lost => AgentStep::Disconnected,
+        }
+    }
+}
+
+/// What the console is told when the answer to its request is larger than one
+/// record of the secure channel.
+const ANSWER_TOO_LARGE: &str = "the answer is too large to send: it does not fit one message of \
+                                the session. The operation itself ran.";
+
+/// What the console is told when the answer to its request breaks a bound of
+/// the protocol.
+const ANSWER_OUT_OF_BOUNDS: &str = "the answer could not be sent: it breaks a bound of the \
+                                    protocol. The operation itself ran.";
+
+/// Answers the request `id` with `result`.
+///
+/// An answer that cannot be sent never ends the session (ST-M010-005,
+/// REQ-N-008). One that is larger than one record of the secure channel, or
+/// that breaks a bound of the protocol, is refused before anything of it
+/// reaches the wire: the request is then failed with that reason, in fixed
+/// words that hold nothing of the answer (REQ-N-015), and the session goes
+/// on. Only a channel that is gone is a disconnect.
+async fn answer<C: FrameSink>(
+    channel: &mut C,
+    session: SessionId,
+    id: RequestId,
+    result: OpResult,
+) -> Answer {
+    let response = Message::Response {
+        id,
+        session,
+        result,
+    };
+    let refusal = match send_message(channel, response).await {
+        Ok(()) => return Answer::Sent,
+        Err(Unsent::Lost) => return Answer::Lost,
+        Err(Unsent::Refused(refusal)) => refusal,
+    };
+    let reason = if refusal.code == ErrorCode::OversizedMessage {
+        ANSWER_TOO_LARGE
+    } else {
+        ANSWER_OUT_OF_BOUNDS
+    };
+    match send_error(
+        channel,
+        Some(id),
+        Some(session),
+        refusal.code,
+        reason,
+        refusal.stage,
+    )
+    .await
+    {
+        Err(Unsent::Lost) => Answer::Lost,
+        // The error is a few fixed words: nothing refuses it.
+        Ok(()) | Err(Unsent::Refused(_)) => Answer::Failed,
+    }
 }
 
 /// Sends a secret-free wire `Error` for a rejected request (bad session, unknown
@@ -872,7 +1026,7 @@ async fn send_error<C: FrameSink>(
     code: ErrorCode,
     message: &str,
     stage: ErrorStage,
-) -> Result<(), ()> {
+) -> Result<(), Unsent> {
     send_message(
         channel,
         Message::Error {
@@ -2621,6 +2775,10 @@ async fn handle_arm_command<T: AsyncRead + AsyncWrite + Unpin>(
 /// single encrypted record; a job's terminal report becomes a `JobExited` event,
 /// is surfaced locally as [`SessionEvent::ExecFinished`] (so the customer sees
 /// the outcome — visible activity, REQ-F-017/S-002), and audited honestly.
+///
+/// An event answers no request, so there is none to fail: an event that is
+/// not sent, for whatever reason, ends the session as a disconnect. Output
+/// that was dropped unmarked would read as complete (REQ-N-008).
 async fn forward_broker_event<T: AsyncRead + AsyncWrite + Unpin>(
     channel: &mut SecureChannel<T>,
     session: SessionId,
@@ -2644,7 +2802,8 @@ async fn forward_broker_event<T: AsyncRead + AsyncWrite + Unpin>(
                         },
                     },
                 )
-                .await?;
+                .await
+                .map_err(|_| ())?;
             }
             Ok(())
         }
@@ -2663,7 +2822,8 @@ async fn forward_broker_event<T: AsyncRead + AsyncWrite + Unpin>(
                     },
                 },
             )
-            .await;
+            .await
+            .map_err(|_| ());
             activity.emit_job(
                 tx,
                 SessionEvent::ExecFinished {
@@ -2992,18 +3152,18 @@ async fn handle_agent_request<C: FrameSink>(
                     // received, so relative-path semantics are unambiguous on
                     // the console/AI side (ST-M003-003, REQ-F-009).
                     let working_dir = started.working_dir.to_string_lossy().into_owned();
-                    if send_message(
+                    let answered = answer(
                         channel,
-                        Message::Response {
-                            id,
-                            session,
-                            result: OpResult::ExecStarted { job, working_dir },
-                        },
+                        session,
+                        id,
+                        OpResult::ExecStarted { job, working_dir },
                     )
-                    .await
-                    .is_err()
-                    {
-                        return AgentStep::Disconnected;
+                    .await;
+                    if answered != Answer::Sent {
+                        // The caller never learned of this job: nobody could
+                        // read what it writes or stop it, so it is ended.
+                        let _ = broker.cancel(started.job);
+                        return answered.step();
                     }
                     // Visible activity: the customer sees exactly what is run
                     // (REQ-F-017, REQ-S-002), and the start is audited.
@@ -3064,20 +3224,9 @@ async fn handle_agent_request<C: FrameSink>(
                     running: summary.running,
                 })
                 .collect();
-            if send_message(
-                channel,
-                Message::Response {
-                    id,
-                    session,
-                    result: OpResult::Jobs { jobs },
-                },
-            )
-            .await
-            .is_err()
-            {
-                return AgentStep::Disconnected;
-            }
-            AgentStep::Continue
+            answer(channel, session, id, OpResult::Jobs { jobs })
+                .await
+                .step()
         }
         // --- Interactive terminal (ADR-0013, ST-M003-009, CAP_TERM_V1) ---
         // A terminal is a job: it spawns an interactive (ConPTY) job and reuses
@@ -3137,20 +3286,13 @@ async fn handle_agent_request<C: FrameSink>(
                     // ST-M003-006). The console stamps Origin::Terminal on the
                     // request.
                     audit.record(Actor::Terminal, "term_open", Outcome::Ok);
-                    if send_message(
-                        channel,
-                        Message::Response {
-                            id,
-                            session,
-                            result: OpResult::TermOpened { job },
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return AgentStep::Disconnected;
+                    let answered = answer(channel, session, id, OpResult::TermOpened { job }).await;
+                    if answered != Answer::Sent {
+                        // As for a command: a terminal nobody learned of is
+                        // ended.
+                        let _ = broker.cancel(started.job);
                     }
-                    AgentStep::Continue
+                    answered.step()
                 }
                 // Off Windows there is no pseudo-console backend: honest
                 // Unsupported, never a silently degraded piped job (REQ-N-008).
@@ -3375,23 +3517,18 @@ async fn handle_agent_request<C: FrameSink>(
                         }
                         image_opt => {
                             let image = image_opt.map(B64Bytes::from);
-                            if send_message(
+                            let answered = answer(
                                 channel,
-                                Message::Response {
-                                    id,
-                                    session,
-                                    result: OpResult::DesktopFrame {
-                                        meta: frame.meta,
-                                        image,
-                                        staged: None,
-                                    },
+                                session,
+                                id,
+                                OpResult::DesktopFrame {
+                                    meta: frame.meta,
+                                    image,
+                                    staged: None,
                                 },
                             )
-                            .await
-                            .is_err()
-                            {
-                                AgentStep::Disconnected
-                            } else {
+                            .await;
+                            if answered == Answer::Sent {
                                 // A frame reached the console: screen observation
                                 // is active, signalled so both surfaces reflect it
                                 // (ST-M005-005). The class is all that crosses —
@@ -3403,8 +3540,8 @@ async fn handle_agent_request<C: FrameSink>(
                                     DesktopAccess::Observe,
                                 )
                                 .await;
-                                AgentStep::Continue
                             }
+                            answered.step()
                         }
                     }
                 }
@@ -3518,20 +3655,14 @@ async fn handle_agent_request<C: FrameSink>(
                     // (ST-M005-005). Emitted before the reply, so the state is
                     // recorded even if the response never lands.
                     signal_desktop_activity(channel, session, tx, DesktopAccess::Observe).await;
-                    if send_message(
+                    answer(
                         channel,
-                        Message::Response {
-                            id,
-                            session,
-                            result: OpResult::ClipboardContents { text: Some(text) },
-                        },
+                        session,
+                        id,
+                        OpResult::ClipboardContents { text: Some(text) },
                     )
                     .await
-                    .is_err()
-                    {
-                        return AgentStep::Disconnected;
-                    }
-                    AgentStep::Continue
+                    .step()
                 }
                 Err(err) => desktop_backend_error(channel, id, session, &err).await,
             }
@@ -3555,23 +3686,17 @@ async fn handle_agent_request<C: FrameSink>(
         // signal observed" (documented best-effort).
         Operation::SystemInfo {} => {
             let reboot_pending = (sysinfo.reboot_probe)();
-            if send_message(
+            answer(
                 channel,
-                Message::Response {
-                    id,
-                    session,
-                    result: OpResult::SystemInfo {
-                        target: sysinfo.identity.clone(),
-                        reboot_pending,
-                    },
+                session,
+                id,
+                OpResult::SystemInfo {
+                    target: sysinfo.identity.clone(),
+                    reboot_pending,
                 },
             )
             .await
-            .is_err()
-            {
-                return AgentStep::Disconnected;
-            }
-            AgentStep::Continue
+            .step()
         }
         // File operations (ADR-0012, CAP_FS_V1) run against a real filesystem at
         // the agent's privilege via the session file store. Mutating operations
@@ -3615,20 +3740,7 @@ async fn handle_agent_request<C: FrameSink>(
                     if let Some(action) = audit_action {
                         audit.record(Actor::Console, action, Outcome::Ok);
                     }
-                    if send_message(
-                        channel,
-                        Message::Response {
-                            id,
-                            session,
-                            result,
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return AgentStep::Disconnected;
-                    }
-                    AgentStep::Continue
+                    answer(channel, session, id, result).await.step()
                 }
                 Err(fs_err) => {
                     if let Some(action) = audit_action {
@@ -3671,23 +3783,9 @@ fn fs_audit_action(op: &Operation) -> Option<&'static str> {
     }
 }
 
-/// Sends a payload-free `Ack` response, mapping a failed send to a disconnect.
+/// Sends a payload-free `Ack` response, mapping a lost channel to a disconnect.
 async fn reply_ack<C: FrameSink>(channel: &mut C, session: SessionId, id: RequestId) -> AgentStep {
-    if send_message(
-        channel,
-        Message::Response {
-            id,
-            session,
-            result: OpResult::Ack {},
-        },
-    )
-    .await
-    .is_err()
-    {
-        AgentStep::Disconnected
-    } else {
-        AgentStep::Continue
-    }
+    answer(channel, session, id, OpResult::Ack {}).await.step()
 }
 
 /// Refuses a desktop operation the agent did not advertise support for.
@@ -4171,6 +4269,276 @@ mod tests {
             records
                 .iter()
                 .all(|record| *record == ("fs_remove_tree", Outcome::Unknown))
+        );
+    }
+
+    // --- an answer that cannot be sent (ST-M010-005) ------------------------
+
+    /// A sink that takes a frame as the secure channel does: one that breaks
+    /// a bound of the protocol, or that is larger than one record, is refused
+    /// before anything is sent, and the sink is as it was.
+    #[derive(Debug, Default)]
+    struct RecordSink {
+        sent: Vec<Message>,
+        lost: bool,
+    }
+
+    impl FrameSink for RecordSink {
+        async fn send_frame(&mut self, message: &Message) -> Result<(), Unsent> {
+            if self.lost {
+                return Err(Unsent::of(&SecureChannelError::Eof, true));
+            }
+            let payload = match message.encode() {
+                Ok(payload) => payload,
+                Err(error) => return Err(Unsent::of(&SecureChannelError::Decode(error), false)),
+            };
+            if payload.len() > limits::MAX_RECORD_BYTES {
+                let oversized = SecureChannelError::Oversized {
+                    len: payload.len(),
+                    max: limits::MAX_RECORD_BYTES,
+                };
+                return Err(Unsent::of(&oversized, false));
+            }
+            self.sent.push(message.clone());
+            Ok(())
+        }
+    }
+
+    /// A file read of `len` bytes, as the agent answers it.
+    fn file_data(len: usize) -> OpResult {
+        OpResult::FileData {
+            data: B64Bytes::new(vec![0x5A; len]),
+            eof: true,
+            file_len: len as u64,
+        }
+    }
+
+    /// The one error the sink took, as (request, session, code, message,
+    /// stage).
+    fn the_error(
+        sink: &RecordSink,
+    ) -> (
+        Option<RequestId>,
+        Option<SessionId>,
+        ErrorCode,
+        String,
+        ErrorStage,
+    ) {
+        match sink.sent.as_slice() {
+            [
+                Message::Error {
+                    id,
+                    session,
+                    code,
+                    message,
+                    stage,
+                },
+            ] => (*id, *session, *code, message.clone(), *stage),
+            other => panic!("expected one error and nothing else, got {other:?}"),
+        }
+    }
+
+    // A frame that the channel refused before it touched the stream is told
+    // apart from a channel that is gone: only the first leaves the session
+    // usable.
+    #[test]
+    fn a_frame_refused_before_the_wire_is_told_apart_from_a_lost_channel() {
+        let too_large = SecureChannelError::Oversized {
+            len: 70_000,
+            max: 1,
+        };
+        assert_eq!(
+            Unsent::of(&too_large, false),
+            Unsent::Refused(Refusal {
+                code: ErrorCode::OversizedMessage,
+                stage: ErrorStage::Transport,
+            })
+        );
+        let out_of_bounds =
+            SecureChannelError::Decode(cretlink_protocol::ProtocolError::LimitExceeded {
+                field: "file_entry name length",
+                len: 2,
+                max: 1,
+            });
+        assert_eq!(
+            Unsent::of(&out_of_bounds, false),
+            Unsent::Refused(Refusal {
+                code: ErrorCode::LimitExceeded,
+                stage: ErrorStage::Validation,
+            })
+        );
+        let frame_too_large =
+            SecureChannelError::Decode(cretlink_protocol::ProtocolError::Oversized {
+                len: 2,
+                max: 1,
+            });
+        assert_eq!(
+            Unsent::of(&frame_too_large, false),
+            Unsent::Refused(Refusal {
+                code: ErrorCode::OversizedMessage,
+                stage: ErrorStage::Transport,
+            })
+        );
+        // Whatever the error says, a poisoned channel is gone; and so is one
+        // whose stream failed.
+        for error in [too_large, out_of_bounds, frame_too_large] {
+            assert_eq!(Unsent::of(&error, true), Unsent::Lost);
+        }
+        for error in [SecureChannelError::Eof, SecureChannelError::Poisoned] {
+            assert_eq!(Unsent::of(&error, false), Unsent::Lost);
+            assert_eq!(Unsent::of(&error, true), Unsent::Lost);
+        }
+    }
+
+    // An answer that fits is sent as it is.
+    #[tokio::test]
+    async fn an_answer_that_fits_is_sent() {
+        let session = SessionId::new();
+        let mut sink = RecordSink::default();
+        let answered = answer(&mut sink, session, RequestId(7), file_data(1024)).await;
+        assert_eq!(answered, Answer::Sent);
+        assert!(matches!(answered.step(), AgentStep::Continue));
+        assert_eq!(
+            sink.sent,
+            vec![Message::Response {
+                id: RequestId(7),
+                session,
+                result: file_data(1024),
+            }]
+        );
+    }
+
+    // An answer that is larger than one record of the secure channel is not
+    // sent, and the session does not end over it: the request is failed with
+    // the reason, in fixed words, and the agent goes on.
+    #[tokio::test]
+    async fn an_answer_larger_than_a_record_fails_its_request_and_the_session_goes_on() {
+        let session = SessionId::new();
+        let mut sink = RecordSink::default();
+        // Within every bound of the protocol, and far larger than a record
+        // once it is encoded.
+        let large = file_data(limits::MAX_CHUNK_BYTES);
+
+        let answered = answer(&mut sink, session, RequestId(7), large).await;
+
+        assert_eq!(answered, Answer::Failed);
+        assert!(matches!(answered.step(), AgentStep::Continue));
+        let (id, stamped, code, message, stage) = the_error(&sink);
+        assert_eq!((id, stamped), (Some(RequestId(7)), Some(session)));
+        assert_eq!(code, ErrorCode::OversizedMessage);
+        assert_eq!(stage, ErrorStage::Transport);
+        assert_eq!(message, ANSWER_TOO_LARGE);
+    }
+
+    // The same for an answer that breaks a bound of the protocol: here a name
+    // longer than a name may be.
+    #[tokio::test]
+    async fn an_answer_that_breaks_a_bound_fails_its_request_and_the_session_goes_on() {
+        let session = SessionId::new();
+        let mut sink = RecordSink::default();
+        let out_of_bounds = OpResult::DirEntries {
+            entries: vec![cretlink_protocol::FileEntry {
+                name: "n".repeat(limits::MAX_NAME_BYTES + 1),
+                kind: cretlink_protocol::FileKind::File,
+                len: 1,
+                modified_ms: None,
+                readonly: false,
+            }],
+            end: true,
+        };
+
+        let answered = answer(&mut sink, session, RequestId(9), out_of_bounds).await;
+
+        assert_eq!(answered, Answer::Failed);
+        let (id, stamped, code, message, stage) = the_error(&sink);
+        assert_eq!((id, stamped), (Some(RequestId(9)), Some(session)));
+        assert_eq!(code, ErrorCode::LimitExceeded);
+        assert_eq!(stage, ErrorStage::Validation);
+        assert_eq!(message, ANSWER_OUT_OF_BOUNDS);
+    }
+
+    // The words that fail such a request are themselves an answer that fits,
+    // whatever the request identifier.
+    #[test]
+    fn the_reason_of_an_answer_that_cannot_be_sent_always_fits() {
+        for (code, reason, stage) in [
+            (
+                ErrorCode::OversizedMessage,
+                ANSWER_TOO_LARGE,
+                ErrorStage::Transport,
+            ),
+            (
+                ErrorCode::LimitExceeded,
+                ANSWER_OUT_OF_BOUNDS,
+                ErrorStage::Validation,
+            ),
+        ] {
+            let encoded = Message::Error {
+                id: Some(RequestId(u64::MAX)),
+                session: Some(SessionId::new()),
+                code,
+                message: reason.to_string(),
+                stage,
+            }
+            .encode()
+            .expect("within the bounds of the wire");
+            assert!(encoded.len() < 1024, "{} bytes", encoded.len());
+            assert!(!reason.contains(['\n', '\r']), "one line: {reason:?}");
+        }
+    }
+
+    // A channel that is gone is a disconnect, for the answer and for the
+    // error that would have failed the request.
+    #[tokio::test]
+    async fn an_answer_on_a_lost_channel_is_a_disconnect() {
+        let mut sink = RecordSink {
+            lost: true,
+            ..RecordSink::default()
+        };
+        let answered = answer(&mut sink, SessionId::new(), RequestId(1), file_data(16)).await;
+        assert_eq!(answered, Answer::Lost);
+        assert!(matches!(answered.step(), AgentStep::Disconnected));
+        assert!(sink.sent.is_empty());
+    }
+
+    // The customer is shown what the console was told: a request whose answer
+    // could not be sent is a failed one, with the reason, and what the unsent
+    // answer said about a file leaving the computer is not kept.
+    #[tokio::test]
+    async fn the_customer_sees_a_request_whose_answer_could_not_be_sent_as_failed() {
+        let session = SessionId::new();
+        let mut sink = RecordSink::default();
+        let mut tap = ReplyTap::new(&mut sink, RequestId(3));
+
+        let answered = answer(
+            &mut tap,
+            session,
+            RequestId(3),
+            file_data(limits::MAX_CHUNK_BYTES),
+        )
+        .await;
+
+        assert_eq!(answered, Answer::Failed);
+        assert_eq!(
+            tap.outcome(),
+            ActionOutcome::Failed {
+                code: ErrorCode::OversizedMessage
+            }
+        );
+        assert_eq!(tap.read, None, "nothing of the file left the computer");
+
+        // An answer that was sent is noted as it always was.
+        let mut tap = ReplyTap::new(&mut sink, RequestId(4));
+        let answered = answer(&mut tap, session, RequestId(4), file_data(64)).await;
+        assert_eq!(answered, Answer::Sent);
+        assert_eq!(tap.outcome(), ActionOutcome::Succeeded);
+        assert_eq!(
+            tap.read,
+            Some(ReadData {
+                len: 64,
+                eof: true,
+                file_len: 64
+            })
         );
     }
 

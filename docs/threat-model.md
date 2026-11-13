@@ -1523,6 +1523,53 @@ adversarial oversized-input tests cover this end to end
 (`crates/protocol/src/tests.rs`) — so an oversized or inconsistent frame is
 rejected rather than buffered (REQ-N-010, ST-M003-007).
 
+The size of one answer is bounded by the channel as well (ST-M010-005). The
+secure channel sends a message in one record of `MAX_RECORD_BYTES` (65519)
+bytes and splits nothing, so an answer whose encoding is longer cannot be
+sent. A folder page was bounded by its number of entries alone
+(`MAX_DIR_PAGE`, 256): a folder of long names — which any program on the
+customer computer can make — gave a page that did not fit, and the agent took
+the failed send for a lost connection and ended the session. Two things
+changed:
+
+- *A folder page fits.* The agent ends a page before the entry that would
+  make its answer larger than one record, and says that more follows; the
+  listing continues after the last name, as it always did. The size is the
+  one the answer has when it is encoded, with the longest request identifier,
+  so a name that the encoding writes longer (a quotation mark or a backslash
+  as two bytes, a control character as six) is counted as it is written. The
+  largest single entry the protocol carries is a small part of a record, so
+  a page that says more follows always holds an entry and a listing always
+  gets further.
+- *An answer that cannot be sent fails its request, not the session.* An
+  answer that is larger than one record, or that breaks a bound of the
+  protocol, is refused before anything of it reaches the wire. The agent
+  then fails that one request with the reason (`oversized_message`, or the
+  category of the bound), in fixed words that hold nothing of the answer
+  (REQ-N-015), and serves the next request. This holds for every kind of
+  answer. Only a channel that is really gone ends the session. The customer
+  sees such a request as failed.
+
+Evidence: `the_counted_size_is_the_size_of_the_real_encoding`,
+`the_real_answer_is_never_longer_than_counted`,
+`a_page_ends_before_the_entry_that_would_not_fit`,
+`the_largest_single_entry_always_fits` and
+`no_character_is_written_longer_than_six_bytes_for_one`
+(`crates/protocol/src/page/tests.rs`);
+`a_folder_of_long_names_is_listed_in_pages_that_fit_one_record`,
+`names_that_the_encoding_writes_longer_are_counted_as_they_are_written` and
+`an_entry_that_fits_no_page_fails_the_listing_instead_of_ending_a_page_empty`
+(`crates/exec/src/fs/tests.rs`);
+`an_answer_larger_than_a_record_fails_its_request_and_the_session_goes_on`,
+`an_answer_that_breaks_a_bound_fails_its_request_and_the_session_goes_on`
+and `a_frame_refused_before_the_wire_is_told_apart_from_a_lost_channel`
+(`crates/session/src/runtime.rs`); and, through a real session,
+`a_folder_of_long_names_is_listed_through_a_session_every_name_exactly_once`
+(600 files; names of 250 characters of three bytes each on Windows, and of 85
+such characters, the longest a name can be, elsewhere) and
+`an_answer_too_large_to_send_fails_its_request_and_the_session_goes_on`
+(`crates/session/tests/e2e.rs`).
+
 *FT-7 — Another program on the customer computer uses CretLink's own
 folders against the elevated program (ST-M006-020).* The staging area is
 where the elevated program acts on its own records: a cleanup removes the
@@ -2049,6 +2096,13 @@ guessed (REQ-N-006, REQ-N-008). Evidence:
 - Resource limits are robustness bounds, not quotas. An authorised session can
   still legitimately fill a disk with a large installer; limits exist to stop
   unbounded or accidental exhaustion, not to police approved work.
+- Only a folder page is built to fit one record of the secure channel. Other
+  answers can still be larger than a record within the bounds of the
+  protocol: a list of very many jobs or staged files, a cleanup report that
+  names very many files, a file read of more bytes than a record carries, a
+  large screenshot, a long clipboard text. Such a request fails with the
+  reason and the session goes on (ST-M010-005), but its answer cannot be had
+  that way. The transfer engine asks for file content in chunks that fit.
 - A removed folder is gone. The removal does not use a recycle bin and cannot
   be undone; the operation removes what it is asked to remove, and any
   question before it is the calling screen's. The defence is consent, the
