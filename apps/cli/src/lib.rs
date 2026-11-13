@@ -230,9 +230,7 @@ async fn recover_command(program: &str, remove: bool) -> ExitCode {
         "{}",
         recovery::identity_text(program, &cretlink_support_agent::current_identity())
     );
-    let store = cretlink_support_agent::TicketStore::new(
-        cretlink_support_agent::default_ticket_store_path(),
-    );
+    let store = cretlink_support_agent::TicketStore::for_this_process();
     let run = recovery::run_recover(program, remove, &store).await;
     print!("{}", run.text);
     if run.success {

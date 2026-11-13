@@ -40,6 +40,9 @@ pub mod sysinfo;
 #[cfg(windows)]
 pub mod dpapi;
 
+/// The Windows folder as the system names it, for a customer-side program that
+/// starts a program of Windows by its full path (ST-M006-020).
+pub use cretlink_exec::windows_folder;
 pub use driver::{DriverError, EventContext, EventOutcome, apply_session_event};
 pub use inventory::{
     Inventory, OwnedResource, RecoveryFailure, RecoveryReport, ResourceKind, UnreadableKind,
@@ -49,7 +52,7 @@ pub use privilege::{EffectiveIdentity, IntegrityLevel, current_identity, integri
 pub use reboot_resume::{
     TicketStore, VaultArmer, default_ticket_store_path, reboot_resume_arming_disclosure,
 };
-pub use recovery::{RecoverRun, run_recover, sweep_stale_staging};
+pub use recovery::{RecoverRun, removal_needs_administrator, run_recover, sweep_stale_staging};
 pub use state::{AgentError, AgentPhase, AgentState, StopReason, VisibleStatus};
 
 #[cfg(windows)]

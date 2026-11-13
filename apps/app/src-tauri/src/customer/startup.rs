@@ -18,8 +18,13 @@
 //! sweep kept files it could not remove, the view carries a
 //! [`StartupCleanupView`] and the customer screen says so in plain words with
 //! the recovery command ([`recovery_command`]), written so that it runs as
-//! shown in an administrator Windows PowerShell: never a silent success
-//! (REQ-N-008).
+//! shown in Windows PowerShell: never a silent success (REQ-N-008).
+//!
+//! A process with administrator rights keeps its files where only
+//! administrators can write, a process without them in the folder of its
+//! account, and the recovery command covers the place of the kind that runs
+//! it (ST-M006-020). So the notice says whether the command is to be run as
+//! administrator ([`StartupCleanupView::administrator`]).
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -36,24 +41,35 @@ use super::{AGENT_VIEW_EVENT, AppState};
 pub struct StartupCleanupView {
     /// How many files were kept.
     pub failed: usize,
-    /// The command that removes them, runnable as written in an
-    /// administrator Windows PowerShell: the full path of `cretlink-cli.exe`
+    /// The command that removes them, runnable as written in Windows
+    /// PowerShell: the full path of `cretlink-cli.exe`
     /// when it sits next to this program, else of this program itself
     /// (`cretlink.exe` or the `CretLink-Support*` copy), see
     /// [`recovery_command`].
     pub command: String,
+    /// Whether the command is to be run in a PowerShell opened as
+    /// administrator: what was kept lies where only administrators can write,
+    /// or is the folder of an earlier release. Otherwise it lies in the folder
+    /// of this account, where a run as administrator would not look.
+    pub administrator: bool,
 }
 
 /// Maps a sweep report to the notice the customer sees: `None` when nothing
-/// was kept, whatever was removed.
+/// was kept, whatever was removed. `administrator` says whether removing what
+/// was kept takes a run as administrator.
 #[must_use]
-pub(crate) fn notice(report: &StartupSweepReport, command: String) -> Option<StartupCleanupView> {
+pub(crate) fn notice(
+    report: &StartupSweepReport,
+    command: String,
+    administrator: bool,
+) -> Option<StartupCleanupView> {
     if report.ok() {
         return None;
     }
     Some(StartupCleanupView {
         failed: report.failed.len(),
         command,
+        administrator,
     })
 }
 
@@ -72,8 +88,8 @@ fn powershell_literal(path: &Path) -> String {
     quoted
 }
 
-/// The recovery command for the program at `exe`, runnable as written in an
-/// administrator Windows PowerShell (ST-M009-010):
+/// The recovery command for the program at `exe`, runnable as written in
+/// Windows PowerShell (ST-M009-010):
 ///
 /// - `& '<folder>\cretlink-cli.exe' recover --remove` when `cretlink-cli.exe`
 ///   sits next to it: a console program, so PowerShell waits for it and shows
@@ -157,7 +173,8 @@ impl StartupSweep {
         tauri::async_runtime::spawn(async move {
             let (report, share) = cretlink_support_agent::sweep_stale_staging().await;
             *in_use.lock().unwrap_or_else(PoisonError::into_inner) = share;
-            if let Some(view) = notice(&report, command()) {
+            let administrator = cretlink_support_agent::removal_needs_administrator(&report);
+            if let Some(view) = notice(&report, command(), administrator) {
                 let mut session = super::lock(&shared);
                 session.startup_cleanup = Some(view);
                 let _ = app.emit(AGENT_VIEW_EVENT, session.view());
@@ -189,14 +206,18 @@ mod tests {
 
     #[test]
     fn a_clean_sweep_shows_nothing_even_after_removing() {
-        assert_eq!(notice(&StartupSweepReport::default(), "x".to_owned()), None);
+        assert_eq!(
+            notice(&StartupSweepReport::default(), "x".to_owned(), true),
+            None
+        );
         let removed = StartupSweepReport {
             sessions_scanned: 2,
             sessions_removed: 2,
             artifacts_removed: 5,
+            foreign_removed: 0,
             failed: vec![],
         };
-        assert_eq!(notice(&removed, "x".to_owned()), None);
+        assert_eq!(notice(&removed, "x".to_owned(), true), None);
     }
 
     #[test]
@@ -207,15 +228,20 @@ mod tests {
         };
         let command = "& 'C:\\x\\cretlink-cli.exe' recover --remove".to_owned();
         assert_eq!(
-            notice(&report, command.clone()),
+            notice(&report, command.clone(), true),
             Some(StartupCleanupView {
                 failed: 2,
                 command: command.clone(),
+                administrator: true,
             })
         );
-        let json = serde_json::to_value(notice(&report, command.clone())).unwrap_or_default();
+        let json =
+            serde_json::to_value(notice(&report, command.clone(), false)).unwrap_or_default();
         assert_eq!(json["failed"], 2);
         assert_eq!(json["command"], command.as_str());
+        // What a process without administrator rights kept lies in the folder
+        // of its account: the command is then not run as administrator.
+        assert_eq!(json["administrator"], false);
     }
 
     #[test]

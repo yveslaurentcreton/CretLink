@@ -1150,6 +1150,7 @@ mod tests {
         let kept = StartupCleanupView {
             failed: 3,
             command: "& 'C:\\x\\cretlink.exe' recover --remove | Out-Host".to_owned(),
+            administrator: true,
         };
         session.startup_cleanup = Some(kept.clone());
         let (tx, _rx) = session_driver::intent_channel();

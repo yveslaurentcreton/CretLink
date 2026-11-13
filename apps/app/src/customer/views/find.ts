@@ -145,7 +145,9 @@ export function leftovers(s: CustomerSnapshot): HTMLElement | null {
       "p",
       null,
       h("b", null, `${files} from an earlier CretLink session could not be removed. `),
-      "They stay on this computer until they are removed. To remove them, open Windows PowerShell as administrator and run: ",
+      `They stay on this computer until they are removed. To remove them, open Windows PowerShell${
+        cleanup.administrator ? " as administrator" : ""
+      } and run: `,
       h("code", null, cleanup.command),
     ),
   );

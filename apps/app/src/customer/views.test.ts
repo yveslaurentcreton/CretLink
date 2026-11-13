@@ -188,17 +188,26 @@ describe("choose your technician (#c-find)", () => {
     // One file, next to the console build.
     const command = "& 'C:\\Program Files\\CretLink\\cretlink-cli.exe' recover --remove";
     const one = show("find", {
-      view: viewIn({ phase: "idle" }, { startup_cleanup: { failed: 1, command } }),
+      view: viewIn({ phase: "idle" }, { startup_cleanup: { failed: 1, command, administrator: true } }),
     });
     expect(text(one.querySelector(".leftovers"))).toContain("1 file from an earlier CretLink session");
     expect(text(one.querySelector(".leftovers code"))).toBe(command);
+    // What a window without administrator rights kept lies in the folder of
+    // its account: the command is then not to be run as administrator.
+    const own = show("find", {
+      view: viewIn({ phase: "idle" }, { startup_cleanup: { failed: 1, command, administrator: false } }),
+    });
+    expect(text(own.querySelector(".leftovers"))).toContain(
+      "To remove them, open Windows PowerShell and run: ",
+    );
+    expect(text(own.querySelector(".leftovers"))).not.toContain("as administrator");
     // Nothing kept: no notice.
     expect(show("find").querySelector(".leftovers")).toBeNull();
   });
 
   it("writes the recovery command as text, never as markup", () => {
     const root = show("find", {
-      view: viewIn({ phase: "idle" }, { startup_cleanup: { failed: 1, command: XSS } }),
+      view: viewIn({ phase: "idle" }, { startup_cleanup: { failed: 1, command: XSS, administrator: true } }),
     });
     expect(root.querySelector(".leftovers img, .leftovers script")).toBeNull();
     expect(root.querySelector(".leftovers code")?.textContent).toBe(XSS);
