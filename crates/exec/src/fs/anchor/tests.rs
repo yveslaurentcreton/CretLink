@@ -314,6 +314,7 @@ mod windows {
     const FILE_READ_DATA: u32 = 0x0001;
     const FILE_WRITE_DATA: u32 = 0x0002;
     const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const FILE_TRAVERSE: u32 = 0x0020;
     const DELETE: u32 = 0x0001_0000;
     const SHARE_ALL: u32 = 0x0007;
 
@@ -619,14 +620,19 @@ mod windows {
     }
 
     /// A folder that another program has open in a way that excludes its
-    /// removal — as its working folder — is still taken up and held; the
-    /// removal is tried again at the end and says that the folder is in use.
+    /// removal — as its working folder — is still taken up; the removal is
+    /// tried again at the end and says that the folder is in use.
     #[test]
     fn a_folder_another_program_holds_is_taken_up_and_reported_in_use() {
-        // FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_FLAG_BACKUP_SEMANTICS.
+        // As a program opens its working folder: with the right to pass
+        // through it, shared for reading and writing but not for removal
+        // (FILE_SHARE_READ | FILE_SHARE_WRITE), FILE_FLAG_BACKUP_SEMANTICS.
+        // The right matters: Windows applies the share mode of a handle only
+        // when the handle may read, write or delete, so a handle that may
+        // only read attributes would exclude nothing.
         let other = |path: &Path| {
             std::fs::OpenOptions::new()
-                .access_mode(FILE_READ_ATTRIBUTES)
+                .access_mode(FILE_TRAVERSE)
                 .share_mode(0x0003)
                 .custom_flags(0x0200_0000)
                 .open(path)

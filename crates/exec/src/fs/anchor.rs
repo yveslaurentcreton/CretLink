@@ -78,8 +78,14 @@ pub(super) enum Hold {
         )
     )]
     Shared,
-    /// For removing the folder. For as long as it is held nobody else renames
-    /// or removes it, and the right to remove it is asked for with it.
+    /// For removing the folder. The right to remove it is asked for with it,
+    /// and for as long as a folder is held with that right nobody else
+    /// renames or removes it. A folder that does not grant the right, or that
+    /// another program has open in a way that excludes it, is taken up
+    /// without it: such a handle keeps nobody from anything, the work inside
+    /// the folder goes through it all the same, and the folder itself is
+    /// removed at the end only if what lies at its path is still the folder
+    /// that was taken up.
     ForRemoval,
 }
 
@@ -363,7 +369,9 @@ mod sys {
 
     /// Others may read and change what is in a folder, but not rename or
     /// remove the folder itself: both need the right to delete, which this
-    /// share mode keeps from every other handle.
+    /// share mode keeps from every other handle. Windows applies a share mode
+    /// only for a handle that itself may read, write or delete; on a handle
+    /// that may only read attributes it keeps nobody from anything.
     const SHARE_HELD: u32 = FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0;
 
     // Windows error codes that say the extended form of a removal or a rename
@@ -725,16 +733,20 @@ mod sys {
         }
     }
 
-    /// Opens a folder that is to be removed and holds it: with the right to
-    /// remove it where that is granted, and in every case without letting
-    /// anybody else rename or remove it meanwhile. Returns the handle and
-    /// whether it carries the right to remove.
+    /// Opens a folder that is to be removed: with the right to remove it
+    /// where that is granted, and then without letting anybody else rename or
+    /// remove it meanwhile. Where the right is not to be had the folder is
+    /// opened without it, and that handle holds nothing: the folder can be
+    /// renamed or removed by others meanwhile, which [`Folder::remove`]
+    /// finds out before it removes anything. Returns the handle and whether
+    /// it carries the right to remove.
     fn open_held(path: &Path) -> io::Result<(File, bool)> {
         match open_for_removal(path, SHARE_HELD) {
             Ok(handle) => Ok((handle, true)),
             // The right to remove is denied, or another program has the
             // folder open in a way that excludes its removal: the folder is
-            // held without that right, and its content can still be removed.
+            // taken up without that right, and its content can still be
+            // removed through the handle.
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied || excluded(&error) => {
                 open_entry(path, FILE_READ_ATTRIBUTES.0, SHARE_HELD).map(|handle| (handle, false))
             }

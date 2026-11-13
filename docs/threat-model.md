@@ -1735,12 +1735,17 @@ activity view or the audit log. Mitigations:
   symbolic link does not compare equal and is refused as `invalid_path`
   before anything is removed; so is a path on a drive made with `subst` and
   one on a network drive, whose real location is not the path that was asked.
-  The step then holds the folder: for as long as it runs, nobody else renames
-  or removes it. A link in the place of the folder itself is removed as a
-  link, by the first step of a removal only. The root of a drive is refused,
-  judged from the path and again from where the opened folder lies, and the
-  path of the request passes the same rules as every remote path on both ends
-  (FT-1).
+  A step that is granted the right to remove the folder then holds it: for
+  as long as the step runs, nobody else renames or removes it. A folder that
+  another program has open in a way that excludes its removal, its working
+  folder for example, is taken up without that right and is not held: what
+  the step removes in it is still checked entry by entry, and the folder
+  itself is opened once more at the end and removed only if it is still the
+  folder that was taken up. A link in the place of the folder itself is
+  removed as a link, by the first step of a removal only. The root of a drive
+  is refused, judged from the path and again from where the opened folder
+  lies, and the path of the request passes the same rules as every remote
+  path on both ends (FT-1).
 - *One removal, one folder.* Between two steps the agent holds nothing, and
   the folder could be swapped for another. An answer that says more remains
   therefore names the folder by its identity — its volume and its file
@@ -1760,7 +1765,9 @@ activity view or the audit log. Mitigations:
   The paths of the entries are built from the folder's verified location in a
   form that Windows does not rewrite, so a name that ends in a dot or a space,
   or the name of a device such as `nul`, names the entry of that very name.
-  The folder itself is removed through the hold the step has on it.
+  The folder itself is removed through the hold the step has on it, or,
+  where it could not be held, through a second open that is compared with
+  the folder that was taken up.
 - *Bounded steps.* One request meets at most `MAX_TREE_STEP_ENTRIES` (4096)
   entries — one it removes, one it cannot remove, one that is gone by the time
   it reaches for it, a folder it enters — and answers after
