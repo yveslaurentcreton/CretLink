@@ -50,6 +50,8 @@ use tauri::{AppHandle, Emitter, State};
 
 // The local MCP bridge for the rail (ST-M009-008).
 mod bridge;
+// The file explorer of the live session (ST-M010-002).
+mod explorer;
 // The session history and the audit files (ST-M009-012).
 mod history;
 // This computer's operating system by name (ST-M009-008).
@@ -105,6 +107,9 @@ pub struct AppState {
     /// change of network can wait until the old listener is gone before it
     /// starts the new one (ST-M009-016).
     pump: PumpSlot,
+    /// The folder listing the file explorer is waiting for, so that the next
+    /// place the technician opens can leave it (ST-M010-002).
+    listings: explorer::Listings,
 }
 
 /// The slot of [`AppState::pump`].
@@ -133,6 +138,7 @@ impl AppState {
             bridge: bridge::BridgeSlot::default(),
             network: network::NetworkChoice::default(),
             pump: PumpSlot::default(),
+            listings: explorer::Listings::default(),
         }
     }
 
@@ -152,6 +158,7 @@ impl AppState {
             bridge: bridge::BridgeSlot::default(),
             network: network::NetworkChoice::default(),
             pump: PumpSlot::default(),
+            listings: explorer::Listings::default(),
         }
     }
 
@@ -166,6 +173,20 @@ impl AppState {
     /// keeps no lock across the subsequent `.await`.
     fn service(&self) -> Option<ConsoleSessionService> {
         lock_service(&self.service).clone()
+    }
+
+    /// The live session's service and its audit sink, for the technician's own
+    /// file actions (ST-M010-002): both exist only while a session is under
+    /// full control. Without either there is no consented session to act on,
+    /// or no trail to record the action in, and the action is refused.
+    fn files(&self) -> Option<(ConsoleSessionService, ChannelAudit)> {
+        let service = self.service()?;
+        let audit = self
+            .audit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        Some((service, audit))
     }
 
     /// Sends a technician [`Intent`] to the running pump task, if a session is
@@ -966,6 +987,8 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         term_input,
         term_resize,
         term_close,
+        explorer::explorer_drives,
+        explorer::explorer_open,
         history::list_sessions,
         history::open_audit,
         history::get_session_audit,
@@ -992,6 +1015,8 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         term_input,
         term_resize,
         term_close,
+        explorer::explorer_drives,
+        explorer::explorer_open,
         history::list_sessions,
         history::open_audit,
         history::get_session_audit,
