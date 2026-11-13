@@ -16,20 +16,39 @@
 //   empty folder, a list cut short, a place that was refused, a session that
 //   ended. Nothing looks like an empty folder that is not one.
 //
+// - **What it changes** (the second part): buttons to upload, download,
+//   rename and delete, the same actions as the context menu and the keys; a
+//   question before a name is replaced and before anything is deleted; the
+//   transfer queue with what did not arrive first; and what could not be
+//   done, entry by entry with its reason.
+//
 // Every name, path and label comes from the customer computer and becomes a
 // text node through `h()`, never markup (REQ-S-016, REQ-S-018). Rows carry no
 // `data-action`: the controller reads clicks and keys on the grid itself.
 
-import type { ActivityEntry, ExplorerDrive, ExplorerEntry } from "../../shared/contract";
+import type {
+  ActivityEntry,
+  ExplorerDrive,
+  ExplorerEntry,
+  TransferEntry,
+} from "../../shared/contract";
 import { type Child, h } from "../../shared/dom";
 import { type IconName, icon } from "../../shared/icons";
 import {
+  type ConflictQuestion,
+  type DeleteQuestion,
   type ExplorerState,
   type SortKey,
+  actionsFor,
+  canChange,
   crumbs,
+  deleteWords,
+  directionWords,
   driveKindWords,
   driveName,
   indexOfKey,
+  isOpen,
+  kindWord,
   layoutOf,
   menuItems,
   modifiedWords,
@@ -37,9 +56,15 @@ import {
   placeText,
   placeWords,
   positionOf,
+  queueRows,
+  queueWords,
+  removalWords,
   rowCount,
+  selectedKeys,
   sizeWords,
   statusWords,
+  transferPercent,
+  transferWords,
   typeWords,
   visibleRange,
 } from "../explorer";
@@ -106,6 +131,59 @@ function toolbar(x: ExplorerState, host: string): HTMLElement {
         ),
       ),
     ),
+  );
+}
+
+/** The actions of the selection as buttons, by the action each dispatches. */
+const ACTION_BUTTONS: ReadonlyArray<{ action: string; icon?: IconName; danger?: boolean }> = [
+  { action: "xp-download" },
+  { action: "xp-download-to" },
+  { action: "xp-rename", icon: "pencil" },
+  { action: "xp-delete", icon: "trash", danger: true },
+];
+
+/**
+ * The buttons that change something: upload to the open folder, and download,
+ * rename and delete for the selection. They are the actions of the context
+ * menu (`actionsFor`), so a button and its menu entry are always the same
+ * action with the same key.
+ */
+function actionBar(x: ExplorerState): HTMLElement {
+  const actions = actionsFor(x, selectedKeys(x));
+  const open = x.menu?.only === "upload";
+  return h(
+    "div",
+    { class: "xp-actions", role: "toolbar", "aria-label": "Send, copy and change" },
+    h(
+      "button",
+      {
+        type: "button",
+        class: "btn sm",
+        id: "xp-upload",
+        "data-action": "xp-upload",
+        "aria-haspopup": "menu",
+        "aria-expanded": open ? "true" : "false",
+        disabled: !canChange(x),
+      },
+      "Upload…",
+    ),
+    ACTION_BUTTONS.map((spec) => {
+      const action = actions.find((item) => item.action === spec.action);
+      if (!action) return null;
+      return h(
+        "button",
+        {
+          type: "button",
+          class: spec.danger ? "btn sm danger-quiet" : "btn sm",
+          "data-action": action.action,
+          "aria-keyshortcuts": action.keys,
+          disabled: action.disabled,
+        },
+        spec.icon ? icon(spec.icon, "sm") : null,
+        action.label,
+        action.keys ? h("kbd", { "aria-hidden": "true" }, action.keys) : null,
+      );
+    }),
   );
 }
 
@@ -197,10 +275,49 @@ function pathField(x: ExplorerState, host: string): HTMLElement {
   );
 }
 
-/** The refusal of a place, or the end of the session, as an assertive alert. */
+/**
+ * What could not be done, or the end of the session, as an assertive alert.
+ * A change that did not happen is shown first, then a place that did not
+ * open; once they are dismissed, the end of the session stands there.
+ */
 function alertRegion(x: ExplorerState): HTMLElement {
   const region = h("div", { class: "alert xp-alert", role: "alert", id: "xp-alert" });
-  if (x.ended !== undefined) {
+  const refusal = x.problem ?? x.refusal;
+  if (refusal) {
+    region.append(
+      icon("alert"),
+      h(
+        "div",
+        { class: "alert-body" },
+        h("b", null, refusal.title),
+        h("p", null, refusal.message),
+        refusal.details && refusal.details.length > 0
+          ? h(
+              "ul",
+              { class: "xp-details" },
+              refusal.details.map((detail) =>
+                h(
+                  "li",
+                  null,
+                  h("code", { class: "mono" }, detail.path),
+                  h("span", null, ` — ${detail.reason}`),
+                ),
+              ),
+              refusal.more
+                ? h("li", { class: "more" }, `and ${refusal.more} more that could not be removed`)
+                : null,
+            )
+          : null,
+        h("p", { class: "next" }, refusal.next),
+      ),
+      h(
+        "button",
+        { type: "button", class: "btn sm ghost", "data-action": "xp-dismiss" },
+        "Dismiss",
+      ),
+    );
+  } else if (x.ended !== undefined) {
+    const stopped = x.transfers.filter((entry) => entry.state === "stopped").length;
     region.append(
       icon("alert"),
       h(
@@ -208,22 +325,15 @@ function alertRegion(x: ExplorerState): HTMLElement {
         { class: "alert-body" },
         h("b", null, "Browsing has stopped"),
         h("p", null, x.ended),
-      ),
-    );
-  } else if (x.refusal) {
-    region.append(
-      icon("alert"),
-      h(
-        "div",
-        { class: "alert-body" },
-        h("b", null, x.refusal.title),
-        h("p", null, x.refusal.message),
-        h("p", { class: "next" }, x.refusal.next),
-      ),
-      h(
-        "button",
-        { type: "button", class: "btn sm ghost", "data-action": "xp-dismiss" },
-        "Dismiss",
+        stopped > 0
+          ? h(
+              "p",
+              { class: "next" },
+              stopped === 1
+                ? "1 transfer was stopped and is not complete."
+                : `${stopped} transfers were stopped and are not complete.`,
+            )
+          : null,
       ),
     );
   }
@@ -285,12 +395,25 @@ const KIND_ICON: Record<ExplorerEntry["kind"], IconName> = {
   other: "file",
 };
 
-function nameCell(iconName: IconName, name: string, kind: string): HTMLElement {
+function nameCell(iconName: IconName, name: string, kind: string, renaming = false): HTMLElement {
   return h(
     "div",
     { class: "xp-cell name", role: "gridcell", "aria-colindex": 1 },
     h("span", { class: `xp-icon ${kind}` }, icon(iconName, "sm")),
-    h("span", { class: "xp-name", title: name }, name),
+    renaming
+      ? // The name as a field: Enter renames, Escape leaves it as it is.
+        h("input", {
+          type: "text",
+          id: "xp-rename-input",
+          class: "xp-rename mono",
+          value: name,
+          spellcheck: "false",
+          autocomplete: "off",
+          autocapitalize: "off",
+          "aria-label": `New name for ${name}`,
+          "aria-describedby": "xp-rename-hint",
+        })
+      : h("span", { class: "xp-name", title: name }, name),
   );
 }
 
@@ -302,8 +425,8 @@ function cell(index: number, text: string, numeric = false): HTMLElement {
   );
 }
 
-function entryCells(entry: ExplorerEntry, details: boolean): Child[] {
-  const name = nameCell(KIND_ICON[entry.kind], entry.name, entry.kind);
+function entryCells(entry: ExplorerEntry, details: boolean, renaming: boolean): Child[] {
+  const name = nameCell(KIND_ICON[entry.kind], entry.name, entry.kind, renaming);
   if (!details) return [name];
   return [
     name,
@@ -377,7 +500,11 @@ export function explorerRows(x: ExplorerState): HTMLElement {
           "data-row": key,
           style: details ? `top:${top}px` : `top:${top}px;left:${left}px`,
         },
-        drive ? driveCells(drive, details) : entry ? entryCells(entry, details) : null,
+        drive
+          ? driveCells(drive, details)
+          : entry
+            ? entryCells(entry, details, x.renaming === key)
+            : null,
       ),
     );
   }
@@ -497,11 +624,13 @@ function menu(x: ExplorerState): HTMLElement | null {
   if (!x.menu) return null;
   const keys = x.menu.keys;
   const label =
-    keys.length === 0
-      ? `Actions for ${placeWords(x.place)}`
-      : keys.length === 1
-        ? `Actions for ${keys[0] ?? ""}`
-        : `Actions for ${keys.length} items`;
+    x.menu.only === "upload"
+      ? `Upload to ${placeWords(x.place)}`
+      : keys.length === 0
+        ? `Actions for ${placeWords(x.place)}`
+        : keys.length === 1
+          ? `Actions for ${keys[0] ?? ""}`
+          : `Actions for ${keys.length} items`;
   return h(
     "ul",
     {
@@ -514,7 +643,7 @@ function menu(x: ExplorerState): HTMLElement | null {
     menuItems(x).map((item) =>
       h(
         "li",
-        { role: "none" },
+        { role: "none", class: item.separated ? "sep" : null },
         h(
           "button",
           {
@@ -532,14 +661,154 @@ function menu(x: ExplorerState): HTMLElement | null {
   );
 }
 
+/**
+ * The files sent and received this session that the activity knows of and the
+ * queue does not show: those of the AI, and any of the technician's that are
+ * not in the queue.
+ */
 function fileEntries(s: TechnicianSnapshot): ActivityEntry[] {
-  return s.activity.filter(
-    (e) => e.entry === "item" && (e.item.kind === "file_sent" || e.item.kind === "file_received"),
+  const queued = new Set<string>();
+  for (const entry of s.explorer.transfers) queued.add(`${entry.direction}|${entry.remote}`);
+  return s.activity.filter((e) => {
+    if (e.entry !== "item") return false;
+    const item = e.item;
+    if (item.kind !== "file_sent" && item.kind !== "file_received") return false;
+    if (item.source !== "technician" || item.path === undefined) return true;
+    return !queued.has(`${item.kind === "file_received" ? "send" : "download"}|${item.path}`);
+  });
+}
+
+const STATE_CLASS: Record<TransferEntry["state"], string> = {
+  waiting: "res wait",
+  running: "res run",
+  done: "res done",
+  failed: "res fail",
+  cancelled: "res stop",
+  left_out: "res fail",
+  stopped: "res fail",
+  listed: "res",
+};
+
+/** The state of a transfer, in words; the colour only repeats them. */
+function stateBadge(entry: TransferEntry): HTMLElement {
+  const words = transferWords(entry);
+  switch (entry.state) {
+    case "running":
+      return h(
+        "span",
+        { class: STATE_CLASS.running },
+        h("span", { class: "spinner xs", "aria-hidden": "true" }),
+        words,
+      );
+    case "done":
+      return h("span", { class: STATE_CLASS.done }, icon("check"), words);
+    case "waiting":
+      return h("span", { class: STATE_CLASS.waiting }, words);
+    default:
+      return h("span", { class: STATE_CLASS[entry.state] }, icon("x"), words);
+  }
+}
+
+/** One transfer of the queue: what, which way, how far, and why not. */
+function queueRow(entry: TransferEntry): HTMLElement {
+  const send = entry.direction === "send";
+  const percent = transferPercent(entry);
+  return h(
+    "li",
+    { class: `it q ${entry.state}`, "data-key": `q-${entry.id}` },
+    h("span", { class: send ? "k" : "k out" }, icon(send ? "in" : "out")),
+    h(
+      "div",
+      { class: "file-text" },
+      h("b", { class: "mono" }, entry.name),
+      h(
+        "div",
+        { class: "m" },
+        stateBadge(entry),
+        h("span", { class: send ? "who sys" : "flag" }, directionWords(entry)),
+      ),
+      entry.state === "running" && entry.kind === "file" && percent !== undefined
+        ? h("progress", {
+            class: "xp-progress",
+            max: 100,
+            value: percent,
+            "aria-label": `${entry.name}: ${percent}%`,
+          })
+        : null,
+      entry.reason ? h("p", { class: "why" }, entry.reason) : null,
+      entry.remote
+        ? h(
+            "code",
+            { class: "path", title: entry.remote },
+            h("span", { class: "sr-only" }, "On the customer computer: "),
+            entry.remote,
+          )
+        : null,
+      !send && entry.local
+        ? h(
+            "code",
+            { class: "path", title: entry.local },
+            h("span", { class: "sr-only" }, "On this computer: "),
+            entry.local,
+          )
+        : null,
+    ),
+    isOpen(entry)
+      ? button("Cancel", "xp-cancel-transfer", {
+          arg: String(entry.id),
+          variant: "sm ghost",
+          label: `Cancel ${entry.name}`,
+        })
+      : null,
+    !send && entry.kind === "file" && entry.state === "done"
+      ? button("Show in folder", "xp-show-folder", {
+          arg: String(entry.id),
+          variant: "sm",
+          label: `Show ${entry.name} in its folder`,
+        })
+      : null,
   );
 }
 
-/** The files sent and received this session, newest first (ST-M009-008). */
+function more(key: string, text: string): HTMLElement {
+  return h("li", { class: "it more", "data-key": key }, text);
+}
+
+/**
+ * The transfer queue: what did not arrive first, with the reason, then what
+ * runs and waits, then what ended. Each part draws a bounded number of rows
+ * and counts the rest.
+ */
+function queue(entries: readonly TransferEntry[]): HTMLElement | null {
+  if (entries.length === 0) return null;
+  const rows = queueRows(entries);
+  const list = h("ul", { class: "list files queue", id: "xp-queue", "aria-label": "Transfers of the explorer" });
+  for (const entry of rows.attention) list.append(queueRow(entry));
+  if (rows.attentionMore > 0) {
+    list.append(more("q-more-attention", `and ${rows.attentionMore} more that did not arrive`));
+  }
+  for (const entry of rows.running) list.append(queueRow(entry));
+  for (const entry of rows.waiting) list.append(queueRow(entry));
+  if (rows.waitingMore > 0) list.append(more("q-more-waiting", `and ${rows.waitingMore} more waiting`));
+  for (const entry of rows.finished) list.append(queueRow(entry));
+  if (rows.finishedMore > 0) {
+    list.append(
+      more(
+        "q-more-finished",
+        `and ${rows.finishedMore} earlier ones; the Audit tab lists every transfer`,
+      ),
+    );
+  }
+  return list;
+}
+
+/**
+ * The transfers of this session: the explorer's queue, and under it the
+ * files sent and received that the activity knows of besides, newest first
+ * (ST-M009-008).
+ */
 function transfers(s: TechnicianSnapshot): HTMLElement {
+  const queued = s.explorer.transfers;
   const files = fileEntries(s);
   const rows = h("ul", { class: "list files" });
   for (let i = files.length - 1; i >= 0; i -= 1) {
@@ -570,14 +839,184 @@ function transfers(s: TechnicianSnapshot): HTMLElement {
       ),
     );
   }
+  const open = queued.filter(isOpen).length;
   return h(
     "section",
     { class: "xp-transfers", "aria-labelledby": "xp-transfers-h" },
-    h("h3", { class: "xp-h", id: "xp-transfers-h" }, "Transfers"),
+    h(
+      "div",
+      { class: "xp-transfers-head" },
+      h("h3", { class: "xp-h", id: "xp-transfers-h" }, "Transfers"),
+      queued.length > 0 ? h("span", { class: "xp-queue-words", id: "xp-queue-words" }, queueWords(queued)) : null,
+      open > 0
+        ? button(open === 1 ? "Cancel" : "Cancel all", "xp-cancel-transfers", {
+            variant: "sm ghost",
+            label: open === 1 ? "Cancel the transfer" : `Cancel all ${open} transfers`,
+          })
+        : null,
+    ),
+    queue(queued),
     files.length === 0
-      ? h("p", { class: "muted" }, "No files were sent or received in this session.")
+      ? queued.length === 0
+        ? h("p", { class: "muted" }, "No files were sent or received in this session.")
+        : null
       : rows,
   );
+}
+
+/** The delete that runs, with the way to cancel it. */
+function removalNote(x: ExplorerState): HTMLElement | null {
+  if (!x.removal) return null;
+  return h(
+    "div",
+    { class: "note xp-note", role: "status", id: "xp-removal" },
+    h("span", { class: "spinner xs", "aria-hidden": "true" }),
+    h("p", null, removalWords(x.removal)),
+    button("Cancel", "xp-cancel-delete", {
+      variant: "sm",
+      label: "Cancel the delete",
+      disabled: x.removal.cancelling === true,
+    }),
+  );
+}
+
+/** Where a drop goes, while files are dragged over the window. */
+function dropTarget(x: ExplorerState): HTMLElement | null {
+  if (!x.dropping) return null;
+  return h(
+    "div",
+    { class: canChange(x) ? "xp-drop" : "xp-drop no", id: "xp-drop" },
+    h(
+      "p",
+      null,
+      canChange(x)
+        ? `Drop to send to ${placeWords(x.place)}`
+        : "Open a folder first: files are sent to the folder that is open.",
+    ),
+  );
+}
+
+/** A name that is taken: replace, keep both or skip. */
+function conflictDialog(q: ConflictQuestion, host: string): HTMLElement | null {
+  const conflict = q.conflicts[q.at];
+  if (!conflict) return null;
+  const send = q.direction === "send";
+  const rest = q.conflicts.length - q.at - 1;
+  const folder = conflict.kind === "folder";
+  const there = kindWord(conflict.existing);
+  const replaceWords = !conflict.replace
+    ? `Replace is not offered: a ${kindWord(conflict.kind)} cannot take the place of a ${there}.`
+    : folder
+      ? `Replace ${send ? "sends" : "copies"} into the folder that is there: files of the same name are replaced, everything else in it stays.`
+      : `Replace puts the one you are ${send ? "sending" : "copying"} in its place.`;
+  return h(
+    "div",
+    { class: "xp-scrim", "data-key": "xp-question" },
+    h(
+      "div",
+      {
+        class: "xp-dialog card",
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-labelledby": "xp-question-title",
+        "aria-describedby": "xp-question-text",
+        id: "xp-question",
+      },
+      h(
+        "h3",
+        { id: "xp-question-title" },
+        `A ${there} named ${conflict.name} is already there`,
+      ),
+      h(
+        "div",
+        { id: "xp-question-text", class: "xp-question-text" },
+        h(
+          "p",
+          null,
+          send ? `In ${q.where} on ${host}.` : `In ${q.where} on this computer.`,
+        ),
+        h("p", null, replaceWords),
+        h(
+          "p",
+          null,
+          `Keep both gives the new one another name, such as ${folder ? `${conflict.name} (2)` : "name (2).ext"}. Skip leaves it out.`,
+        ),
+        q.conflicts.length > 1
+          ? h("p", { class: "muted" }, `Name ${q.at + 1} of ${q.conflicts.length} that is taken.`)
+          : null,
+      ),
+      rest > 0
+        ? // A button that stays pressed, like every control of the explorer a
+          // native button: the next choice then holds for what follows.
+          h(
+            "button",
+            {
+              type: "button",
+              class: q.all ? "btn sm xp-all on" : "btn sm xp-all",
+              id: "xp-conflict-all",
+              "data-action": "xp-conflict-all",
+              "aria-pressed": q.all ? "true" : "false",
+            },
+            q.all ? icon("check", "sm") : null,
+            `Do the same for the next ${rest === 1 ? "name" : `${rest} names`} that ${rest === 1 ? "is" : "are"} taken`,
+          )
+        : null,
+      h(
+        "div",
+        { class: "row end" },
+        button(send ? "Cancel the upload" : "Cancel the download", "xp-question-cancel", {
+          variant: "ghost",
+        }),
+        button("Skip", "xp-conflict", { arg: "skip" }),
+        button("Keep both", "xp-conflict", { arg: "keep_both", autofocus: true }),
+        button("Replace", "xp-conflict", {
+          arg: "replace",
+          variant: "danger",
+          disabled: !conflict.replace,
+        }),
+      ),
+    ),
+  );
+}
+
+/** A delete, confirmed once: how many items, and that nothing brings them back. */
+function deleteDialog(q: DeleteQuestion): HTMLElement {
+  const words = deleteWords(q);
+  return h(
+    "div",
+    { class: "xp-scrim", "data-key": "xp-question" },
+    h(
+      "div",
+      {
+        class: "xp-dialog card",
+        role: "alertdialog",
+        "aria-modal": "true",
+        "aria-labelledby": "xp-question-title",
+        "aria-describedby": "xp-question-text",
+        id: "xp-question",
+      },
+      h("h3", { id: "xp-question-title" }, words.title),
+      h(
+        "div",
+        { id: "xp-question-text", class: "xp-question-text" },
+        words.lines.map((line) => h("p", null, line)),
+      ),
+      h(
+        "div",
+        { class: "row end" },
+        button("Cancel", "xp-question-cancel", { autofocus: true }),
+        button(q.items.length === 1 ? "Delete" : `Delete ${q.items.length} items`, "xp-delete-confirm", {
+          variant: "danger",
+          icon: "trash",
+        }),
+      ),
+    ),
+  );
+}
+
+function question(x: ExplorerState, host: string): HTMLElement | null {
+  if (!x.question) return null;
+  return x.question.kind === "delete" ? deleteDialog(x.question) : conflictDialog(x.question, host);
 }
 
 /** The Files tab: the explorer, and under it the transfers of this session. */
@@ -588,11 +1027,22 @@ export function explorerPanel(s: TechnicianSnapshot): HTMLElement {
     "div",
     { class: "xp", id: "xp" },
     toolbar(x, host),
+    actionBar(x),
     alertRegion(x),
-    h("div", { class: "xp-body" }, grid(x, host), emptyState(x, host)),
+    h("div", { class: "xp-body" }, grid(x, host), emptyState(x, host), dropTarget(x)),
     incomplete(x),
+    removalNote(x),
+    // What the field of a rename is described by.
+    x.renaming !== undefined
+      ? h(
+          "span",
+          { class: "sr-only", id: "xp-rename-hint" },
+          "Press Enter to rename, Escape to leave the name as it is.",
+        )
+      : null,
     h("div", { class: "xp-status", id: "xp-status" }, statusWords(x)),
     menu(x),
     transfers(s),
+    question(x, host),
   );
 }

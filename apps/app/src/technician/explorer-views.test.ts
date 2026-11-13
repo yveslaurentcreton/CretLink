@@ -4,8 +4,8 @@
 // The Files tab is a pure function of the snapshot, rendered in jsdom.
 
 import { afterEach, describe, expect, it } from "vitest";
-import { OVERSCAN, ROW_HEIGHT } from "./explorer";
-import { EXPLORERS, FIXTURES, XSS, XSS_NAME } from "./fixtures";
+import { OVERSCAN, QUEUE_ROWS, ROW_HEIGHT, applyTransfers } from "./explorer";
+import { DOWNLOADS, EXPLORERS, FEED, FIXTURES, XSS, XSS_NAME, transfer } from "./fixtures";
 import type { TechnicianSnapshot } from "./model";
 import { explorerRows } from "./views/explorer";
 import { renderTechnician } from "./views/shell";
@@ -455,11 +455,42 @@ describe("the context menu", () => {
     expect(menu?.getAttribute("aria-label")).toBe("Actions for Invoices");
     expect(menu?.getAttribute("style")).toBe("left:320px;top:260px");
     const items = Array.from(menu?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? []);
-    expect(items.map((item) => text(item.querySelector("span")))).toEqual(["Open", "Refresh"]);
-    expect(items.map((item) => item.dataset.action)).toEqual(["xp-menu-open", "xp-refresh"]);
-    expect(items.map((item) => item.getAttribute("aria-keyshortcuts"))).toEqual(["Enter", "F5"]);
-    expect(items.map((item) => item.disabled)).toEqual([false, false]);
+    expect(items.map((item) => text(item.querySelector("span")))).toEqual([
+      "Open",
+      "Download",
+      "Download to…",
+      "Rename",
+      "Delete",
+      "Upload files…",
+      "Upload a folder…",
+      "Refresh",
+    ]);
+    expect(items.map((item) => item.dataset.action)).toEqual([
+      "xp-menu-open",
+      "xp-download",
+      "xp-download-to",
+      "xp-rename",
+      "xp-delete",
+      "xp-upload-files",
+      "xp-upload-folder",
+      "xp-refresh",
+    ]);
+    expect(items.map((item) => item.getAttribute("aria-keyshortcuts"))).toEqual([
+      "Enter",
+      null,
+      null,
+      "F2",
+      "Delete",
+      null,
+      null,
+      "F5",
+    ]);
+    expect(items.map((item) => item.disabled)).toEqual(Array(8).fill(false));
     expect(items.every((item) => item.parentElement?.getAttribute("role") === "none")).toBe(true);
+    // A line parts what is done with the rows from what is done with the place.
+    expect(
+      items.filter((item) => item.parentElement?.classList.contains("sep")).map((item) => item.dataset.action),
+    ).toEqual(["xp-download", "xp-upload-files", "xp-refresh"]);
   });
 
   it("offers Refresh alone for a file and for the place itself", () => {
@@ -468,11 +499,18 @@ describe("the context menu", () => {
       Array.from(file.querySelectorAll<HTMLButtonElement>('#xp-menu [role="menuitem"]')).map(
         (item) => item.disabled,
       ),
-    ).toEqual([true, false]);
+    ).toEqual([true, false, false, false, false, false, false, false]);
     const place = show("files-menu-place");
     expect(place.querySelector("#xp-menu")?.getAttribute("aria-label")).toBe(
       "Actions for C:\\Users\\ann\\Documents",
     );
+    // Without a row there is nothing to open, copy, rename or delete; the
+    // place still takes an upload and a refresh.
+    expect(
+      Array.from(place.querySelectorAll<HTMLButtonElement>('#xp-menu [role="menuitem"]')).map(
+        (item) => item.disabled,
+      ),
+    ).toEqual([true, true, true, true, true, false, false, false]);
     expect(show("files-details").querySelector("#xp-menu")).toBeNull();
   });
 });
@@ -522,3 +560,458 @@ describe("what comes from the customer computer", () => {
     }
   });
 });
+
+// --- The second part: send, copy to this computer, rename, delete ---
+
+const FOLDER = "C:\\Users\\ann\\Documents";
+
+/** The rows of the queue as they are drawn: name and state in words. */
+function queued(root: HTMLElement): string[] {
+  return Array.from(root.querySelectorAll<HTMLElement>("#xp-queue > li.q")).map(
+    (row) => `${text(row.querySelector("b"))}: ${text(row.querySelector(".res"))}`,
+  );
+}
+
+function queuedRow(root: HTMLElement, name: string): HTMLElement {
+  const found = Array.from(root.querySelectorAll<HTMLElement>("#xp-queue > li.q")).find(
+    (row) => text(row.querySelector("b")) === name,
+  );
+  if (!found) throw new Error(`no transfer ${name}`);
+  return found;
+}
+
+describe("the actions of the explorer", () => {
+  it("offers upload, download, rename and delete as buttons with their keys", () => {
+    const root = show("files-details");
+    const bar = root.querySelector(".xp-actions");
+    expect(bar?.getAttribute("role")).toBe("toolbar");
+    expect(bar?.getAttribute("aria-label")).toBe("Send, copy and change");
+    const buttons = Array.from(bar?.querySelectorAll<HTMLButtonElement>("button") ?? []);
+    expect(buttons.map((b) => b.dataset.action)).toEqual([
+      "xp-upload",
+      "xp-download",
+      "xp-download-to",
+      "xp-rename",
+      "xp-delete",
+    ]);
+    expect(buttons.map((b) => b.getAttribute("aria-keyshortcuts"))).toEqual([
+      null,
+      null,
+      null,
+      "F2",
+      "Delete",
+    ]);
+    // Two rows are selected: both can be copied and deleted, one is renamed.
+    expect(buttons.map((b) => b.disabled)).toEqual([false, false, false, true, false]);
+    expect(buttons.map((b) => b.tagName)).toEqual(Array(5).fill("BUTTON"));
+    expect(buttons[0]?.getAttribute("aria-haspopup")).toBe("menu");
+    expect(buttons[0]?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("offers nothing to change without a selection, at the drives, or after the session", () => {
+    const state = (name: string): boolean[] =>
+      Array.from(show(name).querySelectorAll<HTMLButtonElement>(".xp-actions button")).map(
+        (b) => b.disabled,
+      );
+    // Nothing is selected: the open folder still takes an upload.
+    expect(state("files-sorted")).toEqual([false, true, true, true, true]);
+    expect(state("files-menu")).toEqual([false, false, false, false, false]);
+    expect(state("files-drives")).toEqual([true, true, true, true, true]);
+    expect(state("files-ended")).toEqual([true, true, true, true, true]);
+    // One delete at a time; a copy is still offered.
+    expect(state("files-removal")).toEqual([false, false, false, true, true]);
+  });
+
+  it("opens the two ways to choose what to send as a menu of the Upload button", () => {
+    const root = show("files-upload-menu");
+    expect(root.querySelector("#xp-upload")?.getAttribute("aria-expanded")).toBe("true");
+    const menu = root.querySelector("#xp-menu");
+    expect(menu?.getAttribute("role")).toBe("menu");
+    expect(menu?.getAttribute("aria-label")).toBe(`Upload to ${FOLDER}`);
+    const items = Array.from(menu?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? []);
+    expect(items.map(text)).toEqual(["Files…", "A folder…"]);
+    expect(items.map((item) => item.dataset.action)).toEqual([
+      "xp-upload-files",
+      "xp-upload-folder",
+    ]);
+  });
+});
+
+describe("the transfer queue", () => {
+  it("puts what did not arrive first, then what runs and waits, then what ended", () => {
+    const root = show("files-queue");
+    expect(queued(root)).toEqual([
+      "Photos\\Old laptop: Left out",
+      "Budget 2026.xlsx: Not sent",
+      "Photos\\2026\\holiday.jpg: 45% · 1.7 MB of 3.8 MB",
+      "Photos\\2026\\garden.jpg: Waiting",
+      "Photos\\2026\\cat.jpg: Waiting",
+      "Tools: Made",
+      "drivers\\chipset.zip: Cancelled",
+      "report.pdf: Copied · 1.2 MB",
+      "setup.exe: Sent · 50.0 MB",
+    ]);
+    expect(text(root.querySelector("#xp-queue-words"))).toBe(
+      "1 running · 2 waiting · 1 failed · 1 left out · 1 cancelled · 3 done",
+    );
+    expect(root.querySelector("#xp-queue")?.getAttribute("aria-label")).toBe(
+      "Transfers of the explorer",
+    );
+    expect(text(root.querySelector(".xp-transfers h3"))).toBe("Transfers");
+  });
+
+  it("says why a transfer did not arrive, in words", () => {
+    const root = show("files-queue");
+    expect(text(queuedRow(root, "Budget 2026.xlsx").querySelector(".why"))).toBe(
+      "The file is in use.",
+    );
+    expect(text(queuedRow(root, "Photos\\Old laptop").querySelector(".why"))).toBe(
+      "A link is not followed.",
+    );
+    // A transfer that arrived has nothing to explain.
+    expect(queuedRow(root, "setup.exe").querySelector(".why")).toBeNull();
+  });
+
+  it("shows the progress of the running transfer as a bar that says its number", () => {
+    const root = show("files-queue");
+    const running = queuedRow(root, "Photos\\2026\\holiday.jpg");
+    const bar = running.querySelector("progress");
+    expect(bar?.getAttribute("max")).toBe("100");
+    expect(bar?.getAttribute("value")).toBe("45");
+    expect(bar?.getAttribute("aria-label")).toBe("Photos\\2026\\holiday.jpg: 45%");
+    expect(root.querySelectorAll("#xp-queue progress")).toHaveLength(1);
+  });
+
+  it("names both places of a transfer, and which way it goes", () => {
+    const root = show("files-queue");
+    const copied = queuedRow(root, "report.pdf");
+    expect(text(copied)).toContain("To this computer · leaves the customer computer");
+    expect(text(copied)).toContain(`On the customer computer: ${FOLDER}\\report.pdf`);
+    expect(text(copied)).toContain(`On this computer: ${DOWNLOADS}\\report.pdf`);
+    expect(copied.querySelector(".k")?.classList.contains("out")).toBe(true);
+    const sent = queuedRow(root, "setup.exe");
+    expect(text(sent)).toContain("To the customer computer");
+    expect(text(sent)).not.toContain("On this computer");
+    expect(sent.querySelector(".k")?.classList.contains("out")).toBe(false);
+  });
+
+  it("cancels a transfer that waits or runs, and shows the folder of a copy that arrived", () => {
+    const root = show("files-queue");
+    const actions = (name: string): Array<[string | undefined, string | null]> =>
+      Array.from(queuedRow(root, name).querySelectorAll<HTMLButtonElement>("button")).map((b) => [
+        b.dataset.action,
+        b.getAttribute("aria-label"),
+      ]);
+    expect(actions("Photos\\2026\\holiday.jpg")).toEqual([
+      ["xp-cancel-transfer", "Cancel Photos\\2026\\holiday.jpg"],
+    ]);
+    expect(actions("Photos\\2026\\garden.jpg")).toEqual([
+      ["xp-cancel-transfer", "Cancel Photos\\2026\\garden.jpg"],
+    ]);
+    expect(actions("report.pdf")).toEqual([["xp-show-folder", "Show report.pdf in its folder"]]);
+    expect(
+      queuedRow(root, "report.pdf").querySelector<HTMLElement>("button")?.dataset.arg,
+    ).toBe("2");
+    for (const ended of ["setup.exe", "Budget 2026.xlsx", "drivers\\chipset.zip", "Tools"]) {
+      expect(actions(ended), ended).toEqual([]);
+    }
+    const all = root.querySelector<HTMLButtonElement>('[data-action="xp-cancel-transfers"]');
+    expect(text(all)).toBe("Cancel all");
+    expect(all?.getAttribute("aria-label")).toBe("Cancel all 3 transfers");
+  });
+
+  it("draws a bounded number of rows of thousands of transfers, and counts the rest", () => {
+    const root = show("files-queue-many");
+    const rows = root.querySelectorAll("#xp-queue > li.q");
+    // 5000 transfers: 200 done, one running, 49 failed, 4750 waiting.
+    expect(rows.length).toBe(49 + 1 + QUEUE_ROWS.waiting + QUEUE_ROWS.finished);
+    const more = Array.from(root.querySelectorAll("#xp-queue > li.more")).map(text);
+    expect(more).toEqual([
+      "and 4730 more waiting",
+      "and 150 earlier ones; the Audit tab lists every transfer",
+    ]);
+    // What did not arrive first, the last one queued at the top.
+    expect(queued(root)[0]).toBe("Drivers\\driver-04947.dll: Not sent");
+    expect(queued(root)[49]).toMatch(/^Drivers\\driver-00200\.dll: 0%/);
+    expect(queued(root)[50]).toBe("Drivers\\driver-00201.dll: Waiting");
+    expect(text(root.querySelector("#xp-queue-words"))).toBe(
+      "1 running · 4750 waiting · 49 failed · 200 done",
+    );
+  });
+
+  it("counts what did not arrive beyond the rows it draws", () => {
+    const failed = Array.from({ length: QUEUE_ROWS.attention + 12 }, (_, n) =>
+      transfer({ id: n + 1, state: "failed", reason: "Access was denied." }),
+    );
+    const fixture = FIXTURES["files-details"];
+    if (!fixture) throw new Error("no fixture");
+    const root = show("files-details", {
+      explorer: applyTransfers(fixture.explorer, failed),
+    });
+    expect(root.querySelectorAll("#xp-queue > li.q")).toHaveLength(QUEUE_ROWS.attention);
+    expect(text(root.querySelector("#xp-queue > li.more"))).toBe(
+      "and 12 more that did not arrive",
+    );
+  });
+
+  it("keeps the files the activity knows of besides the queue under it", () => {
+    // The AI's transfers have no row in the queue: they stay listed.
+    const root = show("files-queue", { activity: FEED });
+    const listed = root.querySelectorAll(".xp-transfers .list.files:not(.queue) .it");
+    expect(listed).toHaveLength(2);
+    // The technician's own transfer that the queue shows is not listed twice.
+    const own = show("files-queue", {
+      activity: [
+        {
+          entry: "item",
+          item: {
+            id: "action-4",
+            source: "technician",
+            description: "Copied a file to the customer computer",
+            kind: "file_received",
+            operation: `copy a file to the customer computer at ${FOLDER}\\setup.exe`,
+            path: `${FOLDER}\\setup.exe`,
+            bytes: 52_428_800,
+            state: { state: "done" },
+            startedAt: "2026-11-03T14:00:00.000Z",
+          },
+        },
+      ],
+    });
+    expect(own.querySelectorAll(".xp-transfers .list.files:not(.queue) .it")).toHaveLength(0);
+    expect(text(own.querySelector(".xp-transfers"))).not.toContain(
+      "No files were sent or received",
+    );
+  });
+
+  it("writes the names and reasons of a transfer as text, never as markup", () => {
+    const root = show("files-queue-xss");
+    expect(root.querySelector("#xp-queue img, #xp-queue script")).toBeNull();
+    const row = root.querySelector("#xp-queue > li.q");
+    expect(text(row?.querySelector("b"))).toBe(XSS);
+    expect(text(row?.querySelector(".why"))).toBe(XSS);
+    expect(row?.querySelector("progress")).toBeNull();
+  });
+
+  it("says that the session stopped the transfers, in the alert", () => {
+    const root = show("files-ended-queue");
+    const alert = root.querySelector("#xp-alert");
+    expect(text(alert?.querySelector("b"))).toBe("Browsing has stopped");
+    expect(text(alert)).toContain("2 transfers were stopped and are not complete.");
+    expect(queued(root)).toEqual([
+      "driver.zip: Stopped with the session",
+      "setup.exe: Stopped with the session",
+      "notes.txt: Sent · 1.2 KB",
+    ]);
+    expect(text(queuedRow(root, "setup.exe").querySelector(".why"))).toBe(
+      "The session ended before this was complete.",
+    );
+    expect(root.querySelector('[data-action="xp-cancel-transfers"]')).toBeNull();
+  });
+});
+
+describe("a name that is taken", () => {
+  it("asks in a dialog that a screen reader reads: replace, keep both or skip", () => {
+    const root = show("files-conflict");
+    const dialog = root.querySelector("#xp-question");
+    expect(dialog?.getAttribute("role")).toBe("dialog");
+    expect(dialog?.getAttribute("aria-modal")).toBe("true");
+    expect(text(root.querySelector(`#${dialog?.getAttribute("aria-labelledby")}`))).toBe(
+      "A file named report.pdf is already there",
+    );
+    const said = text(root.querySelector(`#${dialog?.getAttribute("aria-describedby")}`));
+    expect(said).toContain(`In ${FOLDER} on ACME-PC-07.`);
+    expect(said).toContain("Replace puts the one you are sending in its place.");
+    expect(said).toContain("Keep both gives the new one another name, such as name (2).ext.");
+    expect(said).toContain("Name 1 of 3 that is taken.");
+    const buttons = Array.from(
+      dialog?.querySelectorAll<HTMLButtonElement>(".row.end button") ?? [],
+    );
+    expect(buttons.map(text)).toEqual(["Cancel the upload", "Skip", "Keep both", "Replace"]);
+    expect(buttons.map((b) => b.dataset.arg)).toEqual([undefined, "skip", "keep_both", "replace"]);
+    expect(buttons.every((b) => !b.disabled)).toBe(true);
+    // The choice that loses nothing is the one the focus goes to.
+    expect(buttons[2]?.hasAttribute("data-autofocus")).toBe(true);
+    // A button that stays pressed: the next choice then holds for the rest.
+    const all = dialog?.querySelector<HTMLButtonElement>("#xp-conflict-all");
+    expect(all?.tagName).toBe("BUTTON");
+    expect(all?.getAttribute("aria-pressed")).toBe("false");
+    expect(text(all)).toBe("Do the same for the next 2 names that are taken");
+    expect(all?.dataset.action).toBe("xp-conflict-all");
+  });
+
+  it("shows that the choice holds for the names that follow, in words and as a state", () => {
+    const fixture = FIXTURES["files-conflict"];
+    const question = fixture?.explorer.question;
+    if (!fixture || question?.kind !== "conflicts") throw new Error("no fixture");
+    const root = show("files-conflict", {
+      explorer: { ...fixture.explorer, question: { ...question, at: 1, all: true } },
+    });
+    const all = root.querySelector("#xp-conflict-all");
+    expect(all?.getAttribute("aria-pressed")).toBe("true");
+    expect(text(all)).toBe("Do the same for the next name that is taken");
+  });
+
+  it("says what Replace means for a folder, and that the choice holds for the rest", () => {
+    const root = show("files-conflict-folder");
+    expect(text(root.querySelector("#xp-question-title"))).toBe(
+      "A folder named Photos is already there",
+    );
+    const said = text(root.querySelector("#xp-question-text"));
+    expect(said).toContain(
+      "Replace sends into the folder that is there: files of the same name are replaced, everything else in it stays.",
+    );
+    expect(said).toContain("such as Photos (2)");
+    expect(said).toContain("Name 2 of 2 that is taken.");
+    // The last conflict: nothing follows to do the same for.
+    expect(root.querySelector("#xp-conflict-all")).toBeNull();
+  });
+
+  it("does not offer Replace where the kinds differ, and says why", () => {
+    const root = show("files-conflict-kinds");
+    expect(text(root.querySelector("#xp-question-title"))).toBe(
+      "A folder named Invoices is already there",
+    );
+    expect(text(root.querySelector("#xp-question-text"))).toContain(
+      "Replace is not offered: a file cannot take the place of a folder.",
+    );
+    const replace = Array.from(root.querySelectorAll<HTMLButtonElement>("#xp-question button")).find(
+      (b) => text(b) === "Replace",
+    );
+    expect(replace?.disabled).toBe(true);
+    expect(text(root.querySelector("#xp-question-text"))).not.toContain("that is taken.");
+  });
+
+  it("asks the same way for a copy to this computer", () => {
+    const root = show("files-conflict-download");
+    const said = text(root.querySelector("#xp-question-text"));
+    expect(said).toContain(`In ${DOWNLOADS} on this computer.`);
+    expect(said).toContain("Replace puts the one you are copying in its place.");
+    expect(
+      Array.from(root.querySelectorAll("#xp-question button")).map(text)[0],
+    ).toBe("Cancel the download");
+  });
+});
+
+describe("deleting", () => {
+  it("asks first, with the number of items and that there is no recycle bin", () => {
+    const root = show("files-delete");
+    const dialog = root.querySelector("#xp-question");
+    expect(dialog?.getAttribute("role")).toBe("alertdialog");
+    expect(dialog?.getAttribute("aria-modal")).toBe("true");
+    expect(text(root.querySelector(`#${dialog?.getAttribute("aria-labelledby")}`))).toBe(
+      "Delete 3 items?",
+    );
+    const said = text(root.querySelector(`#${dialog?.getAttribute("aria-describedby")}`));
+    expect(said).toContain("Invoices, notes.txt, report.pdf.");
+    expect(said).toContain("1 folder is deleted with everything in it.");
+    expect(said).toContain(
+      `There is no recycle bin on this path: what is deleted from ${FOLDER} is gone for good.`,
+    );
+    const buttons = Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? []);
+    expect(buttons.map(text)).toEqual(["Cancel", "Delete 3 items"]);
+    expect(buttons.map((b) => b.dataset.action)).toEqual([
+      "xp-question-cancel",
+      "xp-delete-confirm",
+    ]);
+    // The focus goes to Cancel: a key pressed too soon deletes nothing.
+    expect(buttons[0]?.hasAttribute("data-autofocus")).toBe(true);
+    expect(buttons[1]?.classList.contains("danger")).toBe(true);
+
+    const one = show("files-delete-one");
+    expect(text(one.querySelector("#xp-question-title"))).toBe("Delete notes.txt?");
+    expect(
+      Array.from(one.querySelectorAll("#xp-question button")).map(text),
+    ).toEqual(["Cancel", "Delete"]);
+  });
+
+  it("shows a delete that runs, with how far it is and a way to cancel it", () => {
+    const root = show("files-removal");
+    const note = root.querySelector("#xp-removal");
+    expect(note?.getAttribute("role")).toBe("status");
+    expect(text(note)).toContain(
+      "Deleting item 2 of 3: Photos… 1204 files and 31 folders removed so far.",
+    );
+    const cancel = note?.querySelector<HTMLButtonElement>("button");
+    expect(cancel?.dataset.action).toBe("xp-cancel-delete");
+    expect(cancel?.getAttribute("aria-label")).toBe("Cancel the delete");
+    expect(cancel?.disabled).toBe(false);
+    const cancelling = show("files-removal-cancelling");
+    expect(text(cancelling.querySelector("#xp-removal"))).toContain("Cancelling the delete…");
+    expect(cancelling.querySelector<HTMLButtonElement>("#xp-removal button")?.disabled).toBe(true);
+    expect(show("files-details").querySelector("#xp-removal")).toBeNull();
+  });
+
+  it("names what could not be removed, each with its reason, in an assertive alert", () => {
+    const root = show("files-problem");
+    const alert = root.querySelector("#xp-alert");
+    expect(alert?.getAttribute("role")).toBe("alert");
+    expect(text(alert?.querySelector("b"))).toBe("2 of 3 items could not be deleted");
+    expect(text(alert)).toContain("1 of 3 items was deleted (40 files and 3 folders in all).");
+    expect(Array.from(alert?.querySelectorAll(".xp-details li") ?? []).map(text)).toEqual([
+      `${FOLDER}\\Scans\\open.xlsx — the file is in use`,
+      `${FOLDER}\\Scans — the folder is not empty`,
+      "and 4 more that could not be removed",
+    ]);
+    expect(text(alert?.querySelector(".next"))).toContain("The list shows what is there now.");
+    expect(buttonNamed(root, "Dismiss")?.dataset.action).toBe("xp-dismiss");
+    // The list is still there under it.
+    expect(names(root)).toContain("Scans");
+  });
+
+  it("writes what could not be done as text, never as markup", () => {
+    const root = show("files-problem-xss");
+    expect(root.querySelector("#xp-alert img, #xp-alert script")).toBeNull();
+    expect(text(root.querySelector("#xp-alert b"))).toBe(XSS);
+    expect(text(root.querySelector("#xp-alert .xp-details code"))).toBe(XSS);
+  });
+});
+
+describe("renaming", () => {
+  it("turns the name of the row into a field that says what it is for", () => {
+    const root = show("files-renaming");
+    const field = root.querySelector<HTMLInputElement>("#xp-rename-input");
+    expect(field?.getAttribute("value")).toBe("report.pdf");
+    expect(field?.getAttribute("aria-label")).toBe("New name for report.pdf");
+    expect(text(root.querySelector(`#${field?.getAttribute("aria-describedby")}`))).toBe(
+      "Press Enter to rename, Escape to leave the name as it is.",
+    );
+    expect(field?.closest("[role='row']")?.getAttribute("data-row")).toBe("report.pdf");
+    expect(field?.closest("[role='gridcell']")).not.toBeNull();
+    // The other rows keep their names as text.
+    expect(root.querySelectorAll("#xp-rows input")).toHaveLength(1);
+    expect(show("files-details").querySelector("#xp-rename-hint")).toBeNull();
+  });
+});
+
+describe("a drop", () => {
+  it("says where the files would go while they are dragged over the window", () => {
+    const root = show("files-dropping");
+    expect(text(root.querySelector("#xp-drop"))).toBe(`Drop to send to ${FOLDER}`);
+    expect(root.querySelector("#xp-drop")?.classList.contains("no")).toBe(false);
+    const drives = show("files-dropping-drives");
+    expect(text(drives.querySelector("#xp-drop"))).toBe(
+      "Open a folder first: files are sent to the folder that is open.",
+    );
+    expect(drives.querySelector("#xp-drop")?.classList.contains("no")).toBe(true);
+    expect(show("files-details").querySelector("#xp-drop")).toBeNull();
+  });
+
+  it("says in the status line what it is finding out before it asks", () => {
+    expect(text(show("files-preparing").querySelector("#xp-status"))).toBe(
+      `11 items · looking at ${FOLDER} for names that are taken…`,
+    );
+  });
+});
+
+describe("every state of the second part", () => {
+  it("renders, with the list behind it", () => {
+    for (const name of Object.keys(EXPLORERS)) {
+      const root = show(name);
+      expect(root.querySelector("#xp"), name).not.toBeNull();
+      expect(root.querySelector(".xp-actions"), name).not.toBeNull();
+      expect(root.querySelector("#xp-grid"), name).not.toBeNull();
+    }
+  });
+});
+

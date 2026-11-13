@@ -8,15 +8,18 @@
 // wants delivered and then lets the queued work run.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ConflictChoice } from "../shared/contract";
 import { type TimerTracker, trackTimers } from "../shared/test-timers";
-import type { ConsoleState } from "./api";
+import type { ConsoleState, DeleteItem, TransferName } from "./api";
 import { ROW_HEIGHT } from "./explorer";
 import { consoleIn } from "./fixtures";
 import {
   SimulatedComputer,
+  type SimulatedLocal,
   simulatedFile,
   simulatedFiles,
   simulatedFolder,
+  simulatedLink,
 } from "./simulated-computer";
 
 type Handler = (args?: Record<string, unknown>) => unknown;
@@ -60,18 +63,50 @@ const file = simulatedFile;
 const dir = simulatedFolder;
 const many = simulatedFiles;
 
-/** The customer computer of a test, delivering on the event the window listens to. */
+/** The customer computer of a test, delivering on the events the window listens to. */
 function computer(): SimulatedComputer {
-  return new SimulatedComputer((event) =>
-    backend.listeners["console-explorer"]?.({ payload: event }),
+  return new SimulatedComputer(
+    (event) => backend.listeners["console-explorer"]?.({ payload: event }),
+    {
+      transfers: (event) => backend.listeners["console-transfers"]?.({ payload: event }),
+      removal: (step) => backend.listeners["console-removal"]?.({ payload: step }),
+      drop: (offer) => backend.listeners["console-explorer-drop"]?.({ payload: offer }),
+    },
   );
 }
 
-/** The two commands of the backend, answered by `target`. */
+/** The commands of the backend, answered by `target`. */
 function commands(target: SimulatedComputer): Record<string, Handler> {
   return {
     explorer_drives: () => target.listDrives(),
     explorer_open: (args) => target.openPath(String(args?.path), Number(args?.listing)),
+    explorer_pick_upload: (args) => target.pickUpload(args?.kind as "files" | "folder"),
+    explorer_send_check: (args) => target.sendCheck(Number(args?.offer), String(args?.folder)),
+    explorer_send: (args) =>
+      target.send(
+        Number(args?.offer),
+        String(args?.folder),
+        args?.choices as Record<string, ConflictChoice>,
+      ),
+    explorer_choose_folder: () => target.chooseFolder(),
+    explorer_download_check: (args) =>
+      target.downloadCheck(args?.names as TransferName[], args?.to as number | undefined),
+    explorer_download: (args) =>
+      target.download(
+        String(args?.folder),
+        args?.names as TransferName[],
+        args?.to as number | undefined,
+        args?.choices as Record<string, ConflictChoice>,
+      ),
+    explorer_transfers: () => target.transfers(),
+    explorer_cancel_transfer: (args) => target.cancelTransfer(Number(args?.transfer)),
+    explorer_cancel_transfers: () => target.cancelTransfers(),
+    explorer_show_folder: (args) => target.showFolder(Number(args?.transfer)),
+    explorer_rename: (args) =>
+      target.rename(String(args?.folder), String(args?.name), String(args?.to)),
+    explorer_delete: (args) =>
+      target.delete(String(args?.folder), args?.items as DeleteItem[], Number(args?.removal)),
+    explorer_cancel_delete: (args) => target.cancelDelete(Number(args?.removal)),
   };
 }
 
@@ -736,8 +771,17 @@ describe("the context menu", () => {
     expect(menu.getAttribute("aria-label")).toBe("Actions for Invoices");
     expect(menu.getAttribute("style")).toBe("left:120px;top:90px");
     const items = Array.from(menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
-    expect(items.map((item) => item.textContent)).toEqual(["OpenEnter", "RefreshF5"]);
-    expect(items.map((item) => item.disabled)).toEqual([false, false]);
+    expect(items.map((item) => item.textContent)).toEqual([
+      "OpenEnter",
+      "Download",
+      "Download to…",
+      "RenameF2",
+      "DeleteDelete",
+      "Upload files…",
+      "Upload a folder…",
+      "RefreshF5",
+    ]);
+    expect(items.map((item) => item.disabled)).toEqual(Array(8).fill(false));
     // The row under the pointer is the selection, and the menu has the focus.
     expect(selected()).toEqual(["Invoices"]);
     expect(document.activeElement).toBe(items[0]);
@@ -754,7 +798,7 @@ describe("the context menu", () => {
     contextMenu(row("a.txt"));
     await flush();
     let items = Array.from($("#xp-menu").querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
-    expect(items.map((item) => item.disabled)).toEqual([true, false]);
+    expect(items.map((item) => item.disabled)).toEqual([true, ...Array(7).fill(false)]);
     // The focus is on the first action that can run.
     expect(document.activeElement).toBe(items[1]);
 
@@ -765,7 +809,8 @@ describe("the context menu", () => {
     expect(selected()).toEqual([]);
     items = Array.from($("#xp-menu").querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
     const before = opened().length;
-    items[1]?.click();
+    expect(items.at(-1)?.dataset.action).toBe("xp-refresh");
+    items.at(-1)?.click();
     await flush();
     expect(opened()).toHaveLength(before + 1);
     expect(opened().at(-1)).toBe("C:\\Users\\ann\\Documents");
@@ -793,7 +838,10 @@ describe("the context menu", () => {
     expect(document.activeElement).toBe(items[0]);
     items[0]?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
     expect(document.activeElement).toBe(items[1]);
-    items[1]?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    items[1]?.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+    expect(document.activeElement).toBe(items.at(-1));
+    // From the last action the arrow goes round to the first.
+    items.at(-1)?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
     expect(document.activeElement).toBe(items[0]);
 
     document.activeElement?.dispatchEvent(
@@ -950,3 +998,1037 @@ describe("the end of the session", () => {
     expect($("#xp-grid").getAttribute("aria-busy")).toBe("false");
   });
 });
+
+// --- The second part: send, copy to this computer, rename, delete ---
+
+const DOCUMENTS = "C:\\Users\\ann\\Documents";
+
+function local(name: string, len = 100): SimulatedLocal {
+  return { name, kind: "file", len };
+}
+
+function localFolder(name: string, children: SimulatedLocal[]): SimulatedLocal {
+  return { name, kind: "folder", children };
+}
+
+/** The Files tab in the documents folder of the customer computer. */
+async function documents(): Promise<void> {
+  await files();
+  await goTo(DOCUMENTS);
+}
+
+/** Files and folders are dropped on the window. */
+async function drop(items: SimulatedLocal[]): Promise<void> {
+  target.drop(items);
+  await flush();
+}
+
+/** The rows of the queue, in the order they are shown: name and state. */
+function queue(): string[] {
+  return Array.from(app().querySelectorAll<HTMLElement>("#xp-queue > li.q")).map(
+    (row) =>
+      `${row.querySelector("b")?.textContent ?? ""}: ${row.querySelector(".res")?.textContent ?? ""}`,
+  );
+}
+
+function queueRow(name: string): HTMLElement {
+  const found = Array.from(app().querySelectorAll<HTMLElement>("#xp-queue > li.q")).find(
+    (row) => row.querySelector("b")?.textContent === name,
+  );
+  if (!found) throw new Error(`no transfer ${name}: ${queue().join(" | ")}`);
+  return found;
+}
+
+function dialog(): HTMLElement {
+  return $("#xp-question");
+}
+
+function dialogButton(label: string): HTMLButtonElement {
+  const found = Array.from(dialog().querySelectorAll("button")).find(
+    (button) => button.textContent === label,
+  );
+  if (!found) throw new Error(`no button ${label}`);
+  return found;
+}
+
+function action(name: string): HTMLButtonElement {
+  return $(`.xp-actions [data-action="${name}"]`) as HTMLButtonElement;
+}
+
+function announced(): string {
+  return $("#announce").textContent ?? "";
+}
+
+describe("sending to the open folder", () => {
+  it("sends dropped files to the open folder, each with its progress, and shows them there", async () => {
+    await documents();
+    target.manualTransfers = true;
+    await drop([local("new.txt", 2048), local("other.txt", 10)]);
+
+    // The folder is looked at first, by the number of the offer: no path of
+    // this computer goes through the window.
+    expect(asked("explorer_send_check")).toEqual([{ offer: 1, folder: DOCUMENTS }]);
+    expect(asked("explorer_send")).toEqual([{ offer: 1, folder: DOCUMENTS, choices: {} }]);
+    expect(app().querySelector("#xp-question")).toBeNull();
+    expect(queue()).toEqual(["new.txt: Waiting", "other.txt: Waiting"]);
+    expect(announced()).toBe("2 items queued to send.");
+    expect($("#xp-queue-words").textContent).toBe("2 waiting");
+
+    target.stepTransfers();
+    await flush();
+    expect(queue()).toEqual(["new.txt: 0% · 0 B of 2.0 KB", "other.txt: Waiting"]);
+    target.stepTransfers();
+    await flush();
+    expect(queue()[0]).toBe("new.txt: 50% · 1.0 KB of 2.0 KB");
+    const progress = queueRow("new.txt").querySelector("progress");
+    expect(progress?.getAttribute("value")).toBe("50");
+    expect(progress?.getAttribute("aria-label")).toBe("new.txt: 50%");
+    expect(queueRow("new.txt").textContent).toContain(`${DOCUMENTS}\\new.txt`);
+    // It is not done before the customer computer has it.
+    expect(drawn()).not.toContain("new.txt");
+
+    while (target.stepTransfers()) await flush();
+    await flush();
+    // What ended is listed newest first.
+    expect(queue()).toEqual(["other.txt: Sent · 10 B", "new.txt: Sent · 2.0 KB"]);
+    expect($("#xp-queue-words").textContent).toBe("2 done");
+    // The folder is listed again, and the files are in it.
+    expect(drawn()).toContain("new.txt");
+    expect(drawn()).toContain("other.txt");
+    expect(app().querySelector('[data-action="xp-cancel-transfers"]')).toBeNull();
+  });
+
+  it("asks about each name that is taken: replace, keep both or skip", async () => {
+    await documents();
+    await drop([local("a.txt"), local("b.txt"), local("fresh.txt")]);
+
+    expect(asked("explorer_send")).toHaveLength(0);
+    const question = dialog();
+    expect(question.getAttribute("role")).toBe("dialog");
+    expect(question.getAttribute("aria-modal")).toBe("true");
+    expect($(`#${question.getAttribute("aria-labelledby")}`).textContent).toBe(
+      "A file named a.txt is already there",
+    );
+    const said = $(`#${question.getAttribute("aria-describedby")}`).textContent ?? "";
+    expect(said).toContain(`In ${DOCUMENTS} on ACME-PC-07.`);
+    expect(said).toContain("Name 1 of 2 that is taken.");
+    // The safe choice has the focus.
+    expect(document.activeElement).toBe(dialogButton("Keep both"));
+
+    dialogButton("Keep both").click();
+    await flush();
+    expect($("#xp-question-title").textContent).toBe("A file named b.txt is already there");
+    expect($("#xp-question-text").textContent).toContain("Name 2 of 2 that is taken.");
+    expect(document.activeElement).toBe(dialogButton("Keep both"));
+    dialogButton("Replace").click();
+    await flush();
+
+    expect(app().querySelector("#xp-question")).toBeNull();
+    expect(asked("explorer_send")).toEqual([
+      { offer: 1, folder: DOCUMENTS, choices: { "a.txt": "keep_both", "b.txt": "replace" } },
+    ]);
+    expect(queue().sort()).toEqual([
+      "a (2).txt: Sent · 100 B",
+      "b.txt: Sent · 100 B",
+      "fresh.txt: Sent · 100 B",
+    ]);
+    // What was there keeps its place; the second copy lies beside it.
+    expect(drawn()).toEqual([
+      "Invoices",
+      "a (2).txt",
+      "a.txt",
+      "b.txt",
+      "c.txt",
+      "fresh.txt",
+      "report.pdf",
+    ]);
+    expect(document.activeElement).toBe($("#xp-grid"));
+  });
+
+  it("applies a choice to the names that follow when asked to", async () => {
+    await documents();
+    await drop([local("a.txt"), local("b.txt"), local("c.txt")]);
+    const all = $("#xp-conflict-all");
+    expect(all.textContent).toBe("Do the same for the next 2 names that are taken");
+    expect(all.getAttribute("aria-pressed")).toBe("false");
+    all.click();
+    await flush();
+    expect($("#xp-conflict-all").getAttribute("aria-pressed")).toBe("true");
+    dialogButton("Skip").click();
+    await flush();
+    expect(asked("explorer_send")).toEqual([
+      { offer: 1, folder: DOCUMENTS, choices: { "a.txt": "skip", "b.txt": "skip", "c.txt": "skip" } },
+    ]);
+    expect(announced()).toBe("0 items queued to send, 3 skipped.");
+    expect(app().querySelector("#xp-queue")).toBeNull();
+  });
+
+  it("does not offer Replace where a folder would take the place of a file", async () => {
+    await documents();
+    await drop([localFolder("a.txt", [local("inside.txt")]), local("b.txt")]);
+    expect($("#xp-question-title").textContent).toBe("A file named a.txt is already there");
+    expect(dialogButton("Replace").disabled).toBe(true);
+    expect($("#xp-question-text").textContent).toContain(
+      "Replace is not offered: a folder cannot take the place of a file.",
+    );
+    // Replace for all that follow still asks where it cannot apply.
+    $("#xp-conflict-all").click();
+    await flush();
+    dialogButton("Skip").click();
+    await flush();
+    expect(asked("explorer_send")[0]?.choices).toEqual({ "a.txt": "skip", "b.txt": "skip" });
+  });
+
+  it("leaves the question with Escape without sending, and only then stops the session", async () => {
+    await documents();
+    await drop([local("a.txt")]);
+    expect(app().querySelector("#xp-question")).not.toBeNull();
+    key("Escape", {}, "#xp-question button");
+    await flush();
+    expect(app().querySelector("#xp-question")).toBeNull();
+    expect(asked("explorer_send")).toHaveLength(0);
+    expect(asked("stop_session")).toHaveLength(0);
+    expect(announced()).toBe("Nothing was sent.");
+    expect(document.activeElement).toBe($("#xp-grid"));
+    key("Escape");
+    await flush();
+    expect(asked("stop_session")).toHaveLength(1);
+  });
+
+  it("keeps the keyboard inside the question while it is open", async () => {
+    await documents();
+    click(row("a.txt"));
+    await drop([local("a.txt")]);
+    const controls = Array.from(dialog().querySelectorAll<HTMLButtonElement>("button:not([disabled])"));
+    expect(controls.map((control) => control.textContent)).toEqual([
+      "Cancel the upload",
+      "Skip",
+      "Keep both",
+      "Replace",
+    ]);
+    controls.at(-1)?.focus();
+    const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    controls.at(-1)?.dispatchEvent(tab);
+    expect(tab.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(controls[0]);
+    controls[0]?.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true }),
+    );
+    expect(document.activeElement).toBe(controls.at(-1));
+    // The list behind the question takes no key: nothing is deleted or moved.
+    key("Delete", {}, "#xp-question button");
+    key("ArrowDown", {}, "#xp-question button");
+    key("F5", {}, "#xp-question button");
+    await flush();
+    expect($("#xp-question-title").textContent).toBe("A file named a.txt is already there");
+    expect(selected()).toEqual(["a.txt"]);
+    dialogButton("Cancel the upload").click();
+    await flush();
+    expect(app().querySelector("#xp-question")).toBeNull();
+    expect(asked("explorer_send")).toHaveLength(0);
+  });
+
+  it("offers files or a folder from the system's dialog with Upload…", async () => {
+    await documents();
+    const upload = $("#xp-upload") as HTMLButtonElement;
+    expect(upload.getAttribute("aria-haspopup")).toBe("menu");
+    expect(upload.getAttribute("aria-expanded")).toBe("false");
+    upload.click();
+    await flush();
+    expect($("#xp-upload").getAttribute("aria-expanded")).toBe("true");
+    const menu = $("#xp-menu");
+    expect(menu.getAttribute("aria-label")).toBe(`Upload to ${DOCUMENTS}`);
+    const items = Array.from(menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
+    expect(items.map((item) => item.textContent)).toEqual(["Files…", "A folder…"]);
+    expect(document.activeElement).toBe(items[0]);
+    // Escape closes the menu, and the focus is back on the button.
+    key("Escape", {}, "#xp-menu button");
+    await flush();
+    expect(app().querySelector("#xp-menu")).toBeNull();
+    expect(document.activeElement).toBe($("#xp-upload"));
+    expect(asked("stop_session")).toHaveLength(0);
+
+    // The dialog is closed without a choice: nothing is sent.
+    $("#xp-upload").click();
+    await flush();
+    ($("#xp-menu").querySelector('[data-action="xp-upload-files"]') as HTMLElement).click();
+    await flush();
+    expect(asked("explorer_pick_upload")).toEqual([{ kind: "files" }]);
+    expect(asked("explorer_send_check")).toHaveLength(0);
+
+    // A folder is picked: it goes file by file.
+    target.picked.folder = [
+      localFolder("Project", [local("readme.txt", 10), localFolder("src", [local("main.rs", 20)])]),
+    ];
+    $("#xp-upload").click();
+    await flush();
+    ($("#xp-menu").querySelector('[data-action="xp-upload-folder"]') as HTMLElement).click();
+    await flush();
+    expect(asked("explorer_pick_upload").at(-1)).toEqual({ kind: "folder" });
+    expect(queue().sort()).toEqual([
+      "Project\\readme.txt: Sent · 10 B",
+      "Project\\src\\main.rs: Sent · 20 B",
+    ]);
+    expect(drawn()).toContain("Project");
+    // The same two ways are in the context menu of the place.
+    $("#xp-scroll").dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 9, clientY: 9 }),
+    );
+    await flush();
+    target.picked.files = [local("picked.txt")];
+    ($("#xp-menu").querySelector('[data-action="xp-upload-files"]') as HTMLElement).click();
+    await flush();
+    expect(queue()).toContain("picked.txt: Sent · 100 B");
+  });
+
+  it("leaves a link out of a dropped folder and says so first", async () => {
+    await documents();
+    await drop([
+      localFolder("Folder", [local("in.txt"), { name: "shortcut", kind: "link" }]),
+      { name: "dropped-link", kind: "link" },
+    ]);
+    expect(queue()).toEqual([
+      "dropped-link: Left out",
+      "Folder\\shortcut: Left out",
+      "Folder\\in.txt: Sent · 100 B",
+    ]);
+    expect(queueRow("Folder\\shortcut").querySelector(".why")?.textContent).toBe(
+      "A link is not followed.",
+    );
+    expect(announced()).toBe("Transfers ended: 1 done, 2 not completed.");
+  });
+
+  it("sends nothing where no folder is open, and says why", async () => {
+    await files();
+    expect(($("#xp-upload") as HTMLButtonElement).disabled).toBe(true);
+    await drop([local("a.txt")]);
+    expect(asked("explorer_send_check")).toHaveLength(0);
+    expect(status()).toContain("Open a folder first: files are sent to the folder that is open.");
+    // Nor from another tab.
+    await goTo(DOCUMENTS);
+    click("#tab-overview");
+    await drop([local("b.txt")]);
+    expect(asked("explorer_send_check")).toHaveLength(0);
+    expect(announced()).toContain("Files are sent from the Files tab");
+  });
+
+  it("shows where a drop goes while files are dragged over the window", async () => {
+    await files();
+    backend.listeners["tauri://drag-enter"]?.({ payload: { paths: ["ignored"] } });
+    await flush();
+    expect($("#xp-drop").textContent).toBe(
+      "Open a folder first: files are sent to the folder that is open.",
+    );
+    backend.listeners["tauri://drag-leave"]?.({ payload: null });
+    await flush();
+    expect(app().querySelector("#xp-drop")).toBeNull();
+    await goTo(DOCUMENTS);
+    backend.listeners["tauri://drag-enter"]?.({ payload: {} });
+    await flush();
+    expect($("#xp-drop").textContent).toBe(`Drop to send to ${DOCUMENTS}`);
+    backend.listeners["tauri://drag-drop"]?.({ payload: {} });
+    await flush();
+    expect(app().querySelector("#xp-drop")).toBeNull();
+  });
+
+  it("shows a folder that cannot be looked at as that refusal, and sends nothing", async () => {
+    await documents();
+    target.refused.set(DOCUMENTS, { stage: "access_denied", message: "access was denied" });
+    await drop([local("a.txt")]);
+    expect($("#xp-alert").textContent).toContain("The files could not be sent");
+    expect($("#xp-alert").textContent).toContain("access was denied (access_denied)");
+    expect(asked("explorer_send")).toHaveLength(0);
+    expect(app().querySelector("#xp-queue")).toBeNull();
+  });
+});
+
+describe("copying to this computer", () => {
+  it("copies the selection to the folder of this customer computer, and shows it there", async () => {
+    await documents();
+    expect(action("xp-download").disabled).toBe(true);
+    click(row("report.pdf"));
+    await flush();
+    expect(action("xp-download").disabled).toBe(false);
+    action("xp-download").click();
+    await flush();
+    expect(asked("explorer_download_check")).toEqual([
+      { names: [{ name: "report.pdf", kind: "file" }] },
+    ]);
+    expect(asked("explorer_download")).toEqual([
+      { folder: DOCUMENTS, names: [{ name: "report.pdf", kind: "file" }], choices: {} },
+    ]);
+    expect(queue()).toEqual(["report.pdf: Copied · 4.9 KB"]);
+    const copied = queueRow("report.pdf");
+    expect(copied.textContent).toContain("leaves the customer computer");
+    expect(copied.textContent).toContain(`${target.downloads}\\report.pdf`);
+    expect(announced()).toBe("Transfers ended: 1 done.");
+
+    const show = copied.querySelector('[data-action="xp-show-folder"]') as HTMLButtonElement;
+    expect(show.getAttribute("aria-label")).toBe("Show report.pdf in its folder");
+    show.click();
+    await flush();
+    expect(target.shownFolders).toEqual([target.downloads]);
+    // A sent file has no folder on this computer to show.
+    await drop([local("up.txt")]);
+    expect(queueRow("up.txt").querySelector('[data-action="xp-show-folder"]')).toBeNull();
+  });
+
+  it("asks for a folder with Download to…, and copies nothing when none is chosen", async () => {
+    await documents();
+    click(row("a.txt"));
+    click(row("b.txt"), { ctrlKey: true });
+    await flush();
+    action("xp-download-to").click();
+    await flush();
+    expect(asked("explorer_choose_folder")).toHaveLength(1);
+    expect(asked("explorer_download_check")).toHaveLength(0);
+
+    target.chosen = "D:\\Kept";
+    action("xp-download-to").click();
+    await flush();
+    const names = [
+      { name: "a.txt", kind: "file" },
+      { name: "b.txt", kind: "file" },
+    ];
+    expect(asked("explorer_download_check")).toEqual([{ names, to: 1 }]);
+    expect(asked("explorer_download")).toEqual([{ folder: DOCUMENTS, names, to: 1, choices: {} }]);
+    expect([...target.local.keys()].sort()).toEqual(["D:\\Kept\\a.txt", "D:\\Kept\\b.txt"]);
+  });
+
+  it("asks the same way when a name is taken on this computer", async () => {
+    await documents();
+    target.local.set(`${target.downloads}\\report.pdf`, 1);
+    click(row("report.pdf"));
+    await flush();
+    action("xp-download").click();
+    await flush();
+    expect($("#xp-question-title").textContent).toBe("A file named report.pdf is already there");
+    expect($("#xp-question-text").textContent).toContain(`In ${target.downloads} on this computer.`);
+    expect(dialogButton("Cancel the download")).not.toBeNull();
+    dialogButton("Keep both").click();
+    await flush();
+    expect(asked("explorer_download")[0]?.choices).toEqual({ "report.pdf": "keep_both" });
+    expect(queueRow("report.pdf").textContent).toContain(`${target.downloads}\\report (2).pdf`);
+    expect(target.local.get(`${target.downloads}\\report.pdf`)).toBe(1);
+  });
+
+  it("copies a folder file by file, leaves a link out, and drops the folder's own row", async () => {
+    await documents();
+    target.manualTransfers = true;
+    target.folders.set(`${DOCUMENTS}\\Invoices`, [
+      file("2026-01.pdf", 100),
+      dir("old"),
+      simulatedLink("shortcut"),
+    ]);
+    target.folders.set(`${DOCUMENTS}\\Invoices\\old`, [file("2025-12.pdf", 50)]);
+    // From the context menu of the row.
+    $(row("Invoices")).dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 9, clientY: 9 }),
+    );
+    await flush();
+    ($("#xp-menu").querySelector('[data-action="xp-download"]') as HTMLElement).click();
+    await flush();
+    expect(asked("explorer_download")[0]?.names).toEqual([{ name: "Invoices", kind: "folder" }]);
+    expect(queue()).toEqual(["Invoices: Waiting"]);
+    target.stepTransfers();
+    await flush();
+    expect(queue()).toEqual(["Invoices: Listing the folder…"]);
+    target.stepTransfers();
+    await flush();
+    // Its files stand for it now; what was left out comes first.
+    expect(queue()).toEqual([
+      "Invoices\\shortcut: Left out",
+      "Invoices\\2026-01.pdf: Waiting",
+      "Invoices\\old\\2025-12.pdf: Waiting",
+    ]);
+    while (target.stepTransfers()) await flush();
+    await flush();
+    expect([...target.local.keys()].sort()).toEqual([
+      `${target.downloads}\\Invoices\\2026-01.pdf`,
+      `${target.downloads}\\Invoices\\old\\2025-12.pdf`,
+    ]);
+  });
+
+  it("copies nothing whose name would leave the folder, and says so", async () => {
+    await documents();
+    target.folders.set(`${DOCUMENTS}\\Invoices`, [
+      file("..\\..\\evil.txt", 5),
+      file("C:evil.txt", 5),
+      file("NUL", 5),
+      file("fine.txt", 5),
+    ]);
+    click(row("Invoices"));
+    await flush();
+    action("xp-download").click();
+    await flush();
+    expect(queue()).toEqual([
+      "Invoices\\NUL: Left out",
+      "Invoices\\C:evil.txt: Left out",
+      "Invoices\\..\\..\\evil.txt: Left out",
+      "Invoices\\fine.txt: Copied · 5 B",
+    ]);
+    expect([...target.local.keys()]).toEqual([`${target.downloads}\\Invoices\\fine.txt`]);
+  });
+});
+
+describe("the transfer queue", () => {
+  it("puts what did not arrive first with its reason, and cancels one or all", async () => {
+    await documents();
+    target.manualTransfers = true;
+    target.failing.set(`${DOCUMENTS}\\locked.docx`, "The file is in use.");
+    await drop([local("first.bin", 4000), local("locked.docx"), local("third.bin"), local("fourth.bin")]);
+    expect(queue()).toEqual([
+      "first.bin: Waiting",
+      "locked.docx: Waiting",
+      "third.bin: Waiting",
+      "fourth.bin: Waiting",
+    ]);
+    const cancelAll = $('[data-action="xp-cancel-transfers"]') as HTMLButtonElement;
+    expect(cancelAll.textContent).toBe("Cancel all");
+    expect(cancelAll.getAttribute("aria-label")).toBe("Cancel all 4 transfers");
+
+    // One waiting transfer is cancelled: it never runs.
+    const cancel = queueRow("fourth.bin").querySelector('[data-action="xp-cancel-transfer"]');
+    expect(cancel?.getAttribute("aria-label")).toBe("Cancel fourth.bin");
+    (cancel as HTMLElement).click();
+    await flush();
+    expect(asked("explorer_cancel_transfer")).toHaveLength(1);
+    expect(queue().at(-1)).toBe("fourth.bin: Cancelled");
+
+    // The first runs to its end, the second fails.
+    for (let i = 0; i < 6; i += 1) {
+      target.stepTransfers();
+      await flush();
+    }
+    // What did not arrive comes first, then what waits, then what ended, the
+    // last one queued first.
+    expect(queue()).toEqual([
+      "locked.docx: Not sent",
+      "third.bin: Waiting",
+      "fourth.bin: Cancelled",
+      "first.bin: Sent · 3.9 KB",
+    ]);
+    expect(queueRow("locked.docx").querySelector(".why")?.textContent).toBe("The file is in use.");
+    expect($("#xp-queue-words").textContent).toBe("1 waiting · 1 failed · 1 cancelled · 1 done");
+    expect(queueRow("locked.docx").querySelector("button")).toBeNull();
+
+    // The running one is cancelled with all that wait.
+    target.stepTransfers();
+    await flush();
+    expect(queue()[1]).toBe("third.bin: 0% · 0 B of 100 B");
+    ($('[data-action="xp-cancel-transfers"]') as HTMLElement).click();
+    await flush();
+    while (target.stepTransfers()) await flush();
+    await flush();
+    expect(queue()).toEqual([
+      "locked.docx: Not sent",
+      "fourth.bin: Cancelled",
+      "third.bin: Cancelled",
+      "first.bin: Sent · 3.9 KB",
+    ]);
+    // Nothing that was cancelled or failed is in the folder.
+    expect(drawn()).toContain("first.bin");
+    expect(drawn()).not.toContain("third.bin");
+    expect(drawn()).not.toContain("locked.docx");
+    expect(announced()).toBe("Transfers ended: 1 done, 1 not completed, 2 cancelled.");
+  });
+
+  it("reads the queue of the session when the tab opens, and keeps the AI's transfers beside it", async () => {
+    await boot();
+    push(LISTENING);
+    push(FULL);
+    await flush();
+    // A transfer queued before this window drew the tab.
+    target.manualTransfers = true;
+    target.picked.files = [local("early.txt")];
+    const offer = target.pickUpload("files");
+    target.sendCheck(offer?.offer ?? 0, DOCUMENTS);
+    target.send(offer?.offer ?? 0, DOCUMENTS, {});
+    backend.listeners["console-activity"]?.({
+      payload: {
+        entry: "item",
+        item: {
+          id: "call-9",
+          source: "ai",
+          clientLabel: "Claude Code",
+          description: "Copied a file to the customer computer",
+          kind: "file_received",
+          operation: "copy a file to the customer computer at C:\\Users\\ann\\Downloads\\tool.exe",
+          path: "C:\\Users\\ann\\Downloads\\tool.exe",
+          bytes: 4096,
+          state: { state: "done" },
+          startedAt: new Date(T0).toISOString(),
+        },
+      },
+    });
+    click("#tab-files");
+    await flush();
+    expect(asked("explorer_transfers")).toHaveLength(1);
+    expect(queue()).toEqual(["early.txt: Waiting"]);
+    expect(app().querySelectorAll(".xp-transfers .list.files:not(.queue) .it")).toHaveLength(1);
+    expect($(".xp-transfers").textContent).toContain("Claude Code");
+
+    // The technician's own transfer is one row, also once the activity names it.
+    while (target.stepTransfers()) await flush();
+    backend.listeners["console-activity"]?.({
+      payload: {
+        entry: "item",
+        item: {
+          id: "action-3",
+          source: "technician",
+          description: "Copied a file to the customer computer",
+          kind: "file_received",
+          operation: `copy a file to the customer computer at ${DOCUMENTS}\\early.txt`,
+          path: `${DOCUMENTS}\\early.txt`,
+          bytes: 100,
+          state: { state: "done" },
+          startedAt: new Date(T0).toISOString(),
+        },
+      },
+    });
+    await flush();
+    expect(queue()).toEqual(["early.txt: Sent · 100 B"]);
+    expect(app().querySelectorAll(".xp-transfers .list.files:not(.queue) .it")).toHaveLength(1);
+    // Coming back to the tab asks nothing again.
+    click("#tab-overview");
+    click("#tab-files");
+    await flush();
+    expect(asked("explorer_transfers")).toHaveLength(1);
+  });
+
+  it("ends every transfer with the session, and the screen says so", async () => {
+    await documents();
+    target.manualTransfers = true;
+    await drop([local("running.bin", 4000), local("waiting.bin")]);
+    target.stepTransfers();
+    target.stepTransfers();
+    await flush();
+    expect(queue()[0]).toBe("running.bin: 50% · 2.0 KB of 3.9 KB");
+
+    target.endSession();
+    await flush();
+    expect(queue()).toEqual([
+      "waiting.bin: Stopped with the session",
+      "running.bin: Stopped with the session",
+    ]);
+    expect(queueRow("running.bin").querySelector(".why")?.textContent).toBe(
+      "The session ended before this was complete.",
+    );
+    const alert = $("#xp-alert").textContent ?? "";
+    expect(alert).toContain("Browsing has stopped");
+    expect(alert).toContain("2 transfers were stopped and are not complete.");
+    // Nothing can be changed any more.
+    expect(($("#xp-upload") as HTMLButtonElement).disabled).toBe(true);
+    expect(app().querySelector('[data-action="xp-cancel-transfers"]')).toBeNull();
+    await drop([local("late.txt")]);
+    expect(asked("explorer_send_check")).toHaveLength(1);
+
+    // The explorer goes with the session; the window still says what stopped.
+    push(consoleIn({ phase: "stopped", reason: "customer_requested" }));
+    await flush();
+    const said = $("#alert").textContent ?? "";
+    expect(said).toContain("2 transfers stopped with the session");
+    expect(said).toContain("Not complete: running.bin, waiting.bin.");
+  });
+
+  it("says in the window what full control cut short, also before the queue could", async () => {
+    await documents();
+    target.manualTransfers = true;
+    await drop([local("one.bin"), local("two.bin"), local("three.bin"), local("four.bin")]);
+    // The phase changes before any transfer was told as stopped.
+    push(consoleIn({ phase: "stopped", reason: "technician_requested" }));
+    await flush();
+    const said = $("#alert").textContent ?? "";
+    expect(said).toContain("4 transfers stopped with the session");
+    expect(said).toContain("Not complete: one.bin, two.bin, three.bin and 1 more.");
+    // What the queue tells afterwards belongs to no explorer any more.
+    target.endSession();
+    await flush();
+    push(LISTENING);
+    push(FULL);
+    await flush();
+    target = computer();
+    Object.assign(backend.handlers, commands(target));
+    click("#tab-files");
+    await flush();
+    expect(app().querySelector("#xp-queue")).toBeNull();
+  });
+});
+
+describe("deleting", () => {
+  it("asks first, naming how many items and that there is no recycle bin", async () => {
+    await documents();
+    click(row("a.txt"));
+    click(row("b.txt"), { ctrlKey: true });
+    click(row("Invoices"), { ctrlKey: true });
+    await flush();
+    key("Delete");
+    await flush();
+
+    expect(asked("explorer_delete")).toHaveLength(0);
+    const question = dialog();
+    expect(question.getAttribute("role")).toBe("alertdialog");
+    expect(question.getAttribute("aria-modal")).toBe("true");
+    expect($("#xp-question-title").textContent).toBe("Delete 3 items?");
+    const said = $("#xp-question-text").textContent ?? "";
+    expect(said).toContain("Invoices, a.txt, b.txt.");
+    expect(said).toContain("1 folder is deleted with everything in it.");
+    expect(said).toContain(
+      `There is no recycle bin on this path: what is deleted from ${DOCUMENTS} is gone for good.`,
+    );
+    // Cancel has the focus: Enter deletes nothing.
+    expect(document.activeElement).toBe(dialogButton("Cancel"));
+
+    dialogButton("Delete 3 items").click();
+    await flush();
+    expect(asked("explorer_delete")).toEqual([
+      {
+        folder: DOCUMENTS,
+        items: [
+          { name: "Invoices", kind: "dir" },
+          { name: "a.txt", kind: "file" },
+          { name: "b.txt", kind: "file" },
+        ],
+        removal: 1,
+      },
+    ]);
+    // The list is what is really there.
+    expect(drawn()).toEqual(["c.txt", "report.pdf"]);
+    expect(announced()).toBe("3 items deleted (2 files and 1 folder in all).");
+    expect($("#xp-alert").textContent).toBe("");
+    expect(document.activeElement).toBe($("#xp-grid"));
+  });
+
+  it("deletes nothing when the question is cancelled", async () => {
+    await documents();
+    click(row("a.txt"));
+    await flush();
+    action("xp-delete").click();
+    await flush();
+    expect($("#xp-question-title").textContent).toBe("Delete a.txt?");
+    expect(dialogButton("Delete")).not.toBeNull();
+    dialogButton("Cancel").click();
+    await flush();
+    expect(app().querySelector("#xp-question")).toBeNull();
+    expect(asked("explorer_delete")).toHaveLength(0);
+    expect(drawn()).toContain("a.txt");
+    expect(announced()).toBe("Nothing was deleted.");
+  });
+
+  it("reports what could not be removed, and why", async () => {
+    await documents();
+    target.folders.set(`${DOCUMENTS}\\Invoices`, [file("open.xlsx"), file("old.pdf")]);
+    target.held.set(`${DOCUMENTS}\\Invoices\\open.xlsx`, "the file is in use");
+    target.held.set(`${DOCUMENTS}\\c.txt`, "access was denied");
+    click(row("Invoices"));
+    click(row("c.txt"), { ctrlKey: true });
+    click(row("b.txt"), { ctrlKey: true });
+    await flush();
+    // From the context menu, on the selection.
+    $(row("b.txt")).dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 9, clientY: 9 }),
+    );
+    await flush();
+    expect($("#xp-menu").getAttribute("aria-label")).toBe("Actions for 3 items");
+    ($("#xp-menu").querySelector('[data-action="xp-delete"]') as HTMLElement).click();
+    await flush();
+    dialogButton("Delete 3 items").click();
+    await flush();
+
+    const alert = $("#xp-alert");
+    expect(alert.querySelector("b")?.textContent).toBe("2 of 3 items could not be deleted");
+    expect(alert.textContent).toContain("1 of 3 items was deleted");
+    const left = Array.from(alert.querySelectorAll(".xp-details li")).map((li) => li.textContent);
+    expect(left).toEqual([
+      `${DOCUMENTS}\\Invoices\\open.xlsx — the file is in use`,
+      `${DOCUMENTS}\\Invoices — the folder is not empty`,
+      `${DOCUMENTS}\\c.txt — access was denied`,
+    ]);
+    // Never "deleted" for what is still there.
+    expect(drawn()).toEqual(["Invoices", "a.txt", "c.txt", "report.pdf"]);
+    expect(announced()).toBe("2 of 3 items could not be deleted.");
+  });
+
+  it("can be cancelled while it runs, and nothing else is deleted or renamed meanwhile", async () => {
+    await documents();
+    target.manualDelete = true;
+    click(row("a.txt"));
+    click(row("b.txt"), { ctrlKey: true });
+    await flush();
+    key("Delete");
+    await flush();
+    dialogButton("Delete 2 items").click();
+    await flush();
+    const note = $("#xp-removal");
+    expect(note.getAttribute("role")).toBe("status");
+    expect(note.textContent).toContain("Deleting 2 items…");
+    expect(action("xp-delete").disabled).toBe(true);
+    expect(action("xp-rename").disabled).toBe(true);
+    key("Delete");
+    key("F2");
+    await flush();
+    expect(app().querySelector("#xp-question")).toBeNull();
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+
+    (note.querySelector('[data-action="xp-cancel-delete"]') as HTMLElement).click();
+    await flush();
+    expect(asked("explorer_cancel_delete")).toEqual([{ removal: 1 }]);
+    expect($("#xp-removal").textContent).toContain("Cancelling the delete…");
+    target.finishDelete();
+    await flush();
+    expect(app().querySelector("#xp-removal")).toBeNull();
+    expect($("#xp-alert b").textContent).toBe("The delete was cancelled");
+    expect($("#xp-alert").textContent).toContain("0 of 2 items were deleted. 2 items were not tried.");
+    expect(drawn()).toContain("a.txt");
+  });
+
+  it("follows a delete that runs, item by item", async () => {
+    await documents();
+    target.manualDelete = true;
+    click(row("a.txt"));
+    await flush();
+    key("Delete");
+    await flush();
+    dialogButton("Delete").click();
+    await flush();
+    backend.listeners["console-removal"]?.({
+      payload: { removal: 1, item: "a.txt", at: 1, of: 1, removedFiles: 1200, removedDirs: 30 },
+    });
+    // A step of another delete is not this one's.
+    backend.listeners["console-removal"]?.({
+      payload: { removal: 7, item: "zzz", at: 9, of: 9, removedFiles: 1, removedDirs: 1 },
+    });
+    await flush();
+    expect($("#xp-removal").textContent).toContain(
+      "Deleting item 1 of 1: a.txt… 1200 files and 30 folders removed so far.",
+    );
+    target.finishDelete();
+    await flush();
+  });
+
+  it("says what a delete came to when the session ended on its way", async () => {
+    await documents();
+    target.manualDelete = true;
+    click(row("a.txt"));
+    await flush();
+    key("Delete");
+    await flush();
+    dialogButton("Delete").click();
+    await flush();
+    // Full control ends, and with it the explorer; then the delete answers.
+    push(consoleIn({ phase: "stopped", reason: "customer_requested" }));
+    await flush();
+    target.endSession();
+    await flush();
+    const said = $("#alert").textContent ?? "";
+    expect(said).toContain("The delete stopped with the session");
+    expect(said).toContain("0 of 1 item were deleted. 1 item was not tried.");
+  });
+
+  it("deletes nothing at the drives", async () => {
+    await files();
+    click(row("C:\\"));
+    await flush();
+    expect(action("xp-delete").disabled).toBe(true);
+    expect(action("xp-rename").disabled).toBe(true);
+    key("Delete");
+    key("F2");
+    await flush();
+    expect(app().querySelector("#xp-question")).toBeNull();
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+  });
+});
+
+describe("renaming", () => {
+  function field(): HTMLInputElement {
+    return $("#xp-rename-input") as HTMLInputElement;
+  }
+
+  it("renames in place with F2 and Enter, and selects the new name", async () => {
+    await documents();
+    click(row("report.pdf"));
+    await flush();
+    key("F2");
+    await flush();
+    const input = field();
+    expect(input.value).toBe("report.pdf");
+    expect(input.getAttribute("aria-label")).toBe("New name for report.pdf");
+    expect(document.activeElement).toBe(input);
+    // The name without its extension is selected to be typed anew.
+    expect([input.selectionStart, input.selectionEnd]).toEqual([0, 6]);
+    expect($(`#${input.getAttribute("aria-describedby")}`).textContent).toBe(
+      "Press Enter to rename, Escape to leave the name as it is.",
+    );
+    // A letter is the field's own: it does not jump to another row.
+    key("c", {}, "#xp-rename-input");
+    key("Backspace", {}, "#xp-rename-input");
+    await flush();
+    expect(selected()).toEqual(["report.pdf"]);
+    expect(crumbs().at(-1)).toBe("Documents");
+
+    input.value = "report 2026.pdf";
+    key("Enter", {}, "#xp-rename-input");
+    await flush();
+    expect(asked("explorer_rename")).toEqual([
+      { folder: DOCUMENTS, name: "report.pdf", to: "report 2026.pdf" },
+    ]);
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+    expect(drawn()).toContain("report 2026.pdf");
+    expect(drawn()).not.toContain("report.pdf");
+    expect(selected()).toEqual(["report 2026.pdf"]);
+    expect(announced()).toBe("report.pdf is now report 2026.pdf.");
+    expect(document.activeElement).toBe($("#xp-grid"));
+  });
+
+  it("leaves the name as it was with Escape or a click elsewhere, and only then stops", async () => {
+    await documents();
+    click(row("a.txt"));
+    await flush();
+    action("xp-rename").click();
+    await flush();
+    field().value = "z.txt";
+    key("Escape", {}, "#xp-rename-input");
+    await flush();
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+    expect(asked("explorer_rename")).toHaveLength(0);
+    expect(asked("stop_session")).toHaveLength(0);
+    expect(document.activeElement).toBe($("#xp-grid"));
+
+    // A folder's whole name is selected; a click on another row leaves it.
+    $(row("Invoices")).dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 9, clientY: 9 }),
+    );
+    await flush();
+    ($("#xp-menu").querySelector('[data-action="xp-rename"]') as HTMLElement).click();
+    await flush();
+    expect([field().selectionStart, field().selectionEnd]).toEqual([0, 8]);
+    // A click in the field is the field's own.
+    click("#xp-rename-input");
+    await flush();
+    expect(app().querySelector("#xp-rename-input")).not.toBeNull();
+    field().value = "Bills";
+    click(row("b.txt"));
+    await flush();
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+    expect(asked("explorer_rename")).toHaveLength(0);
+    expect(drawn()).toContain("Invoices");
+    // The same name is no rename.
+    click(row("a.txt"));
+    key("F2");
+    await flush();
+    key("Enter", {}, "#xp-rename-input");
+    await flush();
+    expect(asked("explorer_rename")).toHaveLength(0);
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+  });
+
+  it("says why a name cannot be used and keeps the field open", async () => {
+    await documents();
+    click(row("a.txt"));
+    await flush();
+    key("F2");
+    await flush();
+    for (const [typed, why] of [
+      ["B.TXT", "B.TXT is already in this folder."],
+      ["sub\\a.txt", 'A name cannot hold any of \\ / : * ? " < > |.'],
+      ["", "A name cannot be empty."],
+      ["a.", "A name cannot end in a dot or a space."],
+    ] as const) {
+      field().value = typed;
+      key("Enter", {}, "#xp-rename-input");
+      await flush();
+      expect($("#xp-alert b").textContent, typed).toBe("That name cannot be used");
+      expect($("#xp-alert").textContent, typed).toContain(why);
+      expect(app().querySelector("#xp-rename-input"), typed).not.toBeNull();
+    }
+    expect(asked("explorer_rename")).toHaveLength(0);
+    field().value = "fine.txt";
+    key("Enter", {}, "#xp-rename-input");
+    await flush();
+    expect(asked("explorer_rename")).toHaveLength(1);
+    expect($("#xp-alert").textContent).toBe("");
+  });
+
+  it("shows a refusal of the customer computer and changes nothing", async () => {
+    await documents();
+    target.held.set(`${DOCUMENTS}\\a.txt`, "the file is in use");
+    click(row("a.txt"));
+    await flush();
+    key("F2");
+    await flush();
+    field().value = "moved.txt";
+    key("Enter", {}, "#xp-rename-input");
+    await flush();
+    expect($("#xp-alert b").textContent).toBe("a.txt could not be renamed");
+    expect($("#xp-alert").textContent).toContain("the file is in use (file_in_use)");
+    expect($("#xp-alert").textContent).toContain("Nothing was changed.");
+    expect(drawn()).toContain("a.txt");
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+  });
+
+  it("renames one entry only: not several, and not without one", async () => {
+    await documents();
+    expect(action("xp-rename").disabled).toBe(true);
+    click(row("a.txt"));
+    click(row("b.txt"), { ctrlKey: true });
+    await flush();
+    expect(action("xp-rename").disabled).toBe(true);
+    key("F2");
+    await flush();
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+  });
+});
+
+describe("changes and the session", () => {
+  it("says that the session has ended when a change fails closed, and offers no more", async () => {
+    await documents();
+    target.ended = { stage: "no_consented_session", message: "no session is under full control" };
+    click(row("a.txt"));
+    await flush();
+    key("F2");
+    await flush();
+    ($("#xp-rename-input") as HTMLInputElement).value = "z.txt";
+    key("Enter", {}, "#xp-rename-input");
+    await flush();
+    const alert = $("#xp-alert").textContent ?? "";
+    expect(alert).toContain("Browsing has stopped");
+    expect(alert).toContain("The session has ended. Browsing has stopped.");
+    expect(alert).not.toContain("could not be renamed");
+    for (const name of ["xp-download", "xp-download-to", "xp-rename", "xp-delete"]) {
+      expect(action(name).disabled, name).toBe(true);
+    }
+    expect(($("#xp-upload") as HTMLButtonElement).disabled).toBe(true);
+    key("Delete");
+    await flush();
+    expect(app().querySelector("#xp-question")).toBeNull();
+  });
+
+  it("offers each action as a button, in the menu and by its key alike", async () => {
+    await documents();
+    click(row("a.txt"));
+    await flush();
+    const buttons = Array.from(
+      app().querySelectorAll<HTMLButtonElement>(".xp-actions button"),
+    ).map((button) => [button.textContent, button.getAttribute("aria-keyshortcuts")]);
+    expect(buttons).toEqual([
+      ["Upload…", null],
+      ["Download", null],
+      ["Download to…", null],
+      ["RenameF2", "F2"],
+      ["DeleteDelete", "Delete"],
+    ]);
+    expect($(".xp-actions").getAttribute("role")).toBe("toolbar");
+    key("F10", { shiftKey: true });
+    await flush();
+    const inMenu = Array.from(
+      $("#xp-menu").querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    ).map((item) => item.dataset.action);
+    for (const button of app().querySelectorAll<HTMLButtonElement>(".xp-actions button")) {
+      const name = button.dataset.action ?? "";
+      if (name !== "xp-upload") expect(inMenu, name).toContain(name);
+    }
+    expect(inMenu).toContain("xp-upload-files");
+    expect(inMenu).toContain("xp-upload-folder");
+  });
+});
+

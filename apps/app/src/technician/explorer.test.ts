@@ -3,8 +3,16 @@
 // keyboard, the part in view, and the honest states.
 
 import { describe, expect, it } from "vitest";
-import type { ExplorerDrive, ExplorerEntry, ExplorerEvent } from "../shared/contract";
+import type {
+  DeleteReport,
+  ExplorerDrive,
+  ExplorerEntry,
+  ExplorerEvent,
+  TransferCheck,
+  TransferEntry,
+} from "../shared/contract";
 import {
+  type ConflictQuestion,
   DRIVES,
   type ExplorerState,
   HISTORY_LIMIT,
@@ -12,24 +20,46 @@ import {
   LIST_COLUMN_WIDTH,
   OVERSCAN,
   type Place,
+  QUEUE_ROWS,
   ROW_HEIGHT,
+  actionsFor,
+  answerConflict,
   applyDrives,
   applyEvent,
   applyFailure,
   applyListing,
+  applyRemoval,
+  applyTransfers,
+  canChange,
   childPath,
   clearSelection,
   compareEntries,
+  conflictQuestion,
+  conflictsDecided,
   crumbs,
+  deleteItems,
+  deleteOutcome,
+  deleteWords,
+  directionWords,
   driveKindWords,
   driveName,
+  endedWords,
   folder,
   indexOfKey,
   initialExplorer,
+  isChosenFolder,
+  isDeleteReport,
   isExplorerDrive,
   isExplorerEntry,
   isExplorerEvent,
   isExplorerListing,
+  isOpen,
+  isRemovalProgress,
+  isTransferCheck,
+  isTransferEntry,
+  isTransferQueued,
+  isTransfersEvent,
+  isUploadOffer,
   keyAt,
   lastName,
   layoutOf,
@@ -43,16 +73,30 @@ import {
   parentPlace,
   placeText,
   positionOf,
+  queueRestWords,
+  queueRows,
+  queueWords,
+  queuedWords,
+  removalOf,
+  removalWords,
+  renameProblem,
+  renameSelection,
   rowCount,
   samePlace,
   selectAll,
   selectByPrefix,
   selectOnly,
   selectTo,
+  selectedKeys,
   sizeWords,
   sortEntries,
   statusWords,
+  stoppedTransfers,
   toggleSelected,
+  transferCounts,
+  transferNames,
+  transferPercent,
+  transferWords,
   typeWords,
   visibleRange,
   withSort,
@@ -1073,13 +1117,20 @@ describe("the context menu", () => {
   it("offers Open for one folder, and Refresh always", () => {
     expect(menuItems(menu(["Invoices"]))).toEqual([
       { action: "xp-menu-open", label: "Open", keys: "Enter", disabled: false },
-      { action: "xp-refresh", label: "Refresh", keys: "F5", disabled: false },
+      { action: "xp-download", label: "Download", disabled: false, separated: true },
+      { action: "xp-download-to", label: "Download to…", disabled: false },
+      { action: "xp-rename", label: "Rename", keys: "F2", disabled: false },
+      { action: "xp-delete", label: "Delete", keys: "Delete", disabled: false },
+      { action: "xp-upload-files", label: "Upload files…", disabled: false, separated: true },
+      { action: "xp-upload-folder", label: "Upload a folder…", disabled: false },
+      { action: "xp-refresh", label: "Refresh", keys: "F5", disabled: false, separated: true },
     ]);
     // A file and a link open nothing; neither do several rows, or none.
     for (const keys of [["a.txt"], ["link"], ["Invoices", "a.txt"], []]) {
       const items = menuItems(menu(keys));
       expect(items[0]?.disabled, keys.join()).toBe(true);
-      expect(items[1]?.disabled).toBe(false);
+      expect(items.at(-1)?.action).toBe("xp-refresh");
+      expect(items.at(-1)?.disabled).toBe(false);
     }
   });
 });
@@ -1166,3 +1217,612 @@ describe("what the backend sends", () => {
     }
   });
 });
+
+// --- The second part: send, copy to this computer, rename, delete ---
+
+function entry(patch: Partial<TransferEntry> & { id: number }): TransferEntry {
+  return {
+    direction: "send",
+    kind: "file",
+    name: `f${patch.id}`,
+    remote: `${DOCUMENTS}\\f${patch.id}`,
+    local: `C:\\Users\\sam\\Desktop\\f${patch.id}`,
+    done: 0,
+    state: "waiting",
+    ...patch,
+  };
+}
+
+function ids(s: ExplorerState): number[] {
+  return s.transfers.map((transfer) => transfer.id);
+}
+
+const documents = (): ExplorerState =>
+  open(
+    initialExplorer(),
+    DOCUMENTS,
+    [[dir("Invoices"), file("a.txt"), file("b.txt"), link("shortcut"), file("report.final.pdf")]],
+    1,
+  );
+
+describe("the transfer queue", () => {
+  it("starts empty, and takes what the backend tells by its number", () => {
+    const empty = initialExplorer();
+    expect(empty.transfers).toEqual([]);
+    expect(applyTransfers(empty, [])).toBe(empty);
+
+    let s = applyTransfers(empty, [entry({ id: 1 }), entry({ id: 2 }), entry({ id: 5 })]);
+    expect(ids(s)).toEqual([1, 2, 5]);
+    // An entry it has is replaced; the others stay the objects they were.
+    const first = s.transfers[0];
+    s = applyTransfers(s, [entry({ id: 2, state: "running", done: 10, bytes: 40 })]);
+    expect(ids(s)).toEqual([1, 2, 5]);
+    expect(s.transfers[1]?.state).toBe("running");
+    expect(s.transfers[0]).toBe(first);
+    // One that arrives late takes its place in the order of the numbers.
+    s = applyTransfers(s, [entry({ id: 4 }), entry({ id: 3 }), entry({ id: 9 })]);
+    expect(ids(s)).toEqual([1, 2, 3, 4, 5, 9]);
+  });
+
+  it("drops a folder whose files are queued, and never adds one", () => {
+    let s = applyTransfers(initialExplorer(), [
+      entry({ id: 1, kind: "folder", direction: "download", state: "running" }),
+    ]);
+    s = applyTransfers(s, [
+      entry({ id: 1, kind: "folder", direction: "download", state: "listed" }),
+      entry({ id: 2 }),
+    ]);
+    expect(ids(s)).toEqual([2]);
+    expect(ids(applyTransfers(s, [entry({ id: 7, state: "listed" })]))).toEqual([2]);
+  });
+
+  it("takes nothing from the backend as done that the backend did not say", () => {
+    // Every state arrives as the backend told it: none is turned into done.
+    for (const state of ["waiting", "running", "failed", "cancelled", "left_out", "stopped"] as const) {
+      const s = applyTransfers(initialExplorer(), [entry({ id: 1, state, done: 100, bytes: 100 })]);
+      expect(s.transfers[0]?.state).toBe(state);
+      expect(transferWords(s.transfers[0] as TransferEntry)).not.toMatch(/^Sent|^Copied/);
+    }
+  });
+
+  it("counts the transfers of each state", () => {
+    const counts = transferCounts([
+      entry({ id: 1, state: "done" }),
+      entry({ id: 2, state: "done" }),
+      entry({ id: 3, state: "failed" }),
+      entry({ id: 4, state: "left_out" }),
+      entry({ id: 5, state: "running" }),
+      entry({ id: 6 }),
+      entry({ id: 7, state: "cancelled" }),
+      entry({ id: 8, state: "stopped" }),
+      entry({ id: 9, state: "listed" }),
+    ]);
+    expect(counts).toEqual({
+      waiting: 1,
+      running: 1,
+      done: 2,
+      failed: 1,
+      cancelled: 1,
+      left_out: 1,
+      stopped: 1,
+    });
+    expect(isOpen(entry({ id: 1 }))).toBe(true);
+    expect(isOpen(entry({ id: 1, state: "running" }))).toBe(true);
+    expect(isOpen(entry({ id: 1, state: "done" }))).toBe(false);
+  });
+
+  it("shows what did not arrive first, then what runs and waits, then what ended", () => {
+    const rows = queueRows([
+      entry({ id: 1, state: "done" }),
+      entry({ id: 2, state: "failed" }),
+      entry({ id: 3, state: "cancelled" }),
+      entry({ id: 4, state: "running" }),
+      entry({ id: 5 }),
+      entry({ id: 6, state: "left_out" }),
+      entry({ id: 7 }),
+      entry({ id: 8, state: "stopped" }),
+    ]);
+    const list = (entries: TransferEntry[]): number[] => entries.map((each) => each.id);
+    // The last one queued first among those that did not arrive and that ended.
+    expect(list(rows.attention)).toEqual([8, 6, 2]);
+    expect(list(rows.running)).toEqual([4]);
+    // What waits is in the order it will run.
+    expect(list(rows.waiting)).toEqual([5, 7]);
+    expect(list(rows.finished)).toEqual([3, 1]);
+    expect([rows.attentionMore, rows.waitingMore, rows.finishedMore]).toEqual([0, 0, 0]);
+  });
+
+  it("draws a bounded number of rows of each part and counts the rest", () => {
+    const many = (state: TransferEntry["state"], count: number, from: number): TransferEntry[] =>
+      Array.from({ length: count }, (_, n) => entry({ id: from + n, state }));
+    const rows = queueRows([
+      ...many("done", QUEUE_ROWS.finished + 30, 1),
+      ...many("failed", QUEUE_ROWS.attention + 7, 1000),
+      ...many("waiting", QUEUE_ROWS.waiting + 400, 5000),
+    ]);
+    expect(rows.attention).toHaveLength(QUEUE_ROWS.attention);
+    expect(rows.attentionMore).toBe(7);
+    expect(rows.waiting).toHaveLength(QUEUE_ROWS.waiting);
+    expect(rows.waitingMore).toBe(400);
+    expect(rows.finished).toHaveLength(QUEUE_ROWS.finished);
+    expect(rows.finishedMore).toBe(30);
+    // The first that waits is the first that will run.
+    expect(rows.waiting[0]?.id).toBe(5000);
+  });
+
+  it("says how far a transfer is, and only of a verified one that it was sent or copied", () => {
+    const sent = entry({ id: 1, bytes: 2048, done: 2048, state: "done" });
+    expect(transferWords(sent)).toBe("Sent · 2.0 KB");
+    expect(transferWords({ ...sent, direction: "download" })).toBe("Copied · 2.0 KB");
+    expect(transferWords(entry({ id: 1 }))).toBe("Waiting");
+    const half = entry({ id: 1, bytes: 2048, done: 1024, state: "running" });
+    expect(transferPercent(half)).toBe(50);
+    expect(transferWords(half)).toBe("50% · 1.0 KB of 2.0 KB");
+    // Nearly there is not there.
+    expect(transferPercent(entry({ id: 1, bytes: 1000, done: 999, state: "running" }))).toBe(99);
+    expect(transferPercent(entry({ id: 1, state: "running" }))).toBeUndefined();
+    expect(transferWords(entry({ id: 1, state: "running" }))).toBe("Sending…");
+    expect(transferWords(entry({ id: 1, state: "running", direction: "download" }))).toBe("Copying…");
+    // An empty file is whole once it is done, and not before.
+    expect(transferPercent(entry({ id: 1, bytes: 0, state: "running" }))).toBe(0);
+    expect(transferPercent(entry({ id: 1, bytes: 0, state: "done" }))).toBe(100);
+    expect(transferWords(entry({ id: 1, state: "failed" }))).toBe("Not sent");
+    expect(transferWords(entry({ id: 1, state: "failed", direction: "download" }))).toBe("Not copied");
+    expect(transferWords(entry({ id: 1, state: "failed", kind: "folder" }))).toBe("Not complete");
+    expect(transferWords(entry({ id: 1, state: "cancelled", done: 5, bytes: 9 }))).toBe("Cancelled");
+    expect(transferWords(entry({ id: 1, state: "left_out" }))).toBe("Left out");
+    expect(transferWords(entry({ id: 1, state: "stopped" }))).toBe("Stopped with the session");
+    expect(transferWords(entry({ id: 1, kind: "folder", state: "done" }))).toBe("Made");
+    expect(transferWords(entry({ id: 1, kind: "folder", state: "running" }))).toBe("Making the folder…");
+    expect(
+      transferWords(entry({ id: 1, kind: "folder", state: "running", direction: "download" })),
+    ).toBe("Listing the folder…");
+    expect(directionWords(sent)).toBe("To the customer computer");
+    expect(directionWords({ ...sent, direction: "download" })).toBe(
+      "To this computer · leaves the customer computer",
+    );
+  });
+
+  it("says the queue in one line, and how it came to rest", () => {
+    const running = [entry({ id: 1, state: "running" }), entry({ id: 2 })];
+    expect(queueWords(running)).toBe("1 running · 1 waiting");
+    expect(queueWords([])).toBe("");
+    const rested = [
+      entry({ id: 1, state: "done" }),
+      entry({ id: 2, state: "failed" }),
+      entry({ id: 3, state: "cancelled" }),
+      entry({ id: 4, state: "left_out" }),
+    ];
+    expect(queueWords(rested)).toBe("1 failed · 1 left out · 1 cancelled · 1 done");
+    expect(queueRestWords(running, rested)).toBe(
+      "Transfers ended: 1 done, 2 not completed, 1 cancelled.",
+    );
+    expect(queueRestWords(running, [entry({ id: 1, state: "done" })])).toBe(
+      "Transfers ended: 1 done.",
+    );
+    // Nothing is said while something still waits, or when nothing was running.
+    expect(queueRestWords(running, running)).toBeUndefined();
+    expect(queueRestWords(rested, rested)).toBeUndefined();
+    expect(queueRestWords([], rested)).toBeUndefined();
+  });
+
+  it("says how a send or a copy was queued", () => {
+    expect(queuedWords("send", { queued: 1, leftOut: 0, skipped: 0 })).toBe("1 item queued to send.");
+    expect(queuedWords("download", { queued: 3, leftOut: 0, skipped: 0 })).toBe(
+      "3 items queued to copy to this computer.",
+    );
+    expect(queuedWords("send", { queued: 2, leftOut: 1, skipped: 4 })).toBe(
+      "2 items queued to send, 4 skipped, 1 left out, see the transfers.",
+    );
+  });
+
+  it("says what the end of full control cut short", () => {
+    expect(stoppedTransfers([])).toBeUndefined();
+    expect(stoppedTransfers([entry({ id: 1, state: "done" }), entry({ id: 2, state: "failed" })])).toBeUndefined();
+    const one = stoppedTransfers([entry({ id: 1, name: "setup.exe", state: "running" })]);
+    expect(one?.title).toBe("1 transfer stopped with the session");
+    expect(one?.message).toBe("Not complete: setup.exe.");
+    const many = stoppedTransfers([
+      entry({ id: 1, name: "a", state: "stopped" }),
+      entry({ id: 2, name: "b" }),
+      entry({ id: 3, name: "c" }),
+      entry({ id: 4, name: "d" }),
+      entry({ id: 5, name: "e", state: "done" }),
+    ]);
+    expect(many?.title).toBe("4 transfers stopped with the session");
+    expect(many?.message).toBe("Not complete: a, b, c and 1 more.");
+    expect(many?.next).toContain("Nothing more is sent or copied");
+  });
+});
+
+describe("a name that is taken", () => {
+  const check = (names: Array<[string, boolean]>): TransferCheck => ({
+    folder: DOCUMENTS,
+    conflicts: names.map(([name, replace]) => ({ name, kind: "file", existing: "file", replace })),
+  });
+  const ask = (names: Array<[string, boolean]>): ConflictQuestion => {
+    const question = conflictQuestion(check(names), { direction: "send", folder: DOCUMENTS, offer: 4 });
+    if (!question) throw new Error("no question");
+    return question;
+  };
+
+  it("asks nothing when no name is taken", () => {
+    expect(conflictQuestion(check([]), { direction: "send", folder: DOCUMENTS, offer: 1 })).toBeUndefined();
+  });
+
+  it("asks about one name after the other and keeps each choice", () => {
+    let q = ask([
+      ["a.txt", true],
+      ["b.txt", true],
+      ["c.txt", true],
+    ]);
+    expect([q.at, q.all, q.where, q.offer]).toEqual([0, false, DOCUMENTS, 4]);
+    q = answerConflict(q, "keep_both");
+    expect(q.at).toBe(1);
+    expect(conflictsDecided(q)).toBe(false);
+    q = answerConflict(q, "replace");
+    q = answerConflict(q, "skip");
+    expect(conflictsDecided(q)).toBe(true);
+    expect(q.choices).toEqual({ "a.txt": "keep_both", "b.txt": "replace", "c.txt": "skip" });
+    // Nothing is left to answer.
+    expect(answerConflict(q, "replace")).toBe(q);
+  });
+
+  it("applies a choice to all that follow when asked to", () => {
+    const q = answerConflict(
+      {
+        ...ask([
+          ["a.txt", true],
+          ["b.txt", true],
+          ["c.txt", true],
+        ]),
+        all: true,
+      },
+      "keep_both",
+    );
+    expect(conflictsDecided(q)).toBe(true);
+    expect(q.choices).toEqual({ "a.txt": "keep_both", "b.txt": "keep_both", "c.txt": "keep_both" });
+  });
+
+  it("never replaces where Replace is not offered, also not for all", () => {
+    const first = ask([
+      ["a.txt", false],
+      ["b.txt", true],
+    ]);
+    // Replace is not a choice for this name.
+    expect(answerConflict(first, "replace")).toBe(first);
+    // Replace for all stops at the name that cannot be replaced, and asks.
+    const q = answerConflict(
+      {
+        ...ask([
+          ["a.txt", true],
+          ["b.txt", true],
+          ["folder", false],
+          ["d.txt", true],
+        ]),
+        all: true,
+      },
+      "replace",
+    );
+    expect(q.at).toBe(2);
+    expect(conflictsDecided(q)).toBe(false);
+    expect(q.choices).toEqual({ "a.txt": "replace", "b.txt": "replace" });
+    const rest = answerConflict(q, "skip");
+    expect(rest.choices).toEqual({
+      "a.txt": "replace",
+      "b.txt": "replace",
+      folder: "skip",
+      "d.txt": "skip",
+    });
+  });
+});
+
+describe("the actions of the selection", () => {
+  const disabled = (s: ExplorerState, keys: string[]): Record<string, boolean> =>
+    Object.fromEntries(actionsFor(s, keys).map((item) => [item.action, item.disabled]));
+
+  it("offers what can be done with the rows it is asked for", () => {
+    const s = documents();
+    expect(canChange(s)).toBe(true);
+    expect(disabled(s, ["a.txt"])).toEqual({
+      "xp-menu-open": true,
+      "xp-download": false,
+      "xp-download-to": false,
+      "xp-rename": false,
+      "xp-delete": false,
+      "xp-upload-files": false,
+      "xp-upload-folder": false,
+      "xp-refresh": false,
+    });
+    // Several rows are copied and deleted together; one at a time is renamed.
+    const several = disabled(s, ["a.txt", "b.txt"]);
+    expect([several["xp-download"], several["xp-rename"], several["xp-delete"]]).toEqual([
+      false,
+      true,
+      false,
+    ]);
+    // Without a row there is only the place to send to and to refresh.
+    const none = disabled(s, []);
+    expect([none["xp-download"], none["xp-rename"], none["xp-delete"], none["xp-upload-files"]]).toEqual(
+      [true, true, true, false],
+    );
+  });
+
+  it("changes nothing at the drives, after the session, or while a delete runs", () => {
+    const drives = applyDrives(opening(initialExplorer(), { listing: 1, place: DRIVES, how: "push" }), 1, [C]);
+    expect(canChange(drives)).toBe(false);
+    const atDrives = disabled(drives, ["C:\\"]);
+    expect(atDrives["xp-menu-open"]).toBe(false);
+    for (const action of ["xp-download", "xp-download-to", "xp-rename", "xp-delete", "xp-upload-files", "xp-upload-folder"]) {
+      expect(atDrives[action], action).toBe(true);
+    }
+    const ended = { ...documents(), ended: "The session has ended. Browsing has stopped." };
+    expect(canChange(ended)).toBe(false);
+    expect(Object.values(disabled(ended, ["a.txt"])).filter((d) => !d)).toHaveLength(1);
+    // One delete at a time; a copy and an upload go on.
+    const deleting = { ...documents(), removal: removalOf(1, 2) };
+    const during = disabled(deleting, ["a.txt"]);
+    expect([during["xp-rename"], during["xp-delete"], during["xp-download"], during["xp-upload-files"]]).toEqual(
+      [true, true, false, false],
+    );
+  });
+
+  it("is the context menu, and the menu of the Upload button is its two ways to choose", () => {
+    const s = documents();
+    const menu = { ...s, menu: { x: 1, y: 1, keys: ["a.txt"] } };
+    expect(menuItems(menu)).toEqual(actionsFor(s, ["a.txt"]));
+    expect(menuItems({ ...s, menu: { x: 1, y: 1, keys: [], only: "upload" } })).toEqual([
+      { action: "xp-upload-files", label: "Files…", disabled: false },
+      { action: "xp-upload-folder", label: "A folder…", disabled: false },
+    ]);
+  });
+
+  it("names the selected rows in the order of the list", () => {
+    let s = documents();
+    expect(selectedKeys(s)).toEqual([]);
+    s = toggleSelected(toggleSelected(selectOnly(s, "report.final.pdf"), "Invoices"), "a.txt");
+    expect(selectedKeys(s)).toEqual(["Invoices", "a.txt", "report.final.pdf"]);
+    expect(deleteItems(s, selectedKeys(s))).toEqual([
+      { name: "Invoices", kind: "dir" },
+      { name: "a.txt", kind: "file" },
+      { name: "report.final.pdf", kind: "file" },
+    ]);
+    // A copy is told a folder from everything else; what a name really is,
+    // the backend finds out itself.
+    expect(transferNames(s, ["Invoices", "a.txt", "shortcut", "gone"])).toEqual([
+      { name: "Invoices", kind: "folder" },
+      { name: "a.txt", kind: "file" },
+      { name: "shortcut", kind: "file" },
+    ]);
+  });
+});
+
+describe("renaming", () => {
+  it("selects the name without its extension, and a folder's whole name", () => {
+    expect(renameSelection(file("report.final.pdf"))).toEqual([0, 12]);
+    expect(renameSelection(file("README"))).toEqual([0, 6]);
+    expect(renameSelection(file(".gitignore"))).toEqual([0, 10]);
+    expect(renameSelection(dir("Photos.2026"))).toEqual([0, 11]);
+  });
+
+  it("says why a name cannot be used before anything is asked", () => {
+    const s = documents();
+    expect(renameProblem(s, "a.txt", "c.txt")).toBeUndefined();
+    // Another letter case of its own name is a new name.
+    expect(renameProblem(s, "a.txt", "A.TXT")).toBeUndefined();
+    expect(renameProblem(s, "a.txt", "B.txt")).toBe("B.txt is already in this folder.");
+    expect(renameProblem(s, "a.txt", "invoices")).toBe("invoices is already in this folder.");
+    expect(renameProblem(s, "a.txt", "")).toBe("A name cannot be empty.");
+    expect(renameProblem(s, "a.txt", "   ")).toBe("A name cannot be empty.");
+    for (const bad of ["sub\\x", "a/b", "c:d", "what?", "a*b", 'say "x"', "<x>", "a|b", "tab\there"]) {
+      expect(renameProblem(s, "a.txt", bad), bad).toBe(
+        'A name cannot hold any of \\ / : * ? " < > |.',
+      );
+    }
+    expect(renameProblem(s, "a.txt", "..")).toBe("This name stands for a folder, not for an entry.");
+    expect(renameProblem(s, "a.txt", "name.")).toBe("A name cannot end in a dot or a space.");
+    expect(renameProblem(s, "a.txt", "name ")).toBe("A name cannot end in a dot or a space.");
+  });
+
+  it("selects the new name once the folder is listed again", () => {
+    let s: ExplorerState = { ...selectOnly(documents(), "a.txt"), reveal: "z.txt" };
+    s = opening(s, { listing: 2, place: folder(DOCUMENTS), how: "replace" });
+    s = applyEvent(s, {
+      kind: "opened",
+      listing: 2,
+      path: DOCUMENTS,
+      entries: [dir("Invoices"), file("b.txt"), file("z.txt")],
+      end: true,
+    });
+    expect(names(s)).toEqual(["Invoices", "b.txt", "z.txt"]);
+    expect([...s.selected]).toEqual(["z.txt"]);
+    expect(s.focus).toBe("z.txt");
+    expect(s.reveal).toBeUndefined();
+  });
+
+  it("closes the field of a rename when the explorer goes elsewhere", () => {
+    const s: ExplorerState = { ...documents(), renaming: "a.txt" };
+    expect(opening(s, { listing: 2, place: DRIVES, how: "push" }).renaming).toBeUndefined();
+  });
+});
+
+describe("deleting", () => {
+  it("asks with the number of items and says that there is no recycle bin", () => {
+    const one = deleteWords({ kind: "delete", folder: DOCUMENTS, items: [{ name: "a.txt", kind: "file" }] });
+    expect(one.title).toBe("Delete a.txt?");
+    expect(one.lines).toEqual([
+      `There is no recycle bin on this path: what is deleted from ${DOCUMENTS} is gone for good.`,
+    ]);
+    const folderOnly = deleteWords({
+      kind: "delete",
+      folder: DOCUMENTS,
+      items: [{ name: "Invoices", kind: "dir" }],
+    });
+    expect(folderOnly.title).toBe("Delete Invoices?");
+    expect(folderOnly.lines[0]).toBe("The folder is deleted with everything in it.");
+    const many = deleteWords({
+      kind: "delete",
+      folder: DOCUMENTS,
+      items: [
+        { name: "A", kind: "dir" },
+        { name: "B", kind: "dir" },
+        ...["c", "d", "e", "f", "g"].map((name) => ({ name, kind: "file" as const })),
+      ],
+    });
+    expect(many.title).toBe("Delete 7 items?");
+    expect(many.lines).toEqual([
+      "A, B, c, d, e and 2 more.",
+      "2 folders are deleted with everything in them.",
+      `There is no recycle bin on this path: what is deleted from ${DOCUMENTS} is gone for good.`,
+    ]);
+  });
+
+  it("follows the delete that runs, and no other", () => {
+    let s: ExplorerState = { ...documents(), removal: removalOf(3, 4) };
+    expect(removalWords(removalOf(3, 4))).toBe("Deleting 4 items…");
+    const step = { removal: 3, item: "Photos", at: 2, of: 4, removedFiles: 120, removedDirs: 1 };
+    s = applyRemoval(s, step);
+    expect(s.removal).toEqual({ id: 3, items: 4, item: "Photos", at: 2, removedFiles: 120, removedDirs: 1 });
+    expect(removalWords(s.removal ?? removalOf(0, 0))).toBe(
+      "Deleting item 2 of 4: Photos… 120 files and 1 folder removed so far.",
+    );
+    expect(applyRemoval(s, { ...step, removal: 9 })).toBe(s);
+    expect(applyRemoval(documents(), step).removal).toBeUndefined();
+    expect(removalWords({ ...removalOf(3, 4), cancelling: true })).toBe("Cancelling the delete…");
+  });
+
+  const report = (patch: Partial<DeleteReport>): DeleteReport => ({
+    selected: 3,
+    removed: 3,
+    removedFiles: 3,
+    removedDirs: 0,
+    failed: [],
+    failedMore: 0,
+    cancelled: false,
+    notTried: 0,
+    ...patch,
+  });
+
+  it("says a delete that removed everything in a sentence, and nothing else as that", () => {
+    expect(deleteOutcome(report({}))).toEqual({ notice: "3 items deleted." });
+    expect(deleteOutcome(report({ selected: 1, removed: 1, removedFiles: 40, removedDirs: 3 }))).toEqual({
+      notice: "1 item deleted (40 files and 3 folders in all).",
+    });
+  });
+
+  it("names what could not be removed, and never says that it was", () => {
+    const partial = deleteOutcome(
+      report({
+        removed: 1,
+        removedFiles: 1,
+        failed: [
+          { path: `${DOCUMENTS}\\open.docx`, reason: "the file is in use" },
+          { path: `${DOCUMENTS}\\Old`, reason: "the folder is not empty" },
+        ],
+        failedMore: 5,
+      }),
+    );
+    expect(partial.notice).toBe("2 of 3 items could not be deleted.");
+    expect(partial.refusal?.title).toBe("2 of 3 items could not be deleted");
+    expect(partial.refusal?.message).toBe("1 of 3 items was deleted.");
+    expect(partial.refusal?.details).toHaveLength(2);
+    expect(partial.refusal?.more).toBe(5);
+    expect(partial.refusal?.next).toContain("The list shows what is there now.");
+    // Nothing was removed at all.
+    const none = deleteOutcome(
+      report({ removed: 0, removedFiles: 0, failed: [{ path: "x", reason: "access was denied" }] }),
+    );
+    expect(none.refusal?.title).toBe("3 of 3 items could not be deleted");
+    expect(none.refusal?.message).toBe("0 of 3 items were deleted.");
+  });
+
+  it("says a cancelled delete and one the session stopped as that", () => {
+    const cancelled = deleteOutcome(
+      report({ removed: 1, removedFiles: 200, removedDirs: 4, cancelled: true, notTried: 1 }),
+    );
+    expect(cancelled.refusal?.title).toBe("The delete was cancelled");
+    expect(cancelled.refusal?.message).toBe(
+      "1 of 3 items was deleted (200 files and 4 folders in all). 1 item was not tried.",
+    );
+    const ended = deleteOutcome(
+      report({ removed: 0, removedFiles: 0, notTried: 3, ended: "The session ended before this was complete." }),
+    );
+    expect(ended.refusal?.title).toBe("The delete stopped with the session");
+    expect(ended.refusal?.message).toBe("0 of 3 items were deleted. 3 items were not tried.");
+    expect(ended.refusal?.next).toBe("The session ended before this was complete.");
+    // All were removed, and yet the session ended: still not a plain success.
+    expect(deleteOutcome(report({ ended: "x" })).refusal).toBeDefined();
+  });
+});
+
+describe("what the backend sends for a change", () => {
+  it("takes only what the contract describes", () => {
+    const transfer = entry({ id: 1, bytes: 10 });
+    expect(isTransferEntry(transfer)).toBe(true);
+    expect(isTransferEntry({ ...transfer, reason: "x" })).toBe(true);
+    for (const bad of [
+      { ...transfer, id: "1" },
+      { ...transfer, direction: "sideways" },
+      { ...transfer, kind: "link" },
+      { ...transfer, state: "finished" },
+      { ...transfer, name: 3 },
+      { ...transfer, bytes: "10" },
+      { ...transfer, done: Number.NaN },
+      { ...transfer, reason: 7 },
+      null,
+      "transfer",
+    ]) {
+      expect(isTransferEntry(bad), JSON.stringify(bad)).toBe(false);
+    }
+    expect(isTransfersEvent({ entries: [transfer] })).toBe(true);
+    expect(isTransfersEvent({ entries: [] })).toBe(true);
+    // An event with an entry that is none is not taken at all.
+    expect(isTransfersEvent({ entries: [transfer, { id: 2 }] })).toBe(false);
+    expect(isTransfersEvent({})).toBe(false);
+
+    expect(isUploadOffer({ offer: 1, items: 2, names: ["a", "b"] })).toBe(true);
+    expect(isUploadOffer({ offer: 1, items: 2, names: [1] })).toBe(false);
+    expect(isUploadOffer(null)).toBe(false);
+
+    expect(
+      isTransferCheck({
+        folder: DOCUMENTS,
+        conflicts: [{ name: "a", kind: "file", existing: "symlink", replace: false }],
+      }),
+    ).toBe(true);
+    expect(isTransferCheck({ folder: DOCUMENTS, conflicts: [{ name: "a", kind: "file" }] })).toBe(false);
+    expect(isTransferCheck({ conflicts: [] })).toBe(false);
+
+    expect(isTransferQueued({ queued: 1, leftOut: 0, skipped: 0 })).toBe(true);
+    expect(isTransferQueued({ queued: 1 })).toBe(false);
+    expect(isChosenFolder({ folder: 1, path: "D:\\Kept" })).toBe(true);
+    expect(isChosenFolder({ folder: "1", path: "D:\\Kept" })).toBe(false);
+    expect(isChosenFolder(null)).toBe(false);
+
+    const step = { removal: 1, item: "a", at: 1, of: 2, removedFiles: 0, removedDirs: 0 };
+    expect(isRemovalProgress(step)).toBe(true);
+    expect(isRemovalProgress({ ...step, item: 4 })).toBe(false);
+
+    const done: DeleteReport = {
+      selected: 1,
+      removed: 1,
+      removedFiles: 1,
+      removedDirs: 0,
+      failed: [],
+      failedMore: 0,
+      cancelled: false,
+      notTried: 0,
+    };
+    expect(isDeleteReport(done)).toBe(true);
+    expect(isDeleteReport({ ...done, ended: "x", failed: [{ path: "p", reason: "r" }] })).toBe(true);
+    expect(isDeleteReport({ ...done, failed: [{ path: "p" }] })).toBe(false);
+    expect(isDeleteReport({ ...done, cancelled: "no" })).toBe(false);
+  });
+
+  it("knows the failures that mean the session is over", () => {
+    expect(endedWords("no_consented_session")).toBe("The session has ended. Browsing has stopped.");
+    expect(endedWords("disconnected")).toContain("was lost");
+    expect(endedWords("access_denied")).toBeUndefined();
+  });
+});
+
