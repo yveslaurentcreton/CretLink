@@ -38,8 +38,8 @@ use cretlink_cli::relay_profile::{self, Field, Problem, ProfileError, RelayProfi
 use cretlink_cli::settings;
 use cretlink_relay::RelayRefusal;
 use cretlink_session::{
-    AdmissionToken, Dial, RELAY_CONNECT_TIMEOUT, RelayFailure, RendezvousTicket, SessionError,
-    WssConnector, WssRelayDial,
+    AdmissionToken, Dial, EndedBy, RELAY_CONNECT_TIMEOUT, RelayFailure, RendezvousTicket,
+    SessionError, SessionEvent, WssConnector, WssRelayDial,
 };
 use serde::Serialize;
 
@@ -717,6 +717,35 @@ pub(crate) fn failure_words(
                 tell("the relay settings of this copy cannot be used")
             },
         ),
+    }
+}
+
+/// The stage of a session through a relay that ended because its connection
+/// was lost before the session was under control (ST-M007-013).
+pub(crate) const LOST_STAGE: &str = "relay_lost";
+
+/// Names the end of a session whose connection was lost, when the session ran
+/// through a relay (ST-M007-013).
+///
+/// The session runtime reports a peer that went away before full control as a
+/// failure of the stage it was in. Through a relay that is not the whole
+/// story: the relay may have stopped, and the window should say so instead of
+/// a lost session of unknown cause (REQ-N-015). `ended_by` is the runtime's
+/// own verdict, so nothing is read out of a message. Any other event, and
+/// every event of a session on one network, is answered as it is.
+pub(crate) fn name_lost_connection(
+    event: SessionEvent,
+    ended_by: Option<EndedBy>,
+    relay_host: Option<&str>,
+) -> SessionEvent {
+    match (event, ended_by, relay_host) {
+        (SessionEvent::Failed { .. }, Some(EndedBy::ConnectionLost), Some(host)) => {
+            SessionEvent::Failed {
+                stage: LOST_STAGE.to_owned(),
+                message: format!("The connection through the relay {host} was lost."),
+            }
+        }
+        (event, _, _) => event,
     }
 }
 

@@ -515,6 +515,50 @@ async fn a_relay_that_stops_in_the_middle_ends_the_session_on_both_sides() {
     assert_eq!(summary.relay.as_deref(), Some(RELAY_NAME));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_stops_before_the_customer_decided_is_said_with_the_relay() {
+    let relay = keyed_relay().await;
+    let technician = technician_at(&relay, "relay-stops-early", Some(TECHNICIAN_KEY));
+    let (mut customer, _folder) = customer_at(&relay, "relay-stops-early", Some(CUSTOMER_KEY));
+    let (code, _, _) = waiting_on(&use_relay(&technician));
+    technician
+        .wait_for("that the relay holds the code", relay_holds_the_code)
+        .await;
+    customer.connect(&code).expect("the code is taken");
+    technician
+        .wait_for("the approval code", |state| {
+            matches!(state.phase, SessionPhase::AwaitingApprovalCode { .. })
+        })
+        .await;
+    customer
+        .wait_for("the approval code", |view| view.approval_code.is_some())
+        .await;
+
+    // The relay stops while both are comparing the approval code.
+    relay.stop();
+
+    // Neither side reads as a failure of unknown cause: both name the relay.
+    let console = technician
+        .wait_for("the end", |state| console_failure(state).is_some())
+        .await;
+    let (stage, message, _) = console_failure(&console).unwrap();
+    assert_eq!(stage, "relay_lost");
+    assert!(message.contains(RELAY_NAME), "{message}");
+    assert_eq!(relay_of(&console), Some(RELAY_NAME));
+    assert!(!console.can_issue_actions());
+    let view = customer
+        .wait_for("the end", |view| failed_at(view).is_some())
+        .await;
+    let (stage, message) = failed_at(&view).unwrap();
+    assert_eq!(stage, "relay_lost");
+    assert!(message.contains(RELAY_NAME), "{message}");
+    assert!(!view.status.control_active);
+    assert!(!view.session_active);
+    technician.finished().await;
+    customer.settled().await;
+    assert!(!technician.has_control());
+}
+
 // --- The code ---
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -354,6 +354,12 @@ impl ConsentSession {
         }
     }
 
+    /// The host name of the relay this session runs through, if it runs
+    /// through one.
+    pub(crate) fn relay_host(&self) -> Option<&str> {
+        self.relay.as_ref().map(|relay| relay.host.as_str())
+    }
+
     /// Says that this session runs through the relay `host` (ST-M007-013).
     fn through_relay(mut self, host: &str) -> Self {
         self.relay = Some(RelayUseView {

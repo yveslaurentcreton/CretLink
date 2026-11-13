@@ -617,3 +617,55 @@ fn a_text_becomes_a_sentence() {
     );
     assert_eq!(sentence("Already one."), "Already one.");
 }
+
+#[test]
+fn a_lost_connection_is_named_with_the_relay_only_when_the_session_ran_through_one() {
+    use cretlink_session::{EndedBy, SessionEvent};
+
+    let gone = || SessionEvent::Failed {
+        stage: "consent".to_owned(),
+        message: "peer disconnected".to_owned(),
+    };
+    // Through a relay, and the runtime says the connection was lost.
+    assert_eq!(
+        name_lost_connection(
+            gone(),
+            Some(EndedBy::ConnectionLost),
+            Some("relay.example.org")
+        ),
+        SessionEvent::Failed {
+            stage: "relay_lost".to_owned(),
+            message: "The connection through the relay relay.example.org was lost.".to_owned(),
+        }
+    );
+    // On one network the failure is what it was.
+    assert_eq!(
+        name_lost_connection(gone(), Some(EndedBy::ConnectionLost), None),
+        gone()
+    );
+    // A failure that is no lost connection keeps its stage: a mismatch of
+    // the approval code through a relay is still a mismatch.
+    for ended_by in [
+        Some(EndedBy::Failure),
+        Some(EndedBy::Technician),
+        Some(EndedBy::Customer),
+        None,
+    ] {
+        assert_eq!(
+            name_lost_connection(gone(), ended_by, Some("relay.example.org")),
+            gone()
+        );
+    }
+    // Only a failure is renamed; a revoke stays a revoke.
+    let revoked = SessionEvent::Revoked {
+        reason: cretlink_session::RevokeReason::Error,
+    };
+    assert_eq!(
+        name_lost_connection(
+            revoked.clone(),
+            Some(EndedBy::ConnectionLost),
+            Some("relay.example.org")
+        ),
+        revoked
+    );
+}

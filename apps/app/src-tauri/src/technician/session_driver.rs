@@ -349,6 +349,14 @@ pub async fn pump(
                     approval_code: code.as_deref(),
                     session: handle.session(),
                 };
+                // A session through a relay whose connection was lost before
+                // full control says so, with the relay (ST-M007-013).
+                let relay_host = lock(&shared).relay.as_ref().map(|relay| relay.host.clone());
+                let event = crate::relay::name_lost_connection(
+                    event,
+                    handle.ended_by(),
+                    relay_host.as_deref(),
+                );
                 // Fold the event under the lock, then release the guard BEFORE any
                 // await. The `MutexGuard` is `!Send`, so computing the decision in
                 // a narrow scope (rather than holding it across the hand-off await)
