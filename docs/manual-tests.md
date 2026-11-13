@@ -689,16 +689,19 @@ with the customer computer on the local network.
    - Expected: the first Escape closes the list and the session keeps
      waiting; the second cancels it (REQ-F-018).
 
-### MT-14 — The file operations of the explorer on Windows (ST-M010-001)
+### MT-14 — The file operations of the explorer on Windows (ST-M010-001, ST-M010-004)
 
-The list of drives, the removal of a folder with its content, and a file sent
-into a folder on any drive, against a real elevated agent on Windows. The
-automated tests cover the same points on the Windows CI runner; this run adds
-real drives, the customer's own folders and a real stop.
+The list of drives, the removal of a folder with its content, a file sent
+into a folder on any drive, and a change to one entry — a delete, the removal
+of an empty folder, a new folder, a move — against a real elevated agent on
+Windows. The automated tests cover the same points on the Windows CI runner;
+this run adds real drives, the customer's own folders and a real stop.
 
 The technician starts these operations from the file explorer of the live
 session (ST-M010-002). A build without that screen has no control for them:
-this scenario waits for the first build that has it. The customer computer
+this scenario waits for the first build that has it. Steps 15 to 17 are the
+exception: the AI tools reach those operations in every build. The customer
+computer
 needs a second drive that may be written to and emptied, such as a spare USB
 stick; the steps call it `E:`. Never point a step at a folder whose content
 matters.
@@ -837,7 +840,72 @@ cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
     - Expected: the transfer fails and says that the storage is exhausted;
       nothing appears under the final name, and no part is left after the
       session has ended.
-15. **Afterwards.** End the session and look again.
+15. **A change to one entry through a junction (ST-M010-004).** Deleting a
+    file, removing an empty folder, creating a folder and moving an entry are
+    asked for with the AI tools `remote_delete`, `remote_remove_dir`,
+    `remote_make_dir` and `remote_move` from an AI client on the technician
+    computer; in a build with the explorer, also with **Delete**,
+    **New folder** and **Rename** there. Prepare:
+
+    ```powershell
+    New-Item -ItemType Directory C:\CretLinkTest\real\empty, C:\CretLinkTest\real\inside | Out-Null
+    Set-Content C:\CretLinkTest\real\victim.txt "victim"
+    Set-Content C:\CretLinkTest\real\inside\deep.txt "deep"
+    Set-Content C:\CretLinkTest\beside.txt "beside"
+    cmd /c mklink /J C:\CretLinkTest\link C:\CretLinkTest\real
+    ```
+
+    Ask, one after the other: to delete `C:\CretLinkTest\link\victim.txt`; to
+    remove the empty folder `C:\CretLinkTest\link\empty`; to create the
+    folder `C:\CretLinkTest\link\new`; to move
+    `C:\CretLinkTest\link\victim.txt` to `C:\CretLinkTest\taken.txt`; to
+    move `C:\CretLinkTest\beside.txt` to `C:\CretLinkTest\link\planted.txt`;
+    and to delete `C:\CretLinkTest\link\inside\deep.txt`, where the junction
+    is a folder further up.
+    - Expected: every request fails with `invalid_path`, and the customer's
+      activity shows each as failed. `C:\CretLinkTest\real` holds exactly what
+      it held: `victim.txt` and `inside\deep.txt` with their content, the
+      folder `empty`, and neither `new` nor `planted.txt`. `beside.txt` is
+      where it was, and there is no `taken.txt`.
+    - Expected: the same six requests with `real` in the place of `link` all
+      succeed.
+16. **A folder swapped between two requests.** Prepare a folder with two
+    files, and another place with a file of the same name:
+
+    ```powershell
+    New-Item -ItemType Directory C:\CretLinkTest\work, C:\CretLinkTest\elsewhere | Out-Null
+    Set-Content C:\CretLinkTest\work\one.txt "ours"; Set-Content C:\CretLinkTest\work\two.txt "ours"
+    Set-Content C:\CretLinkTest\elsewhere\two.txt "theirs"
+    ```
+
+    Ask to delete `C:\CretLinkTest\work\one.txt`. Then, on the customer
+    computer, move the folder away and put a junction in its place, and ask to
+    delete `C:\CretLinkTest\work\two.txt`:
+
+    ```powershell
+    Rename-Item C:\CretLinkTest\work work-moved
+    cmd /c mklink /J C:\CretLinkTest\work C:\CretLinkTest\elsewhere
+    ```
+
+    - Expected: the first delete succeeds. The second fails with
+      `invalid_path`: `C:\CretLinkTest\elsewhere\two.txt` still reads
+      `theirs`, and `C:\CretLinkTest\work-moved\two.txt` is still there.
+17. **A link as the entry itself, and a substituted drive.** Ask to remove
+    `C:\CretLinkTest\link`, the junction of step 15, as an empty folder; then
+    to delete it. Then, in the administrator PowerShell, run
+    `subst X: C:\CretLinkTest\elsewhere` and ask to delete `X:\two.txt`.
+    Afterwards run `subst X: /D`.
+    - Expected: the removal as a folder is refused, because a link is not a
+      folder, and the junction stays. The delete removes the junction and
+      nothing else: `C:\CretLinkTest\real` keeps its content.
+    - Expected: the delete on the substituted drive fails with
+      `invalid_path`, and `C:\CretLinkTest\elsewhere\two.txt` is still there.
+      (Windows keeps a substituted drive per sign-in. If the program of the
+      session was elevated by another account than the PowerShell, it does
+      not see `X:` and answers that the path does not exist; the file stays
+      then too.) By its real path, `C:\CretLinkTest\elsewhere\two.txt`, the
+      file is deleted.
+18. **Afterwards.** End the session and look again.
     - Expected: the files sent in steps 9, 10 and 12 are still in their
       folders: they are the customer's to keep, and the list of staged files
       never named them. `C:\CretLinkTest` can be deleted by hand.
@@ -937,4 +1005,4 @@ hardware.
 | _pending_ | | | MT-11 steps 2, 4, 5 and 7 to 9 on Windows, and all of it on macOS (ST-M009-006) | not yet recorded on hardware |
 | _pending_ | | | MT-12 step 10 (files left from an earlier session and `cretlink recover`) and the Narrator pass (ST-M009-009, ST-M009-010) | not yet recorded on hardware |
 | _pending_ | | | MT-13 (a technician's computer on several networks, ST-M009-016) | not yet recorded on hardware |
-| _pending_ | | | MT-14 (the file operations of the explorer: the drives, a folder with links / through a junction / a held file / cancel and stop / swapped while it is removed, a file sent to a folder on two drives and refused for a junction, ST-M010-001) | not yet recorded on hardware |
+| _pending_ | | | MT-14 (the file operations of the explorer: the drives, a folder with links / through a junction / a held file / cancel and stop / swapped while it is removed, a file sent to a folder on two drives and refused for a junction, ST-M010-001; a delete, a folder removal, a new folder and a move refused through a junction, after a swap and on a substituted drive, ST-M010-004) | not yet recorded on hardware |
