@@ -216,6 +216,10 @@ administrator rights, or of the same account). *The recovery command* below
 is the one the program shows, without `--remove` unless a step says so:
 `& '<folder>\cretlink-cli.exe' recover`, or
 `& '<folder>\CretLink-Support.exe' recover | Out-Host`.
+Start from a clean computer: run the recovery command with `--remove` in the
+administrator PowerShell first. It removes what earlier sessions kept, also a
+folder `C:\ProgramData\CretLink` that an earlier release left, whose owner
+would otherwise decide what step 2 shows.
 
 1. In the administrator PowerShell, create a folder
    `C:\Program Files\cretlink-test` and a text file `important.txt` in it: a
