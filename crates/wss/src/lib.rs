@@ -39,6 +39,7 @@ mod adapter;
 #[cfg(feature = "test-cert")]
 pub mod testcert;
 
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 
 use rustls::crypto::CryptoProvider;
@@ -281,6 +282,18 @@ where
     Ok(WsByteStream::new(ws))
 }
 
+/// The host of a request as the authority of its URI: an IPv6 address stands
+/// in square brackets (RFC 3986, section 3.2.2), and anything else as it is.
+/// Without the brackets the colons of the address read as the start of a port
+/// and no request can be built, so a relay named by an IPv6 address could
+/// never be reached.
+fn authority(host: &str) -> String {
+    match host.parse::<Ipv6Addr>() {
+        Ok(_) => format!("[{host}]"),
+        Err(_) => host.to_owned(),
+    }
+}
+
 /// Completes the client side of a WebSocket **without TLS** over a connected
 /// transport `tcp`: what a reverse proxy does towards a relay behind it
 /// ([`accept_plain`]). The endpoints of a session never use this; they speak
@@ -293,7 +306,7 @@ pub async fn connect_plain<S>(host: &str, tcp: S) -> Result<WsByteStream<S>, Wss
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let request = format!("ws://{host}/");
+    let request = format!("ws://{}/", authority(host));
     let (ws, _response) = tokio_tungstenite::client_async(request, tcp)
         .await
         .map_err(|e| WssError::Handshake(Box::new(e)))?;
@@ -309,9 +322,10 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`WssError::InvalidServerName`] if `server_name` is not a valid DNS
-/// name, [`WssError::Io`] if the TLS handshake fails (including an untrusted
-/// certificate), or [`WssError::Handshake`] if the WebSocket upgrade fails.
+/// Returns [`WssError::InvalidServerName`] if `server_name` is neither a valid
+/// DNS name nor an IP address, [`WssError::Io`] if the TLS handshake fails
+/// (including an untrusted certificate), or [`WssError::Handshake`] if the
+/// WebSocket upgrade fails.
 pub async fn connect<S>(
     connector: &TlsConnector,
     server_name: &str,
@@ -323,7 +337,7 @@ where
     let name = ServerName::try_from(server_name.to_owned())
         .map_err(|_| WssError::InvalidServerName(server_name.to_owned()))?;
     let tls = connector.connect(name, tcp).await.map_err(WssError::Io)?;
-    let request = format!("wss://{server_name}/");
+    let request = format!("wss://{}/", authority(server_name));
     let (ws, _response) = tokio_tungstenite::client_async(request, tls)
         .await
         .map_err(|e| WssError::Handshake(Box::new(e)))?;

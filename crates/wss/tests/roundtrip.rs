@@ -101,3 +101,66 @@ async fn an_untrusted_server_certificate_fails_closed() {
         "an untrusted server certificate must fail the handshake, not connect"
     );
 }
+
+/// Completes both handshakes over a pipe inside this process, with a server
+/// certificate for `certified` and a client that reaches the server as
+/// `name`, and sends a few bytes there and back.
+async fn reach_as(certified: &str, name: &str) -> Result<(), cretlink_wss::WssError> {
+    let (cert, key) = testcert::self_signed(certified).expect("mint test cert");
+    let acceptor = acceptor(server_config(vec![cert.clone()], key).expect("server config"));
+    let roots = pinned_roots(vec![cert]).expect("pin server cert");
+    let connector = connector(client_config(roots).expect("client config"));
+
+    let (near, far) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        // A client that refuses the certificate leaves nothing to echo.
+        let Ok(mut stream) = cretlink_wss::accept(&acceptor, far).await else {
+            return;
+        };
+        let mut got = [0u8; 5];
+        if stream.read_exact(&mut got).await.is_ok() {
+            let _ = stream.write_all(&got).await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    let mut stream = connect(&connector, name, near).await?;
+    stream.write_all(b"hello").await.expect("write");
+    stream.flush().await.expect("flush");
+    let mut echo = [0u8; 5];
+    stream.read_exact(&mut echo).await.expect("read echo");
+    assert_eq!(&echo, b"hello", "{name}");
+    drop(stream);
+    server.await.expect("the server side ends");
+    Ok(())
+}
+
+/// A relay may be named by an IP address (ST-M007-011): its certificate is
+/// then checked against that address, and the request names it as a URI does,
+/// an IPv6 address in square brackets. Without the brackets no request could
+/// be built, and such a relay could never be reached.
+#[tokio::test]
+async fn an_ip_address_is_the_validated_name_of_a_relay() {
+    for name in ["127.0.0.1", "::1", "2001:db8::1"] {
+        reach_as(name, name)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+}
+
+/// The certificate of another address, or of a name, is not the certificate
+/// of the address that was dialled: the handshake fails closed.
+#[tokio::test]
+async fn a_certificate_for_another_address_is_refused() {
+    for (certified, name) in [
+        ("192.0.2.1", "127.0.0.1"),
+        ("2001:db8::2", "2001:db8::1"),
+        ("localhost", "::1"),
+    ] {
+        let refused = reach_as(certified, name).await;
+        assert!(
+            matches!(refused, Err(cretlink_wss::WssError::Io(_))),
+            "{certified} for {name}: {refused:?}"
+        );
+    }
+}
