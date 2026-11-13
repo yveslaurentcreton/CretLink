@@ -396,6 +396,31 @@ pub(crate) fn relay_to_test(
     }
 }
 
+/// The relay a session of this copy goes through (ST-M007-013): the one of
+/// the file next to the program, or of the settings. Without one, or with one
+/// that cannot be used, the refusal says where a relay is set up. Nothing is
+/// written.
+pub(crate) fn relay_of_copy(copy: &ThisCopy) -> Result<Relay, CommandError> {
+    match TechnicianRelays::read(copy).active() {
+        Lookup::Relay(relay) => Ok((**relay).clone()),
+        Lookup::Unusable(error) => Err(of_view(&ProblemView::of(error))),
+        Lookup::None => Err(CommandError::new(
+            "relay_none",
+            if copy.installed.is_some() {
+                "This copy has no relay. Set one up in Settings, under Relay."
+            } else {
+                "This copy has no relay. Put a file cretlink.toml next to the program; Settings, \
+                 Relay shows where and what it holds."
+            },
+        )),
+    }
+}
+
+/// [`relay_of_copy`] for this process.
+pub(crate) fn relay_in_use() -> Result<Relay, CommandError> {
+    relay_of_copy(&this_copy()?)
+}
+
 fn this_copy() -> Result<ThisCopy, CommandError> {
     ThisCopy::current()
         .ok_or_else(|| CommandError::new("current_exe", "CretLink cannot find itself."))

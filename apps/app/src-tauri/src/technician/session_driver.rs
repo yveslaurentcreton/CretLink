@@ -30,6 +30,31 @@ use tokio::sync::{broadcast, oneshot};
 
 use super::bridge::{BridgeSlot, BridgeStatus, lock_bridge, tool_count};
 
+/// Where the task of a session writes outside this process: the audit folder,
+/// and the endpoint of the local MCP bridge. The application uses the user's
+/// own ([`Place::of_this_user`]); a test names a folder and an endpoint of its
+/// own, so that it never touches a technician's audit trail or bridge.
+#[derive(Debug, Clone)]
+pub(crate) struct Place {
+    /// The audit service's configuration, with the folder of the session
+    /// logs.
+    pub(crate) audit: AuditServiceConfig,
+    /// The endpoint the MCP bridge is hosted on while a session is under full
+    /// control.
+    pub(crate) bridge: IpcEndpoint,
+}
+
+impl Place {
+    /// The audit folder and the bridge endpoint of the user who runs this
+    /// copy.
+    pub(crate) fn of_this_user() -> Self {
+        Self {
+            audit: AuditServiceConfig::default(),
+            bridge: IpcEndpoint::user_default(),
+        }
+    }
+}
+
 /// The sender half of the button-intent channel, held by [`AppState`](super::AppState)
 /// so the synchronous Tauri commands can hand a technician decision to the async
 /// [`pump`] task that owns the live [`HostHandle`].
@@ -266,12 +291,16 @@ pub async fn pump(
     sink: Arc<dyn StateSink>,
     mut intents: UnboundedReceiver<Intent>,
     audit: ChannelAudit,
-    audit_config: AuditServiceConfig,
+    place: Place,
     start_tx: oneshot::Sender<SessionAuditStart>,
     service_slot: ServiceSlot,
     activity: ActivitySlot,
     bridge: BridgeSlot,
 ) {
+    let Place {
+        audit: audit_config,
+        bridge: endpoint,
+    } = place;
     // The consent-bound identity, captured from `ConsentGranted` before the fold,
     // so it can be moved into the hosted service at handoff (REQ-F-016).
     let mut identity: Option<TargetIdentity> = None;
@@ -357,7 +386,7 @@ pub async fn pump(
                                 // activity (ST-M004-007); the guard is out of scope.
                                 run_active(
                                     handle, session, target, shared, sink, intents,
-                                    audit, service_slot, activity, bridge,
+                                    audit, service_slot, activity, bridge, endpoint,
                                 )
                                 .await;
                                 return;
@@ -462,6 +491,7 @@ async fn run_active(
     service_slot: ServiceSlot,
     activity: ActivitySlot,
     bridge: BridgeSlot,
+    endpoint: IpcEndpoint,
 ) {
     // Hand the live handle to the hosted session service; its driver task now
     // solely owns the handle and pumps every wire event into the broadcast.
@@ -483,7 +513,6 @@ async fn run_active(
     // Host the local MCP bridge endpoint so Claude routes through THIS consented
     // GUI session (REQ-F-013). Best-effort single-instance: a busy endpoint (a
     // CLI console already hosting) fails the bind honestly without crashing.
-    let endpoint = IpcEndpoint::user_default();
     let ipc_server = match IpcListener::bind(&endpoint) {
         Ok(listener) => {
             let route: Arc<dyn ConsoleRoute> = Arc::new(service.clone());

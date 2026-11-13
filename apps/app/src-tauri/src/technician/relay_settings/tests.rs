@@ -474,6 +474,57 @@ fn a_file_next_to_the_program_wins_and_the_view_says_so() {
 }
 
 #[test]
+fn a_session_goes_through_the_relay_this_copy_uses_or_says_where_one_is_set_up() {
+    // An installed copy without a relay: Settings is where one goes.
+    let home = Home::new("session-relay");
+    let installed = home.installed();
+    let none = relay_of_copy(&installed).unwrap_err();
+    assert_eq!(none.stage, "relay_none");
+    assert_eq!(
+        none.message,
+        "This copy has no relay. Set one up in Settings, under Relay."
+    );
+    // A copy that runs once keeps no settings: the file next to it.
+    let none = relay_of_copy(&home.run_once()).unwrap_err();
+    assert_eq!(none.stage, "relay_none");
+    assert!(none.message.contains("cretlink.toml"), "{}", none.message);
+    assert!(!none.message.contains("  "), "{:?}", none.message);
+
+    // The relay of the settings, with its key, which no word of it shows.
+    save(
+        &installed,
+        &with_key(form("relay.example.org:443"), KEY),
+        &PendingCa::default(),
+    )
+    .unwrap();
+    let relay = relay_of_copy(&installed).unwrap();
+    assert_eq!(relay.host(), "relay.example.org");
+    assert!(relay.profile().key().is_some());
+    assert!(!format!("{relay:?}").contains(KEY));
+
+    // A file next to the program wins, also when it cannot be used: the
+    // session then does not fall back to the other relay in silence.
+    let path = relay_profile::path_next_to(&installed.exe).unwrap();
+    home.folder.write(
+        path.to_str().unwrap(),
+        "[relay]\naddress = \"host-01.example.org:9970\"\n",
+    );
+    assert_eq!(
+        relay_of_copy(&installed).unwrap().host(),
+        "host-01.example.org"
+    );
+    home.folder
+        .write(path.to_str().unwrap(), "[relay]\naddress = \"host-01\"\n");
+    let unusable = relay_of_copy(&installed).unwrap_err();
+    assert_eq!(unusable.stage, "relay_profile");
+    assert!(
+        unusable.message.contains(&path.display().to_string()),
+        "{}",
+        unusable.message
+    );
+}
+
+#[test]
 fn without_a_relay_there_is_nothing_to_test() {
     let home = Home::new("settings-nothing");
     let error = relay_to_test(&home.installed(), None, &PendingCa::default()).unwrap_err();

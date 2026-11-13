@@ -134,6 +134,11 @@ impl Relay {
         })
     }
 
+    /// Where the profile was read from.
+    pub(crate) fn source(&self) -> &Source {
+        &self.source
+    }
+
     /// The profile itself. It holds the admission key: write it to the
     /// settings and nowhere else.
     pub(crate) fn profile(&self) -> &RelayProfile {
@@ -533,7 +538,7 @@ pub(crate) enum Audience {
         not(test),
         expect(
             dead_code,
-            reason = "the customer role reaches a relay from ST-M007-013 on"
+            reason = "the customer role reaches a relay with the next change of ST-M007-013"
         )
     )]
     Customer,
