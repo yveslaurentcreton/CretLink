@@ -1,6 +1,6 @@
-// Development-only page for the relay screens (ST-M007-011): the real
-// technician controller and views, driven against a copy and a relay that
-// are held in memory instead of a backend. Tauri's own mocks answer the
+// Development-only page for the relay screens (ST-M007-011, ST-M007-013): the
+// real technician controller and views, driven against a copy and a relay
+// that are held in memory instead of a backend. Tauri's own mocks answer the
 // commands, so nothing here reads a file, keeps a key or opens a connection.
 //
 // `?copy=` picks what the copy holds when the page opens:
@@ -13,9 +13,18 @@
 // | `file-problem` | installed, with a profile file that cannot be used |
 // | `run-once`     | runs once, and keeps no settings |
 //
-// `?relay=` picks how the relay answers a test: `admit` (the default), `key`
-// (it does not know the key) or `down` (it cannot be reached). The relay
-// takes a moment to answer, so the waiting state can be looked at.
+// `?relay=` picks how the relay answers a test and a session: `admit` (the
+// default), `key` (it does not know the key) or `down` (it cannot be
+// reached). The relay takes a moment to answer (`?pause=`, in milliseconds),
+// so the waiting states can be looked at.
+//
+// A session through the relay (ST-M007-013) starts from **Start a session**
+// and **Use relay** on the waiting screen: the simulated backend stops the
+// wait on the network, answers with a relay code, and a moment later says
+// that the relay holds it, or why it cannot be used. With `?customer=arrives`
+// a customer then types the code: the approval code follows, **Codes match**
+// leads to the customer's decision, and the customer allows. `?customer=lost`
+// lets the relay stop while the code is compared.
 //
 // The simulated backend follows the rules of the real one where the screens
 // depend on them: an address needs a port, a key is never sent back, the
@@ -23,6 +32,7 @@
 // to keep anything.
 
 import "../src/base.css";
+import { emit } from "@tauri-apps/api/event";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type {
   AppInfo,
@@ -32,9 +42,11 @@ import type {
   RelayTest,
   RelayView,
 } from "../src/shared/contract";
+import type { ConsoleState } from "../src/technician/api";
 import {
   APP_INSTALLED,
   APP_RUN_ONCE,
+  NETWORKS,
   RELAY_FILE,
   RELAY_FILE_PROBLEM,
   RELAY_NONE,
@@ -43,6 +55,7 @@ import {
   consoleIn,
 } from "../src/technician/fixtures";
 import { start } from "../src/technician/main";
+import { activeRelay } from "../src/technician/model";
 
 const params = new URLSearchParams(window.location.search);
 const copy = params.get("copy") ?? "installed";
@@ -159,7 +172,155 @@ function test(relay: RelayView): RelayTest {
   }
 }
 
-const state = consoleIn({ phase: "idle" }, { displayName: "Sam" });
+// --- A session, on this network or through the relay (ST-M007-013) ---
+
+/** What the simulated customer does once the relay holds the code. */
+const customer = params.get("customer") ?? "";
+/** The relay codes of this page, one for every wait, as the backend draws one. */
+const CODES = ["53ST-A71D-JKKV-0VGH", "7KQM-2D8R-XW4H-91TC", "B6ZN-QF03-M5YJ-8E2A"];
+let waits = 0;
+/** Counts the waits and sessions, so that a late step of an old one is dropped. */
+let generation = 0;
+
+let state: ConsoleState = consoleIn({ phase: "idle" }, { displayName: "Sam" });
+
+/** Sets the state and pushes it to the window, as the session's task does. */
+function show(next: ConsoleState): ConsoleState {
+  state = next;
+  void emit("console-state", next);
+  return next;
+}
+
+/** Runs `step` after the relay's pause, unless the wait it belongs to is over. */
+function later(step: () => void, times = 1): void {
+  const mine = generation;
+  window.setTimeout(() => {
+    if (mine === generation) step();
+  }, pause * times);
+}
+
+function listening(): ConsoleState {
+  return consoleIn(
+    { phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" },
+    { displayName: "Sam" },
+  );
+}
+
+/** The words of a relay that cannot be used, as the backend gives them. */
+function relayFailure(relay: RelayView): { stage: string; message: string; next: string } {
+  const where = " You can change and test the relay in Settings, under Relay.";
+  const result = test(relay);
+  return { stage: `relay_${result.kind}`, message: result.message, next: result.next + where };
+}
+
+/** **Use relay**: the wait on the network ends, and the wait on the relay begins. */
+function useRelay(): Promise<ConsoleState> {
+  if (state.phase.phase !== "listening" || state.relay) {
+    refuse("relay", "A relay can be chosen only while waiting for the customer.");
+  }
+  const relay = activeRelay(settings);
+  if (!relay) {
+    const problem = settings.source === "file" ? settings.file.problem : settings.stored?.problem;
+    if (problem) refuse("relay_profile", `${problem.message} (${problem.file})`);
+    refuse(
+      "relay_none",
+      settings.editable
+        ? "This copy has no relay. Set one up in Settings, under Relay."
+        : "This copy has no relay. Put a file cretlink.toml next to the program; Settings, Relay shows where and what it holds.",
+    );
+  }
+  generation += 1;
+  // The listener of this network goes first, as in the application.
+  show(consoleIn({ phase: "stopped", reason: "technician_requested" }, { displayName: "Sam" }));
+  const code = CODES[waits % CODES.length] ?? "";
+  waits += 1;
+  const route = { host: relay.host, admitted: false };
+  const waiting = (admitted: boolean): ConsoleState =>
+    consoleIn(
+      { phase: "listening", code, address: relay.address },
+      { displayName: "Sam", relay: { ...route, admitted } },
+    );
+  const mine = generation;
+  return new Promise((resolve) => {
+    window.setTimeout(() => {
+      if (mine !== generation) {
+        resolve(state);
+        return;
+      }
+      resolve(show(waiting(false)));
+      later(() => {
+        if (answers !== "admit") {
+          const failure = relayFailure(relay);
+          show(
+            consoleIn(
+              { phase: "failed", ...failure },
+              { displayName: "Sam", relay: { ...route, admitted: false } },
+            ),
+          );
+          return;
+        }
+        const held = { ...route, admitted: true };
+        show(waiting(true));
+        if (customer === "") return;
+        later(() => {
+          show(
+            consoleIn(
+              { phase: "awaiting_approval_code", code: "482913" },
+              { session: true, target: true, displayName: "Sam", relay: held },
+            ),
+          );
+          if (customer !== "lost") return;
+          later(() => {
+            show(
+              consoleIn(
+                {
+                  phase: "failed",
+                  stage: "relay_lost",
+                  message: `The connection through the relay ${relay.host} was lost.`,
+                },
+                { displayName: "Sam", relay: held },
+              ),
+            );
+          });
+        });
+      });
+    }, pause);
+  });
+}
+
+/** **Codes match**: the customer decides, and here allows. */
+function confirmCode(): ConsoleState {
+  if (state.phase.phase !== "awaiting_approval_code") {
+    refuse("compare", "there is no approval code to confirm right now");
+  }
+  const relay = state.relay;
+  const next = show(
+    consoleIn(
+      { phase: "awaiting_consent" },
+      { session: true, target: true, displayName: "Sam", ...(relay ? { relay } : {}) },
+    ),
+  );
+  later(() => {
+    show(
+      consoleIn(
+        { phase: "full_control" },
+        { session: true, target: true, displayName: "Sam", ...(relay ? { relay } : {}) },
+      ),
+    );
+  });
+  return next;
+}
+
+/** **Cancel**, **Stop** and Escape. */
+function stopSession(): ConsoleState {
+  generation += 1;
+  const relay = state.relay;
+  state = consoleIn(
+    { phase: "stopped", reason: "technician_requested" },
+    { displayName: "Sam", ...(relay ? { relay } : {}) },
+  );
+  return state;
+}
 
 mockWindows("main");
 mockIPC(
@@ -168,6 +329,17 @@ mockIPC(
     switch (cmd) {
       case "get_state":
         return state;
+      case "start_live_session":
+        generation += 1;
+        return show(listening());
+      case "get_listen_networks":
+        return NETWORKS;
+      case "use_relay":
+        return useRelay();
+      case "confirm_code":
+        return confirmCode();
+      case "stop_session":
+        return stopSession();
       case "get_app_info":
         return app;
       case "get_relay_settings":
