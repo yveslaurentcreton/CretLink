@@ -18,6 +18,9 @@
 // reached). The relay takes a moment to answer (`?pause=`, in milliseconds),
 // so the waiting states can be looked at.
 //
+// Settings also offers **Uninstall…** in an installed copy: the plan names a
+// profile file next to the program among what stays (`?copy=file`).
+//
 // A session through the relay (ST-M007-013) starts from **Start a session**
 // and **Use relay** on the waiting screen: the simulated backend stops the
 // wait on the network, answers with a relay code, and a moment later says
@@ -361,6 +364,22 @@ mockIPC(
         return app;
       case "get_relay_settings":
         return settings;
+      case "uninstall_plan": {
+        // What uninstall leaves in place: a relay profile next to the
+        // installed program stays, and the plan says what it holds.
+        const profile = settings.source === "file" ? settings.file.path : undefined;
+        return {
+          removes: [
+            "C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.exe",
+            "Your settings (the relay with its key, the network to wait on): C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\settings.toml",
+          ],
+          stays: profile
+            ? [
+                `The relay profile ${profile}, which CretLink did not write and does not remove. It holds the address of a relay and no admission key`,
+              ]
+            : [],
+        };
+      }
       case "choose_relay_ca":
         // The system's dialog cannot open here: a file is "chosen" at once.
         picked = { pick: nextPick, name: "authority.pem" };
