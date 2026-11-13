@@ -376,11 +376,16 @@ fn a_text_that_is_no_remote_path_is_refused_as_it_is_spelled() {
     ));
 }
 
-/// A spelling that is refused asks nothing of the target.
+/// A spelling that is refused asks nothing of the target, and the refusal
+/// says in plain words what is wrong with it.
 #[tokio::test]
 async fn a_refused_spelling_reaches_nobody() {
     let target = Target::windows();
-    let (code, _, stage) = refusal(&target, "C:\\Users\\..\\Windows").await;
+    let (code, message, stage) = refusal(&target, "C:\\Users\\..\\Windows").await;
+    assert_eq!(
+        message,
+        "this is not a path on a drive of the customer computer: path traversal component"
+    );
     assert_eq!(
         (code, stage),
         (ErrorCode::InvalidPath, ErrorStage::Validation)
@@ -501,7 +506,7 @@ async fn a_name_the_folder_does_not_list_is_not_found() {
     let target = Target::windows();
     let (code, message, stage) = refusal(&target, "C:\\Usres\\ann").await;
     assert_eq!(code, ErrorCode::PathNotFound);
-    assert_eq!(stage, ErrorStage::Execution);
+    assert_eq!(stage, ErrorStage::Validation);
     assert_eq!(message, "C:\\ lists no entry named Usres");
 
     let (code, message, _) = refusal(&target, "C:\\PROGRA~1\\CretLink").await;

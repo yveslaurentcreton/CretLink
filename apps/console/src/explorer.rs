@@ -20,7 +20,10 @@
 //! A path that was typed is taken apart and looked for name by name. A name is
 //! found when the folder above lists it — spelled as it was typed, or in
 //! another letter case, in which case the listed spelling is the one that
-//! counts. Three things end the search, and nothing is opened then:
+//! counts. Three things end the search, and nothing is opened then. Each is a
+//! refusal in the stage `validation` with a message in plain words, like the
+//! refusal of a text that is no remote path at all; a refusal of the target
+//! itself keeps the stage `execution`:
 //!
 //! - the folder above lists no entry of that name ([`ErrorCode::PathNotFound`]).
 //!   That covers a name that does not exist and a second spelling the listing
@@ -73,7 +76,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use cretlink_mcp::{DirPage, TargetError};
 use cretlink_protocol::{
-    DriveEntry, ErrorCode, ErrorStage, FileEntry, FileKind, validate_remote_absolute_path,
+    DriveEntry, ErrorCode, ErrorStage, FileEntry, FileKind, ProtocolError,
+    validate_remote_absolute_path,
 };
 use cretlink_session::{CancelToken, RemotePath};
 
@@ -254,12 +258,15 @@ pub(crate) struct Located {
     pub(crate) select: Option<String>,
 }
 
-/// A refusal that follows from what the target answered.
+/// A refusal the explorer makes itself, from a spelling or from what the
+/// target listed: the stage is `validation`, since the folder that was asked
+/// for is never asked of the target, and the message says in plain words what
+/// stood in the way. A refusal of the target keeps the target's own stage.
 fn refused(code: ErrorCode, message: String) -> TargetError {
     TargetError::Remote {
         code,
         message,
-        stage: ErrorStage::Execution,
+        stage: ErrorStage::Validation,
     }
 }
 
@@ -294,10 +301,17 @@ pub(crate) fn spell(asked: &str) -> Result<(String, Vec<String>), TargetError> {
     {
         text.push('\\');
     }
-    validate_remote_absolute_path("path", &text).map_err(|error| TargetError::Remote {
-        code: error.code(),
-        message: error.to_string(),
-        stage: ErrorStage::Validation,
+    validate_remote_absolute_path("path", &text).map_err(|error| {
+        let message = match &error {
+            ProtocolError::InvalidPath { reason, .. } => {
+                format!("this is not a path on a drive of the customer computer: {reason}")
+            }
+            ProtocolError::LimitExceeded { .. } => {
+                "the path is longer or deeper than a path may be".to_owned()
+            }
+            other => other.to_string(),
+        };
+        refused(error.code(), message)
     })?;
     let mut parts = text.split('\\').filter(|part| !part.is_empty());
     // The validation above saw the drive.
