@@ -588,11 +588,12 @@ describe("view and sort", () => {
 describe("going somewhere", () => {
   it("stays where it was until the first page of the next place has arrived", () => {
     const here = open(initialExplorer(), "C:\\Users", [[dir("ann"), dir("jdoe")]], 1);
-    const waiting = opening(here, { listing: 2, place: folder("C:\\Users\\ann"), how: "push" });
+    const next = "C:\\Users\\ann";
+    const waiting = opening(here, { listing: 2, place: folder(next), how: "push" });
     expect(waiting.place).toEqual(folder("C:\\Users"));
     expect(names(waiting)).toEqual(["ann", "jdoe"]);
-    expect(waiting.pending?.place).toEqual(folder("C:\\Users\\ann"));
-    expect(statusWords(waiting)).toBe("2 items · opening C:\\Users\\ann…");
+    expect(waiting.pending?.place).toEqual(folder(next));
+    expect(statusWords(waiting)).toBe(`2 items · opening ${next}…`);
 
     const there = applyEvent(waiting, {
       kind: "opened",
