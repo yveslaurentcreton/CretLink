@@ -1192,7 +1192,9 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
     if (!inList(event.target)) return;
     element("#xp-grid")?.focus({ preventScroll: true });
     const key = rowOf(event.target);
-    const s = state();
+    // What the technician selects stays selected: a row that was to be
+    // selected once the folder is listed again no longer is.
+    const s: ExplorerState = { ...state(), reveal: undefined };
     if (key === undefined) {
       // A click beside the rows selects nothing.
       host.set(clearSelection(s), "panel");
@@ -1218,7 +1220,7 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
     if (state().renaming !== undefined && commitRename("click")) return;
     element("#xp-grid")?.focus({ preventScroll: true });
     const key = rowOf(event.target);
-    let s = state();
+    let s: ExplorerState = { ...state(), reveal: undefined };
     if (key === undefined) {
       s = clearSelection(s);
     } else if (!s.selected.has(key)) {

@@ -284,64 +284,64 @@ function pathField(x: ExplorerState, host: string): HTMLElement {
 }
 
 /**
- * What could not be done, or the end of the session, as an assertive alert.
- * A change that did not happen is shown first, then a place that did not
- * open; once they are dismissed, the end of the session stands there.
+ * What could not be done, and the end of the session, as an assertive alert.
+ * The end of the session is always said, first: it is why nothing can be
+ * changed any more. A change that did not happen, or else a place that did
+ * not open, stands with it until it is dismissed.
  */
 function alertRegion(x: ExplorerState): HTMLElement {
   const region = h("div", { class: "alert xp-alert", role: "alert", id: "xp-alert" });
   const refusal = x.problem ?? x.refusal;
+  if (!refusal && x.ended === undefined) return region;
+  const body = h("div", { class: "alert-body" });
+  if (x.ended !== undefined) {
+    const stopped = x.transfers.filter((entry) => entry.state === "stopped").length;
+    body.append(h("b", null, "Browsing has stopped"), h("p", null, x.ended));
+    if (stopped > 0) {
+      body.append(
+        h(
+          "p",
+          { class: "next" },
+          stopped === 1
+            ? "1 transfer was stopped and is not complete."
+            : `${stopped} transfers were stopped and are not complete.`,
+        ),
+      );
+    }
+  }
+  if (refusal) {
+    body.append(
+      h("b", x.ended !== undefined ? { class: "also" } : null, refusal.title),
+      h("p", null, refusal.message),
+    );
+    if (refusal.details && refusal.details.length > 0) {
+      body.append(
+        h(
+          "ul",
+          { class: "xp-details" },
+          refusal.details.map((detail) =>
+            h(
+              "li",
+              null,
+              h("code", { class: "mono" }, detail.path),
+              h("span", null, ` — ${detail.reason}`),
+            ),
+          ),
+          refusal.more
+            ? h("li", { class: "more" }, `and ${refusal.more} more that could not be removed`)
+            : null,
+        ),
+      );
+    }
+    body.append(h("p", { class: "next" }, refusal.next));
+  }
+  region.append(icon("alert"), body);
   if (refusal) {
     region.append(
-      icon("alert"),
-      h(
-        "div",
-        { class: "alert-body" },
-        h("b", null, refusal.title),
-        h("p", null, refusal.message),
-        refusal.details && refusal.details.length > 0
-          ? h(
-              "ul",
-              { class: "xp-details" },
-              refusal.details.map((detail) =>
-                h(
-                  "li",
-                  null,
-                  h("code", { class: "mono" }, detail.path),
-                  h("span", null, ` — ${detail.reason}`),
-                ),
-              ),
-              refusal.more
-                ? h("li", { class: "more" }, `and ${refusal.more} more that could not be removed`)
-                : null,
-            )
-          : null,
-        h("p", { class: "next" }, refusal.next),
-      ),
       h(
         "button",
         { type: "button", class: "btn sm ghost", "data-action": "xp-dismiss" },
         "Dismiss",
-      ),
-    );
-  } else if (x.ended !== undefined) {
-    const stopped = x.transfers.filter((entry) => entry.state === "stopped").length;
-    region.append(
-      icon("alert"),
-      h(
-        "div",
-        { class: "alert-body" },
-        h("b", null, "Browsing has stopped"),
-        h("p", null, x.ended),
-        stopped > 0
-          ? h(
-              "p",
-              { class: "next" },
-              stopped === 1
-                ? "1 transfer was stopped and is not complete."
-                : `${stopped} transfers were stopped and are not complete.`,
-            )
-          : null,
       ),
     );
   }

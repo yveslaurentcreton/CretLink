@@ -1956,6 +1956,30 @@ describe("renaming", () => {
     expect(selected()).toEqual(["b.txt"]);
   });
 
+  it("keeps the row the technician clicked selected, whenever the rename answers", async () => {
+    await documents();
+    click(row("a.txt"));
+    await flush();
+    key("F2");
+    await flush();
+    field().value = "z.txt";
+    // The folder is listed again only when the test says so.
+    target.manual = true;
+    // A click beside the rows and the controls takes the name; the rename
+    // answers, and the new name waits to be selected with the next listing.
+    click("#xp-status");
+    await flush();
+    expect(asked("explorer_rename")).toEqual([{ folder: DOCUMENTS, name: "a.txt", to: "z.txt" }]);
+    // The technician selects another row before the folder is listed again.
+    click(row("b.txt"));
+    await flush();
+    target.step();
+    await flush();
+    target.manual = false;
+    expect(drawn()).toContain("z.txt");
+    expect(selected()).toEqual(["b.txt"]);
+  });
+
   it("does not also press a control with the click that sent the new name", async () => {
     await documents();
     click(row("a.txt"));
@@ -2078,6 +2102,55 @@ describe("renaming", () => {
 });
 
 describe("changes and the session", () => {
+  it("says that the session ended when the next look finds it so, and changes nothing more", async () => {
+    await documents();
+    click(row("a.txt"));
+    await flush();
+    // Nothing runs that could tell of the end: the next look does.
+    target.endSession();
+    await flush();
+    expect($("#xp-alert").textContent).toBe("");
+    key("F5");
+    await flush();
+    expect($("#xp-alert").textContent).toContain("Browsing has stopped");
+    expect(drawn()).toContain("a.txt");
+    expect(action("xp-delete").disabled).toBe(true);
+    expect(action("xp-rename").disabled).toBe(true);
+    key("Delete");
+    key("F2");
+    await flush();
+    expect(app().querySelector("#xp-question")).toBeNull();
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+    expect(asked("explorer_delete")).toHaveLength(0);
+  });
+
+  it("says the end of the session first, also while an earlier message stands", async () => {
+    await documents();
+    target.held.set(`${DOCUMENTS}\\a.txt`, "the file is in use");
+    click(row("a.txt"));
+    await flush();
+    key("F2");
+    await flush();
+    ($("#xp-rename-input") as HTMLInputElement).value = "moved.txt";
+    key("Enter", {}, "#xp-rename-input");
+    await flush();
+    expect($("#xp-alert b").textContent).toBe("a.txt could not be renamed");
+
+    target.endSession();
+    key("F5");
+    await flush();
+    // The end is why nothing works any more: it is not hidden behind what
+    // was said before, and what was said before is not lost.
+    const titles = Array.from($("#xp-alert").querySelectorAll("b")).map((b) => b.textContent);
+    expect(titles).toEqual(["Browsing has stopped", "a.txt could not be renamed"]);
+    click('#xp-alert [data-action="xp-dismiss"]');
+    await flush();
+    expect(Array.from($("#xp-alert").querySelectorAll("b")).map((b) => b.textContent)).toEqual([
+      "Browsing has stopped",
+    ]);
+    expect(app().querySelector('#xp-alert [data-action="xp-dismiss"]')).toBeNull();
+  });
+
   it("says that the session has ended when a change fails closed, and offers no more", async () => {
     await documents();
     target.ended = { stage: "no_consented_session", message: "no session is under full control" };

@@ -271,12 +271,14 @@ export class SimulatedComputer {
 
   /** `explorer_drives`. */
   listDrives(): ExplorerDrive[] {
+    this.refuseIfEnded();
     this.leave();
     return this.drives;
   }
 
   /** `explorer_open`: rejects with a `SimulatedRefusal` for a place that is refused. */
   openPath(asked: string, listing: number): Promise<ExplorerListing> {
+    if (this.ended) return Promise.reject(this.ended);
     this.leave();
     let path = this.real(asked);
     let select: string | undefined;
