@@ -286,6 +286,30 @@ fn a_profile_without_an_address_is_an_error() {
 }
 
 #[test]
+fn a_problem_with_how_a_setting_is_written_names_that_setting() {
+    let relay = "[relay]\naddress = \"relay.example.org:443\"\n";
+    for (line, field) in [
+        ("key = abc", Field::Key),
+        ("key = \"abc", Field::Key),
+        ("ca = 'relay-ca.pem' x", Field::Ca),
+        ("name = \"a\\qb\"", Field::Name),
+        ("address = \"host-01.example.org:443\"", Field::Address),
+    ] {
+        let found = problem(&format!("{relay}{line}\n"));
+        assert_eq!((found.line, found.field), (Some(3), Some(field)), "{line}");
+        assert!(
+            found.text.contains(&format!("`{}`", field.name())),
+            "{}",
+            found.text
+        );
+    }
+    // A setting that a relay does not have is not named.
+    let found = problem(&format!("{relay}token = abc\n"));
+    assert_eq!(found.field, None);
+    assert!(found.text.contains("this setting"), "{}", found.text);
+}
+
+#[test]
 fn a_problem_names_the_line_of_its_setting() {
     let bad = problem("[relay]\n\naddress = \"relay.example.org\"\n");
     assert_eq!(bad.line, Some(3));
@@ -592,4 +616,39 @@ fn the_certificate_file_is_read_from_the_folder_of_the_profile() {
         // The message names the setting, not the file it points at.
         assert!(!error.problem.text.contains(name), "{}", error.problem.text);
     }
+}
+
+#[test]
+fn a_certificate_file_that_a_person_chose_is_read_with_the_same_rules() {
+    let folder = Folder::new("chosen-ca");
+    let pem = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+    let file = folder.write("authority.crt", pem);
+    assert_eq!(read_certificate_file(&file).unwrap(), pem);
+
+    let missing = read_certificate_file(&folder.0.join("missing.crt")).unwrap_err();
+    assert_eq!(missing.field, Some(Field::Ca));
+    assert!(missing.text.contains("is not there"), "{}", missing.text);
+    let key = folder.write("key.pem", b"-----BEGIN PRIVATE KEY-----\n");
+    assert!(
+        read_certificate_file(&key)
+            .unwrap_err()
+            .text
+            .contains("holds no certificate")
+    );
+    let large = folder.write(
+        "large.pem",
+        &vec![b'A'; usize::try_from(MAX_CA_BYTES).unwrap() + 1],
+    );
+    assert!(
+        read_certificate_file(&large)
+            .unwrap_err()
+            .text
+            .contains("larger than 256 KiB")
+    );
+    assert!(
+        read_certificate_file(&folder.0)
+            .unwrap_err()
+            .text
+            .contains("not a file")
+    );
 }

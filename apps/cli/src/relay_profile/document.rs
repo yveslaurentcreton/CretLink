@@ -25,7 +25,15 @@
 
 use zeroize::Zeroizing;
 
-use super::Problem;
+use super::{Field, Problem};
+
+/// A setting that a message may name, and the setting of a relay profile it
+/// is, when it is one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Known {
+    pub(crate) name: &'static str,
+    pub(crate) field: Option<Field>,
+}
 
 /// The longest name of a section or a setting.
 const MAX_NAME_CHARS: usize = 32;
@@ -81,10 +89,10 @@ impl Document {
     }
 }
 
-/// Reads `text`. `known` lists the names of settings that a message may name;
-/// any other setting is called "this setting", so that nothing typed into the
+/// Reads `text`. `known` lists the settings that a message may name; any
+/// other setting is called "this setting", so that nothing typed into the
 /// file by mistake is repeated in a message.
-pub(crate) fn parse(text: &str, known: &[&str]) -> Result<Document, Problem> {
+pub(crate) fn parse(text: &str, known: &[Known]) -> Result<Document, Problem> {
     // An editor on Windows may put a byte-order mark first.
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut document = Document::default();
@@ -127,7 +135,9 @@ pub(crate) fn parse(text: &str, known: &[&str]) -> Result<Document, Problem> {
             ));
         };
         if let Some(first) = section.settings.iter().find(|other| other.name == name) {
-            return Err(Problem::at(
+            return Err(about(
+                &name,
+                known,
                 line,
                 format!(
                     "{} is already set on line {}",
@@ -145,11 +155,23 @@ pub(crate) fn parse(text: &str, known: &[&str]) -> Result<Document, Problem> {
 }
 
 /// How a message names a setting: by its name when the caller knows it.
-fn called(name: &str, known: &[&str]) -> String {
-    if known.contains(&name) {
+fn called(name: &str, known: &[Known]) -> String {
+    if known.iter().any(|known| known.name == name) {
         format!("`{name}`")
     } else {
         "this setting".to_owned()
+    }
+}
+
+/// A problem with the setting called `name` on `line`.
+fn about(name: &str, known: &[Known], line: usize, text: String) -> Problem {
+    Problem {
+        line: Some(line),
+        field: known
+            .iter()
+            .find(|known| known.name == name)
+            .and_then(|known| known.field),
+        text,
     }
 }
 
@@ -189,7 +211,7 @@ fn header(rest: &str, line: usize) -> Result<String, Problem> {
 fn setting(
     content: &str,
     line: usize,
-    known: &[&str],
+    known: &[Known],
 ) -> Result<(String, Zeroizing<String>), Problem> {
     let not_a_setting = || {
         Problem::at(
@@ -204,69 +226,71 @@ fn setting(
     }
     let rest = rest.trim_start_matches([' ', '\t']);
     let what = called(name, known);
+    let problem = |text: String| about(name, known, line, text);
     let (value, after) = if let Some(body) = rest.strip_prefix('"') {
         if body.starts_with("\"\"") {
-            return Err(Problem::at(
-                line,
-                format!("the text of {what} must stand on one line, between two double quotes"),
-            ));
+            return Err(problem(format!(
+                "the text of {what} must stand on one line, between two double quotes"
+            )));
         }
-        basic_string(body, line, &what)?
+        basic_string(body).map_err(|wrong| {
+            problem(match wrong {
+                BadString::Escape => format!(
+                    "the text of {what} holds a backslash that starts no escape of TOML; write \
+                     a backslash twice, or put the text between single quotes"
+                ),
+                BadString::TooLong => format!("the text of {what} is too long"),
+                BadString::Open => {
+                    format!("the text of {what} is not closed with a double quote")
+                }
+            })
+        })?
     } else if let Some(body) = rest.strip_prefix('\'') {
         if body.starts_with("''") {
-            return Err(Problem::at(
-                line,
-                format!("the text of {what} must stand on one line, between two quotes"),
-            ));
+            return Err(problem(format!(
+                "the text of {what} must stand on one line, between two quotes"
+            )));
         }
-        let (text, after) = body.split_once('\'').ok_or_else(|| {
-            Problem::at(
-                line,
-                format!("the text of {what} is not closed with a quote"),
-            )
-        })?;
+        let (text, after) = body
+            .split_once('\'')
+            .ok_or_else(|| problem(format!("the text of {what} is not closed with a quote")))?;
         (Zeroizing::new(text.to_owned()), after)
     } else {
-        return Err(Problem::at(
-            line,
-            format!("the value of {what} must be text in double quotes"),
-        ));
+        return Err(problem(format!(
+            "the value of {what} must be text in double quotes"
+        )));
     };
     if !only_a_comment_follows(after) {
-        return Err(Problem::at(
-            line,
-            format!("something follows the closing quote of {what}"),
-        ));
+        return Err(problem(format!(
+            "something follows the closing quote of {what}"
+        )));
     }
     if value.len() > MAX_VALUE_BYTES {
-        return Err(Problem::at(line, format!("the text of {what} is too long")));
+        return Err(problem(format!("the text of {what} is too long")));
     }
     Ok((name.to_owned(), value))
 }
 
+/// Why a text in double quotes could not be read.
+enum BadString {
+    /// A backslash that starts no escape of TOML.
+    Escape,
+    /// Longer than [`MAX_VALUE_BYTES`].
+    TooLong,
+    /// No closing quote on the line.
+    Open,
+}
+
 /// Reads a text in double quotes after its opening quote, with the escapes of
 /// TOML. Returns the text and what follows the closing quote.
-fn basic_string<'a>(
-    body: &'a str,
-    line: usize,
-    what: &str,
-) -> Result<(Zeroizing<String>, &'a str), Problem> {
-    let bad_escape = || {
-        Problem::at(
-            line,
-            format!(
-                "the text of {what} holds a backslash that starts no escape of TOML; write a \
-                 backslash twice, or put the text between single quotes"
-            ),
-        )
-    };
+fn basic_string(body: &str) -> Result<(Zeroizing<String>, &str), BadString> {
     let mut value = Zeroizing::new(String::new());
     let mut chars = body.char_indices();
     while let Some((index, c)) = chars.next() {
         match c {
             '"' => return Ok((value, &body[index + 1..])),
             '\\' => {
-                let (_, escape) = chars.next().ok_or_else(bad_escape)?;
+                let (_, escape) = chars.next().ok_or(BadString::Escape)?;
                 match escape {
                     'b' => value.push('\u{8}'),
                     't' => value.push('\t'),
@@ -282,24 +306,21 @@ fn basic_string<'a>(
                             let digit = chars
                                 .next()
                                 .and_then(|(_, hex)| hex.to_digit(16))
-                                .ok_or_else(bad_escape)?;
+                                .ok_or(BadString::Escape)?;
                             code = code * 16 + digit;
                         }
-                        value.push(char::from_u32(code).ok_or_else(bad_escape)?);
+                        value.push(char::from_u32(code).ok_or(BadString::Escape)?);
                     }
-                    _ => return Err(bad_escape()),
+                    _ => return Err(BadString::Escape),
                 }
             }
             other => value.push(other),
         }
         if value.len() > MAX_VALUE_BYTES {
-            return Err(Problem::at(line, format!("the text of {what} is too long")));
+            return Err(BadString::TooLong);
         }
     }
-    Err(Problem::at(
-        line,
-        format!("the text of {what} is not closed with a double quote"),
-    ))
+    Err(BadString::Open)
 }
 
 /// Writes `text` as a TOML text in double quotes, so that [`parse`] reads the

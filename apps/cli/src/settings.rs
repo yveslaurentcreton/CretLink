@@ -57,8 +57,16 @@ const ADAPTER: &str = "adapter";
 /// The longest name of a network adapter that is kept.
 pub const MAX_ADAPTER_CHARS: usize = 256;
 
-/// The names a message about the settings may use.
-const KNOWN_NAMES: [&str; 5] = ["address", "key", "ca", "name", ADAPTER];
+/// The settings a message about the settings file may name: those of a
+/// relay, and the adapter.
+fn known_names() -> Vec<document::Known> {
+    let mut known = relay_profile::KNOWN_FIELDS.to_vec();
+    known.push(document::Known {
+        name: ADAPTER,
+        field: None,
+    });
+    known
+}
 
 /// What the installed copy keeps between runs.
 #[derive(Debug, Clone, Default)]
@@ -113,7 +121,7 @@ pub fn is_adapter_name(adapter: &str) -> bool {
 /// error, and so is a relay whose certificate file is not the one this
 /// module writes.
 pub fn parse(text: &str) -> Result<Settings, Problem> {
-    let document = document::parse(text, &KNOWN_NAMES)?;
+    let document = document::parse(text, &known_names())?;
     let mut settings = Settings::default();
     for section in &document.sections {
         match section.name.as_str() {
@@ -252,7 +260,6 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         }
         let mut file = options.open(&temporary)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)
     })();

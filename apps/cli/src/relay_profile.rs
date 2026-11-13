@@ -115,8 +115,20 @@ impl Field {
     }
 }
 
-/// The names a message about a profile may use.
-const FIELD_NAMES: [&str; 4] = ["address", "key", "ca", "name"];
+/// The settings a message about a profile may name.
+pub(crate) const KNOWN_FIELDS: [document::Known; 4] = [
+    known(Field::Address),
+    known(Field::Key),
+    known(Field::Ca),
+    known(Field::Name),
+];
+
+const fn known(field: Field) -> document::Known {
+    document::Known {
+        name: field.name(),
+        field: Some(field),
+    }
+}
 
 /// What is wrong with a profile, in plain words (REQ-N-015).
 ///
@@ -523,7 +535,7 @@ pub(crate) fn from_section(section: &document::Section) -> Result<RelayProfile, 
 /// Returns what is wrong, with the line. An unknown section or setting is an
 /// error.
 pub fn parse(text: &str) -> Result<Option<RelayProfile>, Problem> {
-    let document = document::parse(text, &FIELD_NAMES)?;
+    let document = document::parse(text, &KNOWN_FIELDS)?;
     if let Some(other) = document
         .sections
         .iter()
@@ -626,6 +638,43 @@ pub fn read_next_to(exe: &Path) -> Result<Option<(PathBuf, RelayProfile)>, Profi
     Ok(read_file(&path)?.map(|profile| (path, profile)))
 }
 
+/// Reads a certificate authority file: at most [`MAX_CA_BYTES`], and with at
+/// least one PEM certificate in it. Whether that certificate can be used is
+/// decided when the TLS settings are built from it.
+///
+/// # Errors
+///
+/// Returns what is wrong with the file, in words that name it as `what`.
+/// `Ok(None)` when the file is not there.
+fn read_certificates(path: &Path, what: &str) -> Result<Option<Vec<u8>>, Problem> {
+    let Some(bytes) = read_bounded(path, MAX_CA_BYTES, what)? else {
+        return Ok(None);
+    };
+    if !contains(&bytes, b"-----BEGIN CERTIFICATE-----") {
+        return Err(Problem::of(
+            Field::Ca,
+            format!(
+                "{what} holds no certificate; a PEM file has a line -----BEGIN CERTIFICATE-----"
+            ),
+        ));
+    }
+    Ok(Some(bytes.to_vec()))
+}
+
+/// Reads a certificate authority file that a person chose, to keep a copy of
+/// it with a profile.
+///
+/// # Errors
+///
+/// Returns what is wrong with the file: it is not there, is no file, is
+/// larger than [`MAX_CA_BYTES`] or holds no PEM certificate.
+pub fn read_certificate_file(path: &Path) -> Result<Vec<u8>, Problem> {
+    let what = "the certificate file";
+    read_certificates(path, what)
+        .map_err(|problem| Problem::of(Field::Ca, problem.text))?
+        .ok_or_else(|| Problem::of(Field::Ca, format!("{what} is not there")))
+}
+
 /// Reads the certificate authority file that `profile` names, from the folder
 /// of the profile file `profile_file`. `Ok(None)` when the profile names none.
 ///
@@ -649,16 +698,10 @@ pub fn read_ca(
     let folder = profile_file
         .parent()
         .ok_or_else(|| in_file("`ca` names a file next to this file, which has no folder"))?;
-    let bytes = read_bounded(&folder.join(name), MAX_CA_BYTES, "the file that `ca` names")
+    read_certificates(&folder.join(name), "the file that `ca` names")
         .map_err(|problem| in_file(&problem.text))?
-        .ok_or_else(|| in_file("`ca` names a file that is not in the folder of this file"))?;
-    if !contains(&bytes, b"-----BEGIN CERTIFICATE-----") {
-        return Err(in_file(
-            "the file that `ca` names holds no certificate; a PEM file has a line \
-             -----BEGIN CERTIFICATE-----",
-        ));
-    }
-    Ok(Some(bytes.to_vec()))
+        .ok_or_else(|| in_file("`ca` names a file that is not in the folder of this file"))
+        .map(Some)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
