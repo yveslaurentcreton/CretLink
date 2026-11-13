@@ -66,10 +66,10 @@ mod session_task;
 // screen registers part of it too.
 pub(crate) mod setup;
 use session_driver::{
-    ActivitySlot, Intent, IntentSender, Place, ServiceSlot, StateSink, intent_channel, lock,
-    lock_activity, lock_service,
+    ActivitySlot, Intent, IntentSender, Place, ServiceSlot, StateSink, Turn, Waits, intent_channel,
+    lock, lock_activity, lock_service,
 };
-use session_task::{RelayWait, Run, Wait};
+use session_task::{Patience, RelayWait, Run, Wait};
 
 /// The console's single source of truth, shared across command invocations and
 /// the background live-session pump. Both hold the same `Arc<Mutex<..>>`, so the
@@ -84,6 +84,10 @@ use session_task::{RelayWait, Run, Wait};
 #[derive(Debug, Clone)]
 pub struct AppState {
     inner: Arc<Mutex<ConsoleState>>,
+    /// Which wait the state belongs to: every new wait begins a turn of its
+    /// own, and the task of an earlier wait that is still there writes
+    /// nothing more (ST-M007-013).
+    waits: Waits,
     live: Arc<Mutex<Option<IntentSender>>>,
     /// The live session service while a session is under full control, published
     /// by the pump at hand-off so the terminal commands can attach in-process
@@ -146,6 +150,7 @@ impl AppState {
     pub fn live_idle() -> Self {
         Self {
             inner: Arc::new(Mutex::new(ConsoleState::new(technician_host()))),
+            waits: Waits::default(),
             live: Arc::new(Mutex::new(None)),
             service: Arc::new(Mutex::new(None)),
             activity: Arc::new(Mutex::new(TechnicianActivity::new())),
@@ -169,6 +174,7 @@ impl AppState {
     pub fn seeded() -> Self {
         Self {
             inner: Arc::new(Mutex::new(seed_state())),
+            waits: Waits::default(),
             live: Arc::new(Mutex::new(None)),
             service: Arc::new(Mutex::new(None)),
             activity: Arc::new(Mutex::new(TechnicianActivity::new())),
@@ -211,11 +217,19 @@ impl AppState {
         Some((service, audit))
     }
 
-    /// Prepares the task of the next session: a new intent channel, an empty
-    /// feed, an empty bridge status and an empty transfer queue, and the
-    /// slots the task shares with the commands. `place` is where that task
-    /// writes outside this process.
+    /// Prepares the task of the next session: a new turn on the state, a new
+    /// intent channel, an empty feed, an empty bridge status and an empty
+    /// transfer queue, and the slots the task shares with the commands.
+    /// `place` is where that task writes outside this process.
+    ///
+    /// All of it happens with the state locked, in one step: from then on
+    /// the task of an earlier wait that is still there finds its turn over
+    /// and leaves the state and the slots alone ([`Waits`]).
     fn next_run(&self, sink: Arc<dyn StateSink>, place: Place) -> Run {
+        let mut console = self.guard();
+        // The state belongs to the new wait from here on, and no longer
+        // names the relay of the session before it.
+        let turn = self.waits.begin(&mut console);
         // Open the intent channel so the compare-gate confirm/mismatch
         // buttons and the emergency stop can reach the session's task, which
         // exclusively owns the handle (ST-M002-013). The task takes the
@@ -231,14 +245,21 @@ impl AppState {
         // And with an empty transfer queue: what the session before it sent,
         // copied or was offered is dropped (ST-M010-002).
         self.transfers.reset();
+        // No service and no audit sink yet: a session's task publishes the
+        // one at full control and lends the other when it starts. The task
+        // of the wait before, should it still be there, no longer empties
+        // these slots itself.
+        *lock_service(&self.service) = None;
+        *self.audit.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        drop(console);
         Run {
             shared: self.inner.clone(),
+            turn,
             sink,
             intents,
             // The task publishes the hosted service here at full-control
             // hand-off, making the technician terminal reachable in-process
-            // (ST-M008-001). Any stale service from a prior session was
-            // cleared on that session's fail-closed teardown.
+            // (ST-M008-001).
             service: self.service.clone(),
             activity: self.activity.clone(),
             bridge: self.bridge.clone(),
@@ -292,11 +313,19 @@ fn default_app_state() -> AppState {
 
 /// Takes a session's audit sink back from the terminal commands when dropped,
 /// so the last sender can go and the drain can seal the log (ST-M003-006).
-struct AuditLent(Arc<Mutex<Option<ChannelAudit>>>);
+/// Only while the state still belongs to the wait of that session: when a
+/// newer wait began, the sink in the slot is its own and stays.
+struct AuditLent {
+    slot: Arc<Mutex<Option<ChannelAudit>>>,
+    shared: Arc<Mutex<ConsoleState>>,
+    turn: Turn,
+}
 
 impl Drop for AuditLent {
     fn drop(&mut self) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.turn.while_current(&self.shared, || {
+            *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        });
     }
 }
 
@@ -717,9 +746,43 @@ async fn use_relay(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ConsoleState, CommandError> {
-    relay_can_be_chosen(&state.guard())?;
+    let sink: Arc<dyn StateSink> = Arc::new(TauriSink { app });
     // Reading the profile touches the disk: not on this task.
-    let relay = setup::blocking(relay_settings::relay_in_use).await?;
+    let relay = setup::blocking(relay_settings::relay_in_use);
+    use_relay_now(
+        &state,
+        sink,
+        Place::of_this_user(),
+        relay,
+        Patience::default(),
+    )
+    .await
+}
+
+/// [`use_relay`], without Tauri. `relay` reads the relay of this copy; it is
+/// awaited between the two checks that the console still waits on a network.
+///
+/// The order matters, and each step is what a test of this function shows:
+///
+/// 1. Refuse at once unless the console waits on a network.
+/// 2. Read the profile. This takes a moment, and a customer may connect on
+///    the network meanwhile.
+/// 3. Check again and stop the wait under one lock: a customer who connected
+///    in step 2 keeps their session, and the relay is refused.
+/// 4. Wait a bounded moment for the task of the old wait, so that its
+///    listener is gone before the new wait begins. A task that does not let
+///    go in time is left behind; it can no longer write to the state
+///    ([`Waits`]).
+/// 5. Begin the wait on the relay, with a new relay code.
+async fn use_relay_now(
+    state: &AppState,
+    sink: Arc<dyn StateSink>,
+    place: Place,
+    relay: impl Future<Output = Result<crate::relay::Relay, CommandError>>,
+    patience: Patience,
+) -> Result<ConsoleState, CommandError> {
+    relay_can_be_chosen(&state.guard())?;
+    let relay = relay.await?;
     let code = RelayCode::generate().map_err(|_| {
         CommandError::new(
             "relay",
@@ -749,13 +812,7 @@ async fn use_relay(
         let _ = tokio::time::timeout(NETWORK_SWITCH_TIMEOUT, task).await;
     }
 
-    let sink: Arc<dyn StateSink> = Arc::new(TauriSink { app });
-    let task = begin_relay_wait(
-        &state,
-        sink,
-        Place::of_this_user(),
-        RelayWait::new(relay, code),
-    );
+    let task = begin_relay_wait(state, sink, place, RelayWait::new(relay, code, patience));
     *state.pump.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
     Ok(state.guard().clone())
 }

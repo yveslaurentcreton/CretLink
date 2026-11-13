@@ -234,8 +234,19 @@ cannot be used is said with its file (`relayOffer` in
   open for as long as the screen is, and **Cancel** drops it, so the code
   leads to no session any more. No listener is open during a wait on a
   relay, and `switch_listen_network` is refused.
+- **Every wait has a turn of its own on the console's state**
+  (`session_driver::Waits`, `Turn`). A change of wait stops the old task and
+  waits a bounded moment for it (`use_relay`, `switch_listen_network`); a
+  task that does not let go in time lives on beside the new one. It then
+  finds its turn over: it ends the session it holds and writes nothing more,
+  neither to the state nor to the slots that the commands read (the
+  session's service, its audit sink, the activity feed, the bridge status).
+  A late connection to an old listener therefore never shows as a customer
+  of the wait that is on screen. The customer role has the same rule
+  (`customer::session_driver::lock_current`).
 - `ConsoleState.relay` stays through the session and after its end, until
-  the console waits again. Compare, consent, the live session and the end
+  the console waits again: a new wait clears it when it begins, so a wait
+  that then fails to start names no relay. Compare, consent, the live session and the end
   report each say **Through the relay** with the host name. No transition of
   the console state reads it. The audit gets a record `session_route` with
   the relay's host name, the address the copy connected to and the kind of

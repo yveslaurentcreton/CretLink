@@ -50,7 +50,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::bridge::BridgeSlot;
 use super::history::OpenLog;
-use super::session_driver::{ActivitySlot, Intent, Place, ServiceSlot, StateSink, lock, pump};
+use super::session_driver::{
+    ActivitySlot, Intent, Place, ServiceSlot, StateSink, Turn, lock, pump,
+};
 use super::{AUDIT_SEAL_TIMEOUT, AuditLent, advertised_instance};
 use crate::relay::{Audience, Relay, Source, failure_words};
 
@@ -62,26 +64,40 @@ pub(super) enum Wait {
     Relay(RelayWait),
 }
 
+/// How patient a wait on a relay is.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Patience {
+    /// The pause between two dials after a rendezvous that nobody joined.
+    pub(super) pause: Duration,
+    /// How long one parked connection is trusted before it is dialled again.
+    pub(super) park_limit: Duration,
+}
+
+/// As patient as [`WaitingDial`] is by default.
+impl Default for Patience {
+    fn default() -> Self {
+        Self {
+            pause: DEFAULT_REDIAL_PAUSE,
+            park_limit: DEFAULT_PARK_LIMIT,
+        }
+    }
+}
+
 /// A wait on a relay: the relay of this copy's profile, the code of this one
 /// session, and how patient the waiting dial is.
 pub(super) struct RelayWait {
     relay: Relay,
     code: RelayCode,
-    /// The pause between two dials after a rendezvous that nobody joined.
-    pause: Duration,
-    /// How long one parked connection is trusted before it is dialled again.
-    park_limit: Duration,
+    patience: Patience,
 }
 
 impl RelayWait {
-    /// A wait on `relay` with the code `code`, as patient as [`WaitingDial`]
-    /// is by default.
-    pub(super) fn new(relay: Relay, code: RelayCode) -> Self {
+    /// A wait on `relay` with the code `code`.
+    pub(super) fn new(relay: Relay, code: RelayCode, patience: Patience) -> Self {
         Self {
             relay,
             code,
-            pause: DEFAULT_REDIAL_PAUSE,
-            park_limit: DEFAULT_PARK_LIMIT,
+            patience,
         }
     }
 
@@ -95,15 +111,6 @@ impl RelayWait {
     /// checked against.
     pub(super) fn route(&self) -> RelayRoute {
         self.relay.route()
-    }
-
-    /// The same wait with other timing, for a test that lets a rendezvous
-    /// lapse.
-    #[cfg(test)]
-    pub(super) fn with_timing(mut self, pause: Duration, park_limit: Duration) -> Self {
-        self.pause = pause;
-        self.park_limit = park_limit;
-        self
     }
 }
 
@@ -121,6 +128,9 @@ impl std::fmt::Debug for RelayWait {
 /// writes outside this process.
 pub(super) struct Run {
     pub(super) shared: Arc<Mutex<ConsoleState>>,
+    /// This wait's claim on the shared state: what the task writes, it
+    /// writes only while no newer wait began ([`Turn`]).
+    pub(super) turn: Turn,
     pub(super) sink: Arc<dyn StateSink>,
     pub(super) intents: UnboundedReceiver<Intent>,
     pub(super) service: ServiceSlot,
@@ -145,6 +155,7 @@ impl Run {
     pub(super) async fn drive(self, wait: Wait) {
         let Self {
             shared,
+            turn,
             sink,
             mut intents,
             service,
@@ -168,15 +179,26 @@ impl Run {
         let (audit, audit_rx) = ChannelAudit::bounded(AUDIT_CHANNEL_CAPACITY);
         // Lend the terminal commands this session's audit sink; the guard
         // takes it back on every exit path so the log can still be sealed.
-        *audit_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(audit.clone());
-        let audit_lent = AuditLent(audit_slot);
+        // Only while the state is this wait's: a task that was outlived
+        // neither lends its sink over the one of the newer wait nor takes
+        // that one back.
+        turn.while_current(&shared, || {
+            *audit_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(audit.clone());
+        });
+        let audit_lent = AuditLent {
+            slot: audit_slot,
+            shared: Arc::clone(&shared),
+            turn: turn.clone(),
+        };
         // The history leaves this log out until it is sealed (ST-M009-012).
         let (start_tx, start_rx) = audit_log.track();
         let audit_task = spawn_audit_service(place.audit.clone(), audit_rx, start_rx);
 
         let waited = match wait {
-            Wait::Network(bind_ip) => listen(&shared, sink.as_ref(), bind_ip, &audit).await,
-            Wait::Relay(wait) => wait_on_relay(&shared, &sink, &mut intents, wait, &audit).await,
+            Wait::Network(bind_ip) => listen(&shared, &turn, sink.as_ref(), bind_ip, &audit).await,
+            Wait::Relay(wait) => {
+                wait_on_relay(&shared, &turn, &sink, &mut intents, wait, &audit).await
+            }
         };
         // Without a handle the wait ended honestly: it failed in words, or
         // the technician cancelled it. No session log was opened.
@@ -192,6 +214,7 @@ impl Run {
         pump(
             waited.handle,
             shared,
+            turn,
             sink,
             intents,
             audit.clone(),
@@ -236,10 +259,21 @@ fn hints() -> ConsoleHints {
 /// phase with its connection code (ST-M002-009, ST-M002-012).
 async fn listen(
     shared: &Mutex<ConsoleState>,
+    turn: &Turn,
     sink: &dyn StateSink,
     bind_ip: IpAddr,
     audit: &ChannelAudit,
 ) -> Option<Waited> {
+    // The failure of a wait that could not begin, on the state of this wait
+    // only. The state names no relay then: the wait before it may have gone
+    // through one, and this one touched none ([`Waits::begin`](
+    // super::session_driver::Waits::begin)).
+    let fail = |message: String| {
+        if let Some(mut console) = turn.lock(shared) {
+            console.fail("listen", message);
+            sink.emit(&console);
+        }
+    };
     // 1. Bind the listener on a private interface, recording lifecycle
     //    outcomes (pairing, consent, cleanup) to the session's log via
     //    `host_with_audit` (REQ-F-017). A bind failure is an honest terminal
@@ -255,19 +289,12 @@ async fn listen(
     {
         Ok(handle) => handle,
         Err(error) => {
-            let mut console = lock(shared);
-            console.fail("listen", format!("could not start the listener: {error}"));
-            sink.emit(&console);
+            fail(format!("could not start the listener: {error}"));
             return None;
         }
     };
     let Some(local_addr) = handle.local_addr() else {
-        let mut console = lock(shared);
-        console.fail(
-            "listen",
-            "the listener reported no local address".to_string(),
-        );
-        sink.emit(&console);
+        fail("the listener reported no local address".to_string());
         return None;
     };
 
@@ -299,7 +326,9 @@ async fn listen(
         SocketAddr::V6(addr) => addr.to_string(),
     };
     {
-        let mut console = lock(shared);
+        // A newer wait began while this listener was bound: the listener
+        // goes with this task, and the screen is left to the newer wait.
+        let mut console = turn.lock(shared)?;
         let technician = console.technician.clone();
         *console = ConsoleState::new(technician);
         if let Err(error) = console.listen(code, local_addr.to_string()) {
@@ -315,9 +344,10 @@ async fn listen(
     })
 }
 
-/// Whether the console still waits on the relay code `code`. Every wait has a
-/// code of its own, so this also tells a wait that was cancelled, and whose
-/// state another session has taken since, from the one that is on screen.
+/// Whether the console still waits on the relay code `code`: the wait was
+/// neither cancelled nor ended in another way. Whether the state is still
+/// this wait's own is the question of its [`Turn`]; the code is asked beside
+/// it, because every wait has a code of its own.
 fn waits_on(console: &ConsoleState, code: &str) -> bool {
     console.relay.is_some()
         && matches!(&console.phase, SessionPhase::Listening { code: shown, .. } if shown == code)
@@ -365,6 +395,7 @@ fn where_it_is_set(relay: &Relay) -> String {
 /// still on screen is ended.
 fn fail_relay(
     shared: &Mutex<ConsoleState>,
+    turn: &Turn,
     sink: &dyn StateSink,
     code: &str,
     relay: &Relay,
@@ -387,8 +418,9 @@ fn fail_relay(
     } else {
         words.next
     };
-    let mut console = lock(shared);
-    if waits_on(&console, code) {
+    if let Some(mut console) = turn.lock(shared)
+        && waits_on(&console, code)
+    {
         console.fail_with_next(format!("relay_{}", words.kind), words.message, next);
         sink.emit(&console);
     }
@@ -400,6 +432,7 @@ fn fail_relay(
 /// or was cancelled.
 async fn wait_on_relay(
     shared: &Arc<Mutex<ConsoleState>>,
+    turn: &Turn,
     sink: &Arc<dyn StateSink>,
     intents: &mut UnboundedReceiver<Intent>,
     wait: RelayWait,
@@ -408,11 +441,11 @@ async fn wait_on_relay(
     let RelayWait {
         relay,
         code,
-        pause,
-        park_limit,
+        patience,
     } = wait;
     let shown = code.encode();
-    let fail = |failure: &RelayFailure| fail_relay(shared, sink.as_ref(), &shown, &relay, failure);
+    let fail =
+        |failure: &RelayFailure| fail_relay(shared, turn, sink.as_ref(), &shown, &relay, failure);
 
     // The TLS settings first: a profile without usable authorities is said
     // before anything is dialled.
@@ -435,11 +468,14 @@ async fn wait_on_relay(
 
     let admitted = {
         let shared = Arc::clone(shared);
+        let turn = turn.clone();
         let sink = Arc::clone(sink);
         let shown = shown.clone();
         move || {
-            let mut console = lock(&shared);
-            if waits_on(&console, &shown) && console.relay_admitted() {
+            if let Some(mut console) = turn.lock(&shared)
+                && waits_on(&console, &shown)
+                && console.relay_admitted()
+            {
                 sink.emit(&console);
             }
         }
@@ -449,8 +485,8 @@ async fn wait_on_relay(
             inner: relay.dial(connector, ticket),
             admitted,
         },
-        pause,
-        park_limit,
+        patience.pause,
+        patience.park_limit,
     );
 
     // Wait for as long as the technician does. Cancel is looked at first, so
@@ -487,8 +523,12 @@ async fn wait_on_relay(
     };
 
     // The customer's copy is heard. A wait that was called off in this very
-    // moment gets no session: the connection is dropped.
-    if !waits_on(&lock(shared), &shown) {
+    // moment, or that a newer wait took the screen from, gets no session:
+    // the connection is dropped.
+    if !turn
+        .lock(shared)
+        .is_some_and(|console| waits_on(&console, &shown))
+    {
         return None;
     }
     // The audit says first which way the session goes: through this relay,
@@ -520,6 +560,7 @@ mod tests {
     use cretlink_console::TechnicianHost;
     use cretlink_relay::RelayRefusal;
 
+    use super::super::session_driver::Waits;
     use super::*;
 
     const KEY: &str = "5f2c9d0e7a1b4c3d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5";
@@ -553,12 +594,15 @@ mod tests {
         })
     }
 
-    fn waiting(code: &str) -> Mutex<ConsoleState> {
+    /// A console that waits on the relay code `code`, with the turn of the
+    /// task of that wait.
+    fn waiting(code: &str) -> (Mutex<ConsoleState>, Turn) {
         let mut state = console();
+        let turn = Waits::default().begin(&mut state);
         state
             .listen_on_relay(code, from_settings().route())
             .unwrap();
-        Mutex::new(state)
+        (Mutex::new(state), turn)
     }
 
     fn failure(shared: &Mutex<ConsoleState>) -> (String, String, String) {
@@ -583,7 +627,7 @@ mod tests {
         // Waiting on a network is no wait on a relay, whatever the code.
         state.listen(CODE, "10.0.0.42:7000").unwrap();
         assert!(!waits_on(&state, CODE));
-        let shared = waiting(CODE);
+        let (shared, _turn) = waiting(CODE);
         assert!(waits_on(&lock(&shared), CODE));
         assert!(!waits_on(&lock(&shared), "6RRR-2H8F-0000-0000"));
         // Once the wait is over, nothing of it is on screen any more.
@@ -598,9 +642,9 @@ mod tests {
         let sink = Counting::default();
 
         // Put right in the profile: the next step says where that is.
-        let shared = waiting(CODE);
+        let (shared, turn) = waiting(CODE);
         let key = RelayFailure::Refused(RelayRefusal::CredentialRequired);
-        fail_relay(&shared, &sink, CODE, &from_settings(), &key);
+        fail_relay(&shared, &turn, &sink, CODE, &from_settings(), &key);
         let (stage, message, next) = failure(&shared);
         assert_eq!(stage, "relay_key_required");
         assert_eq!(
@@ -621,10 +665,10 @@ mod tests {
         assert!(!lock(&shared).can_issue_actions());
 
         // A copy that takes its relay from the file next to the program.
-        let shared = waiting(CODE);
+        let (shared, turn) = waiting(CODE);
         let file = relay(Source::File(PathBuf::from("cretlink.toml")));
         let gone = RelayFailure::Unreachable(std::io::Error::other("refused"));
-        fail_relay(&shared, &sink, CODE, &file, &gone);
+        fail_relay(&shared, &turn, &sink, CODE, &file, &gone);
         let (stage, _, next) = failure(&shared);
         assert_eq!(stage, "relay_unreachable");
         assert!(
@@ -636,9 +680,9 @@ mod tests {
         );
 
         // Nothing to change in the profile: the next step stands alone.
-        let shared = waiting(CODE);
+        let (shared, turn) = waiting(CODE);
         let busy = RelayFailure::Refused(RelayRefusal::RateLimited);
-        fail_relay(&shared, &sink, CODE, &from_settings(), &busy);
+        fail_relay(&shared, &turn, &sink, CODE, &from_settings(), &busy);
         assert_eq!(
             failure(&shared),
             (
@@ -660,26 +704,72 @@ mod tests {
         let gone = RelayFailure::Unreachable(std::io::Error::other("refused"));
 
         // The technician cancelled: the wait stays cancelled.
-        let shared = waiting(CODE);
+        let (shared, turn) = waiting(CODE);
         lock(&shared)
             .stop(cretlink_console::StopReason::TechnicianRequested)
             .unwrap();
-        fail_relay(&shared, &sink, CODE, &from_settings(), &gone);
+        fail_relay(&shared, &turn, &sink, CODE, &from_settings(), &gone);
         assert!(matches!(lock(&shared).phase, SessionPhase::Stopped { .. }));
 
-        // Another wait took the screen meanwhile: it is left alone.
-        let shared = waiting("6RRR-2H8F-0000-0000");
-        fail_relay(&shared, &sink, CODE, &from_settings(), &gone);
-        assert!(matches!(
-            lock(&shared).phase,
-            SessionPhase::Listening { .. }
-        ));
+        // Another wait took the screen meanwhile: it is left alone, whatever
+        // code it waits on. The turn of the earlier wait is over.
+        for code in ["6RRR-2H8F-0000-0000", CODE] {
+            let waits = Waits::default();
+            let mut state = console();
+            let earlier = waits.begin(&mut state);
+            let later = waits.begin(&mut state);
+            state
+                .listen_on_relay(code, from_settings().route())
+                .unwrap();
+            let shared = Mutex::new(state);
+            fail_relay(&shared, &earlier, &sink, CODE, &from_settings(), &gone);
+            assert!(matches!(
+                lock(&shared).phase,
+                SessionPhase::Listening { .. }
+            ));
+            assert!(earlier.lock(&shared).is_none());
+            assert!(later.lock(&shared).is_some());
+        }
         assert_eq!(sink.0.load(Ordering::Relaxed), 0);
     }
 
     #[test]
+    fn a_new_wait_takes_the_state_from_the_task_of_the_wait_before() {
+        let waits = Waits::default();
+        let mut state = console();
+        // A session through a relay ended; its state still names the relay.
+        let first = waits.begin(&mut state);
+        state
+            .listen_on_relay(CODE, from_settings().route())
+            .unwrap();
+        state
+            .stop(cretlink_console::StopReason::TechnicianRequested)
+            .unwrap();
+        assert!(state.relay.is_some());
+        // The next wait begins: the state is its own from now on, and names
+        // no relay that this wait never touched.
+        let second = waits.begin(&mut state);
+        assert_eq!(state.relay, None);
+        let shared = Mutex::new(state);
+        assert!(first.lock(&shared).is_none());
+        assert!(second.lock(&shared).is_some());
+        // What the earlier task would still write to a slot is not written.
+        let mut written = Vec::new();
+        first.while_current(&shared, || written.push("earlier"));
+        second.while_current(&shared, || written.push("later"));
+        assert_eq!(written, ["later"]);
+        // A turn is this wait's alone, however it is passed around.
+        assert!(second.clone().lock(&shared).is_some());
+        assert!(first.clone().lock(&shared).is_none());
+    }
+
+    #[test]
     fn a_wait_prints_neither_its_code_nor_the_key() {
-        let wait = RelayWait::new(from_settings(), RelayCode::parse(CODE).unwrap());
+        let wait = RelayWait::new(
+            from_settings(),
+            RelayCode::parse(CODE).unwrap(),
+            Patience::default(),
+        );
         assert_eq!(wait.code(), CODE);
         assert_eq!(
             wait.route(),

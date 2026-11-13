@@ -69,11 +69,17 @@ fn technician_at(relay: &TestRelay, test: &str, key: Option<&str>) -> Technician
     technician
 }
 
-/// **Use relay** in a technician copy whose profile file is next to its
-/// program. Answers the waiting state the window gets back.
-fn use_relay(technician: &Technician) -> ConsoleState {
+/// **Start a session** and then **Use relay**, in a technician copy whose
+/// profile file is next to its program: the copy waits on a network first,
+/// and the command itself changes the wait to the relay. Answers the waiting
+/// state the window gets back.
+async fn use_relay(technician: &Technician) -> ConsoleState {
+    technician.start_on_network().await;
     let program = technician.folder().path("cretlink");
-    technician.use_relay(technician.relay_of(&program).expect("a relay profile"))
+    technician
+        .use_relay(&program)
+        .await
+        .expect("the relay is used")
 }
 
 /// The customer's copy in a folder of its own with the profile of `relay`
@@ -153,7 +159,7 @@ fn console_failure(state: &ConsoleState) -> Option<(String, String, Option<Strin
 /// confirms and the customer allows. Answers the relay code that was read
 /// out.
 async fn pair(technician: &Technician, customer: &mut Customer) -> String {
-    let waiting = use_relay(technician);
+    let waiting = use_relay(technician).await;
     let (code, host, _) = waiting_on(&waiting);
     assert_eq!(host, RELAY_NAME);
     technician
@@ -219,7 +225,7 @@ async fn a_relay_code_leads_to_a_session_like_on_one_network_and_the_technician_
 
     // Use relay: the waiting state at once, with the relay by its host name
     // and a relay code. No target, no listener, no authority.
-    let waiting = use_relay(&technician);
+    let waiting = use_relay(&technician).await;
     let (code, host, _) = waiting_on(&waiting);
     assert_eq!(host, RELAY_NAME);
     let SessionPhase::Listening { address, .. } = &waiting.phase else {
@@ -589,7 +595,7 @@ async fn a_relay_that_stops_before_the_customer_decided_is_said_with_the_relay()
     let relay = keyed_relay().await;
     let technician = technician_at(&relay, "relay-stops-early", Some(TECHNICIAN_KEY));
     let (mut customer, _folder) = customer_at(&relay, "relay-stops-early", Some(CUSTOMER_KEY));
-    let (code, _, _) = waiting_on(&use_relay(&technician));
+    let (code, _, _) = waiting_on(&use_relay(&technician).await);
     technician
         .wait_for("that the relay holds the code", relay_holds_the_code)
         .await;
@@ -654,7 +660,7 @@ async fn a_code_that_nobody_waits_on_is_said_and_a_code_leads_to_one_session_onl
     // A code leads to one session: once the customer is connected, the same
     // code leads a second copy to nobody.
     let technician = technician_at(&relay, "once", Some(TECHNICIAN_KEY));
-    let (code, _, _) = waiting_on(&use_relay(&technician));
+    let (code, _, _) = waiting_on(&use_relay(&technician).await);
     technician
         .wait_for("that the relay holds the code", relay_holds_the_code)
         .await;
@@ -690,7 +696,7 @@ async fn a_code_that_nobody_waits_on_is_said_and_a_code_leads_to_one_session_onl
 async fn cancel_ends_the_wait_and_every_wait_has_a_code_of_its_own() {
     let relay = keyed_relay().await;
     let technician = technician_at(&relay, "cancel", Some(TECHNICIAN_KEY));
-    let (first_code, _, _) = waiting_on(&use_relay(&technician));
+    let (first_code, _, _) = waiting_on(&use_relay(&technician).await);
     technician
         .wait_for("that the relay holds the code", relay_holds_the_code)
         .await;
@@ -720,7 +726,7 @@ async fn cancel_ends_the_wait_and_every_wait_has_a_code_of_its_own() {
     assert_eq!(technician.console().phase, cancelled.phase);
 
     // The next wait has a new code, and that one works.
-    let (second_code, _, _) = waiting_on(&use_relay(&technician));
+    let (second_code, _, _) = waiting_on(&use_relay(&technician).await);
     assert_ne!(second_code, first_code);
     technician
         .wait_for("that the relay holds the new code", relay_holds_the_code)
@@ -745,11 +751,12 @@ async fn the_wait_outlives_a_rendezvous_that_the_relay_let_lapse() {
     })
     .await;
     let technician = technician_at(&relay, "lapse", Some(TECHNICIAN_KEY));
+    technician.start_on_network().await;
     let program = technician.folder().path("cretlink");
-    let waiting = technician.use_relay_redialling_after(
-        technician.relay_of(&program).expect("a relay profile"),
-        Duration::from_millis(50),
-    );
+    let waiting = technician
+        .use_relay_redialling_after(&program, Duration::from_millis(50))
+        .await
+        .expect("the relay is used");
     let (code, _, _) = waiting_on(&waiting);
 
     // The relay lets the rendezvous lapse, more than once; the technician's
@@ -783,6 +790,391 @@ async fn the_wait_outlives_a_rendezvous_that_the_relay_let_lapse() {
     customer.settled().await;
 }
 
+// --- The command itself, and the task of a wait that is over ---
+
+/// Whether a customer's window shows that its dial or its session is over.
+fn over(view: &ConsentView) -> bool {
+    matches!(
+        view.status.phase,
+        AgentPhase::Failed { .. } | AgentPhase::Stopped { .. }
+    )
+}
+
+/// The states the technician's screen was given from the first wait on a
+/// relay on.
+fn since_the_relay(technician: &Technician) -> Vec<ConsoleState> {
+    let rendered = technician.rendered();
+    let first = rendered
+        .iter()
+        .position(|state| state.relay.is_some())
+        .expect("the screen showed a wait on the relay");
+    rendered[first..].to_vec()
+}
+
+/// Whether a state is a wait on a relay and nothing else: no target, nobody
+/// connecting.
+fn is_a_wait_on_the_relay(state: &ConsoleState) -> bool {
+    matches!(state.phase, SessionPhase::Listening { .. })
+        && state.relay.is_some()
+        && state.targets.is_empty()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn use_relay_ends_the_wait_on_the_network_before_it_waits_on_the_relay() {
+    let relay = keyed_relay().await;
+    let technician = technician_at(&relay, "command", Some(TECHNICIAN_KEY));
+    let program = technician.folder().path("cretlink");
+
+    // Before a session is started there is no waiting screen that could
+    // offer the relay: the command refuses, and nothing changes.
+    let refused = technician.use_relay(&program).await.unwrap_err();
+    assert_eq!(refused.stage, "relay");
+    assert_eq!(
+        refused.message,
+        "A relay can be chosen only while waiting for the customer."
+    );
+    assert!(technician.rendered().is_empty());
+    assert_eq!(technician.console().phase, SessionPhase::Idle);
+
+    let on_network = technician.start_on_network().await;
+    let SessionPhase::Listening { code: lan_code, .. } = on_network.phase.clone() else {
+        unreachable!();
+    };
+    // What the commands reach the task of this wait through. It is closed
+    // once that task has ended.
+    let to_the_listener = technician.intents();
+    assert!(!to_the_listener.is_closed());
+
+    let waiting = technician
+        .use_relay(&program)
+        .await
+        .expect("the relay is used");
+    // The answer is the wait on the relay, with a code of its own.
+    let (code, host, _) = waiting_on(&waiting);
+    assert_eq!(host, RELAY_NAME);
+    assert_ne!(code, lan_code);
+    assert!(RelayCode::parse(&code).is_ok(), "{code}");
+    assert_eq!(waiting.relay, Some(route_of(&relay)));
+    // The task of the wait on the network had ended when the command
+    // answered: the command stopped it and waited for it, so that nothing of
+    // the old listener is left to speak into the new wait.
+    assert!(
+        to_the_listener.is_closed(),
+        "the task of the wait on the network was still there"
+    );
+    // While the relay is waited on, it cannot be chosen once more.
+    let again = technician.use_relay(&program).await.unwrap_err();
+    assert_eq!(again.stage, "relay");
+
+    // The connection code of the network leads nowhere any more.
+    let (mut customer, _folder) = customer_at(&relay, "command", Some(CUSTOMER_KEY));
+    customer
+        .connect(&lan_code)
+        .expect("the code is well formed");
+    let view = customer.wait_for("that nobody listens", over).await;
+    assert!(failed_at(&view).is_some(), "{:?}", view.status.phase);
+    assert!(customer.rendered().iter().all(|view| view.relay.is_none()));
+    customer.settled().await;
+
+    // The wait on the relay is what it was: the same code, no target, and
+    // nothing but that wait on the screen since it began.
+    technician
+        .wait_for("that the relay holds the code", relay_holds_the_code)
+        .await;
+    assert_eq!(waiting_on(&technician.console()).0, code);
+    for state in since_the_relay(&technician) {
+        assert!(is_a_wait_on_the_relay(&state), "{state:?}");
+    }
+
+    technician.stop().expect("cancel");
+    technician.finished().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_customer_who_connects_while_the_profile_is_read_keeps_their_session() {
+    let relay = keyed_relay().await;
+    let technician = technician_at(&relay, "command-read", Some(TECHNICIAN_KEY));
+    let (mut customer, _folder) = customer_at(&relay, "command-read", Some(CUSTOMER_KEY));
+    let on_network = technician.start_on_network().await;
+    let SessionPhase::Listening { code: lan_code, .. } = on_network.phase.clone() else {
+        unreachable!();
+    };
+    let program = technician.folder().path("cretlink");
+
+    // The technician presses Use relay. Reading the profile takes a moment,
+    // and in that moment the customer types the connection code of this
+    // network and is heard.
+    let reading = async {
+        customer.connect(&lan_code).expect("the code is taken");
+        technician
+            .wait_for("the customer on the network", |state| {
+                !matches!(state.phase, SessionPhase::Listening { .. })
+            })
+            .await;
+        technician.relay_of(&program)
+    };
+    // The command looks again under the lock that would stop the wait: it
+    // no longer waits, so nothing is stopped and the relay is refused.
+    let refused = technician.use_relay_reading(reading).await.unwrap_err();
+    assert_eq!(refused.stage, "relay");
+    assert_eq!(
+        refused.message,
+        "A relay can be chosen only while waiting for the customer."
+    );
+
+    // The session on the network goes on as if nothing was pressed.
+    let on_console = technician
+        .wait_for("the approval code", |state| {
+            matches!(state.phase, SessionPhase::AwaitingApprovalCode { .. })
+        })
+        .await;
+    let on_customer = customer
+        .wait_for("the approval code", |view| view.approval_code.is_some())
+        .await;
+    assert_eq!(on_console.relay, None);
+    assert_eq!(on_customer.relay, None);
+    assert!(
+        technician
+            .rendered()
+            .iter()
+            .all(|state| state.relay.is_none())
+    );
+    // And nothing reached the relay.
+    let metrics = relay.control.metrics();
+    assert_eq!(
+        (metrics.sessions_admitted, metrics.denied_auth),
+        (0, 0),
+        "{metrics:?}"
+    );
+
+    technician.stop().expect("stop");
+    technician.finished().await;
+    customer.settled().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_customer_who_arrives_at_the_moment_of_a_cancel_gets_no_session() {
+    let relay = keyed_relay().await;
+    // Several times, with the cancel a little earlier or later against the
+    // arrival. Whichever comes first: the cancel stands, and nobody gets as
+    // far as a decision, let alone control.
+    for round in 0..6 {
+        let name = format!("cancel-arrival-{round}");
+        let technician = technician_at(&relay, &name, Some(TECHNICIAN_KEY));
+        let (mut customer, _folder) = customer_at(&relay, &name, Some(CUSTOMER_KEY));
+        let (code, _, _) = waiting_on(&use_relay(&technician).await);
+        technician
+            .wait_for("that the relay holds the code", relay_holds_the_code)
+            .await;
+
+        customer
+            .connect_within(&code, Some(Duration::from_millis(400)))
+            .expect("the code is taken");
+        for _ in 0..(1 << round) >> 1 {
+            tokio::task::yield_now().await;
+        }
+        let cancelled = technician.stop().expect("cancel");
+        assert_eq!(
+            cancelled.phase,
+            SessionPhase::Stopped {
+                reason: StopReason::TechnicianRequested
+            }
+        );
+
+        technician.finished().await;
+        let view = customer.wait_for("the end", over).await;
+        customer.settled().await;
+        assert_eq!(technician.console().phase, cancelled.phase, "round {round}");
+        assert!(!technician.has_control());
+        assert!(!view.status.control_active);
+        for state in technician.rendered() {
+            assert!(
+                !matches!(
+                    state.phase,
+                    SessionPhase::AwaitingConsent | SessionPhase::FullControl
+                ),
+                "round {round}: {:?}",
+                state.phase
+            );
+        }
+        for view in customer.rendered() {
+            assert!(!view.status.control_active, "round {round}");
+            assert!(
+                !matches!(view.status.phase, AgentPhase::AwaitingConsent),
+                "round {round}: {:?}",
+                view.status.phase
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_customer_who_arrives_while_the_wait_changes_to_the_relay_never_shows_on_the_relay() {
+    let relay = keyed_relay().await;
+    // Use relay stops the wait on the network exactly as Cancel does. A
+    // customer who types the connection code of the network in that moment
+    // is either heard first, and then the relay is refused and their session
+    // goes on; or the wait changed first, and then they reach nobody and
+    // nothing of them shows on the wait on the relay.
+    for round in 0..6 {
+        let name = format!("change-arrival-{round}");
+        let technician = technician_at(&relay, &name, Some(TECHNICIAN_KEY));
+        let (mut customer, _folder) = customer_at(&relay, &name, Some(CUSTOMER_KEY));
+        let on_network = technician.start_on_network().await;
+        let SessionPhase::Listening { code: lan_code, .. } = on_network.phase.clone() else {
+            unreachable!();
+        };
+        let program = technician.folder().path("cretlink");
+
+        customer.connect(&lan_code).expect("the code is taken");
+        for _ in 0..(1 << round) >> 1 {
+            tokio::task::yield_now().await;
+        }
+        match technician.use_relay(&program).await {
+            Err(refused) => {
+                assert_eq!(refused.stage, "relay", "round {round}");
+                let state = technician
+                    .wait_for("the approval code", |state| {
+                        matches!(state.phase, SessionPhase::AwaitingApprovalCode { .. })
+                    })
+                    .await;
+                assert_eq!(state.relay, None);
+            }
+            Ok(waiting) => {
+                let (code, _, _) = waiting_on(&waiting);
+                let view = customer.wait_for("the end", over).await;
+                assert!(!view.status.control_active);
+                technician
+                    .wait_for("that the relay holds the code", relay_holds_the_code)
+                    .await;
+                assert_eq!(waiting_on(&technician.console()).0, code);
+                for state in since_the_relay(&technician) {
+                    assert!(is_a_wait_on_the_relay(&state), "round {round}: {state:?}");
+                }
+            }
+        }
+        technician.stop().expect("stop");
+        technician.finished().await;
+        customer.settled().await;
+        assert!(!technician.has_control());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_that_outlived_its_wait_cannot_change_the_state_of_a_newer_one() {
+    let relay = keyed_relay().await;
+
+    // The task of a wait on a network that does not let go: the wait
+    // changes to the relay, and the old listener is still there and still
+    // takes a connection. This test keeps what the commands reach that task
+    // through, so that the task has no reason to end by itself.
+    let technician = technician_at(&relay, "outlived", Some(TECHNICIAN_KEY));
+    let on_network = technician.start_on_network().await;
+    let SessionPhase::Listening { code: lan_code, .. } = on_network.phase.clone() else {
+        unreachable!();
+    };
+    let to_the_listener = technician.intents();
+    let program = technician.folder().path("cretlink");
+    let waiting =
+        technician.begin_relay_wait_beside(technician.relay_of(&program).expect("a profile"));
+    let (code, _, _) = waiting_on(&waiting);
+    technician
+        .wait_for("that the relay holds the code", relay_holds_the_code)
+        .await;
+    assert!(!to_the_listener.is_closed());
+
+    // A customer who still types the connection code of the network reaches
+    // the old listener. Its task finds that the screen belongs to a newer
+    // wait: it ends that session and writes nothing.
+    let (mut late, _late_folder) = customer_at(&relay, "outlived-late", Some(CUSTOMER_KEY));
+    late.connect(&lan_code).expect("the code is taken");
+    let view = late.wait_for("the end", over).await;
+    assert!(!view.status.control_active);
+    late.settled().await;
+    tokio::time::timeout(STEP, to_the_listener.closed())
+        .await
+        .expect("the task of the earlier wait ends once it has turned the customer away");
+
+    // The screen is the wait on the relay, untouched: the same code, the
+    // relay holding it, no target, and no other state since it began.
+    let still = technician.console();
+    assert_eq!(waiting_on(&still).0, code);
+    assert!(relay_holds_the_code(&still));
+    for state in since_the_relay(&technician) {
+        assert!(is_a_wait_on_the_relay(&state), "{state:?}");
+    }
+    // And that wait works: a customer with the relay code is heard on it.
+    let (mut customer, _folder) = customer_at(&relay, "outlived", Some(CUSTOMER_KEY));
+    customer.connect(&code).expect("the code is taken");
+    let on_console = technician
+        .wait_for("the approval code", |state| {
+            matches!(state.phase, SessionPhase::AwaitingApprovalCode { .. })
+        })
+        .await;
+    assert_eq!(
+        on_console.relay.map(|relay| relay.host),
+        Some(RELAY_NAME.to_owned())
+    );
+    technician.stop().expect("stop");
+    technician.finished().await;
+    customer.settled().await;
+
+    // The other way a task is left behind: nobody can reach it any more.
+    // It then ends by itself, and used to end "the session" on screen as one
+    // whose transport closed. The screen is the newer wait's, and stays so.
+    let technician = technician_at(&relay, "outlived-alone", Some(TECHNICIAN_KEY));
+    technician.start_on_network().await;
+    let to_the_listener = technician.intents();
+    let waiting =
+        technician.begin_relay_wait_beside(technician.relay_of(&program).expect("a profile"));
+    let (code, _, _) = waiting_on(&waiting);
+    let closed = to_the_listener.downgrade();
+    drop(to_the_listener);
+    let ended = async {
+        while closed.upgrade().is_some_and(|sender| !sender.is_closed()) {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(STEP, ended)
+        .await
+        .expect("the task of the earlier wait ends");
+    technician
+        .wait_for("that the relay holds the code", relay_holds_the_code)
+        .await;
+    assert_eq!(waiting_on(&technician.console()).0, code);
+    for state in since_the_relay(&technician) {
+        assert!(is_a_wait_on_the_relay(&state), "{state:?}");
+    }
+    technician.stop().expect("cancel");
+    technician.finished().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wait_that_cannot_start_after_a_relayed_session_names_no_relay() {
+    let relay = keyed_relay().await;
+    let technician = technician_at(&relay, "next-wait", Some(TECHNICIAN_KEY));
+    let (mut customer, _folder) = customer_at(&relay, "next-wait", Some(CUSTOMER_KEY));
+    pair(&technician, &mut customer).await;
+    technician.stop().expect("stop");
+    technician.finished().await;
+    customer.settled().await;
+    // The end of the session still says which way it went.
+    assert_eq!(relay_of(&technician.console()), Some(RELAY_NAME));
+
+    // The next session is started on an address that this computer does not
+    // have: its listener cannot be bound. That wait touched no relay, and
+    // its failure names none.
+    technician.listen_on(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+    let failed = technician
+        .wait_for("that the listener could not start", |state| {
+            console_failure(state).is_some_and(|(stage, _, _)| stage == "listen")
+        })
+        .await;
+    assert_eq!(failed.relay, None);
+    technician.finished().await;
+    assert_eq!(technician.console().relay, None);
+}
+
 // --- A relay that cannot be used ---
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -791,7 +1183,7 @@ async fn a_key_the_relay_does_not_know_is_said_on_either_side() {
 
     // The technician's copy holds a key the relay does not know.
     let technician = technician_at(&relay, "key-technician", Some(UNKNOWN_KEY));
-    let (code, _, _) = waiting_on(&use_relay(&technician));
+    let (code, _, _) = waiting_on(&use_relay(&technician).await);
     let failed = technician
         .wait_for("that the key is refused", |state| {
             console_failure(state).is_some()
@@ -842,7 +1234,7 @@ async fn a_certificate_that_is_not_trusted_is_said_on_either_side_and_nothing_is
 
     let technician = technician_at(&relay, "untrusted-technician", Some(TECHNICIAN_KEY));
     technician.folder().write(CA_FILE, &other.cert_pem);
-    let (code, _, _) = waiting_on(&use_relay(&technician));
+    let (code, _, _) = waiting_on(&use_relay(&technician).await);
     let failed = technician
         .wait_for("that the certificate is not trusted", |state| {
             console_failure(state).is_some()
@@ -895,7 +1287,7 @@ async fn a_relay_that_cannot_be_reached_is_said_on_either_side() {
     // The relay is gone before either copy reaches it.
     relay.gone().await;
 
-    let (code, _, _) = waiting_on(&use_relay(&technician));
+    let (code, _, _) = waiting_on(&use_relay(&technician).await);
     let failed = technician
         .wait_for("that the relay cannot be reached", |state| {
             console_failure(state).is_some()

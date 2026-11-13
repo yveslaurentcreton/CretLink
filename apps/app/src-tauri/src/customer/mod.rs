@@ -1808,10 +1808,26 @@ mod tests {
             network(typed_target("192.168.1.20:7000", &relay)),
             "192.168.1.20:7000".parse::<SocketAddr>().unwrap()
         );
-        assert!(matches!(
-            typed_target("6RRR-2H8F", &relay),
-            Ok(Typed::Network(_)) | Err(_)
-        ));
+        // A connection code of this network is taken as what it is, to the
+        // address it says, also in a copy that has a relay profile. It is
+        // typed as people type what is read to them.
+        let lan = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(192, 168, 1, 20), 7000);
+        let lan_code = cretlink_discovery::ConnectionCode::encode(lan).to_string();
+        for typed in [
+            lan_code.clone(),
+            lan_code.to_lowercase().replace('-', " "),
+            format!("  {lan_code} "),
+        ] {
+            let found = typed_target(&typed, &relay);
+            let Ok(Typed::Network(address)) = found else {
+                panic!("a connection code of this network was not taken: {typed:?}: {found:?}");
+            };
+            assert_eq!(address, SocketAddr::V4(lan), "{typed:?}");
+        }
+        // A code with a typing error is a mistyped code, as in a copy without
+        // a profile: it is not read as a relay code.
+        let mistyped = typed_target("6RRR-2H8F-0000", &relay).expect_err("a typing error");
+        assert_eq!(mistyped.stage, "connect");
     }
 
     #[test]

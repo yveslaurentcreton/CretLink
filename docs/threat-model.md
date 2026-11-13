@@ -3252,7 +3252,11 @@ metadata rather than content.
   has a profile (ST-M007-013). Nothing reaches out before that, and discovery
   and the connection code of one network work as before with a profile
   present. A wait on a relay opens no listener: the technician's copy dials
-  out, and the listener of the network it waited on is closed first. The
+  out, and the listener of the network it waited on is closed first. Every
+  wait has a turn of its own on the console's state: should the task of an
+  earlier wait still be there, it ends what it holds and writes nothing into
+  the state of the newer one, so a late connection to an old listener never
+  shows as a customer of the wait that is on screen. The
   technician's copy draws a new relay code for every wait and keeps its
   rendezvous open only while the waiting screen is open; **Cancel** closes
   the connection, and the code then leads nowhere. Both windows name the

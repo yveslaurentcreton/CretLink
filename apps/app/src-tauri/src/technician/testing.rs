@@ -4,14 +4,14 @@
 //! touches the audit trail or the MCP bridge of whoever runs it.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cretlink_console::{
-    AuditServiceConfig, ConsoleSessionService, ConsoleState, Integrity, SessionSummary,
-    list_sessions,
+    AuditServiceConfig, ConsoleSessionService, ConsoleState, Integrity, SessionPhase,
+    SessionSummary, list_sessions,
 };
 use cretlink_discovery::RelayCode;
 use cretlink_mcp::IpcEndpoint;
@@ -19,11 +19,11 @@ use tokio::sync::watch;
 
 use super::bridge::BridgeStatus;
 use super::relay_settings::relay_of_copy;
-use super::session_driver::{Place, StateSink, now_unix_millis};
-use super::session_task::RelayWait;
+use super::session_driver::{IntentSender, Place, StateSink, now_unix_millis};
+use super::session_task::{Patience, RelayWait};
 use super::{
     AppState, CommandError, begin_network_wait, begin_relay_wait, confirm_now, relay_can_be_chosen,
-    stop_now,
+    stop_now, use_relay_now,
 };
 use crate::relay::testing::Folder;
 use crate::relay::{Relay, ThisCopy};
@@ -128,26 +128,95 @@ impl Technician {
         self.state.service().is_some()
     }
 
-    /// What **Use relay** does once the wait on the network is over: a new
-    /// relay code, the waiting state, and the task that keeps the rendezvous
-    /// open. Answers the state the window gets back.
-    pub(crate) fn use_relay(&self, relay: Relay) -> ConsoleState {
-        self.use_relay_with(RelayWait::new(relay, RelayCode::generate().unwrap()))
+    /// **Start a session**: wait for the customer on the loopback address of
+    /// this computer, as the command does it, and answer the waiting state
+    /// with its connection code.
+    pub(crate) async fn start_on_network(&self) -> ConsoleState {
+        assert!(
+            matches!(
+                self.console().phase,
+                SessionPhase::Idle | SessionPhase::Stopped { .. } | SessionPhase::Failed { .. }
+            ),
+            "a session is in progress: {:?}",
+            self.console().phase
+        );
+        self.listen_on(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        self.wait_for("the connection code", |state| {
+            matches!(state.phase, SessionPhase::Listening { .. }) && state.relay.is_none()
+        })
+        .await
+    }
+
+    /// **Use relay**, as the command does it ([`use_relay_now`]): from a wait
+    /// on a network to a wait on the relay of the copy `program`, a copy
+    /// that runs once and takes its relay from the profile file next to it.
+    /// Answers what the window gets back.
+    pub(crate) async fn use_relay(
+        &self,
+        program: &std::path::Path,
+    ) -> Result<ConsoleState, CommandError> {
+        let relay = self.relay_of(program);
+        self.use_relay_reading(async { relay }).await
+    }
+
+    /// [`Technician::use_relay`], with `reading` in the place of reading the
+    /// profile: what happens while the profile is read happens inside it.
+    pub(crate) async fn use_relay_reading(
+        &self,
+        reading: impl Future<Output = Result<Relay, CommandError>>,
+    ) -> Result<ConsoleState, CommandError> {
+        use_relay_now(
+            &self.state,
+            self.screen.clone(),
+            self.place.clone(),
+            reading,
+            Patience::default(),
+        )
+        .await
     }
 
     /// [`Technician::use_relay`] with another pause between two dials of the
     /// waiting connection, for a test that lets a rendezvous lapse.
-    pub(crate) fn use_relay_redialling_after(&self, relay: Relay, pause: Duration) -> ConsoleState {
-        self.use_relay_with(
-            RelayWait::new(relay, RelayCode::generate().unwrap())
-                .with_timing(pause, cretlink_session::DEFAULT_PARK_LIMIT),
+    pub(crate) async fn use_relay_redialling_after(
+        &self,
+        program: &std::path::Path,
+        pause: Duration,
+    ) -> Result<ConsoleState, CommandError> {
+        let relay = self.relay_of(program);
+        use_relay_now(
+            &self.state,
+            self.screen.clone(),
+            self.place.clone(),
+            async { relay },
+            Patience {
+                pause,
+                ..Patience::default()
+            },
         )
+        .await
     }
 
-    fn use_relay_with(&self, wait: RelayWait) -> ConsoleState {
+    /// Begins a wait on `relay` beside whatever wait there is, without
+    /// stopping that one first: what is left when the task of an earlier
+    /// wait does not let go in time and the command goes on without it.
+    pub(crate) fn begin_relay_wait_beside(&self, relay: Relay) -> ConsoleState {
+        let wait = RelayWait::new(relay, RelayCode::generate().unwrap(), Patience::default());
         let task = begin_relay_wait(&self.state, self.screen.clone(), self.place.clone(), wait);
+        // The handle of the earlier task is let go of; the task itself is
+        // not stopped by that.
         *self.state.pump.lock().unwrap() = Some(task);
         self.console()
+    }
+
+    /// What the commands send the session's task through: **Codes match**,
+    /// **Stop**. It is closed once that task has ended.
+    pub(crate) fn intents(&self) -> IntentSender {
+        self.state
+            .live
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a session's task was started")
     }
 
     /// What **Start a session** does: wait for the customer on `ip`.
