@@ -47,8 +47,11 @@
 //! listed until then.
 //!
 //! The local path of a file being sent, or of the copy a download makes, is
-//! not recorded, as for a transfer of the AI; no file content ever is
-//! (REQ-S-018).
+//! no argument of a record, as for a transfer of the AI. It stands in one
+//! place only: the `reason` of a transfer that failed on the technician
+//! computer, which is the engine's message and names the file it could not
+//! read or write. That message is not sent to the target. No file content is
+//! ever recorded (REQ-S-018).
 //!
 //! [`Origin::Console`]: cretlink_session::Origin::Console
 
@@ -338,7 +341,9 @@ impl<'a> TechnicianFiles<'a> {
     /// Copies a file of the target to `dest` on the technician computer,
     /// like [`ConsoleSessionService::download_file`], and records it with the
     /// file's path on the target, its length and the digest that was verified
-    /// (ST-M010-002). The local path is not recorded.
+    /// (ST-M010-002). The local path is no argument of the record; the reason
+    /// of a copy that failed on the technician computer names it (see the
+    /// module documentation).
     ///
     /// # Errors
     ///

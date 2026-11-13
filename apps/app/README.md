@@ -210,22 +210,27 @@ when the feed or the phase changes, and when the tab opens.
 
 The **Files** tab of the live session is a file explorer for the customer
 computer: the drives, folders in a **Details** and a **List** view, a path bar,
-back, forward, up and refresh. The files sent and received this session stay
-under it as its transfers panel. This is its first part, browsing; sending,
-copying to this computer, deleting and renaming are not offered yet.
+back, forward, up and refresh. From it the technician sends files and folders
+to the open folder, copies the selection to this computer, renames and
+deletes. The transfers of the session are under it, as its queue.
+
+Browsing:
 
 | Command | What it does |
 | --- | --- |
 | `explorer_drives` | the drives of the customer computer (`ExplorerDrive` in `src/shared/contract.ts`): root, kind, label, total and free space; a value the customer computer could not read is absent, never zero |
 | `explorer_open` `{ path, listing }` | opens the place `path` names and lists it. The folder arrives on the `console-explorer` event while the command runs (`ExplorerEvent`): `opened` once, with the folder as the customer computer names it and the first page, then a `page` for each further page. The answer says how the listing ended (`ExplorerListing`): `complete`, `cancelled` (left for another place) or `limit` |
 
-- **No authority of its own.** Both commands exist in a technician process
-  only and work only while a session is under full control: without one, or
-  without its open audit trail, they refuse with `no_consented_session` before
-  anything is asked (`src-tauri/src/technician/explorer.rs`). Nothing is asked
-  of the customer computer before the technician opens the tab. A stop or a
-  revocation ends a listing with the session, and what was listed is dropped
-  with the session: the next one starts with an empty explorer.
+- **No authority of its own.** Every command of the explorer exists in a
+  technician process only. Those that ask something of the customer computer,
+  or prepare to, work only while a session is under full control: without
+  one, or without its open audit trail, they refuse with
+  `no_consented_session` before anything is asked, opened or kept
+  (`src-tauri/src/technician/explorer.rs`, `explorer/commands.rs`). Nothing
+  is asked of the customer computer before the technician opens the tab. A
+  stop or a revocation ends a listing, every transfer and every removal with
+  the session, and what was listed and queued is dropped with the session:
+  the next one starts with an empty explorer and an empty queue.
 - **Every look is the technician's, and recorded.** The commands go through
   `cretlink_console::TechnicianFiles`: requests carry the origin `console`,
   and each look is a pair of audit records, `console_fs_drives` or
@@ -264,23 +269,127 @@ copying to this computer, deleting and renaming are not offered yet.
   `Ctrl` to move without selecting; letters go to the row that starts with
   them. `Enter` or a double click opens a folder or a drive, `Backspace` or
   `Alt+Up` goes up, `Alt+Left` and `Alt+Right` go back and forward, `F5`
-  refreshes, `Ctrl+L` opens the path field. The context menu (right click,
-  `Shift+F10` or the menu key) offers **Open** and **Refresh**; it is one
-  list of actions (`menuItems` in `explorer.ts`), so an action that is added
-  there appears in it with its key.
-- **Escape.** An open context menu or the path field takes the first
-  `Escape`; `Escape` then stops the session, as always.
+  refreshes, `Ctrl+L` opens the path field, `F2` renames and `Delete`
+  deletes. The context menu (right click, `Shift+F10` or the menu key) and
+  the buttons above the list are one list of actions (`actionsFor` in
+  `explorer.ts`): **Open**, **Download**, **Download to…**, **Rename**,
+  **Delete**, **Upload files…**, **Upload a folder…** and **Refresh**. An
+  action of the menu is for the rows the menu opened on, a button and a key
+  for the selection.
+- **Escape.** An open question, the context menu, a name that is being typed
+  or the path field takes the first `Escape`; `Escape` then stops the
+  session, as always.
 - **A grid for a screen reader.** The list is a `grid` with rows and cells,
   the number of all rows and the place of each, the column that sorts
   (`aria-sort`), the selected rows and the row the keyboard is on
   (`aria-activedescendant`). The grid itself takes the keyboard; changes of
   place are announced politely, a refusal assertively.
 
+Sending, copying, renaming and deleting (`explorer/commands.rs`):
+
+| Command | What it does |
+| --- | --- |
+| `explorer_pick_upload` `{ kind }` | the system's dialog for `"files"` or for one `"folder"`; what was picked is kept as an offer (`UploadOffer`: a number, the count and the first names), or `null` when the dialog was closed |
+| `explorer_send_check` `{ offer, folder }` | lists `folder` on the customer computer and answers which names of the offer are taken there (`TransferCheck`) |
+| `explorer_send` `{ offer, folder, choices }` | queues the offer for `folder`; `choices` holds `replace`, `keep_both` or `skip` for each name that is taken; answers how many were queued, left out and skipped (`TransferQueued`) |
+| `explorer_choose_folder` | the system's dialog for a folder of this computer to copy to; the folder is kept under a number (`ChosenFolder`) |
+| `explorer_download_check` `{ names, to? }` | which of the selected names are taken in the folder a copy would go to; nothing is asked of the customer computer and no folder is made |
+| `explorer_download` `{ folder, names, to?, choices }` | queues the entries `names` of `folder` for a copy to this computer |
+| `explorer_transfers` | the queue as it is (`TransferEntry[]`) |
+| `explorer_cancel_transfer` `{ transfer }`, `explorer_cancel_transfers` | cancels one transfer, or all that wait or run |
+| `explorer_show_folder` `{ transfer }` | shows the folder of a copy that arrived in this computer's file manager |
+| `explorer_rename` `{ folder, name, to }` | gives one entry of `folder` another name in that folder |
+| `explorer_delete` `{ folder, items, removal }`, `explorer_cancel_delete` `{ removal }` | deletes the selection and answers what was removed and what could not be (`DeleteReport`); cancels that delete |
+
+| Event | Payload |
+| --- | --- |
+| `console-explorer-drop` | an `UploadOffer`: files and folders were dropped on the window |
+| `console-transfers` | `TransfersEvent`: the entries of the queue that changed, each replaced by its number |
+| `console-removal` | `RemovalProgress`: the item a delete is at, and the files and folders removed so far |
+
+- **The window names no path of this computer.** Files to send come from a
+  drop on the window or from the system's dialog, opened from Rust (`rfd`;
+  the frontend has no dialog permission). The backend keeps the paths and
+  tells the window the number of the offer and the names; a send names the
+  offer. A copy goes to `Downloads\CretLink\<target>`, which is made when the
+  first file goes there, or to a folder chosen in the system's dialog and
+  named by its number. **Show in folder** shows the folder a copy of the
+  queue went to, with the opener started by its full path: `explorer.exe`
+  in the Windows folder the system names, `/usr/bin/open`, or `xdg-open` from
+  `/usr/bin`, `/bin` or `/usr/local/bin` (`opener::show_folder`).
+- **A name from the customer computer is untrusted.** Every name of a listing
+  must be one plain name before a copy is written under it: no separator, no
+  colon, not `.` or `..`, no reserved device name, no trailing dot or space
+  (`explorer/local.rs`). Anything else is left out with a row that says why,
+  and nothing is written outside the folder that was chosen. What a selected
+  name is — a file, a folder, a link — comes from a listing the backend asks
+  for itself, not from what the window says. The folder for `<target>` is
+  the host name with everything but letters, digits, `-`, `_` and `.`
+  replaced.
+- **A name that is taken.** A look at the folder comes before anything is
+  queued, and the window asks once for each name that is taken: **Replace**,
+  **Keep both** (the new one becomes `name (2).ext`) or **Skip**, with a
+  button to do the same for the names that follow. A file replaces a file;
+  a folder goes into a folder, where its files replace those of the same
+  name and everything else stays. **Replace** is not offered where the kinds
+  differ, and is refused when it is asked for all the same. Nothing is
+  replaced without the request: a name that turns out to be taken after the
+  look fails its transfer and leaves what is there.
+- **Folders go file by file.** A dropped folder is walked on this computer,
+  a folder of the customer computer through its listings; each file is a
+  transfer of its own, and the folders are made on the way, empty ones too.
+  A link is never followed and has a row that says so. One send or one copy
+  queues at most 10 000 files and folders, 32 folders deep; a folder that
+  holds more, or that could not be listed to its end, has a row that says it
+  is not complete.
+- **The queue** (`explorer/transfers.rs`) carries one transfer at a time,
+  because the session serves one transfer at a time; the others wait. What
+  did not arrive is shown first, with its reason in the words the activity
+  has for it, then what runs, with its progress, and what waits, then what
+  ended. The panel draws a bounded number of rows of each and counts the
+  rest. A transfer that waits is cancelled at once; a running one ends at its
+  next step and its unfinished part goes with it — the customer computer
+  discards the part of a send, and the row says so when it could not; the
+  part of a copy is removed from this computer.
+- **Honest states** (REQ-N-008). `done` is a transfer whose length and
+  SHA-256 were verified, and only that reads as sent or copied. A failed,
+  cancelled or left-out transfer never does. When the session ends, the
+  running transfer and every waiting one end as stopped; the queue, the
+  explorer's alert and, once the explorer is dropped with the session, the
+  window's own alert say so.
+- **Rename** types the new name in the row (`F2`): `Enter` renames, `Escape`
+  or a click elsewhere leaves the name as it was. A name must be one name; a
+  name that is taken is refused by the customer computer, which never
+  replaces by a move.
+- **Delete** asks once for the whole selection, with the number of items and
+  the sentence that there is no recycle bin on this path; **Cancel** has the
+  focus. A folder is removed with everything in it, a file or a link as that
+  one entry, a link as the link. The answer counts an item as removed only
+  when the customer computer said so and names what could not be removed
+  with its reason; the list is then read again. One delete runs at a time
+  and can be cancelled between two of its steps.
+- **Recorded and shown.** Every transfer and every change goes through
+  `cretlink_console::TechnicianFiles` and is a pair of audit records of the
+  technician: `console_send`, `console_download`, `console_make_dir`,
+  `console_move`, `console_delete`, `console_remove_tree`, and
+  `console_fs_stat` for the look after a cancelled send. In the customer's
+  activity each is an item of its own; the looks stay the one item that
+  follows along. The path of a file on this computer is no argument of a
+  record; it stands only in the reason of a transfer that failed on this
+  computer, which names the file that could not be read or written.
+- **Questions for a screen reader.** A name that is taken is a `dialog` and a
+  delete an `alertdialog`, each with its title and its text, `Tab` going
+  round its buttons and the first `Escape` leaving it. The queue is a list
+  whose rows say their state in words; a running transfer has a progress bar
+  that says its name and its number.
+
 To try the explorer without a customer computer, run `npx vite` and open
 `/dev/explorer.html`: the real controller and views against a customer
 computer held in memory (`src/technician/simulated-computer.ts`), with Tauri
 replaced by its own mocks. It has a folder of five thousand entries and one of
-sixty thousand. The controller's tests drive the same simulated computer.
+sixty thousand. A browser cannot hand the page a real drop, so a bar at the
+foot of the page drops prepared files and folders and ends the session. The
+controller's tests drive the same simulated computer.
 
 ## Session history and end reports (ST-M009-012)
 
@@ -372,7 +481,10 @@ apps/app/
     src/opener.rs  opens a validated file or folder with the platform opener
     src/technician/  console state, commands, live-session driver, the
                      session history (history.rs) and the file explorer
-                     (explorer.rs)
+                     (explorer.rs; in explorer/: commands.rs, the queue in
+                     transfers.rs, rename and delete in changes.rs, the rules
+                     for names and folders of this computer in local.rs, and
+                     the customer computer as they reach it in target.rs)
     src/customer/    agent state, commands, live-session driver, the end
                      report (report.rs), the admin step (admin.rs), and the
                      compact bar and closing (windows.rs)
@@ -453,7 +565,8 @@ one, and the live session starts with its full-control band.
   shown".
 - The Files tab is the file explorer (ST-M010-002, above). Its state is part
   of the snapshot for one session's full control; a folder that arrives in
-  pages redraws the tab alone, and scrolling redraws only the rows.
+  pages and a change of the queue redraw the tab alone, and scrolling redraws
+  only the rows.
 - The end report and the history come from `list_sessions` (ST-M009-012).
   Until the sealed audit file is read, the end screen says it is preparing the
   report; unknown cleanup is never shown as success.
@@ -567,9 +680,19 @@ filter and the end report.
   a keyboard and screen-reader pass (Narrator, VoiceOver), are manual checks
   of ST-M009-008.
 - The file explorer has not been run against a customer computer on real
-  hardware, and no screen reader has read its grid yet: the browsing steps of
-  scenario MT-14 in `docs/manual-tests.md` (ST-M010-002). Its frontend was
-  tested in jsdom and looked at in Chromium through `dev/explorer.html`, not in
-  the application's own window. Off Windows a customer computer lists its root
-  file system as its one drive, which no path the wire accepts can name, so the
-  explorer shows that drive and a refusal there.
+  hardware, and no screen reader has read its grid, its questions or its
+  queue yet: the steps of scenario MT-14 in `docs/manual-tests.md`
+  (ST-M010-002). Its frontend was tested in jsdom and looked at in Chromium
+  through `dev/explorer.html`, not in the application's own window; a drop
+  from a real file manager and the system's own dialogs were not exercised.
+  Off Windows a customer computer lists its root file system as its one
+  drive, which no path the wire accepts can name, so the explorer shows that
+  drive and a refusal there, and the queue is tested against a customer
+  computer held in memory; the way through a real session runs on Windows.
+- While a file is being sent or copied, the session serves nothing else: a
+  folder that is opened, the terminal and an AI assistant's call wait until
+  that file has ended. Cancelling the transfer frees the session at the
+  transfer's next step.
+- A copy to this computer that is cancelled, or that fails on this computer,
+  stays "in progress" in the customer's activity until the session ends: the
+  customer computer is not told that the copy was given up.
