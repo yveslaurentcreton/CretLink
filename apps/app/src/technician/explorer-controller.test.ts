@@ -1940,6 +1940,20 @@ describe("renaming", () => {
     await flush();
     expect(app().querySelector("#xp-rename-input")).not.toBeNull();
     expect(asked("explorer_rename")).toHaveLength(1);
+    // A press that began in the field and ended on a row selected text in the
+    // field: it renames nothing and selects nothing.
+    field().dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    click(row("b.txt"), { detail: 1 });
+    await flush();
+    expect(app().querySelector("#xp-rename-input")).not.toBeNull();
+    expect(asked("explorer_rename")).toHaveLength(1);
+    expect(selected()).toEqual(["a.txt"]);
+    // The next press outside the field is a click elsewhere again.
+    $(row("b.txt")).dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    click(row("b.txt"));
+    await flush();
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+    expect(selected()).toEqual(["b.txt"]);
   });
 
   it("does not also press a control with the click that sent the new name", async () => {

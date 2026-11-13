@@ -1141,6 +1141,13 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
     return target instanceof Element && target.closest("#xp-rename-input") !== null;
   }
 
+  // Whether the mouse button last went down in the name field.
+  let pressedInRename = false;
+
+  function onMouseDown(event: MouseEvent): void {
+    pressedInRename = inRename(event.target);
+  }
+
   /**
    * A click elsewhere in the explorer ends a name that is being typed and
    * takes it, as in the Windows explorer. Heard on the click's way down, so
@@ -1151,9 +1158,20 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
    * act on is being renamed at that moment.
    */
   function onClickDown(event: MouseEvent): void {
+    // A control pressed from the keyboard clicks without a press of the
+    // mouse (`detail` 0): where the mouse went down last says nothing then.
+    const began = pressedInRename && event.detail > 0;
+    pressedInRename = false;
     if (!host.shown() || state().renaming === undefined) return;
     const target = event.target;
-    if (!(target instanceof Element) || inRename(target) || !target.closest("#xp")) return;
+    if (!(target instanceof Element) || inRename(target)) return;
+    if (began) {
+      // The press began in the name field and ended beside it: text was
+      // selected there. It is no click elsewhere, and no click on a row.
+      event.stopPropagation();
+      return;
+    }
+    if (!target.closest("#xp")) return;
     // A click that dismisses what was said about the name is not a click
     // elsewhere, and neither is one on Rename itself.
     if (target.closest('[data-action="xp-dismiss"], [data-action="xp-rename"]')) return;
@@ -1395,6 +1413,7 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
   }
 
   function bind(root: HTMLElement, signal: AbortSignal): void {
+    root.addEventListener("mousedown", onMouseDown, { capture: true, signal });
     root.addEventListener("click", onClickDown, { capture: true, signal });
     root.addEventListener("click", onClick, { signal });
     root.addEventListener("dblclick", onDoubleClick, { signal });
