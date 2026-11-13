@@ -61,7 +61,7 @@ impl Screen {
 
 /// Opens the window for `screen` and runs until it closes. The customer role
 /// opens through [`run_customer`].
-#[must_use]
+#[must_use = "the exit code is what `main` must return"]
 pub fn run(screen: Screen) -> ExitCode {
     run_screen(screen, Entry::Relaunched)
 }
@@ -72,7 +72,7 @@ pub fn run(screen: Screen) -> ExitCode {
 /// the UAC prompt. A process the application already started with `--role`
 /// never relaunches again: it opens and shows its real, possibly unelevated,
 /// identity (REQ-S-011).
-#[must_use]
+#[must_use = "the exit code is what `main` must return"]
 pub fn run_customer(entry: Entry) -> ExitCode {
     run_screen(Screen::Role(Role::Customer), entry)
 }

@@ -73,11 +73,15 @@ export interface ScreenUseView {
 // `StartupCleanupView`.
 export interface StartupCleanupView {
   failed: number;
-  // Runnable as written in an administrator Windows PowerShell, with the full
-  // path: `& '…\cretlink-cli.exe' recover --remove` when the console build sits
+  // Runnable as written in Windows PowerShell, with the full path:
+  // `& '…\cretlink-cli.exe' recover --remove` when the console build sits
   // next to this program, else `& '…\<this program>.exe' recover --remove |
   // Out-Host` (a GUI program PowerShell waits for only when its output is piped).
   command: string;
+  // Whether PowerShell is to be opened as administrator for it: what was kept
+  // lies where only administrators can write. Otherwise it lies in the folder
+  // of this account, where a run as administrator does not look (ST-M006-020).
+  administrator: boolean;
 }
 
 // Mirrors the application crate's `ConsentView`.
