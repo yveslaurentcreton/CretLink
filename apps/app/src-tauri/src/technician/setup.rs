@@ -200,7 +200,7 @@ fn install_error(err: &InstallError) -> CommandError {
 
 /// Runs blocking work (client command lines, file copies) off the window's
 /// thread.
-async fn blocking<T: Send + 'static>(
+pub(super) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, CommandError> + Send + 'static,
 ) -> Result<T, CommandError> {
     tauri::async_runtime::spawn_blocking(work)

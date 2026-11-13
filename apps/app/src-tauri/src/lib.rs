@@ -20,6 +20,8 @@
 
 pub mod launch;
 mod opener;
+// The relay of this copy, for both roles (ST-M007-011).
+mod relay;
 mod start;
 
 mod customer;

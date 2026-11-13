@@ -58,6 +58,8 @@ mod history;
 mod host_os;
 // The network the technician waits on (ST-M009-016).
 mod network;
+// Settings → Relay (ST-M007-011).
+mod relay_settings;
 mod session_driver;
 // This copy, its AI clients, and run once or install (ST-M009-006); the start
 // screen registers part of it too.
@@ -100,9 +102,14 @@ pub struct AppState {
     /// The local MCP bridge as the rail shows it: its endpoint and the AI
     /// clients that called during this session (ST-M009-008).
     bridge: bridge::BridgeSlot,
-    /// The network adapter the technician chose to wait on earlier in this
-    /// run (ST-M009-016). Kept in memory only.
+    /// The network adapter the technician chose to wait on (ST-M009-016).
+    /// The installed copy keeps it in its settings, so that it holds after
+    /// the program is closed (ST-M007-011); a copy that runs once keeps it
+    /// in memory only.
     network: network::NetworkChoice,
+    /// The certificate authority file the technician chose in Settings →
+    /// Relay and has not saved yet (ST-M007-011).
+    relay_ca: relay_settings::PendingCa,
     /// The task of the session that is live or was live last, so that a
     /// change of network can wait until the old listener is gone before it
     /// starts the new one (ST-M009-016).
@@ -143,7 +150,8 @@ impl AppState {
             audit: Arc::new(Mutex::new(None)),
             audit_log: history::OpenLog::default(),
             bridge: bridge::BridgeSlot::default(),
-            network: network::NetworkChoice::default(),
+            network: network::NetworkChoice::of_this_copy(),
+            relay_ca: relay_settings::PendingCa::default(),
             pump: PumpSlot::default(),
             listings: explorer::Listings::default(),
             transfers: explorer::Transfers::default(),
@@ -165,7 +173,8 @@ impl AppState {
             audit: Arc::new(Mutex::new(None)),
             audit_log: history::OpenLog::default(),
             bridge: bridge::BridgeSlot::default(),
-            network: network::NetworkChoice::default(),
+            network: network::NetworkChoice::of_this_copy(),
+            relay_ca: relay_settings::PendingCa::default(),
             pump: PumpSlot::default(),
             listings: explorer::Listings::default(),
             transfers: explorer::Transfers::default(),
@@ -292,6 +301,22 @@ impl Default for AppState {
     fn default() -> Self {
         default_app_state()
     }
+}
+
+/// The event a [`Notice`] is emitted on.
+pub(crate) const NOTICE_EVENT: &str = "console-notice";
+
+/// Something the technician should know that is not the failure of a command
+/// (`ConsoleNotice` of the contract): what happened and a next step, in plain
+/// words (REQ-N-015). The window shows it in its alert.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Notice {
+    /// What this is about.
+    pub title: String,
+    /// What happened.
+    pub message: String,
+    /// What to do next.
+    pub next: String,
 }
 
 /// A command failure shaped for the frontend: a stage and a plain-language,
@@ -531,7 +556,20 @@ async fn switch_listen_network(
         let _ = tokio::time::timeout(NETWORK_SWITCH_TIMEOUT, task).await;
     }
 
-    state.network.set(&chosen.adapter);
+    if let Err(reason) = state.network.set(&chosen.adapter) {
+        // The choice holds for this run; that it will not be there next time
+        // is said, not kept quiet (REQ-N-008).
+        let _ = app.emit(
+            NOTICE_EVENT,
+            Notice {
+                title: "The network choice could not be saved".to_string(),
+                message: reason,
+                next: "It holds until CretLink closes. Choose the network again next time, or \
+                       check that your settings can be written."
+                    .to_string(),
+            },
+        );
+    }
     begin_listening(app, &state, chosen.addr);
 
     // The new listener reports from its own task: wait for it, so that the
@@ -1032,7 +1070,12 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         setup::ai_client_install,
         setup::ai_client_uninstall,
         setup::uninstall_plan,
-        setup::uninstall_app
+        setup::uninstall_app,
+        relay_settings::get_relay_settings,
+        relay_settings::choose_relay_ca,
+        relay_settings::save_relay,
+        relay_settings::test_relay,
+        relay_settings::remove_relay
     ]);
     #[cfg(not(feature = "dev-simulate"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -1073,7 +1116,12 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         setup::ai_client_install,
         setup::ai_client_uninstall,
         setup::uninstall_plan,
-        setup::uninstall_app
+        setup::uninstall_app,
+        relay_settings::get_relay_settings,
+        relay_settings::choose_relay_ca,
+        relay_settings::save_relay,
+        relay_settings::test_relay,
+        relay_settings::remove_relay
     ]);
     builder
 }

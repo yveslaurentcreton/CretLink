@@ -47,6 +47,7 @@
 //! resting window a stop is refused, never turned into a "stopped" session.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -63,6 +64,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::watch;
 
 use crate::launch::Entry;
+use crate::relay;
 
 // Before the UAC prompt (ST-M009-009).
 mod admin;
@@ -105,17 +107,26 @@ pub struct AppState {
     saved_reports: report::SavedReports,
     /// This process's startup sweep, which a dial waits for (ST-M009-010).
     pub(crate) startup: startup::StartupSweep,
+    /// What the profile file next to this program says about a relay
+    /// (ST-M007-011), read once when the window starts.
+    relay: Arc<relay::Lookup>,
 }
 
 impl AppState {
     /// Builds the initial window of both builds: a resting, honest consent
-    /// window ready to dial a real technician.
+    /// window ready to dial a real technician. It knows no relay.
     #[must_use]
     pub fn idle() -> Self {
+        Self::with_relay(relay::Lookup::None)
+    }
+
+    /// The initial window of a copy whose profile file says `relay`.
+    fn with_relay(relay: relay::Lookup) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ConsentSession::idle())),
             saved_reports: report::SavedReports::default(),
             startup: startup::StartupSweep::default(),
+            relay: Arc::new(relay),
         }
     }
 
@@ -809,7 +820,7 @@ fn start_live_session(
     // Parse the technician's connection code into a dialable address *before*
     // mutating any state, so a typo leaves the window untouched. This grants no
     // authority; trust is established later by the Session Approval Code.
-    let target = typed_target(&code)?;
+    let target = typed_target(&code, &state.relay)?;
 
     Ok(begin_live_dial(app, &state, target))
 }
@@ -821,14 +832,50 @@ const RELAY_CODE_WITHOUT_RELAY: &str = "This is a relay code, for a technician w
     your network. This copy of CretLink is not set up for a relay, so it connects only on the \
     same network.";
 
+/// What the profile file next to the program `exe` says about a relay
+/// (ST-M007-011). It is the one place the customer role reads: no settings of
+/// an installed copy, and nothing is written.
+fn relay_next_to(exe: Option<&Path>) -> relay::Lookup {
+    exe.map_or(relay::Lookup::None, relay::next_to_program)
+}
+
+/// What a relay code gets in a copy whose relay profile cannot be used
+/// (ST-M007-011): the file and what is wrong with it, in plain words, before
+/// anything is dialled (REQ-N-015). The customer passes it on.
+fn unusable_profile_message(error: &cretlink_cli::relay_profile::ProfileError) -> String {
+    let problem = relay::ProblemView::of(error);
+    format!(
+        "This is a relay code, but the relay settings of this copy of CretLink cannot be used. \
+         {} The file is {}.",
+        problem.message, problem.file
+    )
+}
+
 /// Resolves what the customer typed into the code field to the address to
 /// dial (REQ-F-004, ST-M007-012): a LAN connection code or a raw address. A
-/// relay code is told apart from a mistyped code and answered in plain words;
-/// its stage is `relay`, so the window can say what to do next.
-fn typed_target(code: &str) -> Result<SocketAddr, CommandError> {
+/// relay code is told apart from a mistyped code and answered in plain words:
+/// with the stage `relay` in a copy without a relay profile, and with
+/// `relay_profile` in a copy whose profile cannot be used, so the window can
+/// say what to do next.
+fn typed_target(code: &str, relay: &relay::Lookup) -> Result<SocketAddr, CommandError> {
     match parse_entry(code.trim()).map_err(|e| CommandError::new("connect", e))? {
         ManualEntry::Lan(target) => Ok(target.addr()),
-        ManualEntry::Relay(_) => Err(CommandError::new("relay", RELAY_CODE_WITHOUT_RELAY)),
+        ManualEntry::Relay(_) => Err(match relay {
+            relay::Lookup::None => CommandError::new("relay", RELAY_CODE_WITHOUT_RELAY),
+            relay::Lookup::Unusable(error) => {
+                CommandError::new("relay_profile", unusable_profile_message(error))
+            }
+            // The profile is read and checked here; the session through the
+            // relay itself is ST-M007-013.
+            relay::Lookup::Relay(relay) => CommandError::new(
+                "relay_later",
+                format!(
+                    "This is a relay code, and this copy of CretLink is set up for the relay {}. \
+                     This version cannot connect through a relay yet.",
+                    relay.host()
+                ),
+            ),
+        }),
     }
 }
 
@@ -887,8 +934,11 @@ pub(crate) fn attach(
     entry: Entry,
 ) -> tauri::Builder<tauri::Wry> {
     let elevated = current_identity().elevated;
+    // The relay of this copy: the profile file next to this program, read
+    // once and never written (ST-M007-011).
+    let relay = relay_next_to(std::env::current_exe().ok().as_deref());
     let builder = builder
-        .manage(AppState::default())
+        .manage(AppState::with_relay(relay))
         .manage(admin::AdminState::new(entry, elevated))
         .on_window_event(windows::on_window_event);
 
@@ -1331,8 +1381,8 @@ mod tests {
         // receives the discovered "ip:port" string. Both end in the same parser
         // of the discovery crate and the same `begin_live_dial`, so a discovered
         // console is dialed by exactly the code path — no shortcut.
-        let from_code =
-            typed_target(&ConnectionCode::encode(addr)).expect("a freshly encoded code parses");
+        let from_code = typed_target(&ConnectionCode::encode(addr), &relay::Lookup::None)
+            .expect("a freshly encoded code parses");
         let from_pick = parse_manual_entry(&SocketAddr::V4(addr).to_string())
             .expect("a discovered ip:port parses")
             .addr();
@@ -1342,7 +1392,7 @@ mod tests {
         // The field also takes a raw address, typed loosely.
         let typed = format!("  {} ", SocketAddr::V4(addr));
         assert_eq!(
-            typed_target(&typed).expect("a raw address parses"),
+            typed_target(&typed, &relay::Lookup::None).expect("a raw address parses"),
             SocketAddr::V4(addr)
         );
     }
@@ -1350,7 +1400,8 @@ mod tests {
     #[test]
     fn a_relay_code_in_a_copy_without_a_relay_is_answered_in_plain_words() {
         // A well-formed relay code (ST-M007-012), typed loosely.
-        let error = typed_target("53st a71d jkkv 0vgh").expect_err("this copy has no relay");
+        let none = relay::Lookup::None;
+        let error = typed_target("53st a71d jkkv 0vgh", &none).expect_err("this copy has no relay");
         assert_eq!(error.stage, "relay");
         assert!(error.message.contains("relay code"), "{}", error.message);
         assert!(
@@ -1363,8 +1414,138 @@ mod tests {
 
         // A relay code with a typing error is a mistyped code, not a relay
         // matter: the customer checks it with the technician.
-        let error = typed_target("53ST-A71D-JKKV-0VGJ").expect_err("a typing error");
+        let error = typed_target("53ST-A71D-JKKV-0VGJ", &none).expect_err("a typing error");
         assert_eq!(error.stage, "connect");
         assert!(error.message.contains("checksum"), "{}", error.message);
+    }
+
+    /// A key as the relay's operator gives a customer copy.
+    const KEY: &str = "9a41c7b35f2c9d0e7a1b4c3d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1";
+
+    #[test]
+    fn the_customer_role_reads_the_profile_next_to_its_program_and_writes_nothing() {
+        use cretlink_cli::relay_profile::RelayProfile;
+        use cretlink_cli::settings::{self, Settings};
+
+        use crate::relay::testing::Home;
+
+        // A technician's installed copy on the same computer keeps a relay
+        // and a network in its settings.
+        let home = Home::new("customer-reads");
+        settings::write(
+            &home.layout,
+            &Settings {
+                relay: Some(
+                    RelayProfile::from_fields("relay.example.org:443", Some(KEY), None, None)
+                        .expect("a profile"),
+                ),
+                network_adapter: Some("Wi-Fi".to_owned()),
+            },
+        )
+        .expect("write the settings");
+        let program = home.folder.path("usb/CretLink-Support.exe");
+        home.folder.write("usb/CretLink-Support.exe", "program");
+        let before = home.folder.snapshot();
+
+        // No file next to the program: no relay, whatever those settings say,
+        // and also when the installed program itself runs the customer role.
+        assert!(matches!(relay_next_to(Some(&program)), relay::Lookup::None));
+        assert!(matches!(
+            relay_next_to(Some(&home.layout.exe)),
+            relay::Lookup::None
+        ));
+        assert!(matches!(relay_next_to(None), relay::Lookup::None));
+        assert_eq!(home.folder.snapshot(), before, "looking wrote something");
+
+        // The file next to the program is the relay of this copy.
+        home.folder.write(
+            "usb/cretlink.toml",
+            format!("[relay]\naddress = \"host-01.example.org:9970\"\nkey = \"{KEY}\"\n"),
+        );
+        let before = home.folder.snapshot();
+        let found = relay_next_to(Some(&program));
+        assert_eq!(
+            found.relay().map(relay::Relay::host),
+            Some("host-01.example.org")
+        );
+        // The window that starts with it, and every code typed into it, read
+        // and never write: not the profile, no settings, nothing.
+        let state = AppState::with_relay(found);
+        for code in [
+            "53st a71d jkkv 0vgh",
+            "6RRR-2H8F-0000",
+            "192.168.1.20:7000",
+            "",
+        ] {
+            let _ = typed_target(code, &state.relay);
+        }
+        let _ = state.guard().view();
+        assert_eq!(
+            home.folder.snapshot(),
+            before,
+            "the customer role wrote something"
+        );
+
+        // A file that cannot be used stays as it is, too.
+        home.folder.write(
+            "usb/cretlink.toml",
+            "[relay]\naddress = \"host-01.example.org\"\n",
+        );
+        let before = home.folder.snapshot();
+        let broken = relay_next_to(Some(&program));
+        assert!(matches!(broken, relay::Lookup::Unusable(_)));
+        let _ = typed_target("53st a71d jkkv 0vgh", &broken);
+        assert_eq!(home.folder.snapshot(), before);
+    }
+
+    #[test]
+    fn a_relay_code_in_a_copy_whose_profile_cannot_be_used_says_what_is_wrong_with_it() {
+        use crate::relay::testing::Folder;
+
+        let folder = Folder::new("customer-unusable");
+        let file = folder.write(
+            "cretlink.toml",
+            format!("[relay]\naddress = \"relay.example.org:443\"\nkey = {KEY}\n"),
+        );
+        let relay = relay_next_to(Some(&folder.path("CretLink-Support.exe")));
+        let error = typed_target("53ST-A71D-JKKV-0VGH", &relay).expect_err("no usable profile");
+        assert_eq!(error.stage, "relay_profile");
+        assert_eq!(
+            error.message,
+            format!(
+                "This is a relay code, but the relay settings of this copy of CretLink cannot \
+                 be used. Line 3: the value of `key` must be text in double quotes. The file is \
+                 {}.",
+                file.display()
+            )
+        );
+        // The key that stands in the file the wrong way is not repeated.
+        assert!(!error.message.contains(KEY));
+        // A code of the same network needs no relay: it is read as before.
+        assert!(typed_target("192.168.1.20:7000", &relay).is_ok());
+    }
+
+    #[test]
+    fn a_relay_code_in_a_copy_with_a_profile_names_the_relay_it_is_set_up_for() {
+        use crate::relay::testing::Folder;
+
+        let folder = Folder::new("customer-profile");
+        folder.write(
+            "cretlink.toml",
+            format!("[relay]\naddress = \"relay.example.org:443\"\nkey = \"{KEY}\"\n"),
+        );
+        let relay = relay_next_to(Some(&folder.path("CretLink-Support.exe")));
+        let error = typed_target("53ST-A71D-JKKV-0VGH", &relay).expect_err("not yet");
+        assert_eq!(error.stage, "relay_later");
+        assert!(
+            error
+                .message
+                .contains("set up for the relay relay.example.org"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains(KEY));
+        // Without a relay code nothing about the relay is said or dialled.
+        assert!(typed_target("192.168.1.20:7000", &relay).is_ok());
     }
 }
