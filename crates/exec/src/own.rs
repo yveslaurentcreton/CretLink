@@ -909,7 +909,12 @@ mod sys {
     /// folder it lies in hands down, as if the entry had been made there. A
     /// link at `path` is not followed.
     pub(super) fn inherit_permissions(path: &Path) -> io::Result<()> {
-        let entry = open(path, WRITE_DAC.0 | READ_CONTROL.0)?;
+        inherit_permissions_of(&open(path, WRITE_DAC.0 | READ_CONTROL.0)?)
+    }
+
+    /// The same for an entry that is open with the rights to read and to
+    /// change its permissions: nothing is looked up by name.
+    pub(super) fn inherit_permissions_of(entry: &File) -> io::Result<()> {
         let mut none = ACL::default();
         // SAFETY: `none` is a valid place for a list of exactly its own size.
         unsafe { InitializeAcl(&raw mut none, size_of_u32::<ACL>(), ACL_REVISION) }
