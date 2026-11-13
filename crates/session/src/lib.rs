@@ -93,7 +93,10 @@ pub use report::{
     CleanupNote, CleanupResult, CleanupState, CustomerCounts, CustomerReport, CustomerReportInput,
     EndedBy,
 };
-pub use transfer::{CancelToken, DownloadRequest, TransferProgress, TransferReport, UploadRequest};
+pub use transfer::{
+    CancelToken, DownloadRequest, TransferProgress, TransferReport, UploadRequest,
+    download_part_path,
+};
 
 // The revocation-reason vocabulary lives in the protocol crate (it travels on
 // the wire); re-export it so runtime callers depend on one name.

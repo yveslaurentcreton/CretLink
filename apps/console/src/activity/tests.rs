@@ -836,6 +836,159 @@ fn a_file_action_of_the_technician_ends_honestly() {
     assert_eq!(fold.entries().len(), 5);
 }
 
+/// One change to an entry: its start and completion actions, its audit
+/// arguments, and the operation text the item shows.
+type ChangeCase = (
+    &'static str,
+    &'static str,
+    Vec<(&'static str, AuditValue)>,
+    String,
+);
+
+/// What the explorer changes and copies (ST-M010-002): each change to one
+/// entry is an item of the technician in the words the customer's feed has
+/// for it, and a copy to the technician computer is a file that left the
+/// customer computer, with its length once the copy has ended.
+#[test]
+fn the_changes_and_the_copies_of_the_explorer_are_items_of_the_technician() {
+    let mut fold = TechnicianActivity::new();
+    let documents = "C:\\Users\\ann\\Documents";
+    let cases: [ChangeCase; 4] = [
+        (
+            "console_make_dir_start",
+            "console_make_dir",
+            vec![("path", text("C:\\Users\\ann\\Documents\\Photos"))],
+            format!("create the folder {documents}\\Photos"),
+        ),
+        (
+            "console_move_start",
+            "console_move",
+            vec![
+                ("path", text("C:\\Users\\ann\\Documents\\a.txt")),
+                ("to", text("C:\\Users\\ann\\Documents\\b.txt")),
+            ],
+            format!("move {documents}\\a.txt to {documents}\\b.txt"),
+        ),
+        (
+            "console_delete_start",
+            "console_delete",
+            vec![("path", text("C:\\Users\\ann\\Documents\\b.txt"))],
+            format!("delete the file {documents}\\b.txt"),
+        ),
+        (
+            "console_fs_stat_start",
+            "console_fs_stat",
+            vec![("path", text("staging:setup.exe"))],
+            "look up setup.exe (CretLink staging folder)".to_owned(),
+        ),
+    ];
+    for (number, (start, done, args, operation)) in cases.into_iter().enumerate() {
+        let id = i64::try_from(number).unwrap() + 1;
+        let mut args = args;
+        args.push(("action_id", int(id)));
+        let running = item_of(fold.apply(&record(Actor::Console, start, Outcome::Ok, &args), T0));
+        assert_eq!(running.id, format!("action-{id}"), "{start}");
+        assert_eq!(running.source, ActivitySource::Technician, "{start}");
+        assert_eq!(running.kind, ActivityKind::FileOperation, "{start}");
+        assert_eq!(running.description, "Worked with files and folders");
+        assert_eq!(running.operation, operation, "{start}");
+        assert_eq!(running.state, ActivityState::Running, "{start}");
+        let ended = item_of(fold.apply(&record(Actor::Console, done, Outcome::Ok, &args), T0 + 3));
+        assert_eq!(ended.id, running.id, "{done}");
+        assert_eq!(ended.operation, operation, "{done}");
+        assert_eq!(
+            ended.state,
+            ActivityState::Done { exit_code: None },
+            "{done}"
+        );
+        assert_eq!(ended.bytes, None, "{done}");
+    }
+
+    // A refused change says why, and is never done.
+    let refused = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_move",
+            Outcome::Failed,
+            &[
+                ("action_id", int(9)),
+                ("path", text("C:\\Users\\ann\\Documents\\a.txt")),
+                ("to", text("C:\\Users\\ann\\Documents\\c.txt")),
+                ("reason", text("AlreadyExists: the destination exists")),
+            ],
+        ),
+        T0 + 10,
+    ));
+    assert_eq!(
+        refused.state,
+        ActivityState::failed("AlreadyExists: the destination exists")
+    );
+
+    let copying = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_download_start",
+            Outcome::Ok,
+            &[
+                ("action_id", int(20)),
+                ("path", text("C:\\Users\\ann\\Documents\\report.pdf")),
+            ],
+        ),
+        T0 + 20,
+    ));
+    assert_eq!(copying.kind, ActivityKind::FileSent);
+    assert_eq!(
+        copying.description,
+        "Copied a file from the customer computer"
+    );
+    assert_eq!(
+        copying.operation,
+        format!("copy the file {documents}\\report.pdf from the customer computer")
+    );
+    assert_eq!(copying.state, ActivityState::Running);
+    let copied = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_download",
+            Outcome::Ok,
+            &[
+                ("action_id", int(20)),
+                ("path", text("C:\\Users\\ann\\Documents\\report.pdf")),
+                ("len", int(48_213)),
+            ],
+        ),
+        T0 + 900,
+    ));
+    assert_eq!(copied.id, "action-20");
+    assert_eq!(copied.bytes, Some(48_213));
+    assert_eq!(copied.state, ActivityState::Done { exit_code: None });
+
+    // A copy the technician cancelled is cancelled, never done.
+    fold.apply(
+        &record(
+            Actor::Console,
+            "console_download_start",
+            Outcome::Ok,
+            &[("action_id", int(21)), ("path", text("C:\\big.iso"))],
+        ),
+        T0 + 1000,
+    );
+    let cancelled = item_of(fold.apply(
+        &record(
+            Actor::Console,
+            "console_download",
+            Outcome::Cancelled,
+            &[
+                ("action_id", int(21)),
+                ("path", text("C:\\big.iso")),
+                ("len", int(4_000_000)),
+            ],
+        ),
+        T0 + 1500,
+    ));
+    assert_eq!(cancelled.state, ActivityState::Cancelled);
+}
+
 /// A file action of the technician and a routed AI call that happen to carry
 /// the same number are two items: the two are numbered apart.
 #[test]
