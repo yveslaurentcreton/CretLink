@@ -102,8 +102,15 @@ function relayOf(form: RelayForm): RelayView {
     );
   }
   const stored = settings.stored?.relay;
+  const host = (form.name ?? address.slice(0, colon)).toLowerCase();
+  if (form.keyMode === "keep" && keySet && stored && stored.host !== host) {
+    refuse(
+      "relay_key",
+      `The key that is kept is the key of the relay ${stored.host}; enter the key of this relay, or remove the key.`,
+    );
+  }
   const relay: RelayView = {
-    host: (form.name ?? address.slice(0, colon)).toLowerCase(),
+    host,
     address: address.toLowerCase(),
     keySet: form.keyMode === "set" || (form.keyMode === "keep" && keySet),
   };

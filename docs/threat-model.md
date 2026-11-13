@@ -3199,9 +3199,12 @@ metadata rather than content.
   erased when dropped and redacted in debug output. The application never
   shows it again once it is saved, never logs it, puts it in no audit record
   and in no error text; a form that leaves the key alone tells the backend to
-  keep it instead of sending it back. The test of a relay in Settings
-  presents a ticket of its own, meets nobody and carries nothing of a
-  session.
+  keep it instead of sending it back. A kept key stays with the relay it was
+  saved for: when the form names another relay, by another host name for its
+  certificate, the application refuses to keep the key and asks for that
+  relay's own, so a test or a save never presents one relay's key to
+  another. The test of a relay in Settings presents a ticket of its own,
+  meets nobody and carries nothing of a session.
 - *A relay code grants nothing.* It holds a random seed of 64 bits and a
   typing check, no address and no key. Someone who overhears or guesses a code
   can at most reach the rendezvous before the customer does: the approval

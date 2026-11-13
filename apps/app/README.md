@@ -142,7 +142,10 @@ authority file `ca` and an optional `name` in the certificate
   (`cretlink_relay::AdmissionToken`: erased when dropped, redacted in
   `Debug`). No view sent to the window holds it — `RelayView.keySet` says
   only whether there is one — and a form that leaves the key alone says
-  `keep`. It is not logged and is no argument of any audit record.
+  `keep`. It is not logged and is no argument of any audit record. `keep` is
+  honoured only while the relay's host name is the one the key was saved
+  for: a form that names another relay must bring that relay's key or none,
+  so a kept key is never presented to another relay.
 - **Always TLS** (`relay::EndpointDial`). A relay is reached over `wss` only,
   with its certificate checked against the system's authorities or the
   profile's `ca` file, for the profile's `name` or else the host of its

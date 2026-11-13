@@ -18,6 +18,11 @@
 //! - **The key never comes back.** A form sends a key to keep; nothing sends
 //!   one to the window. The view says only whether a key is set, a form that
 //!   leaves the key alone says `keep`, and no message names it.
+//! - **A kept key stays with its relay.** `keep` is honoured only while the
+//!   relay's host name, the name its certificate must carry, is the one the
+//!   key was saved for. A form that names another relay must bring that
+//!   relay's key or none, so that the key of one relay is never presented to
+//!   another one, in a test or in a session.
 //! - **The window names no path of this computer.** The certificate file is
 //!   chosen in the system's dialog, opened from here, and a copy of it is
 //!   kept next to the settings; the form names it by a number.
@@ -251,8 +256,22 @@ fn relay_of(
         .filter(|name| !name.is_empty());
     let mut profile = RelayProfile::from_fields(&form.address, key, None, name)
         .map_err(|problem| of_problem(&problem))?;
-    if form.key_mode == KeyMode::Keep {
-        profile = profile.with_key(stored.as_ref().and_then(RelayProfile::key).cloned());
+    if form.key_mode == KeyMode::Keep
+        && let Some(stored) = stored.as_ref().filter(|stored| stored.key().is_some())
+    {
+        // The kept key is the key of one relay. A form that names another
+        // one does not get it: it would be presented to that other relay.
+        if stored.server_name() != profile.server_name() {
+            return Err(refused(
+                Some(Field::Key),
+                &format!(
+                    "the key that is kept is the key of the relay {}; enter the key of this \
+                     relay, or remove the key",
+                    stored.server_name()
+                ),
+            ));
+        }
+        profile = profile.with_key(stored.key().cloned());
     }
     let ca_pem = match form.ca_mode {
         CaMode::None => None,

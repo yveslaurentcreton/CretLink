@@ -122,20 +122,18 @@ fn a_form_keeps_the_key_changes_it_or_drops_it() {
     )
     .unwrap();
 
-    // Another address, the key left alone: it is still the same key.
-    let view = save(&copy, &form("host-01.example.org:9970"), &pending).unwrap();
+    // Another port of the same relay, the key left alone: it is still the
+    // same key.
+    let view = save(&copy, &form("relay.example.org:9970"), &pending).unwrap();
     assert_eq!(
         view.stored.unwrap().relay.unwrap().address,
-        "host-01.example.org:9970"
+        "relay.example.org:9970"
     );
     assert_eq!(stored_key(&home).as_deref(), Some(KEY.as_bytes()));
 
     save(
         &copy,
-        &with_key(
-            form("host-01.example.org:9970"),
-            "another-key-for-this-copy",
-        ),
+        &with_key(form("relay.example.org:9970"), "another-key-for-this-copy"),
         &pending,
     )
     .unwrap();
@@ -144,11 +142,72 @@ fn a_form_keeps_the_key_changes_it_or_drops_it() {
         Some(&b"another-key-for-this-copy"[..])
     );
 
-    let mut none = form("host-01.example.org:9970");
+    let mut none = form("relay.example.org:9970");
     none.key_mode = KeyMode::None;
     let view = save(&copy, &none, &pending).unwrap();
     assert!(!view.stored.unwrap().relay.unwrap().key_set);
     assert_eq!(stored_key(&home), None);
+}
+
+#[test]
+fn a_kept_key_is_never_given_to_another_relay() {
+    let home = Home::new("settings-key-relay");
+    let copy = home.installed();
+    let pending = PendingCa::default();
+    save(
+        &copy,
+        &with_key(form("relay.example.org:443"), KEY),
+        &pending,
+    )
+    .unwrap();
+    let before = home.folder.snapshot();
+
+    // The address now names another relay, and the form leaves the key alone.
+    // Neither a save nor a test takes the kept key there.
+    let other = form("host-01.example.org:443");
+    let refused = save(&copy, &other, &pending).unwrap_err();
+    assert_eq!(refused.stage, "relay_key");
+    assert_eq!(
+        refused.message,
+        "The key that is kept is the key of the relay relay.example.org; enter the key of this \
+         relay, or remove the key."
+    );
+    assert!(!refused.message.contains(KEY));
+    let refused = relay_to_test(&copy, Some(&other), &pending).unwrap_err();
+    assert_eq!(refused.stage, "relay_key");
+    assert_eq!(home.folder.snapshot(), before);
+
+    // The same relay under another address is still the same relay: its name
+    // in the certificate is what the key was saved for.
+    let mut same = form("192.0.2.1:443");
+    same.name = Some("relay.example.org".to_owned());
+    save(&copy, &same, &pending).unwrap();
+    assert_eq!(stored_key(&home).as_deref(), Some(KEY.as_bytes()));
+    // And a name that says otherwise is another relay.
+    let mut renamed = form("192.0.2.1:443");
+    renamed.name = Some("host-01.example.org".to_owned());
+    assert_eq!(
+        save(&copy, &renamed, &pending).unwrap_err().stage,
+        "relay_key"
+    );
+
+    // The other relay with a key of its own, or with none, is saved.
+    save(
+        &copy,
+        &with_key(other.clone(), "the-key-of-host-01"),
+        &pending,
+    )
+    .unwrap();
+    assert_eq!(
+        stored_key(&home).as_deref(),
+        Some(&b"the-key-of-host-01"[..])
+    );
+    let mut none = form("relay.example.org:443");
+    none.key_mode = KeyMode::None;
+    save(&copy, &none, &pending).unwrap();
+    assert_eq!(stored_key(&home), None);
+    // Without a kept key there is nothing to hold back.
+    save(&copy, &form("host-01.example.org:443"), &pending).unwrap();
 }
 
 #[test]
@@ -316,7 +375,9 @@ fn removing_takes_the_relay_and_its_certificate_file_and_leaves_the_network() {
     settings::write(&home.layout, &kept).unwrap();
 
     // Saving a relay leaves it alone, and so does removing the relay.
-    save(&copy, &form("192.0.2.1:9970"), &pending).unwrap();
+    let mut again = form("192.0.2.1:9970");
+    again.name = Some(RELAY_NAME.to_owned());
+    save(&copy, &again, &pending).unwrap();
     assert_eq!(stored(&home).network_adapter.as_deref(), Some("Wi-Fi"));
     let view = remove(&copy, &pending).unwrap();
     assert_eq!(view.source, "none");

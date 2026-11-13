@@ -371,7 +371,9 @@ settings:
   access rules of that folder. `cretlink uninstall` removes both files and
   says so before it does.
 - The **key is never shown** again once it is saved: the screen says only
-  that a key is set. Leave the field empty to keep it.
+  that a key is set. Leave the field empty to keep it. A kept key stays with
+  its relay: when you change the form to another relay, the application asks
+  for that relay's key instead of presenting the kept one to it.
 - **Test** reaches the relay once, with what stands in the form, and says in
   words what came of it: the relay admits this copy, or it could not be
   reached, its certificate is not trusted, it asks for a key, it does not

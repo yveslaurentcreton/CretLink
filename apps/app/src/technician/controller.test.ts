@@ -644,6 +644,26 @@ describe("Settings → Relay (ST-M007-011)", () => {
     expect(input("relay-key").value).toBe(KEY);
   });
 
+  it("asks for the key of another relay instead of taking the kept one there", async () => {
+    await settings(RELAY_STORED, {
+      save_relay: () => {
+        throw {
+          stage: "relay_key",
+          message:
+            "The key that is kept is the key of the relay relay.example.org; enter the key of this relay, or remove the key.",
+        };
+      },
+    });
+    type("relay-address", "host-01.example.org:443");
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")?.form).toMatchObject({ keyMode: "keep" });
+    expect(alert()).toContain("The relay was not saved");
+    expect(alert()).toContain("is the key of the relay relay.example.org");
+    // The focus is where the key of the other relay goes.
+    expect(document.activeElement?.id).toBe("relay-key");
+  });
+
   it("tests the form as it stands and shows the result in words, without saving", async () => {
     let answer: (value: unknown) => void = () => undefined;
     await settings(RELAY_STORED, {

@@ -209,7 +209,7 @@ function form(s: TechnicianSnapshot, settings: RelaySettings): HTMLElement {
         "p",
         { class: "muted", id: "relay-key-hint" },
         stored?.keySet
-          ? "A key is set. It is never shown. Leave this empty to keep it."
+          ? "A key is set. It is never shown. Leave this empty to keep it; it stays with this relay and is not taken to another one."
           : "The key the relay's operator gave this copy. Leave it empty when the relay asks for none.",
       ),
       stored?.keySet
