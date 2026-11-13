@@ -97,14 +97,16 @@ function testResult(draft: RelayDraft): HTMLElement {
 }
 
 function testButton(s: TechnicianSnapshot): HTMLButtonElement {
-  return button("Test", "relay-test", {
+  const test = button("Test", "relay-test", {
     icon: "link",
-    disabled:
-      s.busy !== undefined ||
-      s.relayDraft.removing === true ||
-      s.relayDraft.test?.state === "running",
+    disabled: s.busy !== undefined || s.relayDraft.removing === true,
     label: "Test the relay",
   });
+  // While its test runs the button is marked as unavailable and not disabled:
+  // a disabled button would lose the keyboard focus, and the technician who
+  // pressed it would have to find their place again when the answer is in.
+  if (s.relayDraft.test?.state === "running") test.setAttribute("aria-disabled", "true");
+  return test;
 }
 
 /** One labelled field of the form, with its hint. */

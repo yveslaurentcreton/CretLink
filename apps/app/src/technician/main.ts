@@ -377,9 +377,14 @@ function readRelayForm(): RelayForm | undefined {
   );
 }
 
-/** Adopts what the backend says the settings hold now, with an empty form. */
-function relayChanged(relay: RelaySettings, notice: string): void {
+/**
+ * Adopts what the backend says the settings hold now, with an empty form.
+ * The form is drawn anew, which would leave the keyboard nowhere: `focus`
+ * names where it goes instead.
+ */
+function relayChanged(relay: RelaySettings, notice: string, focus: string): void {
   relayGeneration += 1;
+  focusNext = focus;
   set({
     busy: undefined,
     relay,
@@ -397,7 +402,12 @@ async function saveRelay(): Promise<void> {
     const relay = await api.saveRelay(form);
     if (!isRelaySettings(relay)) throw new Error("The settings could not be read back.");
     const host = relay.stored?.relay?.host;
-    relayChanged(relay, host ? `The relay ${host} was saved.` : "The relay was saved.");
+    relayChanged(
+      relay,
+      host ? `The relay ${host} was saved.` : "The relay was saved.",
+      // Where the technician was: on Save.
+      '[data-action="relay-save"]',
+    );
   } catch (error) {
     relayRefused(error, "The relay was not saved", "Nothing was changed. Try again.");
   }
@@ -409,10 +419,22 @@ async function removeRelay(): Promise<void> {
   try {
     const relay = await api.removeRelay();
     if (!isRelaySettings(relay)) throw new Error("The settings could not be read back.");
-    relayChanged(relay, "The relay was removed from the settings.");
+    relayChanged(
+      relay,
+      "The relay was removed from the settings.",
+      // The question is gone: on to the empty form, or to the relay of the
+      // file that is in use.
+      '#relay-address, [data-action="relay-test"]',
+    );
   } catch (error) {
     relayRefused(error, "The relay was not removed", "Try again.");
   }
+}
+
+/** Closes "Remove the relay?" and gives the focus back to what opened it. */
+function closeRelayQuestion(): void {
+  focusNext = '[data-action="relay-remove"]';
+  set({ relayDraft: { ...snap.relayDraft, removing: false } });
 }
 
 /** Reaches the relay of the form as it stands, or the one this copy uses. */
@@ -730,6 +752,8 @@ function onAction(event: ActionEvent): void {
       void chooseRelayCa();
       break;
     case "relay-ca-none":
+      // This button goes away with the file: the focus moves to its neighbour.
+      focusNext = "#relay-ca-choose";
       set({ relayDraft: { ...snap.relayDraft, ca: { mode: "none" }, test: undefined } });
       break;
     case "relay-remove":
@@ -737,7 +761,7 @@ function onAction(event: ActionEvent): void {
       set({ relayDraft: { ...snap.relayDraft, removing: true } });
       break;
     case "relay-remove-cancel":
-      set({ relayDraft: { ...snap.relayDraft, removing: false } });
+      closeRelayQuestion();
       break;
     case "relay-remove-confirm":
       void removeRelay();
@@ -880,7 +904,7 @@ function onKeydown(event: KeyboardEvent): void {
     } else if (snap.uninstall) {
       set({ uninstall: undefined });
     } else if (snap.relayDraft.removing) {
-      set({ relayDraft: { ...snap.relayDraft, removing: false } });
+      closeRelayQuestion();
     }
     return;
   }

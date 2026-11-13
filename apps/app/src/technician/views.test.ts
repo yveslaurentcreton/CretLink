@@ -858,7 +858,13 @@ describe("settings: the relay (ST-M007-011)", () => {
     const region = running.querySelector("#relay-test");
     expect(region?.getAttribute("role")).toBe("status");
     expect(text(region)).toBe("Reaching the relay…");
-    expect(buttonNamed(running, "Test the relay")?.disabled).toBe(true);
+    // Unavailable while it runs, and still where the keyboard is.
+    const test = buttonNamed(running, "Test the relay");
+    expect(test?.getAttribute("aria-disabled")).toBe("true");
+    expect(test?.disabled).toBe(false);
+    expect(buttonNamed(show("settings-relay"), "Test the relay")?.hasAttribute("aria-disabled")).toBe(
+      false,
+    );
 
     const admitted = show("settings-relay-admitted").querySelector("#relay-test");
     expect(text(admitted)).toContain("The relay admits this copy");

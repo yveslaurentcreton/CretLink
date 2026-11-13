@@ -575,6 +575,8 @@ describe("Settings → Relay (ST-M007-011)", () => {
     expect(announced()).toBe("The relay relay.example.org was saved.");
     expect(input("relay-address").value).toBe("host-01.example.org:9970");
     expect(alert()).toBe("");
+    // The form was drawn anew; the keyboard is where it was, on Save.
+    expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe("relay-save");
   });
 
   it("sends a typed key to the backend and keeps none of it in the window", async () => {
@@ -657,10 +659,15 @@ describe("Settings → Relay (ST-M007-011)", () => {
       form: { address: "host-01.example.org:9970", keyMode: "keep", caMode: "none" },
     });
     expect(app().querySelector("#relay-test")?.textContent).toBe("Reaching the relay…");
-    // The button waits for the answer: a second test is not started.
-    expect(app().querySelector<HTMLButtonElement>('[data-action="relay-test"]')?.disabled).toBe(
-      true,
-    );
+    // The button waits for the answer: a second press starts no second test.
+    // It keeps the focus meanwhile, so it is marked and not disabled.
+    const test = app().querySelector<HTMLButtonElement>('[data-action="relay-test"]');
+    expect(test?.getAttribute("aria-disabled")).toBe("true");
+    expect(test?.disabled).toBe(false);
+    test?.focus();
+    click('[data-action="relay-test"]');
+    await flush();
+    expect(asked("test_relay")).toBe(1);
 
     answer({
       ok: false,
@@ -679,6 +686,10 @@ describe("Settings → Relay (ST-M007-011)", () => {
     expect(asked("save_relay")).toBe(0);
     // What was typed is still there to be corrected.
     expect(input("relay-address").value).toBe("host-01.example.org:9970");
+    // The button is available again, and the keyboard never left it.
+    expect(test?.isConnected).toBe(true);
+    expect(test?.hasAttribute("aria-disabled")).toBe(false);
+    expect(document.activeElement).toBe(test);
   });
 
   it("drops the result of a test when the relay was removed meanwhile", async () => {
@@ -738,9 +749,11 @@ describe("Settings → Relay (ST-M007-011)", () => {
     expect(sent("save_relay")?.form).toMatchObject({ caMode: "keep" });
     expect((sent("save_relay")?.form as Record<string, unknown>).caPick).toBeUndefined();
 
-    // Back to the authorities of this computer.
+    // Back to the authorities of this computer. The button that was pressed
+    // goes away with the file; the focus moves to its neighbour.
     click('[data-action="relay-ca-none"]');
     await flush();
+    expect(document.activeElement?.id).toBe("relay-ca-choose");
     click('[data-action="relay-save"]');
     await flush();
     expect(sent("save_relay")?.form).toMatchObject({ caMode: "none" });
@@ -770,6 +783,8 @@ describe("Settings → Relay (ST-M007-011)", () => {
     await flush();
     expect(app().querySelector("#relay-remove-step")).toBeNull();
     expect(asked("remove_relay")).toBe(0);
+    // The focus is back on what opened the question.
+    expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe("relay-remove");
 
     click('[data-action="relay-remove"]');
     await flush();
@@ -777,6 +792,7 @@ describe("Settings → Relay (ST-M007-011)", () => {
     await flush();
     expect(asked("remove_relay")).toBe(0);
     expect(input("relay-address").value).toBe("relay.example.org:443");
+    expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe("relay-remove");
 
     click('[data-action="relay-remove"]');
     await flush();
@@ -786,6 +802,8 @@ describe("Settings → Relay (ST-M007-011)", () => {
     expect(announced()).toBe("The relay was removed from the settings.");
     expect(input("relay-address").value).toBe("");
     expect(app().querySelector('[data-action="relay-remove"]')).toBeNull();
+    // The question is gone; the keyboard goes on to the empty form.
+    expect(document.activeElement?.id).toBe("relay-address");
   });
 
   it("tests the relay of the file next to the program, which has no form", async () => {
@@ -808,6 +826,8 @@ describe("Settings → Relay (ST-M007-011)", () => {
     await flush();
     expect(asked("remove_relay")).toBe(1);
     expect(app().querySelector(".relay-unused")).toBeNull();
+    // No form to go to: the focus is on the test of the relay in use.
+    expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe("relay-test");
   });
 
   it("keeps nothing in a copy that runs once", async () => {
