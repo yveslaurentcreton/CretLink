@@ -248,6 +248,68 @@ fn the_name_in_the_certificate_is_a_host_name() {
 }
 
 #[test]
+fn a_host_name_that_tls_refuses_is_a_problem_of_the_profile() {
+    // What a rendezvous ticket takes and TLS does not: a part of more than 63
+    // characters, and a part that begins or ends with a hyphen. Such a name
+    // is refused when the profile is read, in fixed words, and not after a
+    // connection with a message that repeats it.
+    let long = format!("{}.example.org", "a".repeat(64));
+    for host in [
+        long.as_str(),
+        "-relay.example.org",
+        "relay-.example.org",
+        "relay.-example.org",
+        "relay.example-.org",
+    ] {
+        let as_host = RelayAddress::parse(&format!("{host}:443")).unwrap_err();
+        assert_eq!(as_host.field, Some(Field::Address), "{host}");
+        let as_name =
+            RelayProfile::from_fields("192.0.2.1:443", None, None, Some(host)).unwrap_err();
+        assert_eq!(as_name.field, Some(Field::Name), "{host}");
+        for problem in [as_host, as_name] {
+            assert!(
+                problem
+                    .text
+                    .contains("not a name that a certificate can be checked for"),
+                "{host}: {}",
+                problem.text
+            );
+            assert!(problem.text.contains("63 characters"), "{}", problem.text);
+            assert!(!problem.text.contains(host), "{}", problem.text);
+        }
+    }
+    // In a file the problem stands on the line of its setting.
+    let in_file =
+        problem("[relay]\naddress = \"relay.example.org:443\"\nname = \"relay-.example.org\"\n");
+    assert_eq!(in_file.line, Some(3));
+    assert_eq!(in_file.field, Some(Field::Name));
+    let in_file = problem("[relay]\naddress = \"-relay.example.org:443\"\n");
+    assert_eq!(in_file.line, Some(2));
+    assert_eq!(in_file.field, Some(Field::Address));
+
+    // What TLS takes stays a name: a part of 63 characters, a hyphen inside
+    // a part, an underscore, and an address of either family.
+    let longest = format!("{}.example.org", "a".repeat(63));
+    for host in [
+        longest.as_str(),
+        "re-lay.example.org",
+        "relay_1.example.org",
+        "192.0.2.1",
+        "[2001:db8::1]",
+        "[::1]",
+    ] {
+        assert!(
+            RelayAddress::parse(&format!("{host}:443")).is_ok(),
+            "{host}"
+        );
+        assert!(
+            RelayProfile::from_fields("192.0.2.1:443", None, None, Some(host)).is_ok(),
+            "{host}"
+        );
+    }
+}
+
+#[test]
 fn an_unknown_setting_or_section_is_an_error() {
     let unknown = problem("[relay]\naddress = \"relay.example.org:443\"\ntoken = \"x\"\n");
     assert_eq!(unknown.line, Some(3));

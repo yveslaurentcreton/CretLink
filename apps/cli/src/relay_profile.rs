@@ -39,7 +39,9 @@
 //! to the relay, checks its certificate against the system's authorities, or
 //! against `ca` when the profile names one, and checks that the certificate
 //! carries the relay's name ([`RelayProfile::server_name`]). An address with
-//! `ws://` or any other scheme is refused.
+//! `ws://` or any other scheme is refused. A host name that TLS could not
+//! check a certificate for is refused here, when the profile is read, and
+//! not after a connection.
 //!
 //! # A profile file is untrusted input
 //!
@@ -81,6 +83,12 @@ pub const MAX_CA_NAME_CHARS: usize = 100;
 
 /// The longest `address`: a DNS name, a colon and a port.
 const MAX_ADDRESS_BYTES: usize = 253 + 1 + 5 + 2;
+
+/// What TLS asks of a host name beyond what a rendezvous ticket does
+/// (`cretlink_wss::is_server_name`), in fixed words: a message about a name
+/// that TLS refuses never repeats that name.
+const NAME_RULE: &str = "no part between its dots may be longer than 63 characters, and none may \
+                         begin or end with a hyphen";
 
 /// A setting of a relay profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +278,12 @@ impl RelayAddress {
                 "the host in `address` is not a host name or an IP address in its usual spelling",
             )
         })?;
+        if !cretlink_wss::is_server_name(&host) {
+            return Err(problem(&format!(
+                "the host in `address` is not a name that a certificate can be checked for: \
+                 {NAME_RULE}"
+            )));
+        }
         Ok(Self { host, port })
     }
 
@@ -481,12 +495,18 @@ fn parse_name(text: &str) -> Result<String, Problem> {
             "`name` is empty; leave it out when the certificate carries the host of `address`",
         ));
     }
-    canonical_relay_host(text).map_err(|_| {
+    let name = canonical_relay_host(text).map_err(|_| {
         problem(
             "`name` is the name in the relay's certificate: a host name, or an IP address in its \
              usual spelling",
         )
-    })
+    })?;
+    if !cretlink_wss::is_server_name(&name) {
+        return Err(problem(&format!(
+            "`name` is not a name that a certificate can be checked for: {NAME_RULE}"
+        )));
+    }
+    Ok(name)
 }
 
 /// Reads the relay profile of a section of a file read by

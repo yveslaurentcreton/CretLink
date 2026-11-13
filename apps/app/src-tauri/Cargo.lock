@@ -616,6 +616,7 @@ dependencies = [
  "cretlink-relay",
  "cretlink-shared",
  "cretlink-support-agent",
+ "cretlink-wss",
  "serde",
  "serde_json",
  "tokio",

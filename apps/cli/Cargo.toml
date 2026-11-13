@@ -49,6 +49,11 @@ cretlink-support-agent = { path = "../support-agent", version = "0.0.0" }
 # file once it is read, because it may hold that key.
 cretlink-relay.workspace = true
 zeroize.workspace = true
+# Whether TLS can check a certificate for the name of a profile's relay, said
+# when the profile is read and not after a connection (ST-M007-011). The crate
+# is the one seam onto the TLS library; the support agent's library links it
+# already, so this adds nothing to the build.
+cretlink-wss.workspace = true
 
 # Attaching a GUI-subsystem process to its parent's console, and the elevated
 # relaunch through UAC (ST-M009-001); the Start-menu shortcut (COM ShellLink),

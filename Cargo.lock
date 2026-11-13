@@ -370,6 +370,7 @@ dependencies = [
  "cretlink-session",
  "cretlink-shared",
  "cretlink-support-agent",
+ "cretlink-wss",
  "jsonschema",
  "serde",
  "serde_json",

@@ -223,6 +223,21 @@ pub fn private_key_from_pem(pem: &[u8]) -> Result<PrivateKeyDer<'static>, WssErr
     }
 }
 
+/// Whether `name` is a name that the certificate of a server can be checked
+/// against: a DNS name as TLS takes it, or an IP address in its standard text
+/// form.
+///
+/// A DNS name is refused when one of its labels is empty, longer than 63
+/// characters or begins or ends with a hyphen, when it is longer than 253
+/// characters, or when it holds anything but ASCII letters, digits, hyphens,
+/// underscores and dots. [`connect`] refuses the same names, but only once a
+/// connection exists; this lets a caller refuse them when the name is
+/// configured (ST-M007-011).
+#[must_use]
+pub fn is_server_name(name: &str) -> bool {
+    ServerName::try_from(name).is_ok()
+}
+
 /// Wraps a server TLS config into a reusable [`TlsAcceptor`].
 #[must_use]
 pub fn acceptor(config: Arc<ServerConfig>) -> TlsAcceptor {
