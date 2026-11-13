@@ -1880,7 +1880,7 @@ describe("renaming", () => {
     expect(document.activeElement).toBe($("#xp-grid"));
   });
 
-  it("leaves the name as it was with Escape or a click elsewhere, and only then stops", async () => {
+  it("leaves the name as it was with Escape, and takes it with a click elsewhere", async () => {
     await documents();
     click(row("a.txt"));
     await flush();
@@ -1894,7 +1894,7 @@ describe("renaming", () => {
     expect(asked("stop_session")).toHaveLength(0);
     expect(document.activeElement).toBe($("#xp-grid"));
 
-    // A folder's whole name is selected; a click on another row leaves it.
+    // A folder's whole name is selected.
     $(row("Invoices")).dispatchEvent(
       new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 9, clientY: 9 }),
     );
@@ -1906,20 +1906,104 @@ describe("renaming", () => {
     click("#xp-rename-input");
     await flush();
     expect(app().querySelector("#xp-rename-input")).not.toBeNull();
+    // A click on another row takes the name, as in the Windows explorer,
+    // and goes on to select that row.
     field().value = "Bills";
     click(row("b.txt"));
     await flush();
     expect(app().querySelector("#xp-rename-input")).toBeNull();
-    expect(asked("explorer_rename")).toHaveLength(0);
-    expect(drawn()).toContain("Invoices");
-    // The same name is no rename.
+    expect(asked("explorer_rename")).toEqual([{ folder: DOCUMENTS, name: "Invoices", to: "Bills" }]);
+    expect(drawn()).toContain("Bills");
+    expect(drawn()).not.toContain("Invoices");
+    expect(selected()).toEqual(["b.txt"]);
+    expect(announced()).toBe("Invoices is now Bills.");
+    // The same name is no rename, by Enter or by a click.
     click(row("a.txt"));
     key("F2");
     await flush();
     key("Enter", {}, "#xp-rename-input");
     await flush();
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+    key("F2");
+    await flush();
+    click(row("c.txt"));
+    await flush();
+    expect(app().querySelector("#xp-rename-input")).toBeNull();
+    expect(selected()).toEqual(["c.txt"]);
+    expect(asked("explorer_rename")).toHaveLength(1);
+    // A click outside the explorer is not the explorer's: the field stays.
+    click(row("a.txt"));
+    key("F2");
+    await flush();
+    field().value = "elsewhere.txt";
+    app().dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    await flush();
+    expect(app().querySelector("#xp-rename-input")).not.toBeNull();
+    expect(asked("explorer_rename")).toHaveLength(1);
+  });
+
+  it("does not also press a control with the click that sent the new name", async () => {
+    await documents();
+    click(row("a.txt"));
+    await flush();
+    key("F2");
+    await flush();
+    field().value = "z.txt";
+    // What Delete would act on is being renamed at that moment.
+    action("xp-delete").click();
+    await flush();
+    expect(asked("explorer_rename")).toEqual([{ folder: DOCUMENTS, name: "a.txt", to: "z.txt" }]);
+    expect(app().querySelector("#xp-question")).toBeNull();
+    expect(asked("explorer_delete")).toHaveLength(0);
+    expect(drawn()).toContain("z.txt");
+    expect(selected()).toEqual(["z.txt"]);
+    // The next click is the control's own, for the entry under its new name.
+    action("xp-delete").click();
+    await flush();
+    expect($("#xp-question").textContent).toContain("z.txt");
+
+    // A right click elsewhere takes the name too, and opens no menu with it.
+    click("#xp-question [data-action=\"xp-question-cancel\"]");
+    await flush();
+    click(row("b.txt"));
+    key("F2");
+    await flush();
+    field().value = "y.txt";
+    $(row("c.txt")).dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 9, clientY: 9 }),
+    );
+    await flush();
+    expect(asked("explorer_rename")).toHaveLength(2);
+    expect(asked("explorer_rename")[1]).toEqual({ folder: DOCUMENTS, name: "b.txt", to: "y.txt" });
+    expect(app().querySelector("#xp-menu")).toBeNull();
+  });
+
+  it("leaves the name and says why when a click elsewhere finds it cannot be used", async () => {
+    await documents();
+    click(row("a.txt"));
+    await flush();
+    key("F2");
+    await flush();
+    field().value = "B.TXT";
+    click(row("c.txt"));
+    await flush();
     expect(asked("explorer_rename")).toHaveLength(0);
     expect(app().querySelector("#xp-rename-input")).toBeNull();
+    expect($("#xp-alert b").textContent).toBe("a.txt was not renamed");
+    expect($("#xp-alert").textContent).toContain("B.TXT is already in this folder.");
+    expect($("#xp-alert").textContent).toContain("The name is as it was.");
+    expect(drawn()).toContain("a.txt");
+    // The click went on to what it was aimed at.
+    expect(selected()).toEqual(["c.txt"]);
+    // A control is pressed as usual when no new name was sent.
+    click(row("a.txt"));
+    key("F2");
+    await flush();
+    field().value = "";
+    action("xp-delete").click();
+    await flush();
+    expect(asked("explorer_rename")).toHaveLength(0);
+    expect($("#xp-question").textContent).toContain("a.txt");
   });
 
   it("says why a name cannot be used and keeps the field open", async () => {

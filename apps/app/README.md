@@ -357,10 +357,15 @@ Sending, copying, renaming and deleting (`explorer/commands.rs`):
   running transfer and every waiting one end as stopped; the queue, the
   explorer's alert and, once the explorer is dropped with the session, the
   window's own alert say so.
-- **Rename** types the new name in the row (`F2`): `Enter` renames, `Escape`
-  or a click elsewhere leaves the name as it was. A name must be one name; a
-  name that is taken is refused by the customer computer, which never
-  replaces by a move.
+- **Rename** types the new name in the row (`F2`). `Enter` takes the name,
+  and so does a click elsewhere in the explorer, as in the Windows explorer;
+  `Escape` leaves the name as it was. A click on a row goes on to select
+  that row. A click on a control is not also that control's press when it
+  sent a new name: what the control would act on is being renamed at that
+  moment. A name must be one name. One that cannot be used keeps the field
+  open after `Enter`; after a click the name is left as it was and the
+  window says why. A name that is taken is refused by the customer computer,
+  which never replaces by a move.
 - **Delete** asks once for the whole selection, with the number of items and
   the sentence that there is no recycle bin on this path; **Cancel** has the
   focus. A folder is removed with everything in it, a file or a link as that

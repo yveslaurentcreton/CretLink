@@ -1121,11 +1121,16 @@ cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
       the Terminal tab; cancelling the transfer lets them through at once.
 33. **Rename.** Select a file in `C:\CretLinkTest`, press F2, type a new name
     and press Enter. Then try, one after the other: Escape instead of Enter;
-    the name of another file of the folder; a name with a `\` in it; and a
-    file that is held open on the customer computer.
+    a click on another file instead of Enter; a click on **Delete** instead
+    of Enter; the name of another file of the folder; a name with a `\` in
+    it; and a file that is held open on the customer computer.
     - Expected: F2 turns the name into a field with the name selected up to
       its extension. Enter renames; the list shows the new name, selected.
-      Escape, and a click elsewhere, leave the name as it was.
+      Escape leaves the name as it was.
+    - Expected: the click on another file renames too, as in the Windows
+      explorer, and selects the file that was clicked. The click on
+      **Delete** renames and asks nothing: no question opens until **Delete**
+      is pressed again.
     - Expected: the taken name and the name with `\` are refused with their
       reason while the field stays open, and nothing is asked of the customer
       computer. The held file is refused by the customer computer with the

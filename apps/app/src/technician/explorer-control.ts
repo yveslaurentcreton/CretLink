@@ -714,33 +714,50 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
     return true;
   }
 
-  function commitRename(): void {
+  /**
+   * Takes the name that was typed, by `Enter` or by a click elsewhere in the
+   * explorer, as the Windows explorer does. Returns whether a rename was
+   * asked of the customer computer.
+   */
+  function commitRename(by: "enter" | "click"): boolean {
     const s = state();
     const key = s.renaming;
-    if (key === undefined || s.place?.kind !== "folder") return;
+    if (key === undefined || s.place?.kind !== "folder") return false;
     const to = element<HTMLInputElement>("#xp-rename-input")?.value ?? key;
     if (to === key) {
-      cancelRename();
-      return;
+      cancelRename(by === "enter");
+      return false;
     }
     const problem = renameProblem(s, key, to);
     if (problem !== undefined) {
-      // The field stays open: the name is corrected where it was typed.
       host.set(
-        {
-          ...s,
-          problem: {
-            title: "That name cannot be used",
-            message: problem,
-            next: "Type another name, or press Escape to leave the name as it is.",
-          },
-        },
+        by === "enter"
+          ? {
+              // The field stays open: the name is corrected where it was typed.
+              ...s,
+              problem: {
+                title: "That name cannot be used",
+                message: problem,
+                next: "Type another name, or press Escape to leave the name as it is.",
+              },
+            }
+          : {
+              // The technician went on: the name stays, and the window says so.
+              ...s,
+              renaming: undefined,
+              problem: {
+                title: `${key} was not renamed`,
+                message: problem,
+                next: "The name is as it was. Press F2 to type another name.",
+              },
+            },
         "window",
       );
-      return;
+      return false;
     }
     const where = s.place;
-    focusNext = "grid";
+    // After a click the focus is where the click put it.
+    if (by === "enter") focusNext = "grid";
     host.set(
       { ...s, renaming: undefined, problem: undefined, preparing: `renaming ${key}…` },
       "window",
@@ -749,8 +766,13 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
       () => {
         const now = state();
         const here = samePlace(now.place, where);
-        // The new name is selected once the folder is listed again.
-        host.set({ ...now, preparing: undefined, ...(here ? { reveal: to } : {}) }, "window");
+        // The new name is selected once the folder is listed again, unless
+        // the technician selected something else in the meantime.
+        const untouched = now.selected.size === 1 && now.selected.has(key);
+        host.set(
+          { ...now, preparing: undefined, ...(here && untouched ? { reveal: to } : {}) },
+          "window",
+        );
         host.announce(`${key} is now ${to}.`);
         if (here) refresh();
       },
@@ -761,6 +783,7 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
           "Nothing was changed. Check the name, or refresh the folder and try again.",
         ),
     );
+    return true;
   }
 
   // --- The queue ---
@@ -921,7 +944,7 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
     if (inField && target.id === "xp-rename-input") {
       if (event.key === "Enter") {
         event.preventDefault();
-        commitRename();
+        commitRename("enter");
         return true;
       }
       // Every other key is the field's own.
@@ -1118,6 +1141,28 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
     return target instanceof Element && target.closest("#xp-rename-input") !== null;
   }
 
+  /**
+   * A click elsewhere in the explorer ends a name that is being typed and
+   * takes it, as in the Windows explorer. Heard on the click's way down, so
+   * that it is settled before the click reaches what it was aimed at.
+   *
+   * A click on a row goes on to select that row. A click on a control is not
+   * also that control's press when it sent a new name: what the control would
+   * act on is being renamed at that moment.
+   */
+  function onClickDown(event: MouseEvent): void {
+    if (!host.shown() || state().renaming === undefined) return;
+    const target = event.target;
+    if (!(target instanceof Element) || inRename(target) || !target.closest("#xp")) return;
+    // A click that dismisses what was said about the name is not a click
+    // elsewhere, and neither is one on Rename itself.
+    if (target.closest('[data-action="xp-dismiss"], [data-action="xp-rename"]')) return;
+    if (commitRename("click") && target.closest("[data-action]")) {
+      event.stopPropagation();
+      event.preventDefault();
+    }
+  }
+
   function onClick(event: MouseEvent): void {
     if (!host.shown()) return;
     if (inRename(event.target)) return;
@@ -1125,17 +1170,6 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
       event.target instanceof Element && event.target.closest(selector) !== null;
     if (state().menu && !within("#xp-menu") && !within("#xp-upload")) {
       closeMenu(false);
-    }
-    // A click elsewhere leaves a name that is being typed as it was: only
-    // Enter renames. The click that opened the field is not one of them, and
-    // neither is one that dismisses what was said about the name.
-    if (
-      state().renaming !== undefined &&
-      within("#xp") &&
-      !within('[data-action="xp-rename"]') &&
-      !within('[data-action="xp-dismiss"]')
-    ) {
-      cancelRename(false);
     }
     if (!inList(event.target)) return;
     element("#xp-grid")?.focus({ preventScroll: true });
@@ -1161,6 +1195,9 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
   function onContextMenu(event: MouseEvent): void {
     if (!host.shown() || !inList(event.target) || inRename(event.target)) return;
     event.preventDefault();
+    // A right click elsewhere takes a name that is being typed, like a click;
+    // the menu waits for the next one when a new name was sent.
+    if (state().renaming !== undefined && commitRename("click")) return;
     element("#xp-grid")?.focus({ preventScroll: true });
     const key = rowOf(event.target);
     let s = state();
@@ -1358,6 +1395,7 @@ export function createExplorer(host: ExplorerHost): ExplorerControl {
   }
 
   function bind(root: HTMLElement, signal: AbortSignal): void {
+    root.addEventListener("click", onClickDown, { capture: true, signal });
     root.addEventListener("click", onClick, { signal });
     root.addEventListener("dblclick", onDoubleClick, { signal });
     root.addEventListener("contextmenu", onContextMenu, { signal });
