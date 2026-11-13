@@ -236,13 +236,17 @@ function adoptConsole(next: ConsoleState): void {
   }
   // Waiting on an address the list does not name yet: ask which networks this
   // computer has, so the screen can name the adapter and offer the others
-  // (ST-M009-016).
-  if (next.phase.phase === "listening") {
+  // (ST-M009-016). A wait on a relay listens on no network of this computer.
+  if (next.phase.phase === "listening" && !next.relay) {
     const host = listenHost(next.phase.address);
     const previous = snap.console.phase;
     if (previous.phase !== "listening" || listenHost(previous.address) !== host) {
       void loadNetworks();
     }
+    // The waiting screen offers the relay of this copy: read which one that
+    // is now, a profile file may have been put next to the program meanwhile
+    // (ST-M007-013).
+    if (previous.phase !== "listening") void loadRelay();
   }
   const wasFull = before === "full_control";
   // Transfers that the end of full control cuts short are said in the
@@ -560,6 +564,60 @@ async function switchNetwork(address: string): Promise<void> {
   void loadNetworks();
 }
 
+/**
+ * **Use relay** on the waiting screen (ST-M007-013): stop waiting on the
+ * network and wait for the customer on the relay of this copy.
+ */
+async function useRelay(): Promise<void> {
+  const phase = snap.console.phase;
+  if (phase.phase !== "listening" || snap.console.relay || snap.busy !== undefined) return;
+  set({ busy: "relay", error: undefined, networksOpen: false });
+  try {
+    const next = await api.useRelay();
+    // The answer is the waiting state on the relay. States were pushed
+    // meanwhile; the answer is adopted unless the relay has already answered
+    // or failed, which is newer.
+    snap = { ...snap, busy: undefined };
+    const now = snap.console.phase.phase;
+    const newer = snap.console.relay !== undefined && now !== "stopped";
+    if (!newer && (now === "stopped" || now === "listening" || now === "idle")) {
+      adoptConsole(next);
+    }
+    // The keyboard was on **Use relay**, which is gone: on to Cancel.
+    focusNext = "#stop";
+    set({});
+  } catch (error) {
+    // Nothing changed, or the listener is gone already: show what the backend
+    // says now, and why the relay was not used.
+    set({
+      busy: undefined,
+      error: {
+        title: "The relay was not used",
+        message: isCommandError(error) ? error.message : describe(error),
+        next: relayRefusalNext(error),
+      },
+    });
+    try {
+      adoptConsole(await api.getState());
+    } catch {
+      // The state stays as it was pushed.
+    }
+    void loadRelay();
+  }
+}
+
+/** What to do when **Use relay** was refused, by why it was. */
+function relayRefusalNext(error: unknown): string {
+  const stage = isCommandError(error) ? error.stage : "";
+  switch (stage) {
+    case "relay_none":
+    case "relay_profile":
+      return "Open Settings, under Relay, to set up or correct the relay of this copy. The session on this network is unchanged.";
+    default:
+      return "Try again. If the session is no longer waiting, start a new one.";
+  }
+}
+
 // Bumped when a new session starts, so an older `get_session_audit` answer
 // never fills the new session's Audit tab.
 let auditGeneration = 0;
@@ -707,6 +765,9 @@ function onAction(event: ActionEvent): void {
     case "network":
       if (arg) void switchNetwork(arg);
       break;
+    case "use-relay":
+      void useRelay();
+      break;
     case "open-audit":
       void openAudit(arg);
       break;
@@ -775,10 +836,12 @@ function onAction(event: ActionEvent): void {
 
 // A pure clipboard convenience; no backend authority is involved.
 async function copy(text: string): Promise<void> {
+  // Said by its name: a relay code is not the connection code.
+  const what = snap.console.relay ? "Relay code" : "Connection code";
   try {
     if (!navigator.clipboard) throw new Error("no clipboard");
     await navigator.clipboard.writeText(text);
-    set({ notice: "Connection code copied." });
+    set({ notice: `${what} copied.` });
   } catch {
     set({ notice: "The code could not be copied. Read it out instead." });
   }

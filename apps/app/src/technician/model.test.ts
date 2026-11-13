@@ -7,14 +7,17 @@ import {
   NETWORKS,
   NOW,
   RELAY,
+  RELAY_CODE,
   RELAY_FILE,
   RELAY_FILE_PROBLEM,
   RELAY_NONE,
   RELAY_PRIVATE,
   RELAY_RUN_ONCE,
+  RELAY_RUN_ONCE_FILE,
   RELAY_STORED,
   SESSION_ID,
   TARGET,
+  VIA_RELAY,
   consoleIn,
 } from "./fixtures";
 import {
@@ -38,15 +41,23 @@ import {
   isRelayTest,
   listenHost,
   otherNetworks,
+  phaseAnnouncement,
+  relayCodeGroups,
+  relayFailureTitle,
   relayForm,
+  relayLostWords,
+  relayOffer,
+  isRelayFailure,
   screenFor,
   sessionCounts,
+  spokenCode,
   stateWords,
   technicianPick,
   type TechnicianSnapshot,
   trimFeed,
   upsertActivity,
   waitingNetwork,
+  waitingRelay,
 } from "./model";
 
 const item = (id: string, state: "running" | "done" = "done"): ActivityEntry => ({
@@ -477,5 +488,126 @@ describe("the relay of this copy (ST-M007-011)", () => {
     expect(s.relay).toBeNull();
     expect(s.relayDraft).toEqual({ ca: { mode: "keep" }, round: 0 });
     expect(initialRelayDraft(3).round).toBe(3);
+  });
+});
+
+describe("a session through the relay (ST-M007-013)", () => {
+  const onNetwork = consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" });
+  const onRelay = consoleIn(
+    { phase: "listening", code: RELAY_CODE, address: "relay.example.org:443" },
+    { relay: VIA_RELAY },
+  );
+
+  it("knows the relay a console waits on, and only while it waits", () => {
+    expect(waitingRelay(onNetwork)).toBeUndefined();
+    expect(waitingRelay(onRelay)).toEqual(VIA_RELAY);
+    // After the customer connected the relay is still named, but nothing
+    // waits on it any more.
+    const compare = consoleIn(
+      { phase: "awaiting_approval_code", code: "482913" },
+      { session: true, target: true, relay: VIA_RELAY },
+    );
+    expect(waitingRelay(compare)).toBeUndefined();
+    expect(compare.relay).toEqual(VIA_RELAY);
+  });
+
+  it("reads a relay code in four groups and spells it for a screen reader", () => {
+    expect(relayCodeGroups(RELAY_CODE)).toEqual(["53ST", "A71D", "JKKV", "0VGH"]);
+    expect(relayCodeGroups("")).toEqual([]);
+    expect(spokenCode(RELAY_CODE)).toBe("5 3 S T, A 7 1 D, J K K V, 0 V G H");
+  });
+
+  it("offers the relay this copy uses, names Settings without one, and says a profile's problem", () => {
+    expect(relayOffer(RELAY_STORED)).toEqual({ state: "ready", host: "relay.example.org" });
+    // A file next to the program wins over the settings.
+    expect(relayOffer(RELAY_FILE)).toEqual({ state: "ready", host: "host-01.example.org" });
+    expect(relayOffer(RELAY_RUN_ONCE_FILE)).toEqual({ state: "ready", host: "relay.example.org" });
+    expect(relayOffer(RELAY_NONE)).toEqual({ state: "none", runOnce: false });
+    expect(relayOffer(RELAY_RUN_ONCE)).toEqual({ state: "none", runOnce: true });
+    // Until the backend has said: no relay, and nothing claimed about the copy.
+    expect(relayOffer(null)).toEqual({ state: "none", runOnce: false });
+    const problem = relayOffer(RELAY_FILE_PROBLEM);
+    expect(problem.state).toBe("problem");
+    if (problem.state === "problem") {
+      expect(problem.file).toBe(RELAY_FILE_PROBLEM.file.problem?.file);
+      expect(problem.message).toBe(RELAY_FILE_PROBLEM.file.problem?.message);
+    }
+    // Settings that cannot be read, with no file next to the program.
+    const unreadable = relayOffer({
+      editable: true,
+      source: "settings",
+      file: { path: "cretlink.toml" },
+      stored: { path: "settings.toml", problem: { file: "settings.toml", message: "Line 2." } },
+    });
+    expect(unreadable).toEqual({ state: "problem", message: "Line 2.", file: "settings.toml" });
+  });
+
+  it("keeps the waiting screen while the wait changes to the relay", () => {
+    const stopped = consoleIn({ phase: "stopped", reason: "technician_requested" });
+    const s: TechnicianSnapshot = { ...initialSnapshot(stopped, NOW), busy: "relay" };
+    expect(screenFor(s)).toBe("wait");
+    expect(screenFor({ ...s, busy: undefined })).toBe("home");
+    // Waiting on the relay is the waiting screen, and Escape stops it.
+    expect(screenFor(initialSnapshot(onRelay, NOW))).toBe("wait");
+    expect(canStop(onRelay)).toBe(true);
+  });
+
+  it("announces the wait on the relay in words, and whether the relay holds the code", () => {
+    const say = (state: typeof onRelay): string => phaseAnnouncement(initialSnapshot(state, NOW));
+    expect(say(onNetwork)).toBe("Waiting for the customer. No access.");
+    expect(say(onRelay)).toBe(
+      "Waiting for the customer on the relay relay.example.org. Read them the relay code. No access.",
+    );
+    expect(say({ ...onRelay, relay: { ...VIA_RELAY, admitted: false } })).toBe(
+      "Connecting to the relay relay.example.org. No access.",
+    );
+  });
+
+  it("starts a new feed when the wait changes from the network to the relay", () => {
+    const start = { ...initialSnapshot(onNetwork, NOW), activity: FEED };
+    const stopped = applyConsole(
+      start,
+      consoleIn({ phase: "stopped", reason: "technician_requested" }),
+      NOW,
+    );
+    // No session existed, so nothing ended that needs a report.
+    expect(stopped.snapshot.last).toBeUndefined();
+    const waiting = applyConsole({ ...stopped.snapshot, busy: "relay" }, onRelay, NOW);
+    expect(waiting.snapshot.activity).toEqual([]);
+    expect(waiting.snapshot.console.relay).toEqual(VIA_RELAY);
+    expect(waiting.ended).toBe(false);
+  });
+
+  it("names every relay failure in a few words of its own", () => {
+    const stages = [
+      "relay_unreachable",
+      "relay_name_not_found",
+      "relay_untrusted",
+      "relay_no_answer",
+      "relay_key_required",
+      "relay_key_refused",
+      "relay_rate_limited",
+      "relay_busy",
+      "relay_unavailable",
+      "relay_version",
+      "relay_settings",
+    ];
+    const titles = stages.map(relayFailureTitle);
+    expect(new Set(titles).size).toBe(stages.length);
+    for (const stage of stages) expect(isRelayFailure(stage)).toBe(true);
+    expect(titles).not.toContain("The relay could not be used");
+    // A stage this window does not know still reads as a relay matter.
+    expect(relayFailureTitle("relay_something_new")).toBe("The relay could not be used");
+    for (const stage of ["listen", "pairing", "compare", "relay"]) {
+      expect(isRelayFailure(stage)).toBe(false);
+    }
+  });
+
+  it("says a lost connection through a relay with the relay and a next step", () => {
+    const words = relayLostWords("relay.example.org");
+    expect(words.message).toContain("through the relay relay.example.org was lost");
+    expect(words.message).toContain("The relay may have stopped");
+    expect(words.next).toContain("Nobody has access");
+    expect(words.next).toContain("new relay code");
   });
 });

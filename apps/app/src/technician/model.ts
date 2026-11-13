@@ -44,7 +44,13 @@ import {
   trimFeed,
   upsertActivity,
 } from "../shared/feed";
-import { type ConsoleState, type StopReason, type TargetIdentity, selectedTarget } from "./api";
+import {
+  type ConsoleState,
+  type RelayRoute,
+  type StopReason,
+  type TargetIdentity,
+  selectedTarget,
+} from "./api";
 import { type ExplorerState, initialExplorer } from "./explorer";
 
 // The role-neutral feed helpers live in `../shared/feed` (ST-M009-009).
@@ -251,8 +257,9 @@ function isEndPhase(phase: PhaseName): boolean {
 export function screenFor(s: TechnicianSnapshot): Screen {
   const phase = s.console.phase.phase;
   // A change of network stops waiting on one address and starts on another:
-  // the screen stays the waiting screen in between (ST-M009-016).
-  if (s.busy === "network") return "wait";
+  // the screen stays the waiting screen in between (ST-M009-016). So does the
+  // change from the network to the relay (ST-M007-013).
+  if (s.busy === "network" || s.busy === "relay") return "wait";
   if (phase === "full_control") return "live";
   if (phase === "stopping") return "stopping";
   if (SESSION_PHASES.includes(phase) && s.nav === "home") {
@@ -647,8 +654,13 @@ export function formatWhen(at: string | undefined, now: number): string {
 export function phaseAnnouncement(s: TechnicianSnapshot): string {
   const phase = s.console.phase;
   switch (phase.phase) {
-    case "listening":
-      return "Waiting for the customer. No access.";
+    case "listening": {
+      const relay = s.console.relay;
+      if (!relay) return "Waiting for the customer. No access.";
+      return relay.admitted
+        ? `Waiting for the customer on the relay ${relay.host}. Read them the relay code. No access.`
+        : `Connecting to the relay ${relay.host}. No access.`;
+    }
     case "connecting":
       return "The customer is connecting. No access yet.";
     case "awaiting_approval_code":
@@ -678,6 +690,88 @@ export function isListenNetwork(value: unknown): value is ListenNetwork {
     typeof network.adapter === "string" &&
     typeof network.pointToPoint === "boolean"
   );
+}
+
+// --- A session through the relay (ST-M007-013) ---
+
+/** The relay the console waits on, while it waits for the customer there. */
+export function waitingRelay(console: ConsoleState): RelayRoute | undefined {
+  return console.phase.phase === "listening" ? console.relay : undefined;
+}
+
+/** A relay code as the groups it is read in: `53ST-A71D-JKKV-0VGH` is four. */
+export function relayCodeGroups(code: string): string[] {
+  return code.split("-").filter((group) => group !== "");
+}
+
+/** A relay code as a screen reader says it: every character on its own. */
+export function spokenCode(code: string): string {
+  return relayCodeGroups(code)
+    .map((group) => Array.from(group).join(" "))
+    .join(", ");
+}
+
+/** What the waiting screen can say about a relay for this copy. */
+export type RelayOffer =
+  // A relay that can be used, by its host name.
+  | { state: "ready"; host: string }
+  // No relay. `runOnce`: this copy keeps no settings, so a relay goes into
+  // the file next to the program.
+  | { state: "none"; runOnce: boolean }
+  // A profile that cannot be used: what is wrong, and the file.
+  | { state: "problem"; message: string; file: string };
+
+export function relayOffer(settings: RelaySettings | null): RelayOffer {
+  const relay = activeRelay(settings);
+  if (relay) return { state: "ready", host: relay.host };
+  const place = settings?.source === "file" ? settings.file : settings?.stored;
+  if (place?.problem) {
+    return { state: "problem", message: place.problem.message, file: place.problem.file };
+  }
+  return { state: "none", runOnce: settings !== null && !settings.editable };
+}
+
+/** The stage of a relay that could not be used: `relay_unreachable`, … */
+export function isRelayFailure(stage: string): boolean {
+  return stage.startsWith("relay_");
+}
+
+/**
+ * The stage of a session through a relay that lost its connection before it
+ * was under control. The backend takes it from the session's own verdict.
+ */
+export const RELAY_LOST_STAGE = "relay_lost";
+
+const RELAY_FAILURE_TITLES: Record<string, string> = {
+  relay_unreachable: "The relay cannot be reached",
+  relay_name_not_found: "The relay was not found",
+  relay_untrusted: "The relay's certificate is not trusted",
+  relay_no_answer: "The relay did not answer",
+  relay_key_required: "The relay asks for an admission key",
+  relay_key_refused: "The relay refused the admission key",
+  relay_rate_limited: "The relay asks you to wait",
+  relay_busy: "The relay is full",
+  relay_unavailable: "The relay admits nobody right now",
+  relay_version: "The relay and this copy do not fit together",
+  relay_settings: "The relay settings cannot be used",
+};
+
+/** What a relay failure is called, in a few words. */
+export function relayFailureTitle(stage: string): string {
+  return RELAY_FAILURE_TITLES[stage] ?? "The relay could not be used";
+}
+
+/**
+ * Why a session through a relay ended, when its connection was lost: said
+ * with the relay, so that it does not read as a lost session of unknown
+ * cause (REQ-N-015). The relay may have stopped; either computer may have
+ * gone offline. Nothing connects again by itself.
+ */
+export function relayLostWords(host: string): { message: string; next: string } {
+  return {
+    message: `The connection through the relay ${host} was lost. The relay may have stopped, or one of the two computers went offline.`,
+    next: "Nobody has access to the customer computer any more. Start a new session when you are ready; it gets a new relay code.",
+  };
 }
 
 // --- The relay of this copy (ST-M007-011) ---

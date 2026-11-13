@@ -11,6 +11,7 @@ import {
   FEED,
   NETWORKS,
   RELAY,
+  RELAY_CODE,
   RELAY_FILE,
   RELAY_NONE,
   RELAY_PRIVATE,
@@ -18,6 +19,7 @@ import {
   RELAY_STORED,
   SESSIONS,
   SESSION_ID,
+  VIA_RELAY,
   consoleIn,
 } from "./fixtures";
 
@@ -514,6 +516,265 @@ describe("the network to wait on (ST-M009-016)", () => {
     await flush();
     expect(asked("stop_session")).toBe(1);
     expect(app().querySelector(".conn-code")).toBeNull();
+  });
+});
+
+describe("a session through the relay (ST-M007-013)", () => {
+  const listening = (): ConsoleState =>
+    consoleIn(
+      { phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" },
+      { displayName: "Sam" },
+    );
+  const onRelay = (admitted: boolean, code = RELAY_CODE): ConsoleState =>
+    consoleIn(
+      { phase: "listening", code, address: "relay.example.org:443" },
+      { displayName: "Sam", relay: { ...VIA_RELAY, admitted } },
+    );
+  const asked = (cmd: string): number => backend.calls.filter(([name]) => name === cmd).length;
+  const escape = (): void => {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+  };
+  const alert = (): string => app().querySelector('[role="alert"]')?.textContent ?? "";
+
+  it("reads which relay this copy uses when the waiting screen opens, and offers it", async () => {
+    let relay = RELAY_NONE;
+    await boot({ get_relay_settings: () => relay, get_listen_networks: () => NETWORKS });
+    expect(asked("get_relay_settings")).toBe(1);
+    // A profile was set up after CretLink started.
+    relay = RELAY_STORED;
+    push(listening());
+    await flush();
+    expect(asked("get_relay_settings")).toBe(2);
+    const use = app().querySelector<HTMLButtonElement>("#use-relay");
+    expect(use?.textContent).toBe("Use relay…");
+    expect(app().querySelector("#relay-offer")?.textContent).toContain("relay.example.org");
+    // The same waiting state again is no reason to ask again.
+    push(listening());
+    await flush();
+    expect(asked("get_relay_settings")).toBe(2);
+  });
+
+  it("changes the wait to the relay: no code in between, then the relay code and the relay's state", async () => {
+    let finish: (next: ConsoleState) => void = () => undefined;
+    await boot({
+      get_relay_settings: () => RELAY_STORED,
+      get_listen_networks: () => NETWORKS,
+      use_relay: () =>
+        new Promise<ConsoleState>((resolve) => {
+          finish = resolve;
+        }),
+    });
+    push(listening());
+    await flush();
+    app().querySelector<HTMLElement>("#use-relay")?.focus();
+    click("#use-relay");
+    await flush();
+    expect(asked("use_relay")).toBe(1);
+    expect(backend.calls.find(([cmd]) => cmd === "use_relay")?.[1]).toBeUndefined();
+    // The backend stops the listener of this network first.
+    push(consoleIn({ phase: "stopped", reason: "technician_requested" }));
+    await flush();
+    expect(app().querySelector(".screen.wait")).not.toBeNull();
+    expect(app().querySelector(".conn-switching")?.textContent).toBe("Changing to your relay…");
+    expect(app().querySelector(".conn-code")).toBeNull();
+    expect(app().querySelector(".relay-code")).toBeNull();
+    // A second press while it changes does nothing.
+    expect(app().querySelector("#use-relay")).toBeNull();
+
+    // The answer: waiting on the relay, which is still being reached.
+    finish(onRelay(false));
+    await flush();
+    expect(app().querySelector("#relay-code")?.textContent).toBe("53STA71DJKKV0VGH");
+    expect(app().querySelector("#relay-host")?.textContent).toBe("relay.example.org");
+    expect(app().querySelector("#relay-state")?.textContent).toBe(
+      "Connecting to the relay relay.example.org…",
+    );
+    // The button that was pressed is gone: the keyboard is on Cancel.
+    expect(document.activeElement?.id).toBe("stop");
+    expect(alert()).toBe("");
+
+    // The relay holds the code.
+    push(onRelay(true));
+    await flush();
+    expect(app().querySelector("#relay-state")?.textContent).toContain("The relay holds this code.");
+    expect(app().querySelector("#announce")?.textContent).toBe(
+      "Waiting for the customer on the relay relay.example.org. Read them the relay code. No access.",
+    );
+    // Nothing about networks was asked for a wait on the relay.
+    expect(asked("get_listen_networks")).toBe(1);
+  });
+
+  it("does not step back when the relay answers before the command does", async () => {
+    let finish: (next: ConsoleState) => void = () => undefined;
+    await boot({
+      get_relay_settings: () => RELAY_STORED,
+      use_relay: () =>
+        new Promise<ConsoleState>((resolve) => {
+          finish = resolve;
+        }),
+    });
+    push(listening());
+    await flush();
+    click("#use-relay");
+    await flush();
+    push(consoleIn({ phase: "stopped", reason: "technician_requested" }));
+    push(onRelay(false));
+    push(onRelay(true));
+    // The command's answer is the older state.
+    finish(onRelay(false));
+    await flush();
+    expect(app().querySelector("#relay-state")?.textContent).toContain("The relay holds this code.");
+  });
+
+  it("shows a relay that cannot be reached with its own words, although the command answered first", async () => {
+    const failed = consoleIn(
+      {
+        phase: "failed",
+        stage: "relay_unreachable",
+        message: "CretLink could not connect to the relay at relay.example.org:443.",
+        next: "Check that the relay is running.",
+      },
+      { relay: { ...VIA_RELAY, admitted: false } },
+    );
+    await boot({
+      get_relay_settings: () => RELAY_STORED,
+      use_relay: () => {
+        state = onRelay(false);
+        return state;
+      },
+    });
+    push(listening());
+    await flush();
+    click("#use-relay");
+    await flush();
+    expect(app().querySelector("#relay-code")).not.toBeNull();
+    push(failed);
+    await flush();
+    // No session existed: back where a session starts, with the reason.
+    expect(app().querySelector("#start-session")).not.toBeNull();
+    expect(alert()).toContain("The relay cannot be reached");
+    expect(alert()).toContain("could not connect to the relay at relay.example.org:443");
+    expect(alert()).toContain("Check that the relay is running.");
+    expect(alert()).not.toContain("The session failed");
+    expect(app().querySelector(".relay-code")).toBeNull();
+    // Nothing is tried again by itself.
+    expect(asked("use_relay")).toBe(1);
+    expect(asked("start_live_session")).toBe(0);
+  });
+
+  it("says why the relay was not used when the backend refuses, and keeps waiting on this network", async () => {
+    await boot({
+      get_relay_settings: () => RELAY_STORED,
+      use_relay: () => {
+        throw {
+          stage: "relay_profile",
+          message: "Line 3: `address` needs a port, such as relay.example.org:443.",
+        };
+      },
+    });
+    state = listening();
+    push(state);
+    await flush();
+    click("#use-relay");
+    await flush();
+    expect(alert()).toContain("The relay was not used");
+    expect(alert()).toContain("Line 3: `address` needs a port");
+    expect(alert()).toContain("Open Settings, under Relay");
+    // The session on this network is what the backend still says it is.
+    expect(app().querySelector(".conn-code")?.textContent).toBe("6RRR-2H8F");
+    // The relay of this copy was read again: it may have changed.
+    expect(asked("get_relay_settings")).toBeGreaterThanOrEqual(3);
+  });
+
+  it("cancels the wait on the relay with Escape and with Cancel", async () => {
+    await boot({ get_relay_settings: () => RELAY_STORED });
+    push(onRelay(true));
+    await flush();
+    expect(app().querySelector("#relay-code")).not.toBeNull();
+    escape();
+    await flush();
+    expect(asked("stop_session")).toBe(1);
+    expect(app().querySelector(".relay-code")).toBeNull();
+    expect(app().querySelector("#start-session")).not.toBeNull();
+
+    push(onRelay(true, "6TTT-A71D-JKKV-0VGH"));
+    await flush();
+    click("#stop");
+    await flush();
+    expect(asked("stop_session")).toBe(2);
+    expect(app().querySelector(".relay-code")).toBeNull();
+  });
+
+  it("copies the relay code and says so by its name", async () => {
+    const written: string[] = [];
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: async (text: string) => void written.push(text) },
+    });
+    await boot({ get_relay_settings: () => RELAY_STORED });
+    push(onRelay(true));
+    await flush();
+    click('[data-action="copy"]');
+    await flush();
+    expect(written).toEqual([RELAY_CODE]);
+    expect(app().querySelector("#announce")?.textContent).toBe("Relay code copied.");
+    // On one network it is the connection code that was copied.
+    push(listening());
+    await flush();
+    click('[data-action="copy"]');
+    await flush();
+    expect(written).toEqual([RELAY_CODE, "6RRR-2H8F"]);
+    expect(app().querySelector("#announce")?.textContent).toBe("Connection code copied.");
+    Reflect.deleteProperty(navigator, "clipboard");
+  });
+
+  it("goes from the relay code to the approval code, consent and control as on one network", async () => {
+    await boot({
+      get_relay_settings: () => RELAY_STORED,
+      confirm_code: () => state,
+    });
+    push(onRelay(true));
+    await flush();
+    state = consoleIn(
+      { phase: "awaiting_approval_code", code: "482913" },
+      { session: true, target: true, relay: VIA_RELAY },
+    );
+    push(state);
+    await flush();
+    expect(app().querySelector(".sac")?.getAttribute("aria-label")).toBe("Approval code 482 913");
+    expect(app().querySelector(".relay-code")).toBeNull();
+    expect(app().querySelector(".via-relay")?.textContent).toContain("relay.example.org");
+    click('[data-action="compare"]');
+    await flush();
+    expect(asked("confirm_code")).toBe(1);
+    push(
+      consoleIn({ phase: "awaiting_consent" }, { session: true, target: true, relay: VIA_RELAY }),
+    );
+    await flush();
+    expect(app().textContent).toContain("Only the customer can grant control.");
+    push(consoleIn({ phase: "full_control" }, { session: true, target: true, relay: VIA_RELAY }));
+    await flush();
+    expect(app().querySelector("#control-band")?.textContent).toContain("FULL CONTROL");
+    expect(app().querySelector("#session-relay")?.textContent).toContain("relay.example.org");
+    // Escape stops, as in every session.
+    escape();
+    await flush();
+    expect(asked("stop_session")).toBe(1);
+  });
+
+  it("offers Open Settings when this copy has no relay, and comes back to the waiting screen", async () => {
+    await boot({ get_relay_settings: () => RELAY_NONE });
+    push(listening());
+    await flush();
+    expect(app().querySelector("#use-relay")).toBeNull();
+    click('#relay-offer [data-action="nav"]');
+    await flush();
+    expect(app().querySelector("#relay-head")?.textContent).toBe("Relay");
+    // The session keeps waiting meanwhile, and Home shows it again.
+    expect(asked("stop_session")).toBe(0);
+    click('nav.side [data-arg="home"]');
+    await flush();
+    expect(app().querySelector(".conn-code")?.textContent).toBe("6RRR-2H8F");
   });
 });
 

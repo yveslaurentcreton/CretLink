@@ -103,6 +103,9 @@ export interface SessionSummary {
   integrity: "verified" | "unsealed" | "broken";
   hostname?: string;
   os?: string;
+  // The host name of the relay the session ran through; absent for a session
+  // on one network (ST-M007-013).
+  relay?: string;
   startedAt?: string;
   endedAt?: string;
   durationMs?: number;

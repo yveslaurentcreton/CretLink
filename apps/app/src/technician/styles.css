@@ -94,6 +94,17 @@ body {
 .net-list li + li { border-top: 1px solid var(--line-2); }
 .net-list .net-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .net-list .muted { font-size: 12px; }
+/* Not on the same network? (ST-M007-013) */
+.relay-offer { align-items: center; gap: 14px; padding: 14px 18px; margin-top: 14px; }
+.relay-offer > .ic { color: var(--muted); flex: none; }
+.relay-offer-text { flex: 1; min-width: 0; }
+.relay-offer-text b { font-size: 14px; }
+.relay-offer-text .muted { font-size: 12.5px; overflow-wrap: anywhere; }
+.relay-offer .btn { flex: none; }
+/* Waiting on the relay. */
+.relay-wait .relay-state { margin: 14px 0 0; font-weight: 600; }
+.relay-wait .relay-note { margin: 6px 0 0; font-size: 12.5px; max-width: 460px; }
+.sess-id .via-relay-line { margin-top: 2px; }
 .center-col { align-items: center; justify-content: center; text-align: center; flex: 1; }
 .center-col h2 { margin-top: 4px; }
 .compare .reports { margin: 16px 0 4px; }

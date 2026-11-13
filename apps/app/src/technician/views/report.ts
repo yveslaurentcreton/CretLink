@@ -13,6 +13,7 @@ import {
   formatTime,
   formatWhen,
   plural,
+  relayLostWords,
   sessionCounts,
   shortId,
   stopReasonEndedBy,
@@ -90,6 +91,7 @@ export function reportBody(
     ),
     h("h2", null, `${host} · ${formatDuration(summary.durationMs)}`),
     integrityNote(summary),
+    relayLostNote(summary.relay, summary.endedBy),
     h(
       "div",
       { class: "grid2" },
@@ -120,6 +122,12 @@ export function reportBody(
           ],
           ["Started", formatWhen(summary.startedAt, now)],
           [
+            "Connection",
+            summary.relay
+              ? ["Through the relay ", h("span", { class: "mono" }, summary.relay)]
+              : "On one network",
+          ],
+          [
             "Audit",
             h(
               "button",
@@ -139,6 +147,22 @@ export function reportBody(
         ]),
       ),
     ),
+  );
+}
+
+/**
+ * A session through a relay whose connection was lost says so with the relay
+ * and a next step, so that it does not read as a lost session of unknown
+ * cause (ST-M007-013, REQ-N-015).
+ */
+function relayLostNote(relay: string | undefined, endedBy: EndedBy | undefined): Child {
+  if (!relay || endedBy !== "connection_lost") return null;
+  const words = relayLostWords(relay);
+  return h(
+    "div",
+    { class: "note relay-lost", role: "note" },
+    icon("alert"),
+    h("p", null, h("b", null, `${words.message} `), words.next),
   );
 }
 
@@ -277,6 +301,7 @@ function preparingReport(s: TechnicianSnapshot): HTMLElement {
       ),
     ),
     h("h2", null, duration ? `${host} · ${duration}` : host),
+    relayLostNote(s.console.relay?.host, endedBy),
     h(
       "div",
       { class: "grid2" },
@@ -327,6 +352,12 @@ function preparingReport(s: TechnicianSnapshot): HTMLElement {
           ],
           counts.notShown > 0 ? ["Not shown", plural(counts.notShown, "item")] : null,
           last?.failure ? ["Failure", `${last.failure.message} (${last.failure.stage})`] : null,
+          [
+            "Connection",
+            s.console.relay
+              ? ["Through the relay ", h("span", { class: "mono" }, s.console.relay.host)]
+              : "On one network",
+          ],
           [
             "Audit",
             h(

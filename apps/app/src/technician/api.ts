@@ -85,13 +85,29 @@ export type SessionPhase =
   | { phase: "full_control" }
   | { phase: "stopping" }
   | { phase: "stopped"; reason: StopReason }
-  | { phase: "failed"; stage: string; message: string };
+  // `next` is what to do about the failure, when the failure has a next step
+  // of its own (ST-M007-013): a relay that cannot be reached is put right in
+  // another way than a key the relay refuses.
+  | { phase: "failed"; stage: string; message: string; next?: string };
+
+// The relay a session waits on or runs through (ST-M007-013, ADR-0016). A
+// label for the screens: the relay only passes the encrypted session on. In
+// the `listening` phase with a relay, `code` is the relay code the technician
+// reads aloud and `address` is where the relay is reached; `admitted` says
+// whether the relay holds that code yet.
+export interface RelayRoute {
+  host: string;
+  admitted: boolean;
+}
 
 export interface ConsoleState {
   technician: TechnicianHost;
   targets: DiscoveredTarget[];
   selected?: string;
   session?: string;
+  // Absent for a session on one network. It stays after the session has
+  // ended, until the console waits again.
+  relay?: RelayRoute;
   phase: SessionPhase;
 }
 
@@ -169,6 +185,13 @@ export const api = {
   listenNetworks: () => invoke<ListenNetwork[]>("get_listen_networks"),
   switchListenNetwork: (address: string) =>
     invoke<ConsoleState>("switch_listen_network", { address }),
+  // **Use relay** on the waiting screen (ST-M007-013): stops waiting on the
+  // network and waits for the customer on the relay of this copy, with a new
+  // relay code. Answers the new waiting state; that the relay holds the code,
+  // or why it cannot be used, then arrives as `console-state`. Rejects with
+  // the stage `relay_none` or `relay_profile` when this copy has no relay
+  // that can be used.
+  useRelay: () => invoke<ConsoleState>("use_relay"),
   // Interactive terminal panel (ST-M008-001). All four fail closed with
   // `no_consented_session` when no session is under full control — the panel
   // never fabricates a shell. `open_terminal` streams output on the
