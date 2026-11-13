@@ -208,6 +208,14 @@ impl TestRelay {
         self.signal.stop();
     }
 
+    /// Takes the relay away and answers once its port is closed, so that
+    /// what dials it next finds nothing listening there.
+    pub(crate) async fn gone(mut self) {
+        self.task.abort();
+        // The listener goes with the task that owns it.
+        let _ = (&mut self.task).await;
+    }
+
     /// The text of a profile file for this relay: its loopback address, the
     /// name in its certificate, its certificate as the authority file
     /// [`CA_FILE`], and `key` when the relay asks for one.

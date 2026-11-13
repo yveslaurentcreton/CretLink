@@ -817,8 +817,7 @@ async fn a_relay_that_cannot_be_reached_is_said_on_either_side() {
     let (customer_copy, _folder) = customer_at(&relay, "gone-customer", Some(CUSTOMER_KEY));
     let mut customer = customer_copy;
     // The relay is gone before either copy reaches it.
-    drop(relay);
-    tokio::task::yield_now().await;
+    relay.gone().await;
 
     let (code, _, _) = waiting_on(&use_relay(&technician));
     let failed = technician
