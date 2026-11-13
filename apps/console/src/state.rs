@@ -251,6 +251,12 @@ pub enum SessionPhase {
         stage: String,
         /// A plain-language, secret-free description.
         message: String,
+        /// What the technician can do next, when the failure has a next step
+        /// of its own (ST-M007-013): a relay that cannot be reached is put
+        /// right in another way than a key that the relay refuses. Without
+        /// one, the screens say what holds for every failed session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
     },
 }
 
@@ -707,6 +713,23 @@ impl ConsoleState {
         self.phase = SessionPhase::Failed {
             stage: stage.into(),
             message: message.into(),
+            next: None,
+        };
+    }
+
+    /// Like [`Self::fail`], with what the technician can do next
+    /// (ST-M007-013, REQ-N-015). Both texts must be secret-free.
+    pub fn fail_with_next(
+        &mut self,
+        stage: impl Into<String>,
+        message: impl Into<String>,
+        next: impl Into<String>,
+    ) {
+        self.session = None;
+        self.phase = SessionPhase::Failed {
+            stage: stage.into(),
+            message: message.into(),
+            next: Some(next.into()),
         };
     }
 
@@ -1137,6 +1160,55 @@ mod tests {
         // The next wait on this network names no relay.
         state.listen("6RRR-2H8F", "10.0.0.42:7000").unwrap();
         assert_eq!(state.relay, None);
+    }
+
+    #[test]
+    fn a_failure_can_say_what_to_do_next() {
+        let mut state = ConsoleState::new(technician());
+        state
+            .listen_on_relay("53ST-A71D-JKKV-0VGH", "relay.example.org", "192.0.2.1:443")
+            .unwrap();
+        state.fail_with_next(
+            "relay_unreachable",
+            "The relay could not be reached.",
+            "Check that the relay is running.",
+        );
+        assert_eq!(
+            state.phase,
+            SessionPhase::Failed {
+                stage: "relay_unreachable".to_string(),
+                message: "The relay could not be reached.".to_string(),
+                next: Some("Check that the relay is running.".to_string()),
+            }
+        );
+        assert_eq!(state.control_level(), ControlLevel::None);
+        // The failure still says which relay it was about.
+        assert_eq!(
+            state.relay.as_ref().map(|relay| relay.host.as_str()),
+            Some("relay.example.org")
+        );
+        assert_eq!(
+            serde_json::to_value(&state.phase).unwrap(),
+            serde_json::json!({
+                "phase": "failed",
+                "stage": "relay_unreachable",
+                "message": "The relay could not be reached.",
+                "next": "Check that the relay is running.",
+            })
+        );
+
+        // A failure without one is written as before, and read as before.
+        state.fail("pairing", "secure pairing failed");
+        let plain = serde_json::json!({
+            "phase": "failed",
+            "stage": "pairing",
+            "message": "secure pairing failed",
+        });
+        assert_eq!(serde_json::to_value(&state.phase).unwrap(), plain);
+        assert_eq!(
+            serde_json::from_value::<SessionPhase>(plain).unwrap(),
+            state.phase
+        );
     }
 
     #[test]
