@@ -17,12 +17,16 @@ import { morph } from "../shared/morph";
 import {
   CONSOLE_ACTIVITY_EVENT,
   CONSOLE_BRIDGE_EVENT,
+  CONSOLE_EXPLORER_DROP_EVENT,
   CONSOLE_EXPLORER_EVENT,
+  CONSOLE_REMOVAL_EVENT,
   CONSOLE_STATE_EVENT,
+  CONSOLE_TRANSFERS_EVENT,
   type ConsoleState,
   api,
   isCommandError,
 } from "./api";
+import { stoppedTransfers } from "./explorer";
 import { createExplorer } from "./explorer-control";
 import {
   type LiveTab,
@@ -98,7 +102,16 @@ const explorer = createExplorer({
   root: () => root,
   announce: (text) => set({ notice: text }),
   host: () => targetName(snap),
+  live: () => snap.console.phase.phase === "full_control",
+  alert: (problem) => set({ error: problem }),
 });
+
+// The events of the webview itself while files are dragged over the window
+// (ST-M010-002). They only show where a drop would go: what was dropped
+// arrives from the backend, which keeps the paths.
+const DRAG_ENTER_EVENT = "tauri://drag-enter";
+const DRAG_LEAVE_EVENT = "tauri://drag-leave";
+const DRAG_DROP_EVENT = "tauri://drag-drop";
 
 // Bumped every time the live pump pushes a snapshot over `"console-state"`.
 // A command's return value is adopted only if no push arrived while it was in
@@ -219,9 +232,17 @@ function adoptConsole(next: ConsoleState): void {
     }
   }
   const wasFull = before === "full_control";
+  // Transfers that the end of full control cuts short are said in the
+  // window's own alert: the explorer that listed them is dropped with the
+  // session (ST-M010-002).
+  const cut =
+    wasFull && next.phase.phase !== "full_control"
+      ? stoppedTransfers(snap.explorer.transfers)
+      : undefined;
   const { snapshot, ended } = applyConsole(snap, next, Date.now());
   // A phase change is announced in words; an older notice would hide it.
   snap = before === next.phase.phase ? snapshot : { ...snapshot, notice: undefined };
+  if (cut) snap = { ...snap, error: cut };
   if (!wasFull && next.phase.phase === "full_control") {
     // A new session's bridge endpoint starts now: forget the last status
     // until the backend reports this one (ST-M009-008).
@@ -660,7 +681,8 @@ function onKeydown(event: KeyboardEvent): void {
       queueMicrotask(() => document.getElementById("net-toggle")?.focus());
       return;
     }
-    // So do the explorer's open menu and its path field (ST-M010-002).
+    // So do the explorer's open question, its menu, a name that is being
+    // typed and its path field (ST-M010-002).
     if (explorerShown() && explorer.escape()) {
       event.preventDefault();
       return;
@@ -743,6 +765,13 @@ export async function start(options: StartOptions = {}): Promise<void> {
   });
   // The pages of a folder the explorer opened (ST-M010-002).
   await listen<unknown>(CONSOLE_EXPLORER_EVENT, (event) => explorer.onEvent(event.payload));
+  // What was dropped on the window, the transfer queue and a delete that runs.
+  await listen<unknown>(CONSOLE_EXPLORER_DROP_EVENT, (event) => explorer.onDrop(event.payload));
+  await listen<unknown>(CONSOLE_TRANSFERS_EVENT, (event) => explorer.onTransfers(event.payload));
+  await listen<unknown>(CONSOLE_REMOVAL_EVENT, (event) => explorer.onRemoval(event.payload));
+  await listen<unknown>(DRAG_ENTER_EVENT, () => explorer.onDrag(true));
+  await listen<unknown>(DRAG_LEAVE_EVENT, () => explorer.onDrag(false));
+  await listen<unknown>(DRAG_DROP_EVENT, () => explorer.onDrag(false));
   try {
     adoptConsole(await api.getState());
   } catch (error) {

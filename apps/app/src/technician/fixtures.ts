@@ -11,6 +11,7 @@ import type {
   ExplorerEntry,
   ListenNetwork,
   SessionSummary,
+  TransferEntry,
 } from "../shared/contract";
 import type { ConsoleState, SessionPhase, TargetIdentity } from "./api";
 import {
@@ -21,9 +22,11 @@ import {
   applyEvent,
   applyFailure,
   applyListing,
+  applyTransfers,
   folder,
   initialExplorer,
   opening,
+  removalOf,
   selectOnly,
   toggleSelected,
   withSort,
@@ -446,6 +449,83 @@ export function explorerIn(
 
 const documents = explorerIn(EXPLORER_FOLDER, EXPLORER_ENTRIES);
 
+/** Where a copy of this customer computer goes on the technician computer. */
+export const DOWNLOADS = "C:\\Users\\sam\\Downloads\\CretLink\\ACME-PC-07";
+
+const SESSION_ENDED = "The session ended before this was complete.";
+
+/** One entry of the transfer queue; a file sent to the documents folder unless said otherwise. */
+export function transfer(patch: Partial<TransferEntry> & { id: number }): TransferEntry {
+  const name = patch.name ?? `file-${patch.id}.txt`;
+  const direction = patch.direction ?? "send";
+  return {
+    direction,
+    kind: "file",
+    name,
+    remote: `${EXPLORER_FOLDER}\\${name}`,
+    local:
+      direction === "send"
+        ? `C:\\Users\\sam\\Desktop\\${name}`
+        : `${DOWNLOADS}\\${name}`,
+    done: 0,
+    state: "waiting",
+    ...patch,
+  };
+}
+
+/** A queue in every state: what did not arrive, what runs and waits, what ended. */
+export const TRANSFERS: TransferEntry[] = [
+  transfer({ id: 1, name: "setup.exe", bytes: 52_428_800, done: 52_428_800, state: "done" }),
+  transfer({
+    id: 2,
+    direction: "download",
+    name: "report.pdf",
+    bytes: 1_258_291,
+    done: 1_258_291,
+    state: "done",
+  }),
+  transfer({
+    id: 3,
+    name: "Budget 2026.xlsx",
+    bytes: 48_213,
+    state: "failed",
+    reason: "The file is in use.",
+  }),
+  transfer({
+    id: 4,
+    direction: "download",
+    name: "Photos\\Old laptop",
+    state: "left_out",
+    reason: "A link is not followed.",
+  }),
+  transfer({ id: 5, name: "drivers\\chipset.zip", bytes: 9000, done: 3000, state: "cancelled" }),
+  transfer({
+    id: 6,
+    direction: "download",
+    name: "Photos\\2026\\holiday.jpg",
+    bytes: 4_000_000,
+    done: 1_800_000,
+    state: "running",
+  }),
+  transfer({ id: 7, direction: "download", name: "Photos\\2026\\garden.jpg", bytes: 2_500_000 }),
+  transfer({ id: 8, direction: "download", name: "Photos\\2026\\cat.jpg", bytes: 1_100_000 }),
+  transfer({ id: 9, name: "Tools", kind: "folder", state: "done" }),
+];
+
+/** A queue of `count` transfers: a folder of that many files, the first ones done. */
+export function manyTransfers(count: number): TransferEntry[] {
+  return Array.from({ length: count }, (_, n) =>
+    transfer({
+      id: n + 1,
+      name: `Drivers\\driver-${String(n).padStart(5, "0")}.dll`,
+      bytes: 4096,
+      done: n < 200 ? 4096 : 0,
+      state: n < 200 ? "done" : n === 200 ? "running" : n % 97 === 0 ? "failed" : "waiting",
+      ...(n > 200 && n % 97 === 0 ? { reason: "Access was denied." } : {}),
+    }),
+  );
+}
+
 /** Every state of the explorer, by name. */
 export const EXPLORERS: Record<string, ExplorerState> = {
   // The tab was never opened: nothing was asked of the customer computer.
@@ -512,6 +592,136 @@ export const EXPLORERS: Record<string, ExplorerState> = {
     entry(XSS, "file", 12, 5),
     entry(`${XSS}.dir`, "dir", 0, 5),
   ]),
+  // The second part: what the explorer sends, copies, renames and deletes.
+  "files-queue": applyTransfers(selectOnly(documents, "report.pdf"), TRANSFERS),
+  "files-queue-many": applyTransfers(documents, manyTransfers(5000)),
+  "files-queue-xss": applyTransfers(documents, [
+    transfer({ id: 1, name: XSS, remote: XSS, local: XSS, state: "failed", reason: XSS }),
+  ]),
+  "files-conflict": {
+    ...documents,
+    question: {
+      kind: "conflicts",
+      direction: "send",
+      folder: EXPLORER_FOLDER,
+      where: EXPLORER_FOLDER,
+      offer: 3,
+      conflicts: [
+        { name: "report.pdf", kind: "file", existing: "file", replace: true },
+        { name: "notes.txt", kind: "file", existing: "file", replace: true },
+        { name: "Photos", kind: "folder", existing: "dir", replace: true },
+      ],
+      at: 0,
+      choices: {},
+      all: false,
+    },
+  },
+  "files-conflict-folder": {
+    ...documents,
+    question: {
+      kind: "conflicts",
+      direction: "send",
+      folder: EXPLORER_FOLDER,
+      where: EXPLORER_FOLDER,
+      offer: 3,
+      conflicts: [
+        { name: "report.pdf", kind: "file", existing: "file", replace: true },
+        { name: "Photos", kind: "folder", existing: "dir", replace: true },
+      ],
+      at: 1,
+      choices: { "report.pdf": "keep_both" },
+      all: true,
+    },
+  },
+  "files-conflict-kinds": {
+    ...documents,
+    question: {
+      kind: "conflicts",
+      direction: "send",
+      folder: EXPLORER_FOLDER,
+      where: EXPLORER_FOLDER,
+      offer: 4,
+      conflicts: [{ name: "Invoices", kind: "file", existing: "dir", replace: false }],
+      at: 0,
+      choices: {},
+      all: false,
+    },
+  },
+  "files-conflict-download": {
+    ...selectOnly(documents, "report.pdf"),
+    question: {
+      kind: "conflicts",
+      direction: "download",
+      folder: EXPLORER_FOLDER,
+      where: DOWNLOADS,
+      names: [{ name: "report.pdf", kind: "file" }],
+      conflicts: [{ name: "report.pdf", kind: "file", existing: "file", replace: true }],
+      at: 0,
+      choices: {},
+      all: false,
+    },
+  },
+  "files-delete": {
+    ...toggleSelected(toggleSelected(selectOnly(documents, "Invoices"), "notes.txt"), "report.pdf"),
+    question: {
+      kind: "delete",
+      folder: EXPLORER_FOLDER,
+      items: [
+        { name: "Invoices", kind: "dir" },
+        { name: "notes.txt", kind: "file" },
+        { name: "report.pdf", kind: "file" },
+      ],
+    },
+  },
+  "files-delete-one": {
+    ...selectOnly(documents, "notes.txt"),
+    question: {
+      kind: "delete",
+      folder: EXPLORER_FOLDER,
+      items: [{ name: "notes.txt", kind: "file" }],
+    },
+  },
+  "files-removal": {
+    ...selectOnly(documents, "Photos"),
+    removal: { ...removalOf(2, 3), item: "Photos", at: 2, removedFiles: 1204, removedDirs: 31 },
+  },
+  "files-removal-cancelling": {
+    ...documents,
+    removal: { ...removalOf(2, 3), cancelling: true },
+  },
+  "files-renaming": { ...selectOnly(documents, "report.pdf"), renaming: "report.pdf" },
+  "files-problem": {
+    ...documents,
+    problem: {
+      title: "2 of 3 items could not be deleted",
+      message: "1 of 3 items was deleted (40 files and 3 folders in all).",
+      next: "The list shows what is there now. Close what holds a file open, then delete again.",
+      details: [
+        { path: `${EXPLORER_FOLDER}\\Scans\\open.xlsx`, reason: "the file is in use" },
+        { path: `${EXPLORER_FOLDER}\\Scans`, reason: "the folder is not empty" },
+      ],
+      more: 4,
+    },
+  },
+  "files-problem-xss": {
+    ...documents,
+    problem: { title: XSS, message: XSS, next: XSS, details: [{ path: XSS, reason: XSS }] },
+  },
+  "files-dropping": { ...documents, dropping: true },
+  "files-dropping-drives": { ...explorerAtDrives(), dropping: true },
+  "files-upload-menu": { ...documents, menu: { x: 12, y: 96, keys: [], only: "upload" } },
+  "files-preparing": {
+    ...documents,
+    preparing: `looking at ${EXPLORER_FOLDER} for names that are taken…`,
+  },
+  "files-ended-queue": {
+    ...applyTransfers(documents, [
+      transfer({ id: 1, name: "setup.exe", state: "stopped", reason: SESSION_ENDED }),
+      transfer({ id: 2, name: "driver.zip", state: "stopped", reason: SESSION_ENDED }),
+      transfer({ id: 3, name: "notes.txt", state: "done", bytes: 1204, done: 1204 }),
+    ]),
+    ended: "The session has ended. Browsing has stopped.",
+  },
 };
 
 function base(console: ConsoleState): TechnicianSnapshot {

@@ -1,5 +1,12 @@
 //! The file explorer of the live session (ST-M010-002, REQ-F-028).
 //!
+//! The Files tab looks through the customer computer's files with the two
+//! commands of this module, and sends, copies, renames and deletes with those
+//! of [`commands`]: the transfer queue is in [`transfers`], renaming and
+//! deleting in [`changes`], the rules for names and folders on this computer
+//! in [`local`], and the customer computer as all of them reach it in
+//! [`target`].
+//!
 //! Two commands let the Files tab look through the customer computer's files:
 //!
 //! - [`explorer_drives`] lists the drives;
@@ -52,6 +59,17 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use super::{AppState, CommandError, no_session};
+
+mod changes;
+pub(super) mod commands;
+#[cfg(test)]
+mod fake;
+mod local;
+mod target;
+mod transfers;
+
+pub(super) use commands::Removals;
+pub(super) use transfers::Transfers;
 
 /// The Tauri event a listing is delivered on: one [`ExplorerEvent`] each.
 pub(crate) const EXPLORER_EVENT: &str = "console-explorer";

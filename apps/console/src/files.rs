@@ -3,9 +3,10 @@
 //!
 //! [`ConsoleSessionService`] offers the operations of the technician's file
 //! explorer: the drive list, the listing of a folder, the removal of a folder
-//! with its content, and a file sent into a folder. [`TechnicianFiles`] is
-//! their audited front. It
-//! runs each one on the service and records it in the console's audit trail
+//! with its content, a file sent into a folder, a file copied to the
+//! technician computer, and the changes to one entry (a new folder, a move or
+//! a rename, a delete, a look-up). [`TechnicianFiles`] is their audited front.
+//! It runs each one on the service and records it in the console's audit trail
 //! the way the IPC server records a routed AI call: a capture-time start
 //! record before anything reaches the target, then a completion record with
 //! the honest outcome. The records are attributed to the technician (actor
@@ -23,6 +24,11 @@
 //! | `console_fs_list_start`, `console_fs_list` | `path`: the place as it was asked for, then the folder that was listed, as the target names it; `entries`: how many entries were listed; `more` when the listing stopped at its bound and the folder holds more |
 //! | `console_remove_tree_start`, `console_remove_tree` | `path`; `removed_files`, `removed_dirs`; `not_removed` when entries were left behind |
 //! | `console_send_start`, `console_send` | `path`: where the file goes, then the path the target committed it at; `overwrite` when a replacement was asked for; `len`; the digest `sha256` |
+//! | `console_download_start`, `console_download` | `path`: the file on the target; `len`; the digest `sha256` of a copy that was verified |
+//! | `console_fs_stat_start`, `console_fs_stat` | `path`; `found`: whether an entry lies there; `part` when an unfinished part of a transfer does |
+//! | `console_make_dir_start`, `console_make_dir` | `path` |
+//! | `console_move_start`, `console_move` | `path`: the entry; `to`: its new place |
+//! | `console_delete_start`, `console_delete` | `path` |
 //!
 //! Both records of one action carry the same `action_id`, minted by the
 //! service and unique in the session. A completion carries the measured
@@ -40,8 +46,12 @@
 //! technician left for another place is `cancelled`, with what had been
 //! listed until then.
 //!
-//! The local path of a file being sent is not recorded, as for an AI upload;
-//! no file content ever is (REQ-S-018).
+//! The local path of a file being sent, or of the copy a download makes, is
+//! no argument of a record, as for a transfer of the AI. It stands in one
+//! place only: the `reason` of a transfer that failed on the technician
+//! computer, which is the engine's message and names the file it could not
+//! read or write. That message is not sent to the target. No file content is
+//! ever recorded (REQ-S-018).
 //!
 //! [`Origin::Console`]: cretlink_session::Origin::Console
 
@@ -49,7 +59,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use cretlink_mcp::{TargetError, UploadReport};
+use cretlink_mcp::{DownloadReport, StatReport, TargetError, UploadReport};
 use cretlink_session::{
     CancelToken, DriveEntry, JobOutcome, RemotePath, TransferProgress, TreeRemovalProgress,
     TreeRemovalReport,
@@ -325,6 +335,132 @@ impl<'a> TechnicianFiles<'a> {
             );
         }
         self.audit.record(entry);
+        result
+    }
+
+    /// Copies a file of the target to `dest` on the technician computer,
+    /// like [`ConsoleSessionService::download_file`], and records it with the
+    /// file's path on the target, its length and the digest that was verified
+    /// (ST-M010-002). The local path is no argument of the record; the reason
+    /// of a copy that failed on the technician computer names it (see the
+    /// module documentation).
+    ///
+    /// # Errors
+    ///
+    /// See [`ConsoleSessionService::download_file`]. The error is recorded.
+    pub async fn download(
+        &self,
+        source: RemotePath,
+        dest: std::path::PathBuf,
+        cancel: CancelToken,
+        progress: Option<ProgressSink<TransferProgress>>,
+    ) -> Result<DownloadReport, TargetError> {
+        let action = self.begin(
+            "console_download_start",
+            "console_download",
+            AuditArgs::new().with("path", remote_path_value(&source)),
+        );
+        let result = self
+            .service
+            .download_file(source, dest, cancel, progress)
+            .await;
+        let mut entry = action.complete(&result);
+        if let Ok(report) = &result {
+            transfer_detail(
+                &mut entry,
+                None,
+                report.len,
+                report.resumed_from,
+                report.restarted,
+                &report.digest,
+                report.error.as_ref().map(|error| error.message.as_str()),
+                report.outcome,
+            );
+        }
+        self.audit.record(entry);
+        result
+    }
+
+    /// Looks one path of the target up, like
+    /// [`ConsoleSessionService::stat_entry`], and records it with whether an
+    /// entry lies there and whether an unfinished part of a transfer does
+    /// (ST-M010-002).
+    ///
+    /// # Errors
+    ///
+    /// See [`ConsoleSessionService::stat_entry`]. The error is recorded.
+    pub async fn look_up(&self, path: RemotePath) -> Result<StatReport, TargetError> {
+        let action = self.begin(
+            "console_fs_stat_start",
+            "console_fs_stat",
+            AuditArgs::new().with("path", remote_path_value(&path)),
+        );
+        let result = self.service.stat_entry(path).await;
+        let mut entry = action.complete(&result);
+        if let Ok(report) = &result {
+            entry
+                .args
+                .insert("found", AuditValue::Bool(report.entry.is_some()));
+            if report.partial_len.is_some() {
+                entry.args.insert("part", AuditValue::Bool(true));
+            }
+        }
+        self.audit.record(entry);
+        result
+    }
+
+    /// Creates one folder on the target, like
+    /// [`ConsoleSessionService::create_folder`], and records it
+    /// (ST-M010-002).
+    ///
+    /// # Errors
+    ///
+    /// See [`ConsoleSessionService::create_folder`]. The error is recorded.
+    pub async fn create_folder(&self, path: RemotePath) -> Result<(), TargetError> {
+        let action = self.begin(
+            "console_make_dir_start",
+            "console_make_dir",
+            AuditArgs::new().with("path", remote_path_value(&path)),
+        );
+        let result = self.service.create_folder(path).await;
+        self.audit.record(action.complete(&result));
+        result
+    }
+
+    /// Moves or renames one entry of the target, like
+    /// [`ConsoleSessionService::move_entry`], and records it with both places
+    /// (ST-M010-002). A destination that is taken is refused.
+    ///
+    /// # Errors
+    ///
+    /// See [`ConsoleSessionService::move_entry`]. The error is recorded.
+    pub async fn rename(&self, from: RemotePath, to: RemotePath) -> Result<(), TargetError> {
+        let action = self.begin(
+            "console_move_start",
+            "console_move",
+            AuditArgs::new()
+                .with("path", remote_path_value(&from))
+                .with("to", remote_path_value(&to)),
+        );
+        let result = self.service.move_entry(from, to).await;
+        self.audit.record(action.complete(&result));
+        result
+    }
+
+    /// Deletes one file or one link of the target, like
+    /// [`ConsoleSessionService::delete_entry`], and records it (ST-M010-002).
+    ///
+    /// # Errors
+    ///
+    /// See [`ConsoleSessionService::delete_entry`]. The error is recorded.
+    pub async fn delete(&self, path: RemotePath) -> Result<(), TargetError> {
+        let action = self.begin(
+            "console_delete_start",
+            "console_delete",
+            AuditArgs::new().with("path", remote_path_value(&path)),
+        );
+        let result = self.service.delete_entry(path).await;
+        self.audit.record(action.complete(&result));
         result
     }
 

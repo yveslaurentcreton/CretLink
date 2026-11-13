@@ -705,14 +705,16 @@ points on the Windows CI runner; this run adds the application's own window,
 real drives, the customer's own folders and a real stop.
 
 The technician works from the file explorer in the Files tab of the live
-session (ST-M010-002). Its first part browses: steps 1 and 18 to 25 can be
-run with a build whose Files tab is the explorer. It has no control yet for
-the operations of steps 2 to 14, which wait for the build that can delete and
-send from the explorer. Steps 15 to 17 are the exception: the AI tools reach
-those operations in every build. The customer computer
-needs a second drive that may be written to and emptied, such as a spare USB
-stick; the steps call it `E:`. Never point a step at a folder whose content
-matters.
+session (ST-M010-002): it browses (steps 1 and 18 to 25), deletes with
+**Delete** (steps 2 to 8), sends by a drop on the window or with **Upload…**
+(steps 9 to 14), and copies to the technician computer, renames and shows its
+queue (steps 26 to 36). The explorer never stands behind a link, so the
+refusals of a path that leads through one (steps 15 to 17, and the first half
+of steps 3 and 11) are asked with the AI tools, which reach the same
+operations; the automated tests on the Windows CI runner cover them for the
+operations that only the explorer reaches. The customer computer needs a
+second drive that may be written to and emptied, such as a spare USB stick;
+the steps call it `E:`. Never point a step at a folder whose content matters.
 
 Prepare the customer computer in an administrator PowerShell, which the
 technician terminal can also do:
@@ -741,25 +743,32 @@ cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
    - Expected: the customer's activity shows one file action of the
      technician, *list the drives*, and the technician's Audit tab lists
      `console_fs_drives` (REQ-F-017, REQ-S-017).
-2. **A folder with links in it.** Delete `C:\CretLinkTest\tree`.
+2. **A folder with links in it.** Open `C:\CretLinkTest`, select `tree` and
+   press Delete.
+   - Expected: before anything is removed the explorer asks *Delete tree?*,
+     says that the folder is deleted with everything in it and that there is
+     no recycle bin on this path, and has the focus on **Cancel**. Cancel
+     once: nothing is removed. Press Delete again and confirm.
    - Expected: the folder is gone, the read-only file included. The junction
      and the two symbolic links were removed as links:
      `C:\CretLinkTest\outside\keep.txt` is still there with its content.
-     The result says how many files and folders were removed.
+     The result says how many files and folders were removed, and the list
+     no longer shows `tree`.
    - Expected: the customer's activity shows one item, *delete the folder
      C:\CretLinkTest\tree and everything in it*, with the path, done; the
      Audit tab lists `console_remove_tree` with the path and the counts
      (REQ-F-017, REQ-S-017).
-3. **A folder reached through a junction.** Ask to delete
-   `C:\CretLinkTest\via\inner`: the path leads through the junction `via` to
-   `C:\CretLinkTest\outside\inner`.
-   - Expected: refused as an invalid path before anything is removed, with the
-     reason that the path leads through a link.
-     `C:\CretLinkTest\outside\inner\keep-too.txt` is still there, and the
-     customer's item is failed.
-   - Expected: deleting `C:\CretLinkTest\via` itself removes the junction and
-     nothing else: `C:\CretLinkTest\outside` keeps its content. Deleting
-     `C:\CretLinkTest\outside\inner` by its own path removes it.
+3. **A folder reached through a junction.** The path
+   `C:\CretLinkTest\via\inner` leads through the junction `via` to
+   `C:\CretLinkTest\outside\inner`. Type it in the path field.
+   - Expected: the explorer refuses the path with the words that
+     `C:\CretLinkTest\via` is a link, so nothing behind the junction can be
+     selected for a delete. `C:\CretLinkTest\outside\inner\keep-too.txt` is
+     still there. (The agent's own refusal of a removal by that path, with
+     `invalid_path`, is covered by the automated tests on Windows.)
+   - Expected: selecting `via` in `C:\CretLinkTest` and deleting it removes
+     the junction and nothing else: `C:\CretLinkTest\outside` keeps its
+     content. Deleting `inner` in `C:\CretLinkTest\outside` removes it.
 4. **A file held open.** Run the preparation again. On the customer computer
    hold one file open without sharing it, then delete the folder:
 
@@ -798,14 +807,22 @@ cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
      **failed**: the folder is no longer there, or it is not the one the
      removal began with. `C:\CretLinkTest\many\new.txt` is still there, and
      so are the files that were left in `C:\CretLinkTest\many-moved`.
-8. **A drive is not a folder.** Ask to delete `E:\` itself.
-   - Expected: refused as an invalid path before anything is removed; the
-     content of the stick is untouched.
-9. **Send to a folder.** Send a file of some tens of megabytes to the
-   customer's `Documents` folder, and watch that folder in Windows.
+8. **A drive is not a folder.** Go to the drives and select `E:`.
+   - Expected: **Delete**, **Rename**, **Download** and **Upload…** are not
+     offered for a drive, as buttons, in the context menu and by their keys;
+     the content of the stick is untouched. (The agent's refusal of a removal
+     of `E:\` itself is covered by the automated tests on Windows.)
+9. **Send to a folder.** Open the customer's `Documents` folder in the
+   explorer and drag a file of some tens of megabytes from the technician
+   computer's file manager onto the window. Watch that folder in Windows.
+   - Expected: while the file is dragged over the window, the list says
+     *Drop to send to* and the folder. After the drop the transfer is in the
+     queue under the list, with its progress in percent and bytes and a
+     **Cancel** button.
    - Expected: while the transfer runs the folder holds a file whose name
      starts with `.cretlink-part.` and never one with the final name. When the
-     transfer completes the file appears under its name and the part is gone.
+     transfer completes the file appears under its name and the part is gone,
+     the queue says *Sent*, and the list of the explorer shows the file.
      `Get-FileHash` on the customer computer gives the SHA-256 of the file on
      the technician computer (REQ-N-007).
    - Expected: the customer, signed in without administrator rights, can open
@@ -822,28 +839,45 @@ cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
     New-Item -ItemType Directory C:\CretLinkTest\outside\behind | Out-Null
     ```
 
-    Send the file to `C:\CretLinkTest\link-folder`, then to
-    `C:\CretLinkTest\link-folder\behind`.
-    - Expected: both transfers fail with an invalid path. Nothing appears in
-      `C:\CretLinkTest\outside` or in `behind`: neither the file nor a
-      `.cretlink-part.` file. The same file sent to
-      `C:\CretLinkTest\outside\behind`, the real path, arrives.
-12. **A name that is taken.** Send a different file under the name of step 9
-    without asking to replace it, then again asking to replace it. Then hold
-    the file open on the customer computer
-    (`$held = [IO.File]::Open("<the file>", "Open", "Read", "None")`) and
-    send a third file under that name, asking to replace it.
-    - Expected: the first transfer fails because the file already exists, and
-      the file of step 9 keeps its hash. The second replaces it, and the hash
-      is the new file's. The third fails with the reason that the file is in
-      use, and the file keeps its hash; after `$held.Close()` the same
-      transfer replaces it.
-13. **Cancel and stop during a transfer.** Start a large transfer into
-    `Documents` and cancel it. Start it again and press **Stop now** on the
-    customer computer while it runs.
-    - Expected: each time no file appears under the final name, and afterwards
-      no `.cretlink-part.` file is left in the folder. The end report of the
-      stopped session names nothing that could not be removed (REQ-F-019).
+    In the explorer, press Enter on `link-folder` in `C:\CretLinkTest`, then
+    type `C:\CretLinkTest\link-folder\behind` in the path field.
+    - Expected: the explorer opens neither, so no file can be dropped into a
+      folder that is a junction or lies behind one. Nothing appears in
+      `C:\CretLinkTest\outside` or in `behind`: neither a file nor a
+      `.cretlink-part.` file. A file dropped into
+      `C:\CretLinkTest\outside\behind`, the real path, arrives. (That every
+      step of a transfer into a junction fails with an invalid path is
+      covered by the automated tests on Windows.)
+12. **A name that is taken.** On the technician computer make a different
+    file with the name of the file of step 9 and drop it on `Documents`.
+    Choose **Skip**; drop it again and choose **Keep both**; drop it again
+    and choose **Replace**. Then hold the file open on the customer computer
+    (`$held = [IO.File]::Open("<the file>", "Open", "Read", "None")`), drop a
+    third file of that name and choose **Replace**.
+    - Expected: each drop asks before anything is sent: *A file named … is
+      already there*, with **Replace**, **Keep both** and **Skip**, the focus
+      on **Keep both**, and Escape leaving the question without sending.
+    - Expected: after **Skip** nothing was sent and the file of step 9 keeps
+      its hash. After **Keep both** a second file `name (2).ext` lies beside
+      it, and the first keeps its hash. After **Replace** the file has the
+      hash of the new one. The third transfer is in the queue as *Not sent*,
+      first in the list, with the reason that the file is in use, and the
+      file keeps its hash; after `$held.Close()` the same drop replaces it.
+    - Expected: dropping three files whose names are all taken asks three
+      times; with *Do the same for the next names that are taken* pressed,
+      once.
+13. **Cancel and stop during a transfer.** Drop a large file on `Documents`
+    and press **Cancel** on its row in the queue. Drop it again together with
+    two small files and press **Stop now** on the customer computer while the
+    large one runs.
+    - Expected: the cancelled transfer says *Cancelled*, never *Sent*; no file
+      appears under the final name, and no `.cretlink-part.` file is left in
+      the folder.
+    - Expected: after the stop the session ends at once on both sides. The
+      technician's window says how many transfers stopped with the session
+      and names them; none of them reads as sent, and none of the three files
+      is in the folder under its name. The end report of the stopped session
+      names nothing that could not be removed (REQ-F-019).
 14. **A full drive.** Send a file that is larger than the free space of `E:`.
     - Expected: the transfer fails and says that the storage is exhausted;
       nothing appears under the final name, and no part is left after the
@@ -852,8 +886,9 @@ cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
     file, removing an empty folder, creating a folder and moving an entry are
     asked for with the AI tools `remote_delete`, `remote_remove_dir`,
     `remote_make_dir` and `remote_move` from an AI client on the technician
-    computer; in a build with the explorer, also with **Delete**,
-    **New folder** and **Rename** there. Prepare:
+    computer. The explorer reaches the same operations with **Delete** and
+    **Rename**, but never stands behind a link, so it cannot ask for these
+    refusals itself. Prepare:
 
     ```powershell
     New-Item -ItemType Directory C:\CretLinkTest\real\empty, C:\CretLinkTest\real\inside | Out-Null
@@ -999,10 +1034,139 @@ cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
       computer. In the new session the Files tab is empty and asks nothing
       until it is opened: no name of a file from the session before is on
       screen (REQ-S-004, REQ-F-018).
-26. **Afterwards.** End the session and look again.
-    - Expected: the files sent in steps 9, 10 and 12 are still in their
-      folders: they are the customer's to keep, and the list of staged files
-      never named them. `C:\CretLinkTest` can be deleted by hand.
+26. **A folder is dropped (ST-M010-002).** On the technician computer make
+    a folder `Tools` with two files, an empty folder `empty`, a folder `logs`
+    with a file in it, and a symbolic link to a file elsewhere (on Windows
+    made with `mklink`).
+    Drop `Tools` on `C:\CretLinkTest`. Then pick the same folder with
+    **Upload…**, **A folder…**, and choose **Keep both**.
+    - Expected: the queue lists one transfer for each file, named by its path
+      below `Tools`, and they run one after the other. The link has a row
+      *Left out* with the reason that a link is not followed, shown before
+      the other rows; what the link points at was not sent.
+    - Expected: on the customer computer `C:\CretLinkTest\Tools` holds the
+      two files, `empty` and `logs` with its file, and no entry for the link.
+      The second send made `Tools (2)` beside it with the same content.
+    - Expected: the customer's activity shows each folder that was made and
+      each file that arrived as an item of its own, from the technician; the
+      looks stay the one item that follows along. The Audit tab lists a
+      `console_make_dir` for each folder and a `console_send` for each file.
+27. **A folder into one that is there.** Change one of the two files of
+    `Tools` on the technician computer, add a new file, and drop `Tools` on
+    `C:\CretLinkTest` again. Choose **Replace**.
+    - Expected: the question says that Replace sends into the folder that is
+      there, that files of the same name are replaced and everything else
+      stays. Afterwards the changed file has its new content, the new file is
+      there, and a file that was put into `C:\CretLinkTest\Tools` on the
+      customer computer before the drop is still there.
+28. **Copy to the technician computer.** In `C:\CretLinkTest\Tools` select
+    a file and press **Download**. Then select the folder `logs` and a file,
+    press **Download to…** and choose a folder.
+    - Expected: the first copy lands in `Downloads\CretLink\<name of the
+      customer computer>` on the technician computer, which is made by this
+      copy when it was not there. Its row says *Copied*, names both places
+      and says that the file leaves the customer computer; **Show in folder**
+      opens that folder in the file manager.
+    - Expected: the second copy lands in the chosen folder: the file, and
+      `logs` with its file in it. `Get-FileHash` gives the same SHA-256 on
+      both computers. Closing the folder dialog without a choice copies
+      nothing.
+    - Expected: the customer's activity shows each copied file as *left this
+      computer*, from the technician. The Audit tab lists a
+      `console_download` for each, with the path on the customer computer,
+      the length and the digest, and without the place on the technician
+      computer.
+29. **A name that is taken on the technician computer.** Press **Download**
+    for the file of step 28 again.
+    - Expected: the question says that a file of that name is already there,
+      names the folder on *this computer*, and offers **Replace**, **Keep
+      both** and **Skip**. **Keep both** makes `name (2).ext` beside it;
+      **Skip** copies nothing.
+30. **Names that must not leave the folder.** A Windows folder cannot hold a
+    name with a path separator, so the automated tests cover those against a
+    customer computer held in memory. What Windows can hold, made in the
+    administrator PowerShell with the `\\?\` prefix:
+
+    ```powershell
+    New-Item -ItemType Directory C:\CretLinkTest\names | Out-Null
+    [IO.File]::WriteAllText('\\?\C:\CretLinkTest\names\con.txt', 'device')
+    [IO.File]::WriteAllText('\\?\C:\CretLinkTest\names\aux', 'device')
+    [IO.File]::WriteAllText('\\?\C:\CretLinkTest\names\trailing.', 'alias')
+    Set-Content C:\CretLinkTest\names\fine.txt "fine"
+    ```
+
+    Select the folder `names` in `C:\CretLinkTest` and press **Download**.
+    - Expected: `fine.txt` is copied. `con.txt`, `aux` and `trailing.` each
+      have a row *Left out* that says their name cannot be a name on this
+      computer and that it was not copied. Nothing was written to a device,
+      and the technician computer's folder holds `names\fine.txt` and nothing
+      else of it.
+31. **A link in a folder that is copied.** Select `C:\CretLinkTest\tree` as
+    the preparation makes it, with its junction and its two symbolic links,
+    and press **Download**.
+    - Expected: the files of `tree` and of `sub` are copied. The junction and
+      both links have a row *Left out*; nothing of
+      `C:\CretLinkTest\outside` is on the technician computer, and the
+      customer's activity names no folder behind a link.
+32. **The queue.** Drop four files of some megabytes each, one of them with
+    the name of a file that is held open on the customer computer (choose
+    **Replace** for it). While the first runs, cancel the last one, then
+    press **Cancel all**.
+    - Expected: one transfer runs at a time and the others say *Waiting*.
+      The one that is in use ends *Not sent* with its reason and stands first.
+      The cancelled ones say *Cancelled* and never ran. The line above the
+      queue counts what runs, waits, failed and is done.
+    - Expected: while a file of some hundred megabytes is being sent, opening
+      another folder waits until that file has ended, and so does a key in
+      the Terminal tab; cancelling the transfer lets them through at once.
+33. **Rename.** Select a file in `C:\CretLinkTest`, press F2, type a new name
+    and press Enter. Then try, one after the other: Escape instead of Enter;
+    a click on another file instead of Enter; a click on **Delete** instead
+    of Enter; the name of another file of the folder; a name with a `\` in
+    it; and a file that is held open on the customer computer.
+    - Expected: F2 turns the name into a field with the name selected up to
+      its extension. Enter renames; the list shows the new name, selected.
+      Escape leaves the name as it was.
+    - Expected: the click on another file renames too, as in the Windows
+      explorer, and selects the file that was clicked. The click on
+      **Delete** renames and asks nothing: no question opens until **Delete**
+      is pressed again.
+    - Expected: the taken name and the name with `\` are refused with their
+      reason while the field stays open, and nothing is asked of the customer
+      computer. The held file is refused by the customer computer with the
+      reason that the file is in use, and keeps its name.
+    - Expected: the customer's activity shows *move … to …* for the rename,
+      and the Audit tab lists `console_move` with both names.
+34. **Delete several items.** Select two files and a folder with content in
+    `C:\CretLinkTest`, one of the files held open, and delete them from the
+    context menu.
+    - Expected: the question names three items, the two names and the folder,
+      and that there is no recycle bin. The result says that one of three
+      could not be deleted, names the held file with its reason, and the list
+      still shows it. The Audit tab lists `console_delete` for each file and
+      `console_remove_tree` for the folder.
+35. **Keyboard and screen reader.** With Narrator on the technician computer
+    and without the mouse: open the context menu with Shift+F10 and go
+    through it with the arrow keys; rename with F2; delete with Delete and
+    answer the question; send with **Upload…** and answer a name that is
+    taken; go through the queue and cancel a transfer.
+    - Expected: every action is reachable. The question is read with its
+      title and its text when it opens, Tab stays inside it, and the first
+      Escape closes it without stopping the session. A row of the queue is
+      read with its name, its state in words and its reason; the progress of
+      the running transfer is read as a number. What could not be removed is
+      read at once (REQ-N-014, REQ-N-015).
+36. **A copy that is cancelled.** Start a **Download** of a file of some
+    hundred megabytes and cancel it on its row.
+    - Expected: the row says *Cancelled*; neither the file nor a file ending
+      in `.cretlink-part` is left in the folder on the technician computer.
+    - Known and not corrected: the customer's activity keeps showing that
+      copy as in progress until the session ends, because the customer
+      computer is not told that the copy was given up.
+37. **Afterwards.** End the session and look again.
+    - Expected: the files sent in steps 9, 10, 12, 26 and 27 are still in
+      their folders: they are the customer's to keep, and the list of staged
+      files never named them. `C:\CretLinkTest` can be deleted by hand.
 
 ### MT-E2E — Full attended-LAN acceptance walk-through (ST-M006-006)
 

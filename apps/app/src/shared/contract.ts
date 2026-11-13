@@ -272,6 +272,131 @@ export interface ExplorerListing {
   state: "complete" | "cancelled" | "limit";
 }
 
+// --- What the explorer sends, copies, renames and deletes (ST-M010-002) ---
+
+// What the technician dropped on the window or picked in the system's
+// dialog (`explorer_pick_upload`, and the `console-explorer-drop` event): a
+// number to send it by, and names for the words. The window never holds a
+// path of the technician computer.
+export interface UploadOffer {
+  offer: number;
+  // How many files and folders were dropped or picked.
+  items: number;
+  // The names of the first few.
+  names: string[];
+}
+
+export type TransferKind = "file" | "folder";
+
+// A name that is taken where a transfer would put it.
+export interface NameConflict {
+  name: string;
+  // What is to be copied.
+  kind: TransferKind;
+  // What lies under that name now.
+  existing: ExplorerEntryKind;
+  // Whether Replace can be chosen: a file for a file, a folder into a folder.
+  replace: boolean;
+}
+
+// What a look at the folder found (`explorer_send_check`,
+// `explorer_download_check`).
+export interface TransferCheck {
+  // The folder the transfers go to, as text for the question.
+  folder: string;
+  conflicts: NameConflict[];
+}
+
+// What the technician chose for a name that is taken. `keep_both` gives the
+// new one a name in the pattern Windows uses, `name (2).ext`.
+export type ConflictChoice = "replace" | "keep_both" | "skip";
+
+// How a send or a copy was queued (`explorer_send`, `explorer_download`).
+export interface TransferQueued {
+  queued: number;
+  // Left out or not complete, each with a row that says why.
+  leftOut: number;
+  skipped: number;
+}
+
+// Only `done` is a transfer that arrived and was verified. `left_out` was
+// never copied (a link, a name that cannot be used), `stopped` ended with the
+// session, and `listed` is a folder whose files are queued: the window drops
+// it.
+export type TransferState =
+  | "waiting"
+  | "running"
+  | "done"
+  | "failed"
+  | "cancelled"
+  | "left_out"
+  | "stopped"
+  | "listed";
+
+// One entry of the transfer queue (`explorer_transfers`, and the
+// `console-transfers` event). Every text may hold names of the customer
+// computer: written as text, never as markup.
+export interface TransferEntry {
+  // Rising in the order of the queue.
+  id: number;
+  direction: "send" | "download";
+  kind: TransferKind;
+  // What is copied: a name, or a path below a folder that was dropped or
+  // selected.
+  name: string;
+  // Where it is on the customer computer.
+  remote: string;
+  // Where it is on the technician computer.
+  local: string;
+  bytes?: number;
+  // The bytes confirmed so far.
+  done: number;
+  state: TransferState;
+  // Why it is in this state, as sentences.
+  reason?: string;
+}
+
+// Entries of the queue that changed.
+export interface TransfersEvent {
+  entries: TransferEntry[];
+}
+
+// A folder of the technician computer chosen in the system's dialog
+// (`explorer_choose_folder`): the number a copy names it by, and its path
+// for the words.
+export interface ChosenFolder {
+  folder: number;
+  path: string;
+}
+
+// How a delete ended (`explorer_delete`). An item counts as removed only
+// when the customer computer said so.
+export interface DeleteReport {
+  selected: number;
+  removed: number;
+  // Files and links, and folders, removed in all.
+  removedFiles: number;
+  removedDirs: number;
+  // The first entries that could not be removed, each with its reason.
+  failed: Array<{ path: string; reason: string }>;
+  failedMore: number;
+  cancelled: boolean;
+  // The session ended on the way: what to say about it.
+  ended?: string;
+  notTried: number;
+}
+
+// Where a delete stands (`console-removal`).
+export interface RemovalProgress {
+  // The number the window gave the delete.
+  removal: number;
+  item: string;
+  at: number;
+  of: number;
+  removedFiles: number;
+  removedDirs: number;
+}
+
 // --- The network the technician waits on (ST-M009-016) ---
 
 // `get_listen_networks`: this computer's private addresses, each with the

@@ -1086,6 +1086,549 @@ async fn a_large_file_arrives_whole_and_a_cancelled_one_leaves_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --- A copy to the technician computer, and a change to one entry
+// (ST-M010-002) ---
+
+/// Plants the file `name` with `content` in the staging area of the session's
+/// in-process agent, where a test names it on every platform.
+fn staged_file(session: SessionId, name: &str, content: &[u8]) -> PathBuf {
+    let path = FileStore::for_session(session).staging_root().join(name);
+    std::fs::create_dir_all(path.parent().expect("the staging root")).expect("staging root");
+    std::fs::write(&path, content).expect("plant the file");
+    path
+}
+
+/// How `name` in the staging area reads in the words of both sides.
+fn in_staging(name: &str) -> String {
+    format!("{name} (CretLink staging folder)")
+}
+
+/// A file of the customer computer is copied to the technician computer:
+/// it arrives whole under its name, verified, with no part left beside it.
+/// The audit records name the file on the customer computer, its length and
+/// its digest, and never the place on the technician computer. The customer
+/// sees a file leave for the technician, and the technician's own feed has
+/// one item for it.
+#[tokio::test]
+async fn the_technician_copies_a_file_to_this_computer() {
+    let mut live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    let files = TechnicianFiles::new(&live.service, &trail);
+    let dir = temp_dir_for("download");
+    let content: Vec<u8> = (0..100_000u32).map(|n| (n % 251) as u8).collect();
+    staged_file(live.session, "report.bin", &content);
+    let dest = dir.join("report.bin");
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink: ProgressSink<cretlink_session::TransferProgress> = {
+        let seen = Arc::clone(&seen);
+        Box::new(move |step| seen.lock().unwrap().push(step))
+    };
+    let report = files
+        .download(
+            staged("report.bin"),
+            dest.clone(),
+            CancelToken::new(),
+            Some(sink),
+        )
+        .await
+        .expect("the transfer runs");
+    assert_eq!(report.outcome, JobOutcome::Completed, "{:?}", report.error);
+    assert_eq!(report.len, content.len() as u64);
+    assert_eq!(std::fs::read(&dest).expect("read the copy"), content);
+    assert_eq!(entries_in(&dir), 1, "no part is left beside the copy");
+    assert_eq!(
+        seen.lock().unwrap().last().map(|step| step.transferred),
+        Some(content.len() as u64),
+        "the caller followed the copy to its end"
+    );
+
+    let (start, done) = trail.pair("console_download_start", "console_download");
+    assert_eq!(text(&start, "path").as_deref(), Some("staging:report.bin"));
+    assert_eq!(done.outcome, Outcome::Ok);
+    assert_eq!(int(&done, "len"), i64::try_from(content.len()).ok());
+    assert_eq!(done.digests.get("sha256").map(String::len), Some(64));
+    // Where the copy lies on the technician computer is in no record.
+    let local = dir.display().to_string();
+    for entry in trail.all() {
+        for (key, value) in &entry.args.0 {
+            assert!(
+                !value.to_string().contains(&local),
+                "{}: {key} names the technician's folder",
+                entry.action
+            );
+        }
+    }
+
+    // The customer sees the file leave, from its start to its end.
+    let leaving = loop {
+        let shown = next_shown(&mut live.joiner).await;
+        if shown.kind == ActivityKind::FileSent {
+            break shown;
+        }
+    };
+    assert_eq!(leaving.origin, Origin::Console);
+    assert_eq!(leaving.path, Some(in_staging("report.bin")));
+    assert_eq!(leaving.outcome, ActionOutcome::InProgress);
+    let left = loop {
+        let shown = next_shown(&mut live.joiner).await;
+        if shown.kind == ActivityKind::FileSent {
+            break shown;
+        }
+    };
+    assert_eq!(left.outcome, ActionOutcome::Succeeded);
+    assert_eq!(left.bytes, Some(content.len() as u64));
+
+    let feed = said(technician_feed(&trail));
+    assert_eq!(
+        feed,
+        [Said {
+            source: ActivitySource::Technician,
+            kind: ActivityKind::FileSent,
+            description: "Copied a file from the customer computer".to_string(),
+            operation: format!(
+                "copy the file {} from the customer computer",
+                in_staging("report.bin")
+            ),
+            done: true,
+        }]
+    );
+
+    live.service.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A copy the technician cancels on its way is cancelled in the report and in
+/// the record, never done: no file appears under its name, and the part that
+/// is kept for a later resume is where `download_part_path` says, so that a
+/// caller who will not resume can remove it. A file that is not there is a
+/// failed copy with the target's reason.
+#[tokio::test]
+async fn a_cancelled_copy_is_never_done_and_its_part_is_named() {
+    let live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    let files = TechnicianFiles::new(&live.service, &trail);
+    let dir = temp_dir_for("download-cancelled");
+    let content: Vec<u8> = (0..1_500_000u32).map(|n| (n % 241) as u8).collect();
+    staged_file(live.session, "setup.bin", &content);
+    let dest = dir.join("setup.bin");
+
+    // Cancelled once the first bytes are confirmed, and not before.
+    let cancel = CancelToken::new();
+    let sink: ProgressSink<cretlink_session::TransferProgress> = {
+        let cancel = cancel.clone();
+        Box::new(move |progress| {
+            if progress.transferred > 0 {
+                cancel.cancel();
+            }
+        })
+    };
+    let report = files
+        .download(staged("setup.bin"), dest.clone(), cancel, Some(sink))
+        .await
+        .expect("a cancelled transfer is a report");
+    assert_eq!(report.outcome, JobOutcome::Cancelled);
+    assert!(report.sent > 0 && report.sent < content.len() as u64);
+    assert!(!dest.exists(), "nothing appears under the name");
+    let part = cretlink_session::download_part_path(&dest);
+    assert!(part.exists(), "the part is kept where its name says");
+    assert_eq!(part.parent(), dest.parent());
+    std::fs::remove_file(&part).expect("a caller who will not resume removes it");
+    assert_eq!(entries_in(&dir), 0);
+
+    let (_, done) = trail.pair("console_download_start", "console_download");
+    assert_eq!(done.outcome, Outcome::Cancelled);
+    assert!(done.digests.is_empty(), "nothing was verified");
+
+    let missing = files
+        .download(
+            staged("not-there.bin"),
+            dir.join("not-there.bin"),
+            CancelToken::new(),
+            None,
+        )
+        .await
+        .expect("a failed transfer is a report");
+    assert_eq!(missing.outcome, JobOutcome::Failed);
+    assert_eq!(
+        missing.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::PathNotFound)
+    );
+    assert_eq!(entries_in(&dir), 0, "a failed copy leaves nothing");
+    let outcomes: Vec<Outcome> = trail
+        .of("console_download")
+        .iter()
+        .map(|entry| entry.outcome)
+        .collect();
+    assert_eq!(outcomes, [Outcome::Cancelled, Outcome::Failed]);
+
+    live.service.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A copy whose destination on the technician computer cannot be written is
+/// that copy's failure, in the stage `local`, and the session goes on.
+#[tokio::test]
+async fn a_copy_that_cannot_be_written_here_fails_and_the_session_goes_on() {
+    let mut live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    let files = TechnicianFiles::new(&live.service, &trail);
+    let dir = temp_dir_for("download-no-folder");
+    staged_file(live.session, "notes.txt", b"notes");
+
+    let report = files
+        .download(
+            staged("notes.txt"),
+            dir.join("no-such-folder").join("notes.txt"),
+            CancelToken::new(),
+            None,
+        )
+        .await
+        .expect("a failed transfer is a report");
+    assert_eq!(report.outcome, JobOutcome::Failed);
+    assert_eq!(
+        report.error.as_ref().map(|error| error.stage.as_str()),
+        Some("local")
+    );
+    let (_, done) = trail.pair("console_download_start", "console_download");
+    assert_eq!(done.outcome, Outcome::Failed);
+    assert!(text(&done, "reason").is_some());
+
+    files.list_drives().await.expect("the session still works");
+    let _ = customer_feed(&mut live).await;
+    live.service.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The changes to one entry: a new folder, a rename, a delete and a look-up.
+/// Each is the technician's, recorded as a pair, and an item of its own that
+/// says the same on both sides. A rename onto a name that is taken is refused
+/// and both entries stay as they are.
+#[tokio::test]
+async fn the_technician_changes_one_entry_and_both_sides_say_the_same() {
+    let mut live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    let root = FileStore::for_session(live.session)
+        .staging_root()
+        .to_path_buf();
+    staged_file(live.session, "a.txt", b"first");
+    staged_file(live.session, "taken.txt", b"second");
+
+    {
+        let files = TechnicianFiles::new(&live.service, &trail);
+        files
+            .create_folder(staged("Photos"))
+            .await
+            .expect("the folder is created");
+        assert!(root.join("Photos").is_dir());
+
+        // A name that is taken is refused, and nothing changes.
+        match files.rename(staged("a.txt"), staged("taken.txt")).await {
+            Err(TargetError::Remote {
+                code: ErrorCode::AlreadyExists,
+                ..
+            }) => {}
+            other => panic!("expected a refused rename, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(root.join("a.txt")).expect("read"), b"first");
+        assert_eq!(
+            std::fs::read(root.join("taken.txt")).expect("read"),
+            b"second"
+        );
+
+        files
+            .rename(staged("a.txt"), staged("b.txt"))
+            .await
+            .expect("the file is renamed");
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(std::fs::read(root.join("b.txt")).expect("read"), b"first");
+
+        let found = files.look_up(staged("b.txt")).await.expect("looked up");
+        assert_eq!(found.entry.map(|entry| entry.len), Some(5));
+        assert_eq!(found.partial_len, None);
+
+        files
+            .delete(staged("b.txt"))
+            .await
+            .expect("the file is deleted");
+        assert!(!root.join("b.txt").exists());
+        let gone = files.look_up(staged("b.txt")).await.expect("looked up");
+        assert_eq!(gone.entry, None);
+
+        // A folder is not deleted as a file.
+        assert!(matches!(
+            files.delete(staged("Photos")).await,
+            Err(TargetError::Remote { .. })
+        ));
+        assert!(root.join("Photos").is_dir());
+    }
+
+    let (start, done) = trail.pair("console_make_dir_start", "console_make_dir");
+    assert_eq!(text(&start, "path").as_deref(), Some("staging:Photos"));
+    assert_eq!(done.outcome, Outcome::Ok);
+    let moves = trail.of("console_move");
+    assert_eq!(
+        moves.iter().map(|entry| entry.outcome).collect::<Vec<_>>(),
+        [Outcome::Failed, Outcome::Ok]
+    );
+    assert_eq!(text(&moves[1], "path").as_deref(), Some("staging:a.txt"));
+    assert_eq!(text(&moves[1], "to").as_deref(), Some("staging:b.txt"));
+    assert!(text(&moves[0], "reason").is_some());
+    let looks = trail.of("console_fs_stat");
+    assert_eq!(
+        looks
+            .iter()
+            .map(|entry| entry.args.0.get("found").cloned())
+            .collect::<Vec<_>>(),
+        [Some(AuditValue::Bool(true)), Some(AuditValue::Bool(false))]
+    );
+    assert_eq!(
+        trail
+            .of("console_delete")
+            .iter()
+            .map(|entry| entry.outcome)
+            .collect::<Vec<_>>(),
+        [Outcome::Ok, Outcome::Failed]
+    );
+    assert!(
+        trail
+            .all()
+            .iter()
+            .all(|entry| entry.actor == Actor::Console)
+    );
+
+    let change = |operation: String, done: bool| Said {
+        source: ActivitySource::Technician,
+        kind: ActivityKind::FileOperation,
+        description: "Worked with files and folders".to_string(),
+        operation,
+        done,
+    };
+    let expected = [
+        change(format!("create the folder {}", in_staging("Photos")), true),
+        change(
+            format!(
+                "move {} to {}",
+                in_staging("a.txt"),
+                in_staging("taken.txt")
+            ),
+            false,
+        ),
+        change(
+            format!("move {} to {}", in_staging("a.txt"), in_staging("b.txt")),
+            true,
+        ),
+        change(format!("look up {}", in_staging("b.txt")), true),
+        change(format!("delete the file {}", in_staging("b.txt")), true),
+        change(format!("look up {}", in_staging("b.txt")), true),
+        change(format!("delete the file {}", in_staging("Photos")), false),
+    ];
+    assert_eq!(said(customer_feed(&mut live).await), expected);
+    assert_eq!(said(technician_feed(&trail)), expected);
+
+    live.service.stop();
+    let _ = std::fs::remove_dir_all(root.join("Photos"));
+    let _ = std::fs::remove_file(root.join("taken.txt"));
+}
+
+/// Stopping the session ends a copy on its way: it is never reported or
+/// recorded as done and no file appears under its name; every later change
+/// and copy fails closed and is still recorded (REQ-S-004, REQ-S-009).
+#[tokio::test]
+async fn a_stop_ends_a_copy_and_later_changes_fail_closed() {
+    let live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    let files = TechnicianFiles::new(&live.service, &trail);
+    let dir = temp_dir_for("download-stopped");
+    let content: Vec<u8> = (0..1_500_000u32).map(|n| (n % 239) as u8).collect();
+    staged_file(live.session, "big.bin", &content);
+    let dest = dir.join("big.bin");
+
+    // The technician stops the session as soon as the first bytes arrived.
+    let sink: ProgressSink<cretlink_session::TransferProgress> = {
+        let service = live.service.clone();
+        Box::new(move |progress| {
+            if progress.transferred > 0 {
+                service.stop();
+            }
+        })
+    };
+    let result = files
+        .download(
+            staged("big.bin"),
+            dest.clone(),
+            CancelToken::new(),
+            Some(sink),
+        )
+        .await;
+    match &result {
+        Ok(report) => assert_eq!(report.outcome, JobOutcome::Cancelled, "{report:?}"),
+        Err(error) => assert!(
+            matches!(
+                error,
+                TargetError::NoConsentedSession | TargetError::Disconnected
+            ),
+            "{error:?}"
+        ),
+    }
+    assert!(!dest.exists(), "no file appears under the name");
+    let (_, done) = trail.pair("console_download_start", "console_download");
+    assert_ne!(done.outcome, Outcome::Ok);
+
+    assert!(!live.service.is_active());
+    assert!(matches!(
+        files
+            .download(staged("big.bin"), dest, CancelToken::new(), None)
+            .await,
+        Err(TargetError::NoConsentedSession)
+    ));
+    assert_eq!(
+        files.create_folder(staged("Photos")).await,
+        Err(TargetError::NoConsentedSession)
+    );
+    assert_eq!(
+        files.rename(staged("big.bin"), staged("other.bin")).await,
+        Err(TargetError::NoConsentedSession)
+    );
+    assert_eq!(
+        files.delete(staged("big.bin")).await,
+        Err(TargetError::NoConsentedSession)
+    );
+    assert!(matches!(
+        files.look_up(staged("big.bin")).await,
+        Err(TargetError::NoConsentedSession)
+    ));
+    for action in [
+        "console_make_dir",
+        "console_move",
+        "console_delete",
+        "console_fs_stat",
+    ] {
+        let (_, refused) = trail.pair(&format!("{action}_start"), action);
+        assert_eq!(refused.outcome, Outcome::Failed, "{action}");
+    }
+    assert_eq!(trail.of("console_download").len(), 2);
+    assert!(
+        FileStore::for_session(live.session)
+            .staging_root()
+            .join("big.bin")
+            .exists(),
+        "nothing was changed after the stop"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rename, a delete, a new folder and a copy by the paths the explorer
+/// names: in a real folder, each lands in that folder and nowhere else, and a
+/// path through a junction is refused with `invalid_path`, nothing changed.
+/// Windows only: the wire accepts drive-qualified paths only.
+#[cfg(windows)]
+#[tokio::test]
+async fn changes_and_a_copy_work_in_a_real_folder_and_refuse_a_link_on_the_way() {
+    let live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    let files = TechnicianFiles::new(&live.service, &trail);
+    let dir = temp_dir_for("changes-in-a-folder");
+    // The folder by its real names: a runner may give it by a short name.
+    let real = std::fs::canonicalize(&dir).expect("the real path");
+    let real = real.display().to_string();
+    let base = real.strip_prefix("\\\\?\\").unwrap_or(&real).to_string();
+    let documents = format!("{base}\\Documents");
+    std::fs::create_dir_all(&documents).expect("plant");
+    std::fs::write(format!("{documents}\\report.txt"), b"report").expect("plant");
+    let at = |name: &str| RemotePath::Absolute {
+        path: format!("{documents}\\{name}"),
+    };
+
+    files
+        .create_folder(at("Photos"))
+        .await
+        .expect("the folder is created");
+    assert!(Path::new(&format!("{documents}\\Photos")).is_dir());
+    files
+        .rename(at("report.txt"), at("report 2026.txt"))
+        .await
+        .expect("the file is renamed");
+    assert_eq!(
+        std::fs::read(format!("{documents}\\report 2026.txt")).expect("read"),
+        b"report"
+    );
+    assert!(!Path::new(&format!("{documents}\\report.txt")).exists());
+
+    let local = dir.join("copies");
+    std::fs::create_dir_all(&local).expect("the local folder");
+    let copied = files
+        .download(
+            at("report 2026.txt"),
+            local.join("report 2026.txt"),
+            CancelToken::new(),
+            None,
+        )
+        .await
+        .expect("the transfer runs");
+    assert_eq!(copied.outcome, JobOutcome::Completed, "{:?}", copied.error);
+    assert_eq!(
+        std::fs::read(local.join("report 2026.txt")).expect("read"),
+        b"report"
+    );
+
+    // A junction on the way: every change behind it is refused, and what the
+    // junction points at stays as it is.
+    let outside = format!("{base}\\outside");
+    std::fs::create_dir_all(&outside).expect("plant");
+    std::fs::write(format!("{outside}\\keep.txt"), b"keep").expect("plant");
+    let link = format!("{base}\\via");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J", &link, &outside])
+        .output()
+        .expect("run mklink");
+    assert!(made.status.success(), "{made:?}");
+    let behind = |name: &str| RemotePath::Absolute {
+        path: format!("{link}\\{name}"),
+    };
+    for refused in [
+        files.delete(behind("keep.txt")).await,
+        files.rename(behind("keep.txt"), behind("moved.txt")).await,
+        files.create_folder(behind("new")).await,
+    ] {
+        match refused {
+            Err(TargetError::Remote {
+                code: ErrorCode::InvalidPath,
+                ..
+            }) => {}
+            other => panic!("expected invalid_path, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        std::fs::read(format!("{outside}\\keep.txt")).expect("read"),
+        b"keep"
+    );
+    assert!(!Path::new(&format!("{outside}\\new")).exists());
+    assert!(!Path::new(&format!("{outside}\\moved.txt")).exists());
+
+    // The junction itself is deleted as the link it is.
+    files
+        .delete(RemotePath::Absolute { path: link.clone() })
+        .await
+        .expect("the link is removed");
+    assert!(!Path::new(&link).exists());
+    assert_eq!(
+        std::fs::read(format!("{outside}\\keep.txt")).expect("read"),
+        b"keep",
+        "what the link pointed at is untouched"
+    );
+
+    files
+        .delete(at("report 2026.txt"))
+        .await
+        .expect("the file is deleted");
+    assert!(!Path::new(&format!("{documents}\\report 2026.txt")).exists());
+
+    live.service.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The technician's file actions land in the session's audit file with the
 /// session's other records: the sealed chain verifies, the Audit tab lists
 /// them as the technician's in the feed's words, and the history counts them

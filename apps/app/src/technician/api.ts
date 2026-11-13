@@ -13,11 +13,20 @@ import type {
   AppInfo,
   AuditEntryView,
   BridgeStatus,
+  ChosenFolder,
   ClientId,
+  ConflictChoice,
+  DeleteReport,
   ExplorerDrive,
+  ExplorerEntryKind,
   ExplorerListing,
   ListenNetwork,
   SessionSummary,
+  TransferCheck,
+  TransferEntry,
+  TransferKind,
+  TransferQueued,
+  UploadOffer,
 } from "../shared/contract";
 
 export type DiscoverySource = "discovered" | "manual" | "simulated";
@@ -110,6 +119,21 @@ export interface CommandError {
   message: string;
 }
 
+// A selected entry of the open folder, for a copy to this computer: its
+// name, and what the listing showed it as. The backend finds out what it is
+// from a listing of its own.
+export interface TransferName {
+  name: string;
+  kind: TransferKind;
+}
+
+// A selected entry of the open folder, for a delete: its name and the kind
+// the listing gave, which chooses how it is removed.
+export interface DeleteItem {
+  name: string;
+  kind: ExplorerEntryKind;
+}
+
 export function isCommandError(value: unknown): value is CommandError {
   return (
     typeof value === "object" &&
@@ -162,6 +186,43 @@ export const api = {
   explorerDrives: () => invoke<ExplorerDrive[]>("explorer_drives"),
   explorerOpen: (path: string, listing: number) =>
     invoke<ExplorerListing>("explorer_open", { path, listing }),
+  // What the explorer sends, copies, renames and deletes (ST-M010-002). All
+  // fail closed with `no_consented_session` outside full control, except the
+  // four that only look at what the backend holds: the queue, a cancel, and
+  // the folder of a copy. A folder is a path on the customer computer; no
+  // command takes a path of this computer: files to send are named by the
+  // number of an offer, and a folder to copy to by the number it was chosen
+  // under.
+  explorerPickUpload: (kind: "files" | "folder") =>
+    invoke<UploadOffer | null>("explorer_pick_upload", { kind }),
+  explorerSendCheck: (offer: number, folder: string) =>
+    invoke<TransferCheck>("explorer_send_check", { offer, folder }),
+  explorerSend: (offer: number, folder: string, choices: Record<string, ConflictChoice>) =>
+    invoke<TransferQueued>("explorer_send", { offer, folder, choices }),
+  explorerChooseFolder: () => invoke<ChosenFolder | null>("explorer_choose_folder"),
+  explorerDownloadCheck: (names: TransferName[], to?: number) =>
+    invoke<TransferCheck>("explorer_download_check", to === undefined ? { names } : { names, to }),
+  explorerDownload: (
+    folder: string,
+    names: TransferName[],
+    to: number | undefined,
+    choices: Record<string, ConflictChoice>,
+  ) =>
+    invoke<TransferQueued>(
+      "explorer_download",
+      to === undefined ? { folder, names, choices } : { folder, names, to, choices },
+    ),
+  explorerTransfers: () => invoke<TransferEntry[]>("explorer_transfers"),
+  explorerCancelTransfer: (transfer: number) =>
+    invoke<void>("explorer_cancel_transfer", { transfer }),
+  explorerCancelTransfers: () => invoke<void>("explorer_cancel_transfers"),
+  explorerShowFolder: (transfer: number) => invoke<void>("explorer_show_folder", { transfer }),
+  explorerRename: (folder: string, name: string, to: string) =>
+    invoke<void>("explorer_rename", { folder, name, to }),
+  explorerDelete: (folder: string, items: DeleteItem[], removal: number) =>
+    invoke<DeleteReport>("explorer_delete", { folder, items, removal }),
+  explorerCancelDelete: (removal: number) =>
+    invoke<void>("explorer_cancel_delete", { removal }),
 
   // The interfaces of ST-M009-008, ST-M009-006 and ST-M009-012. A command
   // the backend does not offer yet rejects; the controller then shows the
@@ -204,6 +265,16 @@ export const CONSOLE_BRIDGE_EVENT = "console-bridge";
 // The pages of a folder the file explorer opened (ST-M010-002): one
 // `ExplorerEvent` of the shared contract per step of a listing.
 export const CONSOLE_EXPLORER_EVENT = "console-explorer";
+
+// What the technician dropped on the window (ST-M010-002): one `UploadOffer`
+// of the shared contract. The paths stay in the backend.
+export const CONSOLE_EXPLORER_DROP_EVENT = "console-explorer-drop";
+
+// The transfer queue's changes (ST-M010-002): one `TransfersEvent` each.
+export const CONSOLE_TRANSFERS_EVENT = "console-transfers";
+
+// Where a delete stands (ST-M010-002): one `RemovalProgress` each.
+export const CONSOLE_REMOVAL_EVENT = "console-removal";
 
 // The raw terminal frame channel (ST-M008-001). Distinct again so high-frequency
 // VT output never re-renders state or the activity feed; the terminal panel

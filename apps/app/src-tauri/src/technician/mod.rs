@@ -46,7 +46,7 @@ use cretlink_protocol::{JobId, JobOutcome, PROTOCOL_V1, RevokeReason, Shell};
 use cretlink_protocol::{SessionId, TargetIdentity};
 use cretlink_session::{ActivityEntry, ConsoleHints, SessionHost};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 // The local MCP bridge for the rail (ST-M009-008).
 mod bridge;
@@ -110,6 +110,13 @@ pub struct AppState {
     /// The folder listing the file explorer is waiting for, so that the next
     /// place the technician opens can leave it (ST-M010-002).
     listings: explorer::Listings,
+    /// The transfer queue of the file explorer: what the technician sends to
+    /// the customer computer and copies from it in this session, and what was
+    /// dropped or picked to be sent (ST-M010-002).
+    transfers: explorer::Transfers,
+    /// The deletes of the file explorer that run, so that the window can
+    /// cancel one (ST-M010-002).
+    removals: explorer::Removals,
 }
 
 /// The slot of [`AppState::pump`].
@@ -139,6 +146,8 @@ impl AppState {
             network: network::NetworkChoice::default(),
             pump: PumpSlot::default(),
             listings: explorer::Listings::default(),
+            transfers: explorer::Transfers::default(),
+            removals: explorer::Removals::default(),
         }
     }
 
@@ -159,6 +168,8 @@ impl AppState {
             network: network::NetworkChoice::default(),
             pump: PumpSlot::default(),
             listings: explorer::Listings::default(),
+            transfers: explorer::Transfers::default(),
+            removals: explorer::Removals::default(),
         }
     }
 
@@ -575,6 +586,9 @@ fn begin_listening(app: AppHandle, state: &AppState, bind_ip: IpAddr) {
     let activity = state.activity.clone();
     // A new session starts with no bridge endpoint and no AI clients.
     bridge::lock_bridge(&state.bridge).reset();
+    // And with an empty transfer queue: what the session before it sent,
+    // copied or was offered is dropped (ST-M010-002).
+    state.transfers.reset();
     let bridge_slot = state.bridge.clone();
     let audit_slot = state.audit.clone();
     let audit_log = state.audit_log.clone();
@@ -965,6 +979,14 @@ async fn term_close(state: State<'_, AppState>, term: u64) -> Result<(), Command
 /// the shared [`crate::start::get_role`].
 pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
     let builder = builder.manage(default_app_state());
+    // Files and folders dropped on the window are kept on this side, and the
+    // window is told their names: it never names a file to send by its path
+    // (ST-M010-002).
+    let builder = builder.on_window_event(|window, event| {
+        if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+            explorer::commands::dropped(window.app_handle(), paths);
+        }
+    });
 
     // The shipped exe exposes only the real-transport command surface. The
     // simulate-* developer commands are added only under `dev-simulate`, so a
@@ -989,6 +1011,19 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         term_close,
         explorer::explorer_drives,
         explorer::explorer_open,
+        explorer::commands::explorer_pick_upload,
+        explorer::commands::explorer_send_check,
+        explorer::commands::explorer_send,
+        explorer::commands::explorer_choose_folder,
+        explorer::commands::explorer_download_check,
+        explorer::commands::explorer_download,
+        explorer::commands::explorer_transfers,
+        explorer::commands::explorer_cancel_transfer,
+        explorer::commands::explorer_cancel_transfers,
+        explorer::commands::explorer_show_folder,
+        explorer::commands::explorer_rename,
+        explorer::commands::explorer_delete,
+        explorer::commands::explorer_cancel_delete,
         history::list_sessions,
         history::open_audit,
         history::get_session_audit,
@@ -1017,6 +1052,19 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         term_close,
         explorer::explorer_drives,
         explorer::explorer_open,
+        explorer::commands::explorer_pick_upload,
+        explorer::commands::explorer_send_check,
+        explorer::commands::explorer_send,
+        explorer::commands::explorer_choose_folder,
+        explorer::commands::explorer_download_check,
+        explorer::commands::explorer_download,
+        explorer::commands::explorer_transfers,
+        explorer::commands::explorer_cancel_transfer,
+        explorer::commands::explorer_cancel_transfers,
+        explorer::commands::explorer_show_folder,
+        explorer::commands::explorer_rename,
+        explorer::commands::explorer_delete,
+        explorer::commands::explorer_cancel_delete,
         history::list_sessions,
         history::open_audit,
         history::get_session_audit,

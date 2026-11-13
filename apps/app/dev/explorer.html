@@ -13,6 +13,15 @@
          which builds only ../index.html. Serve with `npx vite` and open
          /dev/explorer.html, then the Files tab. -->
     <div id="app" aria-busy="true"></div>
+    <!-- What a browser cannot do here: a drop from a file manager, and the
+         end of the session. These buttons stand in for both (see
+         explorer.ts); they are not part of the application. -->
+    <div
+      id="dev-bar"
+      role="group"
+      aria-label="Development: drops and the end of the session"
+      style="position: fixed; right: 10px; bottom: 10px; z-index: 999; display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; max-width: 60%; padding: 6px; background: #0f172a; border-radius: 8px; font: 12px system-ui, sans-serif"
+    ></div>
     <script type="module" src="./explorer.ts"></script>
   </body>
 </html>

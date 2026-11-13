@@ -1363,13 +1363,17 @@ these operations through the console library. The AI tool surface does not
 contain them.
 
 The file explorer in the Files tab of the technician's window (ST-M010-002)
-has landed in its first part, browsing: the list of drives and the listing of
-a folder, with automated tests on every CI platform (FT-12). A folder is
-found by its path only where the wire accepts such a path, so the tests that
-open a real folder by a typed path run on the Windows CI runner only. The
-explorer has no control yet for the removal of a folder or for a file sent
-into one. Its run on real hardware is the browsing steps of scenario MT-14,
-not yet recorded.
+has landed in both of its parts. It browses — the list of drives and the
+listing of a folder (FT-12) — and it changes: files and folders are sent to
+the open folder, the selection is copied to the technician computer, and an
+entry is renamed or deleted (FT-13). Both have automated tests on every CI
+platform. A folder is found by its path only where the wire accepts such a
+path, so the tests that open a real folder by a typed path, and those that
+send, copy, rename and delete in one, run on the Windows CI runner only. On
+every platform the technician's calls run through a real session in the
+staging area, and the transfer queue and the changes of the window are
+tested against a customer computer held in memory. Its run on real hardware
+is scenario MT-14, not yet recorded.
 
 The four operations that change one entry of a folder — delete a file, remove
 an empty folder, create a folder, move or rename (M003; the AI tools
@@ -1389,12 +1393,19 @@ swapped run on the Windows CI runner only; the run on real hardware is steps
   write tool; content crosses only through `remote_upload` and
   `remote_download`.
 - The technician's own file actions in the console library
-  (`TechnicianFiles`, ST-M010-001): the list of drives, the removal of a folder
-  with everything in it, and a file sent into a folder on any drive. Their
-  requests carry the origin `console`; they are not MCP tools. The first two
-  are wire operations of their own (`fs_drives`, `remove_tree`), which an
-  agent serves only when it advertises the capability `fs.v2`; the third uses
-  the transfer operations with an absolute destination.
+  (`TechnicianFiles`, ST-M010-001, ST-M010-002): the list of drives, the
+  listing of a folder, the removal of a folder with everything in it, a file
+  sent into a folder on any drive, a file copied to the technician computer,
+  and the changes to one entry (a new folder, a move or rename, a delete, a
+  look-up). Their requests carry the origin `console`; they are not MCP
+  tools. The drive list and the removal are wire operations of their own
+  (`fs_drives`, `remove_tree`), which an agent serves only when it advertises
+  the capability `fs.v2`; the others use the operations the AI tools use,
+  under the technician's name.
+- The commands of the technician's window that drive those actions
+  (`explorer_*` in `apps/app`, FT-12 and FT-13). They take text from the
+  window — a folder and names on the customer computer — and write files on
+  the technician computer under names that the customer computer gives.
 - The file explorer in the Files tab of the technician's window
   (ST-M010-002): the commands `explorer_drives` and `explorer_open` of the
   application's backend, registered in a technician process only. They call
@@ -2134,6 +2145,192 @@ tests `explorer.test.ts`, `explorer-views.test.ts` and
 hardware is the browsing steps of scenario MT-14 in
 [`manual-tests.md`](manual-tests.md), not yet recorded.
 
+*FT-13 — Sending, copying to the technician computer, renaming and deleting
+from the technician's window (ST-M010-002).* The second part of the explorer
+makes changes everyday actions: a drop on the window sends files, **Download**
+writes files of the customer computer on the technician computer, **Delete**
+removes a folder with everything in it, **Rename** moves an entry. What it
+adds: commands of the application's backend that are driven by text from the
+window; files written on the technician computer under names that the
+customer computer chooses; a destructive action one key away; many requests
+that run without the technician watching each; and transfers that are still
+on their way when the session ends. Abuse: a customer computer — or whoever
+answers in its place — names a file `..\..\Startup\run.bat`, `C:\x`, `NUL`
+or `report.pdf.` so that a copy lands outside the folder the technician
+chose, on a device, or over another file; a listing says that a link is a
+folder so that a copy follows it; the content of the window, should it ever
+be led astray, names a file of the technician computer to send or a place to
+write to; a transfer that failed, was cancelled or was cut off by the end of
+the session is shown as done; a delete removes more than was confirmed, or
+reports as removed what is still there; a rename moves an entry to another
+folder or replaces another file. Mitigations:
+
+- *No authority of its own.* Every command exists in a technician process
+  only. Those that ask something of the customer computer, or that prepare
+  to, refuse with `no_consented_session` outside a session under full
+  control with an open audit trail, before a dialog opens or anything is
+  kept: nothing the technician changes can miss the trail. What a dialog
+  gave is not kept either when the session ended while it was open. The five
+  that only look at or cancel what the backend holds — the queue, the three
+  cancels, the folder of a copy — reach nothing on the customer computer. A
+  stop or a revocation cancels the transfer and the removal that run; the
+  queue then ends the running transfer and every waiting one as stopped,
+  never as done, and a delete says how far it came. The window says so in
+  the queue, in the explorer's alert and, once the explorer is dropped with
+  the session, in its own alert (REQ-S-023, REQ-S-004, REQ-N-008).
+- *The window names no file of the technician computer.* What is sent comes
+  from the system's file dialog, which the backend opens itself, or from a
+  drop on the window, which the backend receives itself. It keeps the paths
+  as an offer and tells the window a number and the names; a send names the
+  number. A copy goes to `Downloads\CretLink\<target>` or to a folder the
+  technician chose in the system's folder dialog, kept under a number. The
+  folder that **Show in folder** opens is the one a copy of the queue went
+  to. So a window that was led astray could send only what the technician
+  dropped or picked, and write only where the technician chose.
+- *A place on the customer computer is text, and checked.* A folder from the
+  window must be a rooted path on a drive (`validate_remote_absolute_path`,
+  FT-12); a name must be one name, without a separator, a colon or a
+  character that no name may hold. Neither is ever opened on the technician
+  computer. The agent has the last word: it takes up the folder of a change
+  or of a transfer as a verified folder and refuses a path through a link
+  (FT-8, FT-9, FT-11).
+- *A name from the customer computer is untrusted.* A copy is written at the
+  chosen folder plus names that listings give. Each such name must be one
+  plain name before anything is written (`explorer/local.rs`): not empty,
+  not `.` or `..`, no `\` or `/`, no colon (a drive or an alternate data
+  stream), no control character, none of `< > " | ? *`, no trailing dot or
+  space (Windows would read it as another name), no reserved device name
+  (`CON`, `NUL`, `COM1`, `LPT1` and the others, with or without an
+  extension), not longer than 255 units, and not the name CretLink gives an
+  unfinished copy. Any other name is refused, never repaired: its entry is
+  left out with a row that says why, and what lies beside it is still
+  copied. The path of every copy is checked once more, when it is about to
+  be written, to lie inside the chosen folder through plain names only. The
+  folder for `<target>` is made from the host name the customer computer
+  reports, with everything but letters, digits, `-`, `_` and `.` replaced,
+  and a fixed name when nothing usable is left.
+- *What a name is comes from the backend's own look.* The window says which
+  entries are selected; whether each is a file, a folder or a link is read
+  from a listing the backend asks for, once for the selection and once for
+  each folder below it. A link is never followed in either direction: one
+  that is selected or lies in a folder that is copied is left out and says
+  so, and a link in a dropped folder is not sent (`symlink_metadata`, never
+  the target). The walks are bounded — 10 000 files and folders for one send
+  or one copy, 32 folders deep, 100 000 transfers in a session's queue — and
+  a folder that holds more, or that could not be listed to its end, has a
+  row that says it is not complete (REQ-N-006, REQ-N-008).
+- *Nothing is replaced without the request.* Before a send the backend lists
+  the folder and the window asks, for each name that is taken, whether to
+  replace it, keep both (`name (2).ext`) or skip; before a copy it looks at
+  the technician computer's folder and asks the same. A file replaces a
+  file and a folder goes into a folder; where the kinds differ, replacing is
+  not offered, and it is refused when it is asked for all the same. A name
+  that is taken and has no choice is left out. A name that turns out to be
+  taken after the look fails its transfer: the agent refuses to publish over
+  a file without the request (FT-9), and a copy whose place is taken is not
+  started.
+- *Done means verified.* A row of the queue reads as sent or copied only for
+  a transfer the engine reported as completed, which is one whose length and
+  SHA-256 were verified (FT-2, FT-3). A failed transfer carries the reason in
+  the words the activity has for its category — in use, access denied, the
+  disk is full — or the local path and reason for a file of the technician
+  computer; a cancelled one says cancelled; one that the end of the session
+  cut off says stopped. A transfer that the session cancelled without the
+  technician asking is the end of the session, not the technician's cancel.
+- *A cancel leaves no part.* The engine asks the agent to discard the part
+  of a cancelled send; the queue then asks whether a part is still there and
+  says so when it is, with what happens to it (the session's cleanup removes
+  it, FT-9). The part of a cancelled or stopped copy is removed from the
+  technician computer, and the row says so when it could not be.
+- *Delete is confirmed once, for exactly what is selected.* The window asks
+  before anything is removed, with the number of items and the sentence that
+  there is no recycle bin, and gives the focus to **Cancel**. Each item is
+  then removed by the operation its listed kind has: `remove_tree` for a
+  folder (FT-8), `fs_delete` for a file or a link, which removes a link as
+  the link (FT-11). The kind only chooses the operation: the agent refuses a
+  folder that is asked to be deleted as a file and a file or a link that is
+  asked to be removed as a folder, so a kind that is out of date removes
+  nothing. The answer counts an item as removed only when the agent said so,
+  names the entries that could not be removed with their reasons — the first
+  twenty, the others as a number — and the folder is listed again. One
+  delete takes at most 10 000 items and can be cancelled between two steps.
+- *Rename stays in its folder.* The new name is one name; a text with a
+  separator would move the entry and is refused before anything is asked.
+  The move never replaces: a name that is taken is refused by the agent in
+  one step with the rename (FT-11).
+- *Text from the customer computer.* Names, paths and reasons are written
+  into the queue, the questions and the alerts as text, never as markup, and
+  every event of the queue is checked against the contract before it is
+  taken; one with a malformed entry is dropped whole (REQ-S-016, REQ-S-018).
+- *The file manager is started by its full path.* **Show in folder** starts
+  `explorer.exe` in the Windows folder the system names, `/usr/bin/open`, or
+  `xdg-open` from one of the system's program folders, with the folder as its
+  only argument and never through a shell; a bare name that a search path
+  resolves is never handed over.
+- *What the customer sees, and what is recorded.* Every request carries the
+  origin `console`. Each file that arrives, each file that leaves, each
+  folder that is made, each rename and each delete is an item of its own in
+  the customer's activity; the looks stay the one item that follows along
+  (FT-12). Each is a pair of audit records of the technician
+  (`console_send`, `console_download`, `console_make_dir`, `console_move`,
+  `console_delete`, `console_remove_tree`, and `console_fs_stat` for the
+  look after a cancelled send), with the path on the customer computer, the
+  length and the digest of a transfer, and an outcome that is `ok` only for
+  what the agent confirmed. The path of a file on the technician computer is
+  no argument of a record. It stands in one place only: the reason of a
+  transfer that failed on the technician computer, which names the file that
+  could not be read or written. That reason stays in the technician's own
+  audit log and is not sent to the customer computer (REQ-F-017, REQ-S-017,
+  REQ-S-018).
+
+Evidence: `a_name_that_could_leave_its_folder_is_refused`,
+`a_name_in_a_folder_stays_in_that_folder`,
+`the_folder_of_a_customer_computer_is_a_plain_name`,
+`a_link_in_a_dropped_folder_is_named_and_not_followed` and
+`a_walk_stops_at_its_bounds_and_says_so`
+(`apps/app/src-tauri/src/technician/explorer/local/tests.rs`);
+`names_that_try_to_leave_the_chosen_folder_are_left_out`,
+`a_copy_whose_place_is_outside_the_chosen_folder_is_refused`,
+`what_a_selected_name_is_comes_from_the_listing_not_from_the_window`,
+`a_selected_folder_is_copied_file_by_file_and_a_link_is_left_out`,
+`a_name_that_is_taken_is_replaced_kept_beside_or_skipped_as_chosen`,
+`a_name_that_is_taken_here_is_replaced_kept_beside_or_skipped_as_chosen`,
+`a_file_never_replaces_a_folder_on_this_computer`,
+`a_file_that_appeared_after_the_look_is_never_replaced`,
+`an_offer_is_queued_only_for_the_folder_it_was_checked_against`,
+`a_cancelled_transfer_never_reads_as_done_and_says_what_it_left`,
+`a_cancelled_or_stopped_copy_leaves_no_part_on_this_computer`,
+`the_end_of_the_session_stops_the_running_and_every_waiting_transfer`,
+`a_transfer_the_session_cancelled_is_stopped_not_cancelled`,
+`a_folder_that_is_not_walked_to_its_end_says_so` and
+`a_new_session_starts_with_an_empty_queue`
+(`apps/app/src-tauri/src/technician/explorer/transfers/tests.rs`);
+`a_new_name_that_is_a_path_is_refused_before_anything_is_asked`,
+`a_rename_onto_a_name_that_is_taken_changes_nothing`,
+`a_delete_removes_each_item_by_what_it_is`,
+`a_kind_that_is_out_of_date_removes_nothing`,
+`what_could_not_be_removed_is_named_with_its_reason` and
+`the_end_of_the_session_stops_a_delete_and_says_so`
+(`apps/app/src-tauri/src/technician/explorer/changes/tests.rs`);
+`without_a_session_every_command_fails_closed`,
+`without_an_audit_trail_every_command_fails_closed`,
+`a_folder_from_the_window_is_a_path_on_a_drive_of_the_customer_computer`,
+`a_copy_goes_to_the_default_folder_or_to_one_the_technician_chose`,
+`a_selection_whose_name_is_a_path_is_refused_whole` and, on Windows,
+`files_are_sent_copied_back_renamed_and_deleted_through_a_session`
+(`apps/app/src-tauri/src/technician/explorer/commands/tests.rs`);
+`the_file_manager_is_named_by_its_full_path` (`apps/app/src-tauri/src/opener.rs`);
+`the_technician_copies_a_file_to_this_computer`,
+`a_cancelled_copy_is_never_done_and_its_part_is_named`,
+`the_technician_changes_one_entry_and_both_sides_say_the_same`,
+`a_stop_ends_a_copy_and_later_changes_fail_closed` and, on Windows,
+`changes_and_a_copy_work_in_a_real_folder_and_refuse_a_link_on_the_way`
+(`apps/console/tests/technician_files_e2e.rs`); and the frontend tests
+`explorer.test.ts`, `explorer-views.test.ts` and
+`explorer-controller.test.ts` in `apps/app/src/technician`. The run on real
+hardware is scenario MT-14 in [`manual-tests.md`](manual-tests.md), not yet
+recorded.
+
 *FT-11 — A change to one entry is led to another place (ST-M010-004).*
 Deleting a file, removing an empty folder, creating a folder and moving or
 renaming an entry each change one entry of a folder. The operations exist
@@ -2406,9 +2603,35 @@ scenario MT-14 in [`manual-tests.md`](manual-tests.md), not yet recorded.
   and reads the type of a file from the end of its real name, but it does
   not mark or rewrite such names. It opens no file and runs nothing.
 - The explorer was not run against a customer computer on real hardware yet
-  (the browsing steps of MT-14). Its window was tested in jsdom and looked at
-  in Chromium with a simulated customer computer, not in WebView2, and no
-  screen reader has read its grid.
+  (MT-14). Its window was tested in jsdom and looked at in Chromium with a
+  simulated customer computer, not in WebView2; a drop from a real file
+  manager and the system's own dialogs were not exercised, and no screen
+  reader has read its grid, its questions or its queue.
+- The technician decides about a name that is taken from a look at the
+  folder that was true when it was made (FT-13). A file that appears under
+  a free name afterwards is not replaced: its transfer fails. A name the
+  technician chose to replace is replaced whatever file lies under it when
+  the transfer commits: the one that was listed, or another that took its
+  place since.
+- A delete removes what lies under the selected names when it runs. The
+  technician confirmed names of a listing; a program on the customer
+  computer can put another file under one of them in between. The agent
+  removes only inside the folder that was named, and a folder only as the
+  folder it took up (FT-8, FT-11).
+- The names a copy writes are checked for what they could do to the place of
+  the file (FT-13), not for what they look like. A name can still be made to
+  look like another one, and a copied file is the customer computer's
+  content: the explorer opens and runs none of it, and what the technician
+  does with it afterwards is outside CretLink.
+- A copy to the technician computer that is cancelled, or that fails on the
+  technician computer, stays in progress in the customer's activity until
+  the session ends: the wire has no way to tell the agent that a copy was
+  given up, so the agent closes that item with the session. What left the
+  computer is never under-reported by this; the item never reads as done.
+- While one file is being sent or copied, the session serves nothing else
+  from the technician computer: a listing, the terminal and a call of the AI
+  wait until that file has ended. A stop by either side does not wait: it
+  cancels the transfer.
 - An operation on a staging name works by path (FT-11). That rests on the
   staging area being a place that no other account can change (FT-7).
 - The identity of a folder is only as good as its file system. On FAT and
@@ -3498,9 +3721,9 @@ Known upcoming triggers for revision:
   execution suite (ST-M003-007) and the other hardware scenarios in
   [`manual-tests.md`](manual-tests.md), including the reboot-resume run (MT-8)
   and the file operations of the explorer (MT-14), being recorded;
-- the second part of the explorer screen (ST-M010-002), which makes the
-  removal of a folder and the transfer into any folder everyday actions of
-  the technician and must record what it asks before a removal;
+- a way to tell the agent that a copy was given up, and a session service
+  that serves other requests while a file is on its way, which would lift two
+  of the residual risks of the explorer (FT-13);
 - promotion of desktop observation and control (M005) or the technician
   terminal (M008) out of draft, which must record their actual status and any
   new residual risk in the

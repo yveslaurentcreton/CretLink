@@ -151,7 +151,7 @@ body {
  * 28 pixels high and a column of the List view 260 wide: `explorer.ts` draws
  * only the rows in view from those two numbers. */
 .panel-files { overflow: hidden; }
-.xp { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #fff; }
+.xp { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #fff; position: relative; }
 .xp-bar {
   display: flex; align-items: center; gap: 2px; padding: 8px 12px; flex: none;
   border-bottom: 1px solid var(--line);
@@ -192,6 +192,8 @@ body {
 .xp > .alert { margin: 8px 12px; flex: none; }
 .xp > .alert .alert-body { flex: 1; }
 .xp > .alert .next { margin-top: 4px; font-weight: 600; }
+/* A second message below the end of the session. */
+.xp > .alert b.also { margin-top: 10px; }
 
 .xp-body { flex: 1; min-height: 0; display: flex; position: relative; }
 .xp-grid { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; font-size: 13px; }
@@ -261,6 +263,62 @@ body {
   font-weight: 700;
 }
 .xp-transfers p { margin: 0; font-size: 12.5px; }
+
+/* What the explorer changes (ST-M010-002): the buttons, the rename field, the
+ * queue, the questions, and where a drop goes. */
+.xp-actions {
+  display: flex; align-items: center; gap: 6px; padding: 6px 12px; flex: none; flex-wrap: wrap;
+  border-bottom: 1px solid var(--line); background: var(--bg);
+}
+.xp-actions .btn { display: inline-flex; align-items: center; gap: 6px; }
+.xp-actions .btn.danger-quiet:not(:disabled) { color: var(--bad-deep); }
+.xp-actions .btn.danger-quiet:not(:disabled):hover { background: var(--bad-soft); border-color: var(--bad-line); }
+.xp-rename {
+  flex: 1; min-width: 0; height: 22px; padding: 0 6px; font-size: 13px; color: var(--ink);
+  border: 1px solid var(--tech); border-radius: var(--r-sm); background: #fff;
+}
+.xp-rename:focus { outline: none; box-shadow: 0 0 0 2px var(--tech-line); }
+.xp-details { margin: 6px 0 0; padding: 0 0 0 18px; font-size: 12.5px; max-height: 140px; overflow: auto; }
+.xp-details code { overflow-wrap: anywhere; }
+.xp-details .more { list-style: none; margin-left: -18px; color: var(--muted); }
+.xp-menu li.sep { border-top: 1px solid var(--line-2); margin-top: 4px; padding-top: 4px; }
+.xp-drop {
+  position: absolute; inset: 6px; z-index: 5; display: grid; place-items: center; pointer-events: none;
+  border: 2px dashed var(--tech); border-radius: var(--r-md); background: rgba(238, 242, 255, 0.92);
+  color: var(--tech-deep); font-weight: 600; text-align: center; padding: 24px;
+}
+.xp-drop.no { border-color: var(--warn); background: rgba(255, 251, 235, 0.94); color: var(--warn); }
+.xp-drop p { margin: 0; max-width: 460px; }
+.xp-transfers-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.xp-transfers-head .xp-h { margin: 0; }
+.xp-queue-words { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); }
+.xp-transfers.queued { max-height: 42%; min-height: 132px; }
+.list.files.queue .it { padding: 6px 0; align-items: center; }
+.list.files.queue .it .file-text { flex: 1; }
+.q-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.q-line b { min-width: 0; overflow-wrap: anywhere; }
+.list.files.queue .it.failed .k,
+.list.files.queue .it.left_out .k,
+.list.files.queue .it.stopped .k { background: var(--bad-soft); border-color: var(--bad-line); color: var(--bad); }
+.list.files.queue .it.more { color: var(--muted); font-size: 12px; padding: 6px 0 6px 40px; }
+.list.files.queue .why { margin: 4px 0 0; font-size: 12.5px; color: var(--bad-deep); overflow-wrap: anywhere; }
+.list.files.queue .it.cancelled .why { color: var(--warn); }
+.list.files.queue code.path {
+  display: block; margin-top: 4px; font: 11.5px/1.45 var(--mono); color: var(--muted); overflow-wrap: anywhere;
+}
+.res.wait { color: var(--muted); }
+.xp-progress { display: block; width: 100%; max-width: 360px; height: 6px; margin-top: 6px; accent-color: var(--tech); }
+.xp-scrim {
+  position: absolute; inset: 0; z-index: 40; display: grid; place-items: center; padding: 24px;
+  background: rgba(15, 23, 42, 0.45);
+}
+.xp-dialog { max-width: 520px; width: 100%; max-height: 100%; overflow: auto; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35); }
+.xp-dialog h3 { margin: 0 0 10px; font-size: 17px; overflow-wrap: anywhere; }
+.xp-question-text p { margin: 0 0 8px; font-size: 13.5px; overflow-wrap: anywhere; }
+.xp-all { display: inline-flex; align-items: center; gap: 6px; margin: 4px 0 0; }
+.xp-all.on { background: var(--tech-soft); border-color: var(--tech-line); color: var(--tech-deep); font-weight: 600; }
+.xp-dialog .row.end { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.xp-dialog .row.end .btn { padding: 8px 14px; }
 
 /* Transfers and audit */
 .list.files .it { align-items: flex-start; }

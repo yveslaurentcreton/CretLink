@@ -20,12 +20,20 @@
 //! attributed to the technician ([`Origin::Console`]):
 //! [`ConsoleSessionService::list_drives`],
 //! [`ConsoleSessionService::list_folder`],
-//! [`ConsoleSessionService::remove_tree`] and
-//! [`ConsoleSessionService::send_to_folder`]. The last two can run long, so
-//! the caller hands in a [`CancelToken`] to cancel them and may hand in a
-//! [`ProgressSink`]; a revoke or stop cancels them like any transfer. They add
-//! no authority: they work only on the consented session and fail closed with
-//! it. The MCP tool surface does not offer them.
+//! [`ConsoleSessionService::remove_tree`],
+//! [`ConsoleSessionService::send_to_folder`] and
+//! [`ConsoleSessionService::download_file`], and the changes to one entry:
+//! [`ConsoleSessionService::stat_entry`],
+//! [`ConsoleSessionService::create_folder`],
+//! [`ConsoleSessionService::move_entry`] and
+//! [`ConsoleSessionService::delete_entry`]. The removal and the two transfers
+//! can run long, so the caller hands in a [`CancelToken`] to cancel them and
+//! may hand in a [`ProgressSink`]; a revoke or stop cancels them like any
+//! transfer. They add no authority: they work only on the consented session
+//! and fail closed with it. The MCP tool surface offers the same wire
+//! operations for one entry and for a transfer under the AI's own name; it
+//! does not offer the drive list, the removal of a folder with its content or
+//! a file sent into a folder.
 //!
 //! The service also keeps, for its session only, what the target has
 //! confirmed about the places the explorer went to (see [`crate::explorer`]).
@@ -223,10 +231,13 @@ enum DriverCommand {
         reply: oneshot::Sender<Result<TreeRemovalReport, HostSessionError>>,
     },
     /// A resumable, verified download driven inline by the transfer engine
-    /// (ST-M004-003, REQ-N-007).
+    /// (ST-M004-003, REQ-N-007). Like an upload it runs under the caller's own
+    /// [`CancelToken`] when it handed one in (ST-M010-002).
     Download {
         request: DownloadRequest,
         attribution: Attribution,
+        cancel: Option<CancelToken>,
+        progress: Option<ProgressSink<TransferProgress>>,
         reply: oneshot::Sender<Result<TransferReport, HostSessionError>>,
     },
     Stop {
@@ -1574,6 +1585,110 @@ impl ConsoleSessionService {
             .await
     }
 
+    /// Copies a file of the target to `dest` on the technician computer, for
+    /// the technician (ST-M010-002). The bytes land in a part beside `dest`,
+    /// and the file gets its name only after its whole-file SHA-256 matches
+    /// the target's; a file that lies at `dest` is replaced by that step.
+    ///
+    /// Setting `cancel` ends the transfer, and so does a revoke or stop. The
+    /// part of a cancelled download stays beside `dest` for a later resume;
+    /// [`cretlink_session::download_part_path`] names it for a caller that
+    /// wants it gone. `progress` receives the bytes confirmed so far.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive or revoked. A
+    /// transfer that failed on either computer is not an error of the call:
+    /// it is a `Failed` report, as for [`Self::download`].
+    pub async fn download_file(
+        &self,
+        source: RemotePath,
+        dest: PathBuf,
+        cancel: CancelToken,
+        progress: Option<ProgressSink<TransferProgress>>,
+    ) -> Result<DownloadReport, TargetError> {
+        if !self.is_active() {
+            return Err(TargetError::NoConsentedSession);
+        }
+        let request = DownloadRequest { source, dest };
+        self.dispatch_download(request, Origin::Console.into(), Some(cancel), progress)
+            .await
+    }
+
+    /// Looks one path of the target up for the technician: the entry that
+    /// lies there, or none, and the length of an unfinished part of a
+    /// transfer to it (ST-M010-002). A link is described, never followed.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive.
+    pub async fn stat_entry(&self, path: RemotePath) -> Result<StatReport, TargetError> {
+        match self
+            .file_op(Origin::Console.into(), Operation::FsStat { path })
+            .await?
+        {
+            OpResult::PathStat { entry, partial_len } => Ok(StatReport { entry, partial_len }),
+            _ => Err(TargetError::Unexpected),
+        }
+    }
+
+    /// Creates one folder on the target for the technician (ST-M010-002): the
+    /// folder that holds it must exist, and a name that is taken is refused.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive.
+    pub async fn create_folder(&self, path: RemotePath) -> Result<(), TargetError> {
+        match self
+            .file_op(Origin::Console.into(), Operation::CreateDir { path })
+            .await?
+        {
+            OpResult::Ack {} => Ok(()),
+            _ => Err(TargetError::Unexpected),
+        }
+    }
+
+    /// Moves or renames one entry of the target for the technician
+    /// (ST-M010-002). A destination that is taken is refused and left as it
+    /// is: the technician's explorer never replaces by a move.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive.
+    pub async fn move_entry(&self, from: RemotePath, to: RemotePath) -> Result<(), TargetError> {
+        match self
+            .file_op(
+                Origin::Console.into(),
+                Operation::FsMove {
+                    from,
+                    to,
+                    overwrite: false,
+                },
+            )
+            .await?
+        {
+            OpResult::Ack {} => Ok(()),
+            _ => Err(TargetError::Unexpected),
+        }
+    }
+
+    /// Deletes one file or one link of the target for the technician
+    /// (ST-M010-002). A link is removed as the link, never what it points at;
+    /// a folder is refused ([`Self::remove_tree`] removes one).
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive.
+    pub async fn delete_entry(&self, path: RemotePath) -> Result<(), TargetError> {
+        match self
+            .file_op(Origin::Console.into(), Operation::FsDelete { path })
+            .await?
+        {
+            OpResult::Ack {} => Ok(()),
+            _ => Err(TargetError::Unexpected),
+        }
+    }
+
     /// Downloads a target file to a local path, driven inline by the console
     /// transfer engine; content is verified before landing and never returned to
     /// the caller (REQ-N-007, REQ-S-018).
@@ -1591,17 +1706,31 @@ impl ConsoleSessionService {
         if !self.is_active() {
             return Err(TargetError::NoConsentedSession);
         }
-        let local_path = params.local_path.clone();
         let request = DownloadRequest {
             source: params.source,
             dest: PathBuf::from(params.local_path),
         };
+        self.dispatch_download(request, mcp(purpose), None, None)
+            .await
+    }
+
+    /// Queues one download on the driver and awaits its honest report.
+    async fn dispatch_download(
+        &self,
+        request: DownloadRequest,
+        attribution: Attribution,
+        cancel: Option<CancelToken>,
+        progress: Option<ProgressSink<TransferProgress>>,
+    ) -> Result<DownloadReport, TargetError> {
+        let local_path = request.dest.display().to_string();
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
             .send(DriverCommand::Download {
                 request,
-                attribution: mcp(purpose),
+                attribution,
+                cancel,
+                progress,
                 reply: reply_tx,
             })
             .map_err(|_| TargetError::Disconnected)?;
@@ -1963,9 +2092,12 @@ async fn run_command(handle: &HostHandle, inner: &Inner, command: DriverCommand)
         DriverCommand::Download {
             request,
             attribution,
+            cancel,
+            progress,
             reply,
         } => {
-            let _ = reply.send(run_download(handle, inner, request, attribution).await);
+            let _ = reply
+                .send(run_download(handle, inner, request, attribution, cancel, progress).await);
         }
         DriverCommand::OpenTerminal {
             shell,
@@ -2114,13 +2246,19 @@ async fn run_download(
     inner: &Inner,
     request: DownloadRequest,
     attribution: Attribution,
+    cancel: Option<CancelToken>,
+    mut progress: Option<ProgressSink<TransferProgress>>,
 ) -> Result<TransferReport, HostSessionError> {
-    let token = match enter_transfer(inner, None) {
+    let token = match enter_transfer(inner, cancel) {
         Some(token) => token,
         None => return Err(HostSessionError::NotActive),
     };
     let result = handle
-        .download_file_as(request, attribution, &token, |_| {})
+        .download_file_as(request, attribution, &token, |step| {
+            if let Some(sink) = progress.as_mut() {
+                sink(step);
+            }
+        })
         .await;
     leave_transfer(inner);
     result

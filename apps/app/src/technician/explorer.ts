@@ -22,15 +22,41 @@
 //   sorted into what is there. Rows are selected by name, so the selection
 //   stays on the same entries, and the row in focus, or else the first row in
 //   view, stays where it is on screen.
+//
+// The second part of the explorer changes things: it sends files, copies
+// them to this computer, renames and deletes. Its state is here too:
+//
+// - **The transfer queue** (`transfers`) is what the backend says it is: an
+//   entry is replaced by its number each time the backend tells its state.
+//   `done` is the backend's word for a transfer that was verified; nothing
+//   here turns another state into it.
+// - **A question before a change** (`question`): a name that is taken is
+//   decided by the technician, one conflict after the other, and a delete is
+//   confirmed once, with the number of items and the sentence that there is
+//   no recycle bin.
+// - **What could not be done** is a `Refusal` like a place that did not open,
+//   with the entries it is about and the reason of each.
 
 import type {
+  ChosenFolder,
+  ConflictChoice,
+  DeleteReport,
   ExplorerDrive,
   ExplorerDriveKind,
   ExplorerEntry,
   ExplorerEvent,
   ExplorerListing,
+  NameConflict,
+  RemovalProgress,
+  TransferCheck,
+  TransferEntry,
+  TransferQueued,
+  TransferState,
+  TransfersEvent,
+  UploadOffer,
 } from "../shared/contract";
 import { formatBytes, plural } from "../shared/feed";
+import type { DeleteItem, TransferName } from "./api";
 
 /** The height of one row of the list, in pixels; the stylesheet agrees. */
 export const ROW_HEIGHT = 28;
@@ -83,11 +109,18 @@ export interface Pending {
   reveal?: string;
 }
 
-/** A place that could not be opened, in the application's words. */
+/**
+ * A place that could not be opened, or a change that could not be made, in
+ * the application's words.
+ */
 export interface Refusal {
   title: string;
   message: string;
   next: string;
+  // The entries it is about, each with its reason, when there are any.
+  details?: Array<{ path: string; reason: string }>;
+  // How many more there are than `details` names.
+  more?: number;
 }
 
 /** The context menu: where it opened, and for which rows (none: the place). */
@@ -95,6 +128,52 @@ export interface Menu {
   x: number;
   y: number;
   keys: string[];
+  // The menu of the Upload button: only the two ways to choose what to send.
+  only?: "upload";
+}
+
+/** A name that is taken: asked about one conflict after the other. */
+export interface ConflictQuestion {
+  kind: "conflicts";
+  direction: "send" | "download";
+  // The open folder on the customer computer.
+  folder: string;
+  // The folder the items go to, as text.
+  where: string;
+  // A send: the offer that was dropped or picked.
+  offer?: number;
+  // A copy: the selection, and the folder that was chosen for it, if one was.
+  names?: TransferName[];
+  to?: number;
+  conflicts: NameConflict[];
+  // The conflict that is asked about now; past the last one, all are decided.
+  at: number;
+  choices: Record<string, ConflictChoice>;
+  // The next choice holds for every conflict that follows.
+  all: boolean;
+}
+
+/** A delete, to be confirmed once for the whole selection. */
+export interface DeleteQuestion {
+  kind: "delete";
+  folder: string;
+  items: DeleteItem[];
+}
+
+export type Question = ConflictQuestion | DeleteQuestion;
+
+/** A delete that runs. */
+export interface Removal {
+  // The number the window gave it, to follow and to cancel it.
+  id: number;
+  items: number;
+  // The item that is being removed, and its place among the items.
+  item?: string;
+  at?: number;
+  removedFiles: number;
+  removedDirs: number;
+  // The technician asked to cancel it.
+  cancelling?: boolean;
 }
 
 /** The part of the list in view, in pixels. */
@@ -143,6 +222,21 @@ export interface ExplorerState {
   // Why the last thing the technician tried did nothing, in words: a file
   // does not open here. Gone with the next step.
   hint?: string;
+  // The transfers of this session, in the order of the queue (ST-M010-002).
+  transfers: TransferEntry[];
+  // What the explorer asks before it sends, copies or deletes.
+  question?: Question;
+  // What the explorer is finding out before it can ask or queue, in words.
+  preparing?: string;
+  // The row whose name is being typed anew.
+  renaming?: string;
+  // The delete that runs.
+  removal?: Removal;
+  // Files are being dragged over the window.
+  dropping?: boolean;
+  // What a change could not do, or did only in part: shown until it is
+  // dismissed or the next change begins. A place that opens leaves it there.
+  problem?: Refusal;
 }
 
 export function initialExplorer(): ExplorerState {
@@ -158,6 +252,7 @@ export function initialExplorer(): ExplorerState {
     selected: new Set(),
     viewport: { top: 0, left: 0, ...DEFAULT_VIEWPORT },
     scrollSeq: 0,
+    transfers: [],
   };
 }
 
@@ -662,7 +757,14 @@ function trimmed(places: Place[]): Place[] {
 
 /** The technician asked for a place: it is pending until it is open. */
 export function opening(s: ExplorerState, pending: Pending): ExplorerState {
-  return { ...s, pending, menu: undefined, editing: undefined, hint: undefined };
+  return {
+    ...s,
+    pending,
+    menu: undefined,
+    editing: undefined,
+    hint: undefined,
+    renaming: undefined,
+  };
 }
 
 /**
@@ -768,7 +870,9 @@ export function applyDrives(
 /** A refresh is complete: the folder as it was listed again takes its place. */
 function refreshed(s: ExplorerState, content: Content): ExplorerState {
   if (!s.fresh) return s;
-  return kept({ ...s, entries: s.fresh, fresh: undefined, content });
+  // A row to reveal is selected once the folder is listed again: the new
+  // name of an entry that was renamed.
+  return revealed(kept({ ...s, entries: s.fresh, fresh: undefined, content }));
 }
 
 /**
@@ -864,7 +968,13 @@ const ENDED: Record<string, string> = {
   disconnected: "The connection to the customer computer was lost. Browsing has stopped.",
 };
 
-function failureWords(failure: Failure): string {
+/** What a failure says about the session: that it is over, or nothing. */
+export function endedWords(stage: string): string | undefined {
+  return ENDED[stage];
+}
+
+/** A failure as the explorer shows it: its words, and its category. */
+export function failureWords(failure: Failure): string {
   return `${failure.message} (${failure.stage})`;
 }
 
@@ -936,15 +1046,30 @@ export interface MenuItem {
   // The key that does the same, as `aria-keyshortcuts` names it.
   keys?: string;
   disabled: boolean;
+  // A line separates it from the action before it.
+  separated?: boolean;
 }
 
 /**
- * What the context menu offers, in order. The menu is this list and nothing
- * else: an action that is added here appears in it, with its key.
+ * Whether the explorer can change something where it stands: in a folder of
+ * a session that has not ended. The drives hold no entry to change.
  */
-export function menuItems(s: ExplorerState): MenuItem[] {
-  const keys = s.menu?.keys ?? [];
+export function canChange(s: ExplorerState): boolean {
+  return s.place?.kind === "folder" && s.ended === undefined;
+}
+
+/**
+ * What the explorer can do with the rows `keys` — the rows of the menu, or
+ * the selection for the buttons and the keys — in order. The context menu,
+ * the buttons above the list and the keys are all this one list: an action
+ * that is added here appears in the menu and as a button, with its key.
+ */
+export function actionsFor(s: ExplorerState, keys: readonly string[]): MenuItem[] {
   const one = keys.length === 1 ? keys[0] : undefined;
+  const change = canChange(s);
+  const some = change && keys.length > 0;
+  // One delete at a time: what it removes is not renamed or deleted meanwhile.
+  const free = s.removal === undefined;
   return [
     {
       action: "xp-menu-open",
@@ -952,8 +1077,52 @@ export function menuItems(s: ExplorerState): MenuItem[] {
       keys: "Enter",
       disabled: openTarget(s, one) === null,
     },
-    { action: "xp-refresh", label: "Refresh", keys: "F5", disabled: s.place === null },
+    { action: "xp-download", label: "Download", disabled: !some, separated: true },
+    { action: "xp-download-to", label: "Download to…", disabled: !some },
+    {
+      action: "xp-rename",
+      label: "Rename",
+      keys: "F2",
+      disabled: !(change && free && one !== undefined),
+    },
+    { action: "xp-delete", label: "Delete", keys: "Delete", disabled: !(some && free) },
+    { action: "xp-upload-files", label: "Upload files…", disabled: !change, separated: true },
+    { action: "xp-upload-folder", label: "Upload a folder…", disabled: !change },
+    {
+      action: "xp-refresh",
+      label: "Refresh",
+      keys: "F5",
+      disabled: s.place === null,
+      separated: true,
+    },
   ];
+}
+
+/**
+ * What the open menu offers, in order. The menu is this list and nothing
+ * else. The menu of the Upload button offers the two ways to choose what to
+ * send.
+ */
+export function menuItems(s: ExplorerState): MenuItem[] {
+  if (s.menu?.only === "upload") {
+    const disabled = !canChange(s);
+    return [
+      { action: "xp-upload-files", label: "Files…", disabled },
+      { action: "xp-upload-folder", label: "A folder…", disabled },
+    ];
+  }
+  return actionsFor(s, s.menu?.keys ?? []);
+}
+
+/** The selected rows, in the order of the list. */
+export function selectedKeys(s: ExplorerState): string[] {
+  if (s.selected.size === 0) return [];
+  const keys: string[] = [];
+  for (let i = 0; i < rowCount(s); i += 1) {
+    const key = keyAt(s, i);
+    if (key !== undefined && s.selected.has(key)) keys.push(key);
+  }
+  return keys;
 }
 
 // --- The status line ---
@@ -984,8 +1153,440 @@ export function statusWords(s: ExplorerState): string {
   if (s.selected.size > 0) parts.push(`${s.selected.size} selected`);
   if (s.fresh) parts.push("refreshing…");
   if (s.pending) parts.push(`opening ${placeWords(s.pending.place)}…`);
+  if (s.preparing !== undefined) parts.push(s.preparing);
   if (s.hint !== undefined) parts.push(s.hint);
   return parts.join(" · ");
+}
+
+// --- The transfer queue (ST-M010-002) ---
+
+/** Whether a transfer waits or runs. */
+export function isOpen(entry: TransferEntry): boolean {
+  return entry.state === "waiting" || entry.state === "running";
+}
+
+/**
+ * Takes entries the backend told into the queue: an entry with a number the
+ * queue has replaces it, another one is added at its place in the order of
+ * the numbers, and a folder that says its files are queued is dropped.
+ */
+export function applyTransfers(
+  s: ExplorerState,
+  entries: readonly TransferEntry[],
+): ExplorerState {
+  if (entries.length === 0) return s;
+  const queue = s.transfers.slice();
+  for (const entry of entries) {
+    // The queue is kept by number: the place of this one is searched.
+    let low = 0;
+    let high = queue.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if ((queue[middle] as TransferEntry).id < entry.id) low = middle + 1;
+      else high = middle;
+    }
+    const known = queue[low]?.id === entry.id;
+    if (entry.state === "listed") {
+      if (known) queue.splice(low, 1);
+    } else if (known) {
+      queue[low] = entry;
+    } else {
+      queue.splice(low, 0, entry);
+    }
+  }
+  return { ...s, transfers: queue };
+}
+
+/** How many transfers are in each state. */
+export type TransferCounts = Record<Exclude<TransferState, "listed">, number>;
+
+export function transferCounts(entries: readonly TransferEntry[]): TransferCounts {
+  const counts: TransferCounts = {
+    waiting: 0,
+    running: 0,
+    done: 0,
+    failed: 0,
+    cancelled: 0,
+    left_out: 0,
+    stopped: 0,
+  };
+  for (const entry of entries) if (entry.state !== "listed") counts[entry.state] += 1;
+  return counts;
+}
+
+/** The most rows of each part of the queue that are drawn; the rest are counted. */
+export const QUEUE_ROWS = { attention: 100, waiting: 20, finished: 50 } as const;
+
+/** The queue as the transfers panel shows it. */
+export interface QueueRows {
+  // What did not arrive, the newest first: failed, left out, stopped.
+  attention: TransferEntry[];
+  attentionMore: number;
+  running: TransferEntry[];
+  // In the order they will run.
+  waiting: TransferEntry[];
+  waitingMore: number;
+  // What ended otherwise, the newest first: done, cancelled.
+  finished: TransferEntry[];
+  finishedMore: number;
+}
+
+/**
+ * The rows of the queue in the order they are shown: what did not arrive
+ * first, then what runs and what waits, then what ended. Each part is
+ * bounded, so a folder of thousands of files costs what a screenful costs.
+ */
+export function queueRows(entries: readonly TransferEntry[]): QueueRows {
+  const rows: QueueRows = {
+    attention: [],
+    attentionMore: 0,
+    running: [],
+    waiting: [],
+    waitingMore: 0,
+    finished: [],
+    finishedMore: 0,
+  };
+  for (const entry of entries) {
+    if (entry.state === "running") rows.running.push(entry);
+    else if (entry.state === "waiting") {
+      if (rows.waiting.length < QUEUE_ROWS.waiting) rows.waiting.push(entry);
+      else rows.waitingMore += 1;
+    }
+  }
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const entry = entries[i] as TransferEntry;
+    if (entry.state === "failed" || entry.state === "left_out" || entry.state === "stopped") {
+      if (rows.attention.length < QUEUE_ROWS.attention) rows.attention.push(entry);
+      else rows.attentionMore += 1;
+    } else if (entry.state === "done" || entry.state === "cancelled") {
+      if (rows.finished.length < QUEUE_ROWS.finished) rows.finished.push(entry);
+      else rows.finishedMore += 1;
+    }
+  }
+  return rows;
+}
+
+/** How far a transfer is, in percent, when its length is known. */
+export function transferPercent(entry: TransferEntry): number | undefined {
+  if (entry.bytes === undefined) return undefined;
+  if (entry.bytes === 0) return entry.state === "done" ? 100 : 0;
+  return Math.min(100, Math.floor((entry.done / entry.bytes) * 100));
+}
+
+/** The state of a transfer in words. Only a verified transfer reads as sent or copied. */
+export function transferWords(entry: TransferEntry): string {
+  const send = entry.direction === "send";
+  const folder = entry.kind === "folder";
+  switch (entry.state) {
+    case "waiting":
+      return "Waiting";
+    case "running": {
+      if (folder) return send ? "Making the folder…" : "Listing the folder…";
+      const percent = transferPercent(entry);
+      return percent === undefined
+        ? send
+          ? "Sending…"
+          : "Copying…"
+        : `${percent}% · ${formatBytes(entry.done)} of ${formatBytes(entry.bytes)}`;
+    }
+    case "done":
+      if (folder) return send ? "Made" : "Copied · an empty folder";
+      return `${send ? "Sent" : "Copied"} · ${formatBytes(entry.bytes ?? entry.done)}`;
+    case "failed":
+      return folder ? "Not complete" : send ? "Not sent" : "Not copied";
+    case "cancelled":
+      return "Cancelled";
+    case "left_out":
+      return "Left out";
+    case "stopped":
+      return "Stopped with the session";
+    case "listed":
+      return "";
+  }
+}
+
+/** Which way a transfer goes, in the words the customer's side knows it by. */
+export function directionWords(entry: TransferEntry): string {
+  return entry.direction === "send"
+    ? "To the customer computer"
+    : "To this computer · leaves the customer computer";
+}
+
+/** The queue in one line: what runs, waits, did not arrive and is done. */
+export function queueWords(entries: readonly TransferEntry[]): string {
+  const counts = transferCounts(entries);
+  const parts: string[] = [];
+  if (counts.running > 0) parts.push(`${counts.running} running`);
+  if (counts.waiting > 0) parts.push(`${counts.waiting} waiting`);
+  if (counts.failed > 0) parts.push(`${counts.failed} failed`);
+  if (counts.stopped > 0) parts.push(`${counts.stopped} stopped`);
+  if (counts.left_out > 0) parts.push(`${counts.left_out} left out`);
+  if (counts.cancelled > 0) parts.push(`${counts.cancelled} cancelled`);
+  if (counts.done > 0) parts.push(`${counts.done} done`);
+  return parts.join(" · ");
+}
+
+/**
+ * What to say when the queue comes to rest: how many arrived and how many
+ * did not. Nothing while a transfer still waits or runs.
+ */
+export function queueRestWords(
+  before: readonly TransferEntry[],
+  after: readonly TransferEntry[],
+): string | undefined {
+  if (!before.some(isOpen) || after.some(isOpen)) return undefined;
+  const counts = transferCounts(after);
+  const not = counts.failed + counts.left_out + counts.stopped;
+  const parts = [`Transfers ended: ${counts.done} done`];
+  if (not > 0) parts.push(`${not} not completed`);
+  if (counts.cancelled > 0) parts.push(`${counts.cancelled} cancelled`);
+  return `${parts.join(", ")}.`;
+}
+
+/** How a send or a copy was queued, in a sentence. */
+export function queuedWords(direction: "send" | "download", queued: TransferQueued): string {
+  const parts = [
+    direction === "send"
+      ? `${plural(queued.queued, "item")} queued to send`
+      : `${plural(queued.queued, "item")} queued to copy to this computer`,
+  ];
+  if (queued.skipped > 0) parts.push(`${queued.skipped} skipped`);
+  if (queued.leftOut > 0) parts.push(`${queued.leftOut} left out, see the transfers`);
+  return `${parts.join(", ")}.`;
+}
+
+/**
+ * What the window says when full control ends while transfers were not
+ * complete: which ones, and that nothing more is sent or copied.
+ */
+export function stoppedTransfers(entries: readonly TransferEntry[]): Refusal | undefined {
+  const cut = entries.filter((entry) => isOpen(entry) || entry.state === "stopped");
+  if (cut.length === 0) return undefined;
+  const names = cut.slice(0, 3).map((entry) => entry.name);
+  const more = cut.length - names.length;
+  return {
+    title:
+      cut.length === 1
+        ? "1 transfer stopped with the session"
+        : `${cut.length} transfers stopped with the session`,
+    message: `Not complete: ${names.join(", ")}${more > 0 ? ` and ${more} more` : ""}.`,
+    next: "Nothing more is sent or copied, and no unfinished file was kept under its name. Start a new session to send or copy them again.",
+  };
+}
+
+// --- A name that is taken ---
+
+/** The question for the names `check` found taken; none when no name is. */
+export function conflictQuestion(
+  check: TransferCheck,
+  from: Pick<ConflictQuestion, "direction" | "folder" | "offer" | "names" | "to">,
+): ConflictQuestion | undefined {
+  if (check.conflicts.length === 0) return undefined;
+  return {
+    kind: "conflicts",
+    ...from,
+    where: check.folder,
+    conflicts: check.conflicts,
+    at: 0,
+    choices: {},
+    all: false,
+  };
+}
+
+/**
+ * The technician chose for the conflict that is asked about. With `all` the
+ * choice also holds for the conflicts that follow, as far as it can: a name
+ * that cannot be replaced is still asked about.
+ */
+export function answerConflict(q: ConflictQuestion, choice: ConflictChoice): ConflictQuestion {
+  const current = q.conflicts[q.at];
+  if (!current || (choice === "replace" && !current.replace)) return q;
+  const choices = { ...q.choices, [current.name]: choice };
+  let at = q.at + 1;
+  if (q.all) {
+    for (; at < q.conflicts.length; at += 1) {
+      const next = q.conflicts[at] as NameConflict;
+      if (choice === "replace" && !next.replace) break;
+      choices[next.name] = choice;
+    }
+  }
+  return { ...q, choices, at };
+}
+
+/** Whether every conflict of the question is decided. */
+export function conflictsDecided(q: ConflictQuestion): boolean {
+  return q.at >= q.conflicts.length;
+}
+
+/** What lies under a name, in a word. */
+export function kindWord(kind: ExplorerEntry["kind"] | "folder"): string {
+  switch (kind) {
+    case "dir":
+    case "folder":
+      return "folder";
+    case "file":
+      return "file";
+    case "symlink":
+      return "link";
+    case "other":
+      return "entry";
+  }
+}
+
+// --- Rename ---
+
+/** The characters no name on Windows may hold. */
+const NAME_FORBIDDEN = /[\\/:*?"<>|\u0000-\u001f]/;
+
+/**
+ * Why `to` cannot be the new name of the row `key`, in a sentence; nothing
+ * when it can. The customer computer has the last word: this only saves a
+ * request for what it would refuse.
+ */
+export function renameProblem(s: ExplorerState, key: string, to: string): string | undefined {
+  if (to.trim() === "") return "A name cannot be empty.";
+  if (NAME_FORBIDDEN.test(to)) return 'A name cannot hold any of \\ / : * ? " < > |.';
+  if (to === "." || to === "..") return "This name stands for a folder, not for an entry.";
+  if (/[. ]$/.test(to)) return "A name cannot end in a dot or a space.";
+  const wanted = to.toLowerCase();
+  const taken = s.entries.some(
+    (entry) => entry.name !== key && entry.name.toLowerCase() === wanted,
+  );
+  return taken ? `${to} is already in this folder.` : undefined;
+}
+
+/**
+ * The part of a name that is selected when its field opens: the whole name
+ * of a folder, a file's name without its extension.
+ */
+export function renameSelection(entry: ExplorerEntry): [number, number] {
+  const dot = entry.name.lastIndexOf(".");
+  return entry.kind === "file" && dot > 0 ? [0, dot] : [0, entry.name.length];
+}
+
+// --- Delete ---
+
+/** The entries `keys` name, as a delete takes them. */
+export function deleteItems(s: ExplorerState, keys: readonly string[]): DeleteItem[] {
+  const items: DeleteItem[] = [];
+  for (const key of keys) {
+    const entry = entryOf(s, key);
+    if (entry) items.push({ name: entry.name, kind: entry.kind });
+  }
+  return items;
+}
+
+/** The entries `keys` name, as a copy to this computer takes them. */
+export function transferNames(s: ExplorerState, keys: readonly string[]): TransferName[] {
+  return deleteItems(s, keys).map((item) => ({
+    name: item.name,
+    kind: item.kind === "dir" ? "folder" : "file",
+  }));
+}
+
+/** The words of the question before a delete. */
+export function deleteWords(q: DeleteQuestion): { title: string; lines: string[] } {
+  const count = q.items.length;
+  const first = q.items[0];
+  const folders = q.items.filter((item) => item.kind === "dir").length;
+  const names = q.items.slice(0, 5).map((item) => item.name);
+  const more = count - names.length;
+  const lines: string[] = [];
+  if (count > 1) lines.push(`${names.join(", ")}${more > 0 ? ` and ${more} more` : ""}.`);
+  if (folders > 0) {
+    lines.push(
+      folders === 1 && count === 1
+        ? "The folder is deleted with everything in it."
+        : `${plural(folders, "folder")} ${folders === 1 ? "is" : "are"} deleted with everything in ${folders === 1 ? "it" : "them"}.`,
+    );
+  }
+  lines.push(
+    `There is no recycle bin on this path: what is deleted from ${q.folder} is gone for good.`,
+  );
+  return {
+    title: count === 1 && first ? `Delete ${first.name}?` : `Delete ${count} items?`,
+    lines,
+  };
+}
+
+/** A delete that began: nothing removed yet. */
+export function removalOf(id: number, items: number): Removal {
+  return { id, items, removedFiles: 0, removedDirs: 0 };
+}
+
+/** Where the delete `removal` stands, from one step the backend told. */
+export function applyRemoval(s: ExplorerState, step: RemovalProgress): ExplorerState {
+  if (!s.removal || s.removal.id !== step.removal) return s;
+  return {
+    ...s,
+    removal: {
+      ...s.removal,
+      item: step.item,
+      at: step.at,
+      removedFiles: step.removedFiles,
+      removedDirs: step.removedDirs,
+    },
+  };
+}
+
+/** A delete that runs, in words. */
+export function removalWords(removal: Removal): string {
+  const parts = [
+    removal.cancelling
+      ? "Cancelling the delete…"
+      : removal.at !== undefined && removal.item !== undefined
+        ? `Deleting item ${removal.at} of ${removal.items}: ${removal.item}…`
+        : `Deleting ${plural(removal.items, "item")}…`,
+  ];
+  const removed = removal.removedFiles + removal.removedDirs;
+  if (removed > 0) {
+    parts.push(
+      `${plural(removal.removedFiles, "file")} and ${plural(removal.removedDirs, "folder")} removed so far.`,
+    );
+  }
+  return parts.join(" ");
+}
+
+/**
+ * What a delete came to. A delete that removed everything is said in a
+ * sentence; anything else is a refusal that names what could not be removed,
+ * with the reason of each, and never says that it was.
+ */
+export function deleteOutcome(report: DeleteReport): { notice: string; refusal?: Refusal } {
+  const total = report.removedFiles + report.removedDirs;
+  const inAll =
+    report.removedDirs > 0
+      ? ` (${plural(report.removedFiles, "file")} and ${plural(report.removedDirs, "folder")} in all)`
+      : "";
+  const whole =
+    report.removed === report.selected &&
+    !report.cancelled &&
+    report.ended === undefined &&
+    report.failed.length === 0;
+  if (whole) return { notice: `${plural(report.removed, "item")} deleted${inAll}.` };
+  const left = report.selected - report.removed;
+  const title =
+    report.ended !== undefined
+      ? "The delete stopped with the session"
+      : report.cancelled
+        ? "The delete was cancelled"
+        : `${left} of ${plural(report.selected, "item")} could not be deleted`;
+  const parts = [
+    `${report.removed} of ${plural(report.selected, "item")} ${report.removed === 1 ? "was" : "were"} deleted${total > 0 ? inAll : ""}.`,
+  ];
+  if (report.notTried > 0) {
+    parts.push(`${plural(report.notTried, "item")} ${report.notTried === 1 ? "was" : "were"} not tried.`);
+  }
+  const refusal: Refusal = {
+    title,
+    message: parts.join(" "),
+    next:
+      report.ended ??
+      "The list shows what is there now. Close what holds a file open, then delete again.",
+  };
+  if (report.failed.length > 0) refusal.details = report.failed;
+  if (report.failedMore > 0) refusal.more = report.failedMore;
+  return { notice: `${title}.`, refusal };
 }
 
 // --- What the backend sends ---
@@ -1058,5 +1659,132 @@ export function isExplorerListing(value: unknown): value is ExplorerListing {
     typeof listing.entries === "number" &&
     (listing.path === undefined || typeof listing.path === "string") &&
     (listing.state === "complete" || listing.state === "cancelled" || listing.state === "limit")
+  );
+}
+
+const TRANSFER_STATES: readonly string[] = [
+  "waiting",
+  "running",
+  "done",
+  "failed",
+  "cancelled",
+  "left_out",
+  "stopped",
+  "listed",
+];
+
+/** Whether a value is a `TransferEntry` of the contract. */
+export function isTransferEntry(value: unknown): value is TransferEntry {
+  if (typeof value !== "object" || value === null) return false;
+  const entry = value as Record<string, unknown>;
+  return (
+    typeof entry.id === "number" &&
+    Number.isFinite(entry.id) &&
+    (entry.direction === "send" || entry.direction === "download") &&
+    (entry.kind === "file" || entry.kind === "folder") &&
+    typeof entry.name === "string" &&
+    typeof entry.remote === "string" &&
+    typeof entry.local === "string" &&
+    optionalNumber(entry.bytes) &&
+    typeof entry.done === "number" &&
+    Number.isFinite(entry.done) &&
+    TRANSFER_STATES.includes(entry.state as string) &&
+    (entry.reason === undefined || typeof entry.reason === "string")
+  );
+}
+
+/**
+ * Whether a value is a `TransfersEvent` of the contract. An event with an
+ * entry that is none is not taken at all.
+ */
+export function isTransfersEvent(value: unknown): value is TransfersEvent {
+  if (typeof value !== "object" || value === null) return false;
+  const event = value as Record<string, unknown>;
+  return Array.isArray(event.entries) && event.entries.every(isTransferEntry);
+}
+
+/** Whether a value is an `UploadOffer` of the contract. */
+export function isUploadOffer(value: unknown): value is UploadOffer {
+  if (typeof value !== "object" || value === null) return false;
+  const offer = value as Record<string, unknown>;
+  return (
+    typeof offer.offer === "number" &&
+    typeof offer.items === "number" &&
+    Array.isArray(offer.names) &&
+    offer.names.every((name) => typeof name === "string")
+  );
+}
+
+/** Whether a value is a `TransferCheck` of the contract. */
+export function isTransferCheck(value: unknown): value is TransferCheck {
+  if (typeof value !== "object" || value === null) return false;
+  const check = value as Record<string, unknown>;
+  return (
+    typeof check.folder === "string" &&
+    Array.isArray(check.conflicts) &&
+    check.conflicts.every((conflict: unknown) => {
+      if (typeof conflict !== "object" || conflict === null) return false;
+      const c = conflict as Record<string, unknown>;
+      return (
+        typeof c.name === "string" &&
+        (c.kind === "file" || c.kind === "folder") &&
+        ENTRY_KINDS.includes(c.existing as string) &&
+        typeof c.replace === "boolean"
+      );
+    })
+  );
+}
+
+/** Whether a value is a `TransferQueued` of the contract. */
+export function isTransferQueued(value: unknown): value is TransferQueued {
+  if (typeof value !== "object" || value === null) return false;
+  const queued = value as Record<string, unknown>;
+  return (
+    typeof queued.queued === "number" &&
+    typeof queued.leftOut === "number" &&
+    typeof queued.skipped === "number"
+  );
+}
+
+/** Whether a value is a `ChosenFolder` of the contract. */
+export function isChosenFolder(value: unknown): value is ChosenFolder {
+  if (typeof value !== "object" || value === null) return false;
+  const chosen = value as Record<string, unknown>;
+  return typeof chosen.folder === "number" && typeof chosen.path === "string";
+}
+
+/** Whether a value is a `RemovalProgress` of the contract. */
+export function isRemovalProgress(value: unknown): value is RemovalProgress {
+  if (typeof value !== "object" || value === null) return false;
+  const step = value as Record<string, unknown>;
+  return (
+    typeof step.removal === "number" &&
+    typeof step.item === "string" &&
+    typeof step.at === "number" &&
+    typeof step.of === "number" &&
+    typeof step.removedFiles === "number" &&
+    typeof step.removedDirs === "number"
+  );
+}
+
+/** Whether a value is a `DeleteReport` of the contract. */
+export function isDeleteReport(value: unknown): value is DeleteReport {
+  if (typeof value !== "object" || value === null) return false;
+  const report = value as Record<string, unknown>;
+  return (
+    typeof report.selected === "number" &&
+    typeof report.removed === "number" &&
+    typeof report.removedFiles === "number" &&
+    typeof report.removedDirs === "number" &&
+    typeof report.failedMore === "number" &&
+    typeof report.cancelled === "boolean" &&
+    typeof report.notTried === "number" &&
+    (report.ended === undefined || typeof report.ended === "string") &&
+    Array.isArray(report.failed) &&
+    report.failed.every((left: unknown) => {
+      if (typeof left !== "object" || left === null) return false;
+      const l = left as Record<string, unknown>;
+      return typeof l.path === "string" && typeof l.reason === "string";
+    })
   );
 }

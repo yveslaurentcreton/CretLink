@@ -11,7 +11,8 @@
 //! - [`Actor::Terminal`]: the technician terminal opening and closing;
 //! - [`Actor::Console`]: manual console commands and cancellations, and the
 //!   technician's own file actions — the drive list, the listing of a folder,
-//!   the removal of a folder with its content, a file sent into a folder
+//!   the removal of a folder with its content, a file sent into a folder, a
+//!   file copied to the technician computer, and the changes to one entry
 //!   (ST-M010-001, ST-M010-002).
 //!
 //! A call's `_start` record opens a running item and its completion record
@@ -364,6 +365,37 @@ fn action_of(entry: &RecordView<'_>, base: &str) -> Option<Action> {
                         "copy a file to the customer computer at {}",
                         path_text(&arg(entry, "path"))
                     ),
+                ),
+                // What the explorer does besides (ST-M010-002): a copy to the
+                // technician computer in the words of the AI's download, and
+                // each change to one entry in the words the customer's own
+                // feed has for it.
+                "console_download" => (
+                    ActivityKind::FileSent,
+                    format!(
+                        "copy the file {} from the customer computer",
+                        path_text(&arg(entry, "path"))
+                    ),
+                ),
+                "console_fs_stat" => (
+                    ActivityKind::FileOperation,
+                    format!("look up {}", path_text(&arg(entry, "path"))),
+                ),
+                "console_make_dir" => (
+                    ActivityKind::FileOperation,
+                    format!("create the folder {}", path_text(&arg(entry, "path"))),
+                ),
+                "console_move" => (
+                    ActivityKind::FileOperation,
+                    format!(
+                        "move {} to {}",
+                        path_text(&arg(entry, "path")),
+                        path_text(&arg(entry, "to"))
+                    ),
+                ),
+                "console_delete" => (
+                    ActivityKind::FileOperation,
+                    format!("delete the file {}", path_text(&arg(entry, "path"))),
                 ),
                 // Lifecycle records (pairing, compare, consent, revoke) are
                 // session events, not actions on the customer computer.
