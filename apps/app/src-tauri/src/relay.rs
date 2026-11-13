@@ -534,13 +534,6 @@ pub(crate) enum Audience {
     /// The technician role.
     Technician,
     /// The customer role.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the customer role reaches a relay with the next change of ST-M007-013"
-        )
-    )]
     Customer,
 }
 
