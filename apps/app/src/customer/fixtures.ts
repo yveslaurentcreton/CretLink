@@ -43,9 +43,14 @@ export function viewIn(phase: AgentPhase, patch: Partial<ConsentView> = {}): Con
         ? null
         : { display_name: "Sam", provenance: "as the technician's computer reports it" },
     startup_cleanup: null,
+    relay: null,
+    failure_next: null,
     ...patch,
   };
 }
+
+/** The relay of the fixtures. */
+export const VIA_RELAY = { host: "relay.example.org" };
 
 export const LAUNCH_READY: LaunchView = {
   step: "ready",
@@ -280,6 +285,101 @@ export const FIXTURES: Record<string, CustomerSnapshot> = {
   "find-connect-failed": base(
     viewIn({ phase: "failed", stage: "connect", message: "could not reach the technician: connection refused" }),
     { discovery: { state: "done", consoles: CONSOLES }, ended: "" },
+  ),
+  // A relay code (ST-M007-013): what was typed is not on the same network.
+  "find-nobody-waits": base(
+    viewIn(
+      { phase: "failed", stage: "rendezvous", message: "nobody joined the rendezvous on the relay" },
+      { relay: VIA_RELAY, technician: null },
+    ),
+    { discovery: { state: "done", consoles: [] }, ended: "" },
+  ),
+  "find-relay-unreachable": base(
+    viewIn(
+      {
+        phase: "failed",
+        stage: "relay_unreachable",
+        message:
+          "CretLink could not connect to the relay at relay.example.org:443. The relay may be off, the address may be wrong, or this network does not let this computer reach it.",
+      },
+      {
+        relay: VIA_RELAY,
+        technician: null,
+        failure_next:
+          "Check that this computer is online, then try again. If it stays like this, tell your technician that the relay relay.example.org cannot be reached. Nobody has access to this computer.",
+      },
+    ),
+    { discovery: { state: "done", consoles: [] }, ended: "" },
+  ),
+  "find-relay-untrusted": base(
+    viewIn(
+      {
+        phase: "failed",
+        stage: "relay_untrusted",
+        message:
+          "The relay at relay.example.org:443 showed no certificate that this computer trusts for the name relay.example.org, so nothing was sent to it.",
+      },
+      {
+        relay: VIA_RELAY,
+        technician: null,
+        failure_next:
+          "Tell your technician that this computer does not trust the certificate of the relay relay.example.org. Nobody has access to this computer.",
+      },
+    ),
+    { discovery: { state: "done", consoles: [] }, ended: "" },
+  ),
+  "find-relay-key": base(
+    viewIn(
+      {
+        phase: "failed",
+        stage: "relay_key_refused",
+        message:
+          "The relay relay.example.org does not know the admission key of this copy. The key may be mistyped, or it was withdrawn.",
+      },
+      {
+        relay: VIA_RELAY,
+        technician: null,
+        failure_next:
+          "Ask your technician for a new copy of CretLink, or to look at the keys of their relay.",
+      },
+    ),
+    { discovery: { state: "done", consoles: [] }, ended: "" },
+  ),
+  "find-relay-lost": base(
+    viewIn(
+      {
+        phase: "failed",
+        stage: "relay_lost",
+        message: "The connection through the relay relay.example.org was lost.",
+      },
+      { relay: VIA_RELAY },
+    ),
+    { discovery: { state: "done", consoles: [] }, ended: "" },
+  ),
+  "find-relay-lost-before-code": base(
+    viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY }),
+    {
+      discovery: { state: "done", consoles: [] },
+      ended:
+        "The connection through the relay relay.example.org was lost before anyone got access. Nothing was shared.",
+    },
+  ),
+  "relay-connecting": base(viewIn({ phase: "announced" }, { technician: null, relay: VIA_RELAY })),
+  "relay-sac": base(
+    viewIn({ phase: "awaiting_approval_compare" }, { approval_code: "482913", relay: VIA_RELAY }),
+  ),
+  "relay-consent": base(viewIn({ phase: "awaiting_consent" }, { relay: VIA_RELAY })),
+  "relay-live": base(
+    { ...live, relay: VIA_RELAY },
+    { activity: FEED, hadControl: true },
+  ),
+  "relay-end": base(
+    { ...stoppedByCustomer, relay: VIA_RELAY },
+    { activity: FEED_DONE, hadControl: true, report: REPORT },
+  ),
+  "relay-end-lost": base(
+    viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY }),
+    { activity: FEED_DONE, hadControl: true, report: REPORT_UNKNOWN },
   ),
   connecting: base(viewIn({ phase: "announced" }, { technician: null })),
   sac: base(viewIn({ phase: "awaiting_approval_compare" }, { approval_code: "482913" })),

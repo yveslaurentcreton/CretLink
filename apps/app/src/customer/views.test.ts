@@ -222,6 +222,142 @@ describe("choose your technician (#c-find)", () => {
   });
 });
 
+describe("a relay code (ST-M007-013)", () => {
+  const alert = (root: HTMLElement): HTMLElement | null => root.querySelector("#alert");
+
+  it("says Connecting through the relay, by its host name, and what a relay is", () => {
+    const root = show("relay-connecting");
+    expect(root.dataset.screen).toBe("connecting");
+    expect(text(root.querySelector("#connecting-h"))).toBe(
+      "Connecting through the relay relay.example.org",
+    );
+    expect(text(root.querySelector(".relay-explained"))).toBe(
+      "The relay only passes encrypted traffic on. It cannot look into the session, and it gives nobody access to this computer.",
+    );
+    // The band still says that nobody has access, and Cancel is there.
+    expect(band(root)).toContain("NO ACCESS");
+    const cancel = buttonNamed(root, /Cancel/);
+    expect(cancel?.dataset.action).toBe("stop");
+    expect(cancel?.getAttribute("aria-keyshortcuts")).toBe("Escape");
+    expect(text(root.querySelector("#announce"))).toBe(
+      "Connecting through the relay relay.example.org. No access.",
+    );
+    // On one network the screen is what it was.
+    const lan = show("connecting");
+    expect(text(lan.querySelector("#connecting-h"))).toBe("Connecting to your technician");
+    expect(lan.querySelector(".relay-explained")).toBeNull();
+    expect(text(lan.querySelector("#announce"))).toBe("Connecting. No access.");
+  });
+
+  it("says that nobody waits on the code, in plain words with a next step", () => {
+    const root = show("find-nobody-waits");
+    expect(root.dataset.screen).toBe("find");
+    const region = alert(root);
+    expect(region?.getAttribute("role")).toBe("alert");
+    expect(text(region?.querySelector("b"))).toBe("Nobody is waiting on that code");
+    expect(text(region)).toContain(
+      "The relay relay.example.org found nobody waiting on the code you typed. It may be mistyped or already used, or your technician stopped waiting.",
+    );
+    expect(text(region?.querySelector(".next"))).toBe(
+      "Nobody has access to this computer. Ask your technician for the code on their screen and type it again. A code works once.",
+    );
+    // Neither the backend's word for it nor a session of unknown cause.
+    expect(text(region)).not.toContain("rendezvous");
+    expect(text(region)).not.toContain("The session failed");
+    // The code field is there to type the code again.
+    expect(root.querySelector("#code")).not.toBeNull();
+    expect(band(root)).toContain("NO ACCESS");
+  });
+
+  it.each([
+    ["find-relay-unreachable", "CretLink could not reach the relay", "could not connect to the relay at relay.example.org:443", "Check that this computer is online"],
+    ["find-relay-untrusted", "This computer does not trust the relay", "showed no certificate that this computer trusts", "Tell your technician that this computer does not trust the certificate"],
+    ["find-relay-key", "The relay did not let this copy in", "does not know the admission key of this copy", "Ask your technician for a new copy of CretLink"],
+  ])("%s: says what happened in its own words, with the next step for a customer", (name, title, message, next) => {
+    const root = show(name);
+    expect(root.dataset.screen).toBe("find");
+    const region = alert(root);
+    expect(text(region?.querySelector("b"))).toBe(title);
+    expect(text(region)).toContain(message);
+    expect(text(region?.querySelector(".next"))).toContain(next);
+    expect(text(region)).not.toContain("The session failed");
+    expect(text(region)).not.toContain("CretLink could not reach your technician");
+    expect(root.querySelector("#stop")).toBeNull();
+  });
+
+  it("falls back to telling the technician when a relay failure brings no next step", () => {
+    const root = show("find-relay-key", {
+      view: { ...FIXTURES["find-relay-key"]!.view!, failure_next: null },
+    });
+    expect(text(alert(root)?.querySelector(".next"))).toBe(
+      "Nobody has access to this computer. Tell your technician what this says.",
+    );
+  });
+
+  it("says that the relay may have stopped when the connection is lost before anyone had control", () => {
+    const failed = show("find-relay-lost");
+    const region = alert(failed);
+    expect(text(region?.querySelector("b"))).toBe("The connection through the relay was lost");
+    expect(text(region)).toContain(
+      "The connection through the relay relay.example.org was lost. The relay may have stopped, or one of the two computers went offline.",
+    );
+    expect(text(region?.querySelector(".next"))).toBe(
+      "Nobody has access to this computer any more. Nothing connects again by itself: ask your technician for a new code when you want to start again.",
+    );
+    // A connection that ended without a failure says it with the relay too.
+    const stopped = show("find-relay-lost-before-code");
+    expect(text(stopped)).toContain(
+      "The connection through the relay relay.example.org was lost before anyone got access. Nothing was shared.",
+    );
+  });
+
+  it.each(["relay-sac", "relay-consent", "relay-live", "relay-end"])(
+    "%s: says that the session runs through the relay, by its host name",
+    (name) => {
+      expect(text(show(name).querySelector(".via-relay"))).toBe(
+        "Through the relay relay.example.org · it only passes encrypted traffic on",
+      );
+    },
+  );
+
+  it("leaves the code, the decision and Stop of a relayed session what they are on one network", () => {
+    const sac = show("relay-sac");
+    expect(sac.querySelector(".sac")?.getAttribute("aria-label")).toBe("Approval code 482 913");
+    expect(buttonNamed(sac, /It doesn't match/)?.dataset.action).toBe("stop");
+    const consent = show("relay-consent");
+    expect(text(consent.querySelector("#disclosure"))).toBe(DISCLOSURE_TEXT);
+    expect(buttonNamed(consent, "Decline")?.dataset.action).toBe("decline");
+    expect(buttonNamed(consent, "Allow full control")?.dataset.action).toBe("allow");
+    const live = show("relay-live");
+    expect(band(live)).toContain("UNDER FULL CONTROL");
+    expect(live.querySelector<HTMLButtonElement>("#stop")?.dataset.action).toBe("stop");
+  });
+
+  it("says that the relay may have stopped when a relayed session loses its connection", () => {
+    const root = show("relay-end-lost");
+    expect(root.dataset.screen).toBe("end");
+    expect(text(root.querySelector("#end-title"))).toBe("The connection was lost");
+    const note = root.querySelector(".relay-lost");
+    expect(note?.getAttribute("role")).toBe("note");
+    expect(text(note)).toBe(
+      "The connection through the relay relay.example.org was lost. The relay may have stopped, or one of the two computers went offline. Nobody has access to this computer any more. Nothing connects again by itself: ask your technician for a new code when you want to start again.",
+    );
+    // The cleanup is still not shown as a success.
+    expect(text(root)).toContain("Cleanup not confirmed.");
+    // A session the customer stopped says nothing of the kind.
+    expect(show("relay-end").querySelector(".relay-lost")).toBeNull();
+  });
+
+  it("says nothing about a relay in a session on one network", () => {
+    for (const name of ["connecting", "sac", "consent", "live-running", "end-by-customer", "end-lost"]) {
+      const root = show(name);
+      expect(root.querySelector(".via-relay")).toBeNull();
+      expect(root.querySelector(".relay-lost")).toBeNull();
+      expect(text(root).toLowerCase()).not.toContain("relay");
+    }
+  });
+});
+
 describe("compare (#c-sac)", () => {
   it("asks whether the technician reads this code, shows it grouped, and offers It doesn't match — stop", () => {
     const root = show("sac");

@@ -272,11 +272,6 @@ export function relayCodeFailure(error: unknown): Omit<UiError, "message"> {
         title: "The relay settings of this copy cannot be used",
         next: "Tell your technician what this says and ask for a new copy of CretLink. You can still connect while you are on the same network.",
       };
-    case "relay_later":
-      return {
-        title: "This copy cannot connect through a relay yet",
-        next: "Connect while you are on the same network as your technician.",
-      };
     default:
       return {
         title: "That code did not work",
