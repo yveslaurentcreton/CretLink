@@ -1,18 +1,19 @@
-//! The technician's own file actions, end to end (ST-M010-001).
+//! The technician's own file actions, end to end (ST-M010-001, ST-M010-002).
 //!
 //! One real loopback session joins a console to an in-process agent that
 //! serves its real file store. The technician's actions — the drive list, the
-//! removal of a folder with its content, a file sent into a folder — go
-//! through [`TechnicianFiles`], and each test looks at the three places an
-//! action must show up in: the report the caller gets, the console's audit
-//! records, and what the customer's side shows (REQ-F-017, REQ-S-017,
-//! REQ-N-008).
+//! listing of a folder, the removal of a folder with its content, a file sent
+//! into a folder — go through [`TechnicianFiles`], and each test looks at the
+//! three places an action must show up in: the report the caller gets, the
+//! console's audit records, and what the customer's side shows (REQ-F-017,
+//! REQ-S-017, REQ-N-008).
 //!
 //! The wire accepts an absolute path only when it is rooted on a drive, so a
-//! file can be committed in a folder only where such a path names a real
-//! folder: that test runs on Windows. The tests that run everywhere send
-//! nothing into a folder; they cover what is refused, cancelled or fails
-//! before a byte is written.
+//! file can be committed in a folder, and a folder can be found by its path,
+//! only where such a path names a real folder: those tests run on Windows.
+//! The tests that run everywhere send nothing into a folder and list a folder
+//! of the staging area by its name; they cover the pages of a large folder,
+//! what both sides show for it, and what is refused, cancelled or fails.
 //!
 //! `unwrap`/`expect`/`panic` are allowed here: test-only code.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -24,9 +25,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cretlink_console::{
-    AuditActorView, AuditEntry, AuditServiceConfig, ChannelAudit, ConsoleSessionService, IpcAudit,
-    ProgressSink, SendToFolder, TechnicianActivity, TechnicianFiles, open_session_log,
-    read_session, session_entries, spawn_audit_service,
+    AuditActorView, AuditEntry, AuditServiceConfig, ChannelAudit, ConsoleSessionService,
+    FolderEvent, FolderReport, IpcAudit, ListingEnd, ProgressSink, SendToFolder,
+    TechnicianActivity, TechnicianFiles, open_session_log, read_session, session_entries,
+    spawn_audit_service,
 };
 use cretlink_exec::FileStore;
 use cretlink_mcp::TargetError;
@@ -35,9 +37,9 @@ use cretlink_protocol::{
     CAP_FS_V1, CAP_FS_V2, ErrorCode, ErrorStage, JobOutcome, PROTOCOL_V1, SessionId, TargetIdentity,
 };
 use cretlink_session::{
-    ActionOutcome, ActivityEntry, ActivityKind, ActivitySource, ActivityState, CancelToken,
-    ConsoleHints, HostHandle, JoinHandle, Origin, RemotePath, SessionAudit, SessionEvent,
-    SessionHost, SessionJoiner, TreeRemovalProgress,
+    ActionOutcome, ActivityEntry, ActivityItem, ActivityKind, ActivitySource, ActivityState,
+    CancelToken, ConsoleHints, CustomerActivity, HostHandle, JoinHandle, Origin, RemotePath,
+    SessionAudit, SessionEvent, SessionHost, SessionJoiner, TreeRemovalProgress,
 };
 use cretlink_shared::{
     Actor, AuditRecord, AuditValue, ChainReport, Outcome, RetentionPolicy, verify_sealed,
@@ -1208,4 +1210,614 @@ async fn the_file_actions_are_in_the_sealed_audit_log_and_the_history() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- The technician looks through folders (ST-M010-002) ---
+
+/// Everything one listing delivered to its caller.
+#[derive(Debug, Default)]
+struct Delivered {
+    opened: Option<(RemotePath, Option<String>)>,
+    names: Vec<String>,
+    pages: Vec<usize>,
+    ended: bool,
+}
+
+impl Delivered {
+    fn take(&mut self, event: FolderEvent) {
+        assert!(!self.ended, "nothing follows the last page");
+        let (entries, end) = match event {
+            FolderEvent::Opened {
+                folder,
+                select,
+                entries,
+                end,
+            } => {
+                assert!(self.opened.is_none(), "a folder opens once");
+                self.opened = Some((folder, select));
+                (entries, end)
+            }
+            FolderEvent::Page { entries, end } => {
+                assert!(self.opened.is_some(), "the folder opens first");
+                (entries, end)
+            }
+        };
+        self.pages.push(entries.len());
+        self.names
+            .extend(entries.into_iter().map(|entry| entry.name));
+        self.ended = end;
+    }
+}
+
+/// Lists the staged folder `name` to its end.
+async fn list_staged_folder(
+    files: &TechnicianFiles<'_>,
+    name: &str,
+    cancel: CancelToken,
+) -> (Result<FolderReport, TargetError>, Delivered) {
+    let mut delivered = Delivered::default();
+    let result = {
+        let mut sink = |event| delivered.take(event);
+        files.list_folder(staged(name), cancel, &mut sink).await
+    };
+    (result, delivered)
+}
+
+/// Opens the place the path `asked` names.
+async fn open_path(
+    files: &TechnicianFiles<'_>,
+    asked: &str,
+) -> (Result<FolderReport, TargetError>, Delivered) {
+    let mut delivered = Delivered::default();
+    let result = {
+        let mut sink = |event| delivered.take(event);
+        files
+            .open_folder(asked, CancelToken::new(), &mut sink)
+            .await
+    };
+    (result, delivered)
+}
+
+/// The words both sides use for a look at the staged folder `name`.
+fn look_at(name: &str) -> String {
+    format!("list the folder {name} (CretLink staging folder)")
+}
+
+/// What an item says, without what differs between the two sides by design:
+/// its id and its times.
+#[derive(Debug, PartialEq)]
+struct Said {
+    source: ActivitySource,
+    kind: ActivityKind,
+    description: String,
+    operation: String,
+    done: bool,
+}
+
+fn said(entries: Vec<ActivityEntry>) -> Vec<Said> {
+    entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            ActivityEntry::Item { item } => Some(item),
+            ActivityEntry::Gap { .. } => None,
+        })
+        .map(|item: ActivityItem| Said {
+            source: item.source,
+            kind: item.kind,
+            description: item.description,
+            done: item.state == ActivityState::Done { exit_code: None },
+            operation: item.operation,
+        })
+        .collect()
+}
+
+/// The customer's feed of everything the agent reported until now. A request
+/// that only the test makes marks the end of what came before it, and is
+/// left out.
+async fn customer_feed(live: &mut Live) -> Vec<ActivityEntry> {
+    const MARK: &str = "list the files CretLink staged";
+    live.service
+        .list_staged(None)
+        .await
+        .expect("the mark is answered");
+    let mut fold = CustomerActivity::new();
+    loop {
+        let event = timeout(STEP, live.joiner.next_event())
+            .await
+            .expect("timed out waiting for what the customer's side shows")
+            .expect("the agent's event stream ended unexpectedly");
+        if matches!(&event, SessionEvent::RequestHandled { operation, .. } if operation == MARK) {
+            return fold.entries();
+        }
+        fold.apply(&event, 0);
+    }
+}
+
+/// The technician's feed, folded from the console's audit records.
+fn technician_feed(trail: &Trail) -> Vec<ActivityEntry> {
+    let mut fold = TechnicianActivity::new();
+    for entry in trail.all() {
+        fold.apply(&entry, 0);
+    }
+    fold.entries()
+}
+
+/// A folder of thousands of entries is listed page by page until its end:
+/// every name once, in the target's order, in pages as long as the target
+/// makes them. It is one recorded action, and on both sides one item that
+/// names the folder.
+#[tokio::test]
+async fn a_large_folder_is_listed_in_pages_and_is_one_item_on_both_sides() {
+    let mut live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    let folder = staged_folder(live.session, "many");
+    let planted = 3000;
+    plant_files(&folder, planted);
+    std::fs::create_dir(folder.join("sub")).expect("plant a subfolder");
+
+    let (result, delivered) = {
+        let files = TechnicianFiles::new(&live.service, &trail);
+        list_staged_folder(&files, "many", CancelToken::new()).await
+    };
+    let report = result.expect("the folder is listed");
+    assert_eq!(
+        report,
+        FolderReport {
+            folder: Some(staged("many")),
+            select: None,
+            entries: planted + 1,
+            end: ListingEnd::Complete,
+        }
+    );
+    assert_eq!(delivered.opened, Some((staged("many"), None)));
+    assert!(delivered.ended, "the last page says that it is the last");
+    let mut expected: Vec<String> = (0..planted)
+        .map(|n| format!("file-{n:05}.txt"))
+        .chain(std::iter::once("sub".to_string()))
+        .collect();
+    expected.sort();
+    assert_eq!(delivered.names, expected, "every name once, in order");
+    assert!(
+        delivered.pages.len() > 10,
+        "thousands of entries take many pages: {:?}",
+        delivered.pages
+    );
+
+    // One action in the audit trail, with the folder and what was listed.
+    let (start, done) = trail.pair("console_fs_list_start", "console_fs_list");
+    assert_eq!(text(&start, "path").as_deref(), Some("staging:many"));
+    assert_eq!(text(&done, "path").as_deref(), Some("staging:many"));
+    assert_eq!(done.outcome, Outcome::Ok);
+    assert_eq!(int(&done, "entries"), i64::try_from(planted + 1).ok());
+    assert_eq!(text(&done, "more"), None);
+    assert_eq!(text(&done, "reason"), None);
+
+    // One item on each side, saying the same.
+    let one_look = [Said {
+        source: ActivitySource::Technician,
+        kind: ActivityKind::FileOperation,
+        description: "Looked through files and folders".to_string(),
+        operation: look_at("many"),
+        done: true,
+    }];
+    assert_eq!(said(customer_feed(&mut live).await), one_look);
+    assert_eq!(said(technician_feed(&trail)), one_look);
+
+    live.service.stop();
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// The drives and one folder after another are one item that follows along;
+/// a change is an item of its own, and the looks after it a new one. Both
+/// sides show the same items in the same order.
+#[tokio::test]
+async fn looks_follow_along_and_a_change_is_its_own_item_on_both_sides() {
+    let mut live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    let first = staged_folder(live.session, "first");
+    plant_files(&first, 3);
+    let second = staged_folder(live.session, "second");
+    plant_files(&second, 600);
+    let old = staged_folder(live.session, "old-setup");
+    plant_files(&old, 4);
+
+    {
+        let files = TechnicianFiles::new(&live.service, &trail);
+        files.list_drives().await.expect("the drives are listed");
+        for name in ["first", "second"] {
+            let (result, _) = list_staged_folder(&files, name, CancelToken::new()).await;
+            assert_eq!(result.expect("listed").end, ListingEnd::Complete);
+        }
+        let report = files
+            .remove_tree(staged("old-setup"), CancelToken::new(), None)
+            .await
+            .expect("the removal runs");
+        assert_eq!(report.outcome, JobOutcome::Completed);
+        let (result, _) = list_staged_folder(&files, "first", CancelToken::new()).await;
+        assert_eq!(result.expect("listed").entries, 3);
+    }
+
+    let look = |name: &str| Said {
+        source: ActivitySource::Technician,
+        kind: ActivityKind::FileOperation,
+        description: "Looked through files and folders".to_string(),
+        operation: look_at(name),
+        done: true,
+    };
+    let expected = [
+        // The drives, `first`, and the pages of `second`: one item, at the
+        // folder listed last.
+        look("second"),
+        Said {
+            source: ActivitySource::Technician,
+            kind: ActivityKind::FileOperation,
+            description: "Worked with files and folders".to_string(),
+            operation: removal_of("old-setup"),
+            done: true,
+        },
+        look("first"),
+    ];
+    assert_eq!(said(customer_feed(&mut live).await), expected);
+    assert_eq!(said(technician_feed(&trail)), expected);
+
+    live.service.stop();
+    for folder in [first, second] {
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+}
+
+/// A folder the customer computer cannot list is refused with its reason:
+/// nothing is delivered, the action is recorded as failed, and both sides
+/// show a failed item that no later look replaces.
+#[tokio::test]
+async fn a_folder_that_cannot_be_listed_is_refused_and_recorded() {
+    let mut live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    let there = staged_folder(live.session, "there");
+    plant_files(&there, 2);
+
+    {
+        let files = TechnicianFiles::new(&live.service, &trail);
+        let (result, delivered) =
+            list_staged_folder(&files, "never-there", CancelToken::new()).await;
+        match result {
+            Err(TargetError::Remote { code, .. }) => assert_eq!(code, ErrorCode::PathNotFound),
+            other => panic!("expected the target's refusal, got {other:?}"),
+        }
+        assert!(delivered.opened.is_none(), "nothing was opened");
+        assert!(delivered.names.is_empty());
+        let (result, _) = list_staged_folder(&files, "there", CancelToken::new()).await;
+        result.expect("the session still works");
+    }
+
+    let starts = trail.of("console_fs_list_start");
+    let ends = trail.of("console_fs_list");
+    assert_eq!((starts.len(), ends.len()), (2, 2));
+    assert_eq!(ends[0].outcome, Outcome::Failed);
+    assert_eq!(int(&starts[0], "action_id"), int(&ends[0], "action_id"));
+    assert_eq!(
+        text(&ends[0], "path").as_deref(),
+        Some("staging:never-there")
+    );
+    assert!(
+        text(&ends[0], "reason").is_some_and(|reason| reason.contains("PathNotFound")),
+        "{:?}",
+        ends[0]
+    );
+    assert_eq!(int(&ends[0], "entries"), None, "nothing was listed");
+    assert_eq!(ends[1].outcome, Outcome::Ok);
+
+    for (side, feed) in [
+        ("customer", customer_feed(&mut live).await),
+        ("technician", technician_feed(&trail)),
+    ] {
+        let items = said(feed);
+        assert_eq!(items.len(), 2, "{side}: {items:?}");
+        assert_eq!(items[0].operation, look_at("never-there"), "{side}");
+        assert!(!items[0].done, "{side}: a refused look is never done");
+        assert_eq!(
+            items[0].description, "Worked with files and folders",
+            "{side}: not part of the item of the looks"
+        );
+        assert_eq!(items[1].operation, look_at("there"), "{side}");
+        assert!(items[1].done, "{side}");
+    }
+
+    live.service.stop();
+    let _ = std::fs::remove_dir_all(&there);
+}
+
+/// The technician leaves a folder while it is still being listed: the
+/// listing stops between two pages, says what it delivered, and is recorded
+/// as cancelled, never as the whole folder.
+#[tokio::test]
+async fn a_listing_that_is_left_stops_and_is_recorded_as_cancelled() {
+    let live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    let files = TechnicianFiles::new(&live.service, &trail);
+    let folder = staged_folder(live.session, "left");
+    plant_files(&folder, 2000);
+
+    let cancel = CancelToken::new();
+    let mut delivered = Delivered::default();
+    let report = {
+        let token = cancel.clone();
+        // Left as soon as the first page is there.
+        let mut sink = |event| {
+            delivered.take(event);
+            token.cancel();
+        };
+        files.list_folder(staged("left"), cancel, &mut sink).await
+    }
+    .expect("a listing that was left is a report");
+    assert_eq!(report.end, ListingEnd::Cancelled);
+    assert_eq!(delivered.pages.len(), 1, "no page after the first");
+    assert_eq!(report.entries, delivered.names.len() as u64);
+    assert!(report.entries > 0 && report.entries < 2000, "{report:?}");
+    assert!(!delivered.ended);
+
+    let (_, done) = trail.pair("console_fs_list_start", "console_fs_list");
+    assert_eq!(done.outcome, Outcome::Cancelled);
+    assert_eq!(int(&done, "entries"), i64::try_from(report.entries).ok());
+
+    live.service.stop();
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// Stopping the session ends a listing between two pages: it is an error,
+/// never the whole folder, it is recorded with what it had listed, and every
+/// later look fails closed and is still recorded (REQ-S-004, REQ-S-009).
+#[tokio::test]
+async fn a_stop_ends_a_listing_and_later_looks_fail_closed() {
+    let live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    let files = TechnicianFiles::new(&live.service, &trail);
+    let folder = staged_folder(live.session, "stopped-listing");
+    plant_files(&folder, 2000);
+
+    let mut delivered = Delivered::default();
+    let result = {
+        let service = live.service.clone();
+        // The technician stops the session as soon as the first page is there.
+        let mut sink = |event| {
+            delivered.take(event);
+            service.stop();
+        };
+        files
+            .list_folder(staged("stopped-listing"), CancelToken::new(), &mut sink)
+            .await
+    };
+    assert!(
+        matches!(
+            result,
+            Err(TargetError::NoConsentedSession | TargetError::Disconnected)
+        ),
+        "{result:?}"
+    );
+    assert_eq!(delivered.pages.len(), 1, "no page after the stop");
+    assert!(!delivered.ended, "the folder was not listed to its end");
+
+    let (_, done) = trail.pair("console_fs_list_start", "console_fs_list");
+    assert_ne!(done.outcome, Outcome::Ok);
+    assert_eq!(
+        int(&done, "entries"),
+        i64::try_from(delivered.names.len()).ok(),
+        "what was listed until the stop is recorded: {done:?}"
+    );
+    assert!(text(&done, "reason").is_some());
+
+    assert!(!live.service.is_active());
+    let (again, delivered) =
+        list_staged_folder(&files, "stopped-listing", CancelToken::new()).await;
+    assert_eq!(again, Err(TargetError::NoConsentedSession));
+    assert!(delivered.opened.is_none());
+    let (opened, delivered) = open_path(&files, "C:\\Users\\ann\\Documents").await;
+    assert_eq!(opened, Err(TargetError::NoConsentedSession));
+    assert!(delivered.opened.is_none());
+    let ends = trail.of("console_fs_list");
+    assert_eq!(ends.len(), 3, "each look after the stop is recorded");
+    assert!(ends.iter().all(|entry| entry.outcome != Outcome::Ok));
+
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A path that is no remote path is refused before anything is asked: one
+/// failed record, and the customer's computer never hears of it.
+#[tokio::test]
+async fn a_path_that_is_no_remote_path_is_refused_before_it_begins() {
+    let mut live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    {
+        let files = TechnicianFiles::new(&live.service, &trail);
+        for asked in ["C:\\Users\\..\\Windows", "\\\\server\\share", "Documents"] {
+            let (result, delivered) = open_path(&files, asked).await;
+            match result {
+                Err(TargetError::Remote {
+                    code: ErrorCode::InvalidPath,
+                    stage: ErrorStage::Validation,
+                    ..
+                }) => {}
+                other => panic!("{asked}: expected a locally refused path, got {other:?}"),
+            }
+            assert!(delivered.opened.is_none(), "{asked}");
+        }
+    }
+    let all = trail.all();
+    assert_eq!(all.len(), 3, "{all:?}");
+    for refused in &all {
+        assert_eq!(refused.action, "console_fs_list_start");
+        assert_eq!(refused.actor, Actor::Console);
+        assert_eq!(refused.outcome, Outcome::Failed);
+        assert!(text(refused, "reason").is_some());
+    }
+    assert_eq!(
+        text(&all[0], "path").as_deref(),
+        Some("C:\\Users\\..\\Windows"),
+        "the path is recorded as it was asked for"
+    );
+    assert!(
+        said(customer_feed(&mut live).await).is_empty(),
+        "nothing reached the customer's computer"
+    );
+    live.service.stop();
+}
+
+/// A target without drive letters lists its root file system as its one
+/// drive. No path the wire accepts names a folder there, so a drive it does
+/// not list is not found, and the look is recorded as failed. Off Windows
+/// only: there every drive has a letter.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_drive_the_target_does_not_list_is_not_found() {
+    let mut live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    {
+        let files = TechnicianFiles::new(&live.service, &trail);
+        let (result, delivered) = open_path(&files, "c:\\users\\ann").await;
+        match result {
+            Err(TargetError::Remote { code, message, .. }) => {
+                assert_eq!(code, ErrorCode::PathNotFound);
+                assert_eq!(message, "the customer computer lists no drive C:");
+            }
+            other => panic!("expected a drive that is not found, got {other:?}"),
+        }
+        assert!(delivered.opened.is_none());
+    }
+    let (start, done) = trail.pair("console_fs_list_start", "console_fs_list");
+    assert_eq!(text(&start, "path").as_deref(), Some("c:\\users\\ann"));
+    assert_eq!(done.outcome, Outcome::Failed);
+    assert!(
+        text(&done, "reason").is_some_and(|reason| reason.contains("lists no drive C:")),
+        "{done:?}"
+    );
+    // The one request it took was the drive list, which the customer sees.
+    let items = said(customer_feed(&mut live).await);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0].operation, "list the drives");
+    live.service.stop();
+}
+
+/// A path typed in another letter case leads to the folder as the customer
+/// computer names it; a path to a file opens the folder that holds it; a
+/// step into a subfolder costs its listing alone. Windows only: the wire
+/// accepts drive-qualified paths only.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_typed_path_opens_the_folder_under_its_real_name() {
+    let mut live = live_session(explorer_caps(), None).await;
+    let trail = Trail::default();
+    // The temporary folder by its real names: a runner may give it by a
+    // short name, which no listing shows.
+    let base = std::fs::canonicalize(temp_dir_for("explorer-open")).expect("the real path");
+    let base = base.display().to_string();
+    let base = base.strip_prefix("\\\\?\\").unwrap_or(&base).to_string();
+    let documents = format!("{base}\\Documents");
+    std::fs::create_dir_all(format!("{documents}\\Invoices")).expect("plant");
+    plant_files(Path::new(&documents), 700);
+    std::fs::write(format!("{documents}\\Report.pdf"), b"report").expect("plant");
+
+    {
+        let files = TechnicianFiles::new(&live.service, &trail);
+
+        // Typed in capitals, with forward slashes.
+        let typed = documents.to_uppercase().replace('\\', "/");
+        let (result, delivered) = open_path(&files, &typed).await;
+        let report = result.expect("the folder opens");
+        let real = RemotePath::Absolute {
+            path: documents.clone(),
+        };
+        assert_eq!(report.folder, Some(real.clone()));
+        assert_eq!(report.end, ListingEnd::Complete);
+        assert_eq!(report.entries, 702);
+        assert_eq!(delivered.opened, Some((real.clone(), None)));
+        assert_eq!(delivered.names.len(), 702);
+        assert!(delivered.names.contains(&"Invoices".to_string()));
+        assert!(delivered.pages.len() > 1, "{:?}", delivered.pages);
+
+        // A path to a file opens its folder and names the file as listed.
+        let (result, delivered) = open_path(&files, &format!("{documents}\\report.PDF")).await;
+        let report = result.expect("the folder of the file opens");
+        assert_eq!(report.folder, Some(real.clone()));
+        assert_eq!(report.select.as_deref(), Some("Report.pdf"));
+        assert_eq!(
+            delivered.opened,
+            Some((real, Some("Report.pdf".to_string())))
+        );
+
+        // A name the folder does not list is not found, and nothing opens.
+        let (result, delivered) = open_path(&files, &format!("{documents}\\Invoicez")).await;
+        match result {
+            Err(TargetError::Remote { code, message, .. }) => {
+                assert_eq!(code, ErrorCode::PathNotFound);
+                assert_eq!(
+                    message,
+                    format!("{documents} lists no entry named Invoicez")
+                );
+            }
+            other => panic!("expected a name that is not found, got {other:?}"),
+        }
+        assert!(delivered.opened.is_none());
+    }
+
+    let ends = trail.of("console_fs_list");
+    assert_eq!(ends.len(), 3);
+    assert_eq!(ends[0].outcome, Outcome::Ok);
+    assert_eq!(
+        text(&ends[0], "path").as_deref(),
+        Some(documents.as_str()),
+        "the record names the folder as the customer computer names it"
+    );
+    assert_eq!(int(&ends[0], "entries"), Some(702));
+    assert_eq!(ends[2].outcome, Outcome::Failed);
+    let starts = trail.of("console_fs_list_start");
+    assert_eq!(
+        text(&starts[0], "path"),
+        Some(documents.to_uppercase().replace('\\', "/")),
+        "the start names the place as it was asked for"
+    );
+
+    // What the customer was shown ends at the folder, under its real name.
+    let items = said(customer_feed(&mut live).await);
+    let looks: Vec<&Said> = items.iter().filter(|item| item.done).collect();
+    assert_eq!(
+        looks.last().map(|item| item.operation.as_str()),
+        Some(format!("list the folder {documents}").as_str())
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| item.description == "Looked through files and folders"),
+        "every request was a look that was answered: {items:?}"
+    );
+
+    // A step into a subfolder of the folder that was just listed costs one
+    // request, its listing.
+    {
+        let files = TechnicianFiles::new(&live.service, &trail);
+        let (result, _) = open_path(&files, &documents).await;
+        result.expect("the folder opens again");
+    }
+    let _ = customer_feed(&mut live).await;
+    {
+        let files = TechnicianFiles::new(&live.service, &trail);
+        let (result, delivered) = open_path(&files, &format!("{documents}\\Invoices")).await;
+        assert_eq!(result.expect("the subfolder opens").entries, 0);
+        assert!(delivered.ended);
+    }
+    live.service
+        .list_staged(None)
+        .await
+        .expect("the mark is answered");
+    let mut requests = Vec::new();
+    loop {
+        let shown = next_shown(&mut live.joiner).await;
+        if shown.operation == "list the files CretLink staged" {
+            break;
+        }
+        requests.push(shown.operation);
+    }
+    assert_eq!(requests, [format!("list the folder {documents}\\Invoices")]);
+
+    live.service.stop();
+    let _ = std::fs::remove_dir_all(&base);
 }

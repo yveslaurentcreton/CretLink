@@ -33,6 +33,7 @@ pub mod audit;
 pub mod audit_entries;
 pub mod display_name;
 pub mod driver;
+pub mod explorer;
 pub mod files;
 pub mod history;
 pub mod ipc_server;
@@ -51,6 +52,7 @@ pub use audit::{
 pub use audit_entries::{AuditActorView, AuditEntryView, session_entries};
 pub use display_name::technician_display_name;
 pub use driver::{DriverError, EventContext, EventOutcome, apply_session_event};
+pub use explorer::{FolderEvent, FolderReport, ListingEnd, MAX_FOLDER_ENTRIES};
 pub use files::TechnicianFiles;
 pub use history::{ActionCounts, Integrity, SessionSummary, list_sessions, read_session};
 pub use ipc_server::{

@@ -13,12 +13,13 @@
 //! - executes command requests (`run_command`, `write_stdin`, `cancel_job`,
 //!   `list_jobs`, `stop`) on the handle, correlated by one-shot replies.
 //!
-//! # The technician's file explorer (ST-M010-001)
+//! # The technician's file explorer (ST-M010-001, ST-M010-002)
 //!
 //! Beside the MCP-facing file surface, which attributes every call to the AI,
-//! the service offers the three operations the technician's own file explorer
-//! adds, attributed to the technician ([`Origin::Console`]):
+//! the service offers the operations of the technician's own file explorer,
+//! attributed to the technician ([`Origin::Console`]):
 //! [`ConsoleSessionService::list_drives`],
+//! [`ConsoleSessionService::list_folder`],
 //! [`ConsoleSessionService::remove_tree`] and
 //! [`ConsoleSessionService::send_to_folder`]. The last two can run long, so
 //! the caller hands in a [`CancelToken`] to cancel them and may hand in a
@@ -26,8 +27,11 @@
 //! no authority: they work only on the consented session and fail closed with
 //! it. The MCP tool surface does not offer them.
 //!
+//! The service also keeps, for its session only, what the target has
+//! confirmed about the places the explorer went to (see [`crate::explorer`]).
+//!
 //! The service does not write the audit trail; whoever drives an action
-//! records it. For these three that is [`crate::TechnicianFiles`], which a
+//! records it. For these that is [`crate::TechnicianFiles`], which a
 //! screen calls instead of the service: it records each action before and
 //! after it runs.
 //!
@@ -69,6 +73,8 @@ use cretlink_session::{
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+use crate::explorer::{Browsed, FolderSource};
 
 /// Capacity of the broadcast event stream. Each `ExecOutput` event carries at
 /// most one wire output chunk (~32 KiB), so buffered output is bounded at
@@ -513,6 +519,10 @@ struct Inner {
     /// (ST-M010-001). One counter for the session, so two such actions never
     /// share an id whoever records them.
     technician_actions: AtomicU64,
+    /// What the target has confirmed about the places the technician's
+    /// explorer went to in this session (ST-M010-002). It ends with the
+    /// session, so nothing of one customer computer is taken to the next.
+    browsed: Mutex<Browsed>,
 }
 
 /// One owner of a live console session, shareable across the CLI and the IPC
@@ -558,6 +568,7 @@ impl ConsoleSessionService {
             terminals: Mutex::new(TerminalRegistry::default()),
             ai_in_flight: Arc::new(AtomicU64::new(0)),
             technician_actions: AtomicU64::new(0),
+            browsed: Mutex::new(Browsed::default()),
         });
         let driver = tokio::spawn(drive(handle, command_rx, event_tx, Arc::clone(&inner)));
         (Self { inner }, driver)
@@ -584,6 +595,12 @@ impl ConsoleSessionService {
     /// this session and rising (ST-M010-001).
     pub(crate) fn next_technician_action(&self) -> u64 {
         self.inner.technician_actions.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// What this session remembers of the places the technician's explorer
+    /// went to (ST-M010-002).
+    pub(crate) fn browsed(&self) -> &Mutex<Browsed> {
+        &self.inner.browsed
     }
 
     /// The routed session id (REQ-F-016).
@@ -1414,9 +1431,9 @@ impl ConsoleSessionService {
         Ok(upload_report_from(report))
     }
 
-    // --- The technician's file explorer (ST-M010-001) ---
+    // --- The technician's file explorer (ST-M010-001, ST-M010-002) ---
     //
-    // These three are the technician's own actions: every request they issue
+    // These are the technician's own actions: every request they issue
     // is stamped `Origin::Console`, so the agent and the attended customer
     // attribute them to the technician, not to the AI (REQ-F-017, REQ-S-023).
     // `TechnicianFiles` runs them and records them in the audit trail.
@@ -1434,7 +1451,47 @@ impl ConsoleSessionService {
             .file_op(Origin::Console.into(), Operation::FsDrives {})
             .await?
         {
-            OpResult::Drives { drives } => Ok(drives),
+            OpResult::Drives { drives } => {
+                // The roots are what the explorer names a drive by.
+                self.inner
+                    .browsed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set_roots(&drives);
+                Ok(drives)
+            }
+            _ => Err(TargetError::Unexpected),
+        }
+    }
+
+    /// Lists one page of a folder of the target for the technician: the
+    /// entries after the name `continue_after`, ordered by name, and whether
+    /// the folder ends with them (ST-M010-002). A page is as long as fits one
+    /// record of the secure channel, so pages differ in length
+    /// (ST-M010-005).
+    ///
+    /// This is one request. [`crate::TechnicianFiles::open_folder`] lists a
+    /// whole folder with it and records that in the audit trail.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive.
+    pub async fn list_folder(
+        &self,
+        path: RemotePath,
+        continue_after: Option<String>,
+    ) -> Result<DirPage, TargetError> {
+        match self
+            .file_op(
+                Origin::Console.into(),
+                Operation::FsList {
+                    path,
+                    continue_after,
+                },
+            )
+            .await?
+        {
+            OpResult::DirEntries { entries, end } => Ok(DirPage { entries, end }),
             _ => Err(TargetError::Unexpected),
         }
     }
@@ -2261,6 +2318,21 @@ fn download_report_from(report: TransferReport, local_path: String) -> DownloadR
             message: e.message,
             stage: e.stage.to_string(),
         }),
+    }
+}
+
+/// The technician's explorer reads the target through the service, so every
+/// request it makes is the technician's ([`Origin::Console`]) and fails closed
+/// with the session (ST-M010-002).
+#[async_trait::async_trait]
+impl FolderSource for ConsoleSessionService {
+    async fn drives(&self) -> Result<Vec<DriveEntry>, TargetError> {
+        self.list_drives().await
+    }
+
+    async fn page(&self, folder: &RemotePath, after: Option<&str>) -> Result<DirPage, TargetError> {
+        self.list_folder(folder.clone(), after.map(str::to_owned))
+            .await
     }
 }
 
