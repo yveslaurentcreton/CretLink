@@ -424,19 +424,32 @@ async fn requested_working_dir_receives_relative_writes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Without a requested directory the job inherits — and the spawn reports —
-/// the broker process's current directory at spawn time.
+/// Without a requested directory the job starts in — and the spawn reports —
+/// the system folder on Windows, never the folder this program was started in
+/// (ST-M006-020), and the broker process's current directory elsewhere.
 #[tokio::test]
-async fn default_working_dir_is_the_process_current_dir() {
+async fn default_working_dir_is_the_system_folder_on_windows() {
     let (broker, mut rx) = Broker::new();
+    // `cd` alone prints the working directory in Command Prompt.
+    let command = if cfg!(windows) {
+        "cd"
+    } else {
+        "echo default-cwd"
+    };
     let started = broker
-        .spawn(JobSpec::new(Shell::Cmd, "echo default-cwd"))
+        .spawn(JobSpec::new(Shell::Cmd, command))
         .await
         .unwrap();
-    let current = std::env::current_dir().expect("current dir");
-    assert_eq!(started.working_dir, current);
+    let expected = crate::system::job_folder()
+        .unwrap_or_else(|| std::env::current_dir().expect("current dir"));
+    assert_eq!(started.working_dir, expected);
     let c = drain_job(&mut rx, started.job).await;
     assert_eq!(c.done.outcome, JobOutcome::Completed);
+    if cfg!(windows) {
+        // The job says itself where it runs.
+        let printed = String::from_utf8_lossy(&c.stdout).trim().to_lowercase();
+        assert_eq!(printed, expected.to_string_lossy().to_lowercase());
+    }
 }
 
 // --- Windows Job Object tree-kill (REQ-S-014) ---

@@ -826,8 +826,9 @@ pub enum OpResult {
         /// The identifier assigned to the new job.
         job: JobId,
         /// The effective absolute **remote** working directory the job actually
-        /// received: the validated requested directory, or the agent process's
-        /// current directory at spawn time (ST-M003-003, REQ-F-009). Defaults
+        /// received: the validated requested directory; otherwise the system
+        /// folder on Windows (ST-M006-020) and the agent process's current
+        /// directory at spawn time elsewhere (ST-M003-003, REQ-F-009). Defaults
         /// to empty on decode so a same-major peer on an older minor stays
         /// interoperable (REQ-N-012): empty means "not reported (an
         /// older-minor peer) or the agent could not read its own directory" —

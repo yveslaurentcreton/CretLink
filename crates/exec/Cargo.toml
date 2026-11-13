@@ -85,12 +85,19 @@ windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Globalization",
   "Win32_Security",
+  # What the system itself names (ST-M006-020): its Windows folder and its
+  # system folder, for the folders CretLink keeps for itself and for the shells
+  # a job starts (`Win32_System_SystemInformation`); and the owner and the
+  # permissions of a folder, read and set through its handle
+  # (`Win32_Security_Authorization`).
+  "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
   "Win32_System_Diagnostics_Debug",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_JobObjects",
   "Win32_System_Pipes",
+  "Win32_System_SystemInformation",
   "Win32_System_Threading",
   # Interactive-desktop capture and input (ADR-0015, ST-M005-001/002/003).
   # GDI screen capture, monitor enumeration and DPI, SendInput synthesis,

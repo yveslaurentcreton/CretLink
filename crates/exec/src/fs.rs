@@ -66,6 +66,22 @@
 //! bounded step at a time, without ever leaving the folder (see the `tree`
 //! module). It takes up its folder as a verified folder too.
 //!
+//! # The staging area is CretLink's own (ST-M006-020, REQ-S-024)
+//!
+//! A cleanup acts on what a manifest in the staging area names, and a staged
+//! tool is run, with the rights of the program. So nobody without those
+//! rights may ever have been able to put or open anything there. The store
+//! knows the folder its staging area lies in as an [`OwnFolder`]: for an
+//! elevated program a folder that administrators made, private from the
+//! moment it existed, which is prepared before any staging operation touches
+//! it. What a manifest holds is not trusted all the same: a cleanup removes
+//! only what lies directly in the session's own staging folder, whatever a
+//! manifest names. An entry that is not what CretLink makes there — a link, a
+//! file where a folder belongs — is reported, never read, and removed whole
+//! only by the purge that an administrator asks for. And nothing is moved
+//! into such a staging area from elsewhere: a move keeps a file as it is, with
+//! its permissions and with every handle a program opened on it before.
+//!
 //! # Honest failures (REQ-N-008, REQ-N-015)
 //!
 //! Every failure is a secret-free [`FsError`] carrying a wire [`ErrorCode`] and
@@ -100,6 +116,7 @@ use cretlink_protocol::{
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::own::{OwnFolder, Standing, remove_whole};
 use manifest::{MANIFEST_FILE, Manifest};
 
 /// The subdirectory of a staging root that holds in-progress part files, kept
@@ -115,6 +132,26 @@ const HASH_BUF_BYTES: usize = 128 * 1024;
 /// stays bounded and every part the session leaves is one it knows of
 /// (REQ-N-006, REQ-F-019).
 const MAX_UNFINISHED_TRANSFERS: usize = 1024;
+
+/// How the reason starts with which a cleanup reports an entry of a manifest
+/// that names a path outside the session's staging folder. Such a path is
+/// never touched, so there is nothing to remove by hand either.
+pub const OUTSIDE_STAGING_REASON: &str = "outside the staging area";
+
+/// Why a cleanup left an entry of a manifest alone: it names a path that does
+/// not lie directly in the session's staging folder.
+const REASON_OUTSIDE: &str = "outside the staging area; not touched";
+
+/// The same from the purge, which also drops the entry: there is nothing to
+/// try again.
+const REASON_OUTSIDE_DROPPED: &str = "outside the staging area; not touched, entry dropped";
+
+/// Why a sweep left a folder alone: CretLink did not make it, or something in
+/// it that a cleanup would read is not CretLink's.
+const REASON_FOREIGN: &str = "not made by CretLink; left as it is";
+
+/// Why a sweep did nothing: the staging area could not be made private.
+const REASON_NOT_PRIVATE: &str = "the staging area could not be made private";
 
 /// A secret-free file-operation failure.
 ///
@@ -164,6 +201,13 @@ impl FsError {
 
     fn internal() -> Self {
         Self::new(ErrorCode::Internal, "the file operation failed")
+    }
+
+    fn not_ours() -> Self {
+        Self::new(
+            ErrorCode::AccessDenied,
+            "the staging area holds what CretLink did not make",
+        )
     }
 
     /// Maps a raw I/O error onto a wire [`ErrorCode`], preferring the precise
@@ -271,6 +315,8 @@ pub struct FileStore {
     /// The parts, beside their destinations, of the transfers to a folder that
     /// this store began and has neither committed nor discarded.
     unfinished: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// The folder the staging root lies in, and whether it must be private.
+    base: OwnFolder,
 }
 
 /// The honest outcome of a startup crash-recovery sweep across every session
@@ -288,8 +334,14 @@ pub struct StartupSweepReport {
     pub sessions_removed: u32,
     /// Artifacts and orphaned part files removed.
     pub artifacts_removed: u32,
+    /// Entries that CretLink did not make and that the purge removed whole
+    /// (ST-M006-020).
+    pub foreign_removed: u32,
     /// Artifacts that could not be removed; their manifest records are kept so a
-    /// later start retries them (never reported as success — REQ-N-008).
+    /// later start retries them (never reported as success — REQ-N-008). Also
+    /// what the sweep found in the staging area that CretLink did not make: it
+    /// is named here at every start until an administrator has it removed
+    /// (ST-M006-020).
     pub failed: Vec<CleanupFailure>,
 }
 
@@ -326,6 +378,16 @@ pub struct StagingCensus {
     /// whose tree is already empty is omitted so a clean base reads as empty
     /// rather than a row of zeros.
     pub sessions: Vec<SessionStaging>,
+    /// What lies in the staging area under the name of a session and is not
+    /// what CretLink makes there: a link, a file, or a folder whose manifest
+    /// or folder of parts is one. Named by its path and never read
+    /// (ST-M006-020).
+    pub foreign: Vec<String>,
+    /// Where CretLink's own records could not be read: a session folder
+    /// whose manifest is damaged, or the staging area itself when it is not
+    /// CretLink's own. What is staged there is unknown, never "nothing"
+    /// (REQ-N-008).
+    pub unread: Vec<String>,
 }
 
 impl StagingCensus {
@@ -343,33 +405,40 @@ impl StagingCensus {
             .fold(0u32, |acc, s| acc.saturating_add(s.orphaned_parts))
     }
 
-    /// Whether the census found no staged residue at all.
+    /// Whether the census found no staged residue at all, nothing that is
+    /// not CretLink's, and nothing it could not read.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
+        self.sessions.is_empty() && self.foreign.is_empty() && self.unread.is_empty()
     }
 }
 
 impl FileStore {
-    /// Binds a store to `session`, rooting its staging area under the platform
-    /// default base (`%ProgramData%\CretLink\staging` on Windows, a temp
-    /// directory elsewhere). The staging directory itself is created lazily on
-    /// first use, so a session that only touches absolute paths never creates it.
+    /// Binds a store to `session`, rooting its staging area in the staging
+    /// folder of this process ([`OwnFolder::staging_for_this_process`]): on
+    /// Windows `CretLink Data\staging` in `Program Files` for an elevated
+    /// program and `CretLink\staging` in the account's local application
+    /// data otherwise, a temp directory elsewhere. The staging directory
+    /// itself is created lazily on first use, so a session that only touches
+    /// absolute paths never creates it.
     #[must_use]
     pub fn for_session(session: SessionId) -> Self {
-        Self::with_base(session, default_staging_base())
+        Self::with_base(session, OwnFolder::staging_for_this_process())
     }
 
-    /// Binds a store to `session` with an explicit staging base directory. Used
-    /// by the session layer to place staging where policy dictates, and by tests
-    /// to sandbox it.
+    /// Binds a store to `session` with an explicit staging base. Used by the
+    /// session layer to place staging where policy dictates, and by tests to
+    /// sandbox it. A plain path is a folder of the account that runs this
+    /// process ([`OwnFolder::same_account`]).
     #[must_use]
-    pub fn with_base(session: SessionId, base: impl Into<PathBuf>) -> Self {
-        let staging_root = base.into().join(session.to_string());
+    pub fn with_base(session: SessionId, base: impl Into<OwnFolder>) -> Self {
+        let base = base.into();
+        let staging_root = base.path().join(session.to_string());
         Self {
             session,
             staging_root,
             unfinished: Arc::new(Mutex::new(BTreeSet::new())),
+            base,
         }
     }
 
@@ -388,6 +457,11 @@ impl FileStore {
     /// means adding any future operation breaks this build until a deliberate
     /// decision is made.
     pub async fn perform(&self, op: Operation) -> Result<OpResult, FsError> {
+        // No operation goes through the folders above a staging area before
+        // those folders are private (ST-M006-020).
+        if touches_staging(&op) {
+            self.prepare_base().await?;
+        }
         match op {
             Operation::FsStat { path } => self.stat(&path).await,
             Operation::FsList {
@@ -904,6 +978,20 @@ impl FileStore {
         to: &RemotePath,
         overwrite: bool,
     ) -> Result<OpResult, FsError> {
+        // A move keeps a file as it is: its permissions, and every handle a
+        // program opened on it before. In a private staging area nothing may
+        // stand that was ever open to others (ST-M006-020), so nothing is
+        // moved in from elsewhere: it is uploaded, which makes it new.
+        if self.base.is_private()
+            && matches!(to, RemotePath::Staging { .. })
+            && !matches!(from, RemotePath::Staging { .. })
+        {
+            return Err(FsError::new(
+                ErrorCode::Unsupported,
+                "a move into the staging area of a program with administrator rights is not \
+                 supported: upload the file",
+            ));
+        }
         let from_path = self.resolve(from)?;
         let to_path = self.resolve(to)?;
         if matches!(to, RemotePath::Staging { .. }) {
@@ -1039,14 +1127,47 @@ impl FileStore {
     /// reports honest per-artifact outcomes. Records for artifacts that were
     /// removed (or were already gone) are dropped; records for artifacts that
     /// could not be removed are kept so a later cleanup can retry.
+    ///
+    /// The cleanup reads the manifest only when the session's folder, the
+    /// manifest and the folder of parts are what CretLink makes there, not
+    /// links, and it removes an entry only when it lies directly in the
+    /// session's staging folder: a manifest decides which of the session's
+    /// files go, never where a file is removed (ST-M006-020, REQ-S-024). An
+    /// entry that names another place is reported and kept; the purge drops
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// When something in the session's folder is not CretLink's
+    /// ([`ErrorCode::AccessDenied`]; nothing was read or removed), or the
+    /// manifest cannot be read or written.
     pub async fn cleanup(&self, trigger: CleanupTrigger) -> Result<OpResult, FsError> {
+        self.prepare_base().await?;
+        if self.session_standing().await == Standing::Foreign {
+            return Err(FsError::not_ours());
+        }
         let mut manifest = self.load_manifest().await?;
         let selected = manifest.selected(trigger);
         let mut removed: u32 = 0;
         let mut failed: Vec<CleanupFailure> = Vec::new();
 
         for canonical_path in selected {
-            match tokio::fs::remove_file(&canonical_path).await {
+            let Some(artifact) = self.own_artifact(&canonical_path) else {
+                let reason = if trigger == CleanupTrigger::All {
+                    manifest.remove(&canonical_path);
+                    REASON_OUTSIDE_DROPPED
+                } else {
+                    REASON_OUTSIDE
+                };
+                if failed.len() < limits::MAX_DIR_PAGE {
+                    failed.push(CleanupFailure {
+                        canonical_path,
+                        reason: reason.to_string(),
+                    });
+                }
+                continue;
+            };
+            match tokio::fs::remove_file(&artifact).await {
                 Ok(()) => {
                     removed = removed.saturating_add(1);
                     manifest.remove(&canonical_path);
@@ -1134,7 +1255,11 @@ impl FileStore {
     /// untouched, so the sweep never destroys what policy or the customer meant
     /// to keep.
     pub async fn sweep_startup() -> StartupSweepReport {
-        Self::sweep_all_sessions(default_staging_base(), CleanupTrigger::Shutdown).await
+        Self::sweep_all_sessions(
+            OwnFolder::staging_for_this_process(),
+            CleanupTrigger::Shutdown,
+        )
+        .await
     }
 
     /// The base-directory sweep behind [`FileStore::sweep_startup`], with an
@@ -1142,13 +1267,36 @@ impl FileStore {
     /// trigger by tests. Never errors: a base that does not exist yet is a clean
     /// no-op, and a per-session failure leaves that tree for the next start
     /// rather than aborting the whole sweep.
+    ///
+    /// A base that must be private is prepared before anything in it is read;
+    /// if that fails, nothing is read and the report says so. Where CretLink
+    /// never kept anything, the sweep makes nothing. What lies in the base
+    /// under the name of a session and is not what CretLink makes there — a
+    /// link, a file, a folder whose manifest or folder of parts is a link — is
+    /// never read. It is named in the report, and removed whole, without
+    /// following a link, only by [`CleanupTrigger::All`], the purge an
+    /// administrator asks for (ST-M006-020, REQ-S-024). A session whose
+    /// cleanup failed is named too: its files are still there.
     pub async fn sweep_all_sessions(
-        base: impl Into<PathBuf>,
+        base: impl Into<OwnFolder>,
         trigger: CleanupTrigger,
     ) -> StartupSweepReport {
         let base = base.into();
         let mut report = StartupSweepReport::default();
-        let mut rd = match tokio::fs::read_dir(&base).await {
+        if base.is_private() {
+            // A sweep makes nothing where nothing is.
+            if !has_a_data_folder(&base).await {
+                return report;
+            }
+            if prepare(&base).await.is_err() {
+                report.failed.push(CleanupFailure {
+                    canonical_path: base.path().to_string_lossy().into_owned(),
+                    reason: REASON_NOT_PRIVATE.to_string(),
+                });
+                return report;
+            }
+        }
+        let mut rd = match tokio::fs::read_dir(base.path()).await {
             Ok(rd) => rd,
             // No base yet: nothing was ever staged. A clean no-op.
             Err(_) => return report,
@@ -1161,8 +1309,8 @@ impl FileStore {
                 Err(_) => break,
             };
             // Foreign-dir safe: a session staging tree is a *directory* whose
-            // name is a session id. A stray file, or a folder named anything
-            // else, belongs to someone else and is left exactly as found.
+            // name is a session id. An entry named anything else belongs to
+            // someone else and is left exactly as found.
             let file_name = entry.file_name();
             let Some(name) = file_name.to_str() else {
                 continue;
@@ -1170,13 +1318,17 @@ impl FileStore {
             let Ok(session) = name.parse::<SessionId>() else {
                 continue;
             };
-            match entry.file_type().await {
-                Ok(kind) if kind.is_dir() => {}
-                _ => continue,
+            let store = Self::with_base(session, base.clone());
+            match store.session_standing().await {
+                Standing::Absent => continue,
+                Standing::Foreign => {
+                    Self::sweep_foreign(&mut report, entry.path(), trigger).await;
+                    continue;
+                }
+                Standing::Ours => {}
             }
 
             report.sessions_scanned = report.sessions_scanned.saturating_add(1);
-            let store = Self::with_base(session, base.clone());
             match store.cleanup(trigger).await {
                 Ok(OpResult::CleanupReport { removed, failed }) => {
                     report.artifacts_removed = report.artifacts_removed.saturating_add(removed);
@@ -1193,14 +1345,58 @@ impl FileStore {
                         report.sessions_removed = report.sessions_removed.saturating_add(1);
                     }
                 }
-                // `cleanup` only yields a `CleanupReport`; any other shape or a
-                // per-session error leaves that tree for the next start.
+                // `cleanup` only yields a `CleanupReport`.
                 Ok(_) => {}
-                Err(_) => {}
+                // A cleanup that failed leaves that tree for the next start,
+                // and says so: what the session staged is still there.
+                Err(error) => {
+                    if report.failed.len() < limits::MAX_DIR_PAGE {
+                        report.failed.push(CleanupFailure {
+                            canonical_path: store.staging_root.to_string_lossy().into_owned(),
+                            reason: error.message.to_string(),
+                        });
+                    }
+                }
             }
         }
 
         report
+    }
+
+    /// What a sweep does with something in the staging area that is not what
+    /// CretLink makes there: the purge removes it whole, every other sweep
+    /// names it.
+    async fn sweep_foreign(
+        report: &mut StartupSweepReport,
+        path: PathBuf,
+        trigger: CleanupTrigger,
+    ) {
+        let canonical_path = path.to_string_lossy().into_owned();
+        let failure = if trigger == CleanupTrigger::All {
+            let removed = tokio::task::spawn_blocking(move || remove_whole(&path)).await;
+            match removed {
+                Ok(Ok(())) => {
+                    report.foreign_removed = report.foreign_removed.saturating_add(1);
+                    return;
+                }
+                Ok(Err(error)) => CleanupFailure {
+                    canonical_path,
+                    reason: cleanup_reason(&error).to_string(),
+                },
+                Err(_) => CleanupFailure {
+                    canonical_path,
+                    reason: "i/o error".to_string(),
+                },
+            }
+        } else {
+            CleanupFailure {
+                canonical_path,
+                reason: REASON_FOREIGN.to_string(),
+            }
+        };
+        if report.failed.len() < limits::MAX_DIR_PAGE {
+            report.failed.push(failure);
+        }
     }
 
     // --- read-only residual census (ST-M006-003) --------------------------
@@ -1209,7 +1405,7 @@ impl FileStore {
     /// without removing anything — the inspect-side entry point behind the
     /// owned-resource inventory's recovery verb (ST-M006-003, REQ-F-019).
     pub async fn census_startup() -> StagingCensus {
-        Self::census_all_sessions(default_staging_base()).await
+        Self::census_all_sessions(OwnFolder::staging_for_this_process()).await
     }
 
     /// The base-directory census behind [`FileStore::census_startup`], with an
@@ -1218,13 +1414,40 @@ impl FileStore {
     /// only directories named as session ids are examined — but reads rather
     /// than removes. Never errors: a base that does not exist yet is an empty
     /// census, and an unreadable session tree is simply omitted.
-    pub async fn census_all_sessions(base: impl Into<PathBuf>) -> StagingCensus {
+    ///
+    /// It changes and makes nothing. What lies in the base under the name of
+    /// a session and is not what CretLink makes there is named as foreign and
+    /// not read (ST-M006-020). A session folder whose manifest cannot be
+    /// read, and a base that cannot be listed, are named as unread: what is
+    /// staged there is unknown, not nothing (REQ-N-008).
+    pub async fn census_all_sessions(base: impl Into<OwnFolder>) -> StagingCensus {
         let base = base.into();
         let mut census = StagingCensus::default();
-        let mut rd = match tokio::fs::read_dir(&base).await {
+        // A base that must be private is read only where folders stand under
+        // its names: a link there is not followed, and what lies behind it
+        // is not taken for what CretLink staged.
+        if base.is_private() {
+            match standing(&base).await {
+                Standing::Ours => {}
+                Standing::Absent => return census,
+                Standing::Foreign => {
+                    census
+                        .unread
+                        .push(base.path().to_string_lossy().into_owned());
+                    return census;
+                }
+            }
+        }
+        let mut rd = match tokio::fs::read_dir(base.path()).await {
             Ok(rd) => rd,
             // No base yet: nothing was ever staged. A clean, empty census.
-            Err(_) => return census,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return census,
+            Err(_) => {
+                census
+                    .unread
+                    .push(base.path().to_string_lossy().into_owned());
+                return census;
+            }
         };
 
         loop {
@@ -1243,13 +1466,28 @@ impl FileStore {
             let Ok(session) = name.parse::<SessionId>() else {
                 continue;
             };
-            match entry.file_type().await {
-                Ok(kind) if kind.is_dir() => {}
-                _ => continue,
-            }
-
             let store = Self::with_base(session, base.clone());
-            let staging = store.census().await;
+            match store.session_standing().await {
+                Standing::Absent => continue,
+                Standing::Foreign => {
+                    census
+                        .foreign
+                        .push(entry.path().to_string_lossy().into_owned());
+                    continue;
+                }
+                Standing::Ours => {}
+            }
+            let Ok(manifest) = store.load_manifest().await else {
+                census
+                    .unread
+                    .push(entry.path().to_string_lossy().into_owned());
+                continue;
+            };
+            let staging = SessionStaging {
+                session,
+                staged: manifest.entries().to_vec(),
+                orphaned_parts: store.count_orphaned_parts().await,
+            };
             // Omit spent trees so a clean base reads as empty, not a row of
             // zeros; a tree with any staged record or orphaned part is residue.
             if !staging.staged.is_empty() || staging.orphaned_parts > 0 {
@@ -1265,7 +1503,18 @@ impl FileStore {
     /// read-only counterpart to [`FileStore::cleanup`]. A manifest that cannot
     /// be read yields no enumerable records rather than an error — the sweep
     /// remains the authority on removal and its honest failure reporting.
+    ///
+    /// A session folder that holds a link where a cleanup would read or enter
+    /// is not read: it yields nothing here, and the census of the base names
+    /// it as foreign (ST-M006-020).
     pub async fn census(&self) -> SessionStaging {
+        if self.session_standing().await == Standing::Foreign {
+            return SessionStaging {
+                session: self.session,
+                staged: Vec::new(),
+                orphaned_parts: 0,
+            };
+        }
         let staged = match self.load_manifest().await {
             Ok(manifest) => manifest.entries().to_vec(),
             Err(_) => Vec::new(),
@@ -1275,6 +1524,55 @@ impl FileStore {
             staged,
             orphaned_parts: self.count_orphaned_parts().await,
         }
+    }
+
+    /// What this session's staging folder is: absent; what CretLink makes
+    /// there, together with its manifest and its folder of parts; or not — a
+    /// link or an entry of another kind under one of the three names
+    /// (ST-M006-020). In a private base no such entry can appear; in a base of
+    /// the account it is still never followed. A private base that is itself
+    /// a link, or lies behind one, makes everything in it foreign.
+    async fn session_standing(&self) -> Standing {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            if store.base.is_private() && store.base.standing() == Standing::Foreign {
+                return Standing::Foreign;
+            }
+            match Standing::of_dir(&store.staging_root) {
+                Standing::Ours => {}
+                other => return other,
+            }
+            if Standing::of_file(&store.manifest_path()) == Standing::Foreign
+                || Standing::of_dir(&store.staging_root.join(PARTS_DIR)) == Standing::Foreign
+            {
+                return Standing::Foreign;
+            }
+            Standing::Ours
+        })
+        .await
+        // What could not be looked at is not taken for CretLink's own.
+        .unwrap_or(Standing::Foreign)
+    }
+
+    /// The file a manifest entry stands for, when the entry names a file
+    /// directly in this session's staging folder: its last part is the name
+    /// of a staged file, and the part before it is the name of this session's
+    /// folder. `None` for every other path.
+    ///
+    /// The file is then addressed through the staging folder as this store
+    /// knows it. How the manifest spells the folders above does not matter,
+    /// and cannot lead anywhere else.
+    fn own_artifact(&self, canonical_path: &str) -> Option<PathBuf> {
+        let mut parts = canonical_path.rsplitn(3, ['/', '\\']);
+        let name = parts.next()?;
+        let folder = parts.next()?;
+        if !is_safe_staging_name(name) || name == MANIFEST_FILE || name == PARTS_DIR {
+            return None;
+        }
+        let session = self.staging_root.file_name()?.to_str()?;
+        folder
+            .eq_ignore_ascii_case(session)
+            .then(|| self.staging_root.join(name))
     }
 
     /// Counts orphaned part files under `.parts` without removing them.
@@ -1436,10 +1734,48 @@ impl FileStore {
             .map(|m| m.len())
     }
 
-    async fn ensure_staging_dirs(&self) -> Result<(), FsError> {
-        tokio::fs::create_dir_all(self.staging_root.join(PARTS_DIR))
+    /// Prepares the folders above the staging area of a base that must be
+    /// private, once per process. Nothing for a base of the account.
+    async fn prepare_base(&self) -> Result<(), FsError> {
+        if !self.base.is_private() {
+            return Ok(());
+        }
+        let base = self.base.clone();
+        tokio::task::spawn_blocking(move || base.prepare_once())
             .await
-            .map_err(|e| FsError::from_io("failed to create the staging area", &e))
+            .map_err(|_| FsError::internal())?
+            .map_err(|_| FsError::new(ErrorCode::AccessDenied, REASON_NOT_PRIVATE))
+    }
+
+    /// Makes the session's staging folder and its folder of parts exist.
+    ///
+    /// In a base that must be private the two are made one at a time, never
+    /// together with a folder above them: those are made by
+    /// [`Self::prepare_base`] with permissions of their own, and a folder
+    /// made here inherits them (ST-M006-020).
+    async fn ensure_staging_dirs(&self) -> Result<(), FsError> {
+        let parts = self.staging_root.join(PARTS_DIR);
+        if !self.base.is_private() {
+            return tokio::fs::create_dir_all(&parts)
+                .await
+                .map_err(|e| FsError::from_io("failed to create the staging area", &e));
+        }
+        self.prepare_base().await?;
+        let mut made = make_dirs(&[&self.staging_root, &parts]).await;
+        if made
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            // A folder above is gone since it was prepared: prepare again.
+            self.base.forget_prepared();
+            self.prepare_base().await?;
+            made = make_dirs(&[&self.staging_root, &parts]).await;
+        }
+        made.map_err(|e| FsError::from_io("failed to create the staging area", &e))?;
+        if self.session_standing().await != Standing::Ours {
+            return Err(FsError::not_ours());
+        }
+        Ok(())
     }
 
     /// The parts of the unfinished transfers to a folder. A poisoned lock is
@@ -1481,7 +1817,7 @@ impl FileStore {
     async fn load_manifest(&self) -> Result<Manifest, FsError> {
         Manifest::load(&self.manifest_path())
             .await
-            .map_err(|_| FsError::internal())
+            .map_err(|_| FsError::new(ErrorCode::Internal, "the manifest could not be read"))
     }
 
     async fn store_manifest(&self, manifest: &Manifest) -> Result<(), FsError> {
@@ -1847,15 +2183,59 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// The default staging base directory: `%ProgramData%\CretLink\staging` on
-/// Windows (the agent is elevated and this is machine-scoped), falling back to a
-/// temp directory when the variable is unset or off Windows.
-///
-/// Public so the owned-resource inventory's recovery verb can name and sweep the
-/// exact tree the agent stages into (ST-M006-003), rather than re-deriving it.
-pub fn default_staging_base() -> PathBuf {
-    if let Some(program_data) = std::env::var_os("ProgramData") {
-        return PathBuf::from(program_data).join("CretLink").join("staging");
+/// Whether `op` works in a staging area: on a staging path, or on the
+/// staging area as a whole.
+fn touches_staging(op: &Operation) -> bool {
+    let staged = |path: &RemotePath| matches!(path, RemotePath::Staging { .. });
+    match op {
+        Operation::FsStat { path }
+        | Operation::FsList { path, .. }
+        | Operation::CreateDir { path }
+        | Operation::FsRead { path, .. }
+        | Operation::FsDigest { path, .. }
+        | Operation::FsDelete { path }
+        | Operation::RemoveDir { path } => staged(path),
+        Operation::FsWrite { dest, .. }
+        | Operation::FsCommit { dest, .. }
+        | Operation::FsAbort { dest } => staged(dest),
+        Operation::FsMove { from, to, .. } => staged(from) || staged(to),
+        Operation::ListStaged {} | Operation::StagingCleanup { .. } => true,
+        _ => false,
     }
-    std::env::temp_dir().join("cretlink").join("staging")
+}
+
+/// Makes each of `dirs` exist, in order, without making a folder above it.
+async fn make_dirs(dirs: &[&Path]) -> std::io::Result<()> {
+    for dir in dirs {
+        match tokio::fs::create_dir(dir).await {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// [`OwnFolder::has_a_data_folder`], off the async runtime.
+async fn has_a_data_folder(base: &OwnFolder) -> bool {
+    let base = base.clone();
+    tokio::task::spawn_blocking(move || base.has_a_data_folder())
+        .await
+        .unwrap_or(true)
+}
+
+/// [`OwnFolder::standing`], off the async runtime. What could not be looked
+/// at is not taken for CretLink's own.
+async fn standing(base: &OwnFolder) -> Standing {
+    let base = base.clone();
+    tokio::task::spawn_blocking(move || base.standing())
+        .await
+        .unwrap_or(Standing::Foreign)
+}
+
+/// [`OwnFolder::prepare`], off the async runtime.
+async fn prepare(base: &OwnFolder) -> std::io::Result<()> {
+    let base = base.clone();
+    tokio::task::spawn_blocking(move || base.prepare())
+        .await
+        .map_err(std::io::Error::other)?
 }

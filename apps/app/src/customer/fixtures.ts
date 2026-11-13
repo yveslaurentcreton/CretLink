@@ -261,6 +261,7 @@ export const FIXTURES: Record<string, CustomerSnapshot> = {
     { ...idle, startup_cleanup: {
         failed: 2,
         command: "& 'C:\\Users\\ann\\Downloads\\CretLink-Support.exe' recover --remove | Out-Host",
+        administrator: true,
       }, },
     { discovery: { state: "done", consoles: CONSOLES } },
   ),

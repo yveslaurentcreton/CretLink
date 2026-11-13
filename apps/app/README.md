@@ -64,11 +64,16 @@ only when it can take that lock exclusively, so a second Get help window never
 removes the staging of a session that is live in the first; it skips the sweep
 and a later start retries. When the sweep keeps files it could not
 remove, `ConsentView.startup_cleanup` carries their number and the recovery
-command as it runs in an administrator Windows PowerShell, with the full path
+command as it runs in Windows PowerShell, with the full path
 — `& '…\cretlink-cli.exe' recover --remove` when the console build sits next
 to the program, else `& '…\cretlink.exe' recover --remove | Out-Host` (or the
 `CretLink-Support*` copy's path), since PowerShell waits for a GUI-subsystem
-program only when its output is piped — and `#c-find` says so in plain words. The same
+program only when its output is piped — and `#c-find` says so in plain words.
+It also carries whether PowerShell is to be opened as administrator for it: a
+process with administrator rights keeps its files in `CretLink Data` in
+`Program Files`, a process without them in `CretLink` in the account's local
+application data, and the command covers the place of the kind that runs it
+(ST-M006-020). The same
 `recover [--remove]` runs from `cretlink`, `cretlink-cli` and a
 `CretLink-Support*` copy, with the report and exit codes of the support
 agent's verb.
