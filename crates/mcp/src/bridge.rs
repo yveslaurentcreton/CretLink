@@ -951,7 +951,7 @@ impl McpBridge {
 
     /// Create a directory on the selected remote target.
     #[tool(
-        description = "Create a directory on the selected remote target: one level, in a folder that exists. A path through a link is refused: an absolute path that reaches the folder it creates in through a junction or a symbolic link, or that lies on a `subst` or network drive, fails with `invalid_path` and creates nothing. Name the folder by its real location."
+        description = "Create a directory on the selected remote target: one level, in a folder that exists. A path through a link is refused: an absolute path that reaches the folder it creates in through a junction or a symbolic link, or that lies on a `subst` or network drive, fails with `invalid_path` (with `path_not_found` when the agent, which runs elevated, does not see that drive) and creates nothing. Name the folder by its real location."
     )]
     async fn remote_make_dir(
         &self,
@@ -975,7 +975,7 @@ impl McpBridge {
 
     /// Move (rename) a path on the selected remote target.
     #[tool(
-        description = "Move (rename) a path on the selected remote target. Same volume only; set `overwrite` to true to replace an existing destination file (an existing destination directory is never replaced). A path through a link is refused: an absolute path that reaches the folder of the source or of the destination through a junction or a symbolic link, or that lies on a `subst` or network drive, fails with `invalid_path` and moves nothing. Name both by their real location. A link that is itself the source is moved as the link."
+        description = "Move (rename) a path on the selected remote target. Same volume only; set `overwrite` to true to replace an existing destination file (an existing destination directory is never replaced). A path through a link is refused: an absolute path that reaches the folder of the source or of the destination through a junction or a symbolic link, or that lies on a `subst` or network drive, fails with `invalid_path` (with `path_not_found` when the agent, which runs elevated, does not see that drive) and moves nothing. Name both by their real location. A link that is itself the source is moved as the link."
     )]
     async fn remote_move(
         &self,
@@ -1004,7 +1004,7 @@ impl McpBridge {
 
     /// Delete a file or reparse point on the selected remote target.
     #[tool(
-        description = "Delete a file or reparse point on the selected remote target. Never deletes a directory; use remote_remove_dir for an empty directory. A link is removed as the link, never what it points at. A path through a link is refused: an absolute path that reaches the file's folder through a junction or a symbolic link, or that lies on a `subst` or network drive, fails with `invalid_path` and deletes nothing. Name the file by its real location."
+        description = "Delete a file or reparse point on the selected remote target. Never deletes a directory; use remote_remove_dir for an empty directory. A link is removed as the link, never what it points at. A path through a link is refused: an absolute path that reaches the file's folder through a junction or a symbolic link, or that lies on a `subst` or network drive, fails with `invalid_path` (with `path_not_found` when the agent, which runs elevated, does not see that drive) and deletes nothing. Name the file by its real location."
     )]
     async fn remote_delete(
         &self,
@@ -1028,7 +1028,7 @@ impl McpBridge {
 
     /// Remove an empty directory on the selected remote target.
     #[tool(
-        description = "Remove an empty directory on the selected remote target. Fails if the directory is not empty; a link is not removed as a directory. A path through a link is refused: an absolute path that reaches the directory through a junction or a symbolic link in a folder above it, or that lies on a `subst` or network drive, fails with `invalid_path` and removes nothing. Name the directory by its real location."
+        description = "Remove an empty directory on the selected remote target. Fails if the directory is not empty; a link is not removed as a directory. A path through a link is refused: an absolute path that reaches the directory through a junction or a symbolic link in a folder above it, or that lies on a `subst` or network drive, fails with `invalid_path` (with `path_not_found` when the agent, which runs elevated, does not see that drive) and removes nothing. Name the directory by its real location."
     )]
     async fn remote_remove_dir(
         &self,

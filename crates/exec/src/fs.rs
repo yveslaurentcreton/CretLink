@@ -280,6 +280,17 @@ impl FsError {
         )
     }
 
+    /// An entry left the private folder of an elevated program and kept the
+    /// permissions it had there.
+    #[cfg(windows)]
+    fn kept_its_permissions() -> Self {
+        Self::new(
+            ErrorCode::AccessDenied,
+            "the entry was moved, but it kept the permissions of the staging area: only an \
+             administrator can open it",
+        )
+    }
+
     /// Maps a raw I/O error onto a wire [`ErrorCode`], preferring the precise
     /// Windows status code and falling back to the portable [`std::io::ErrorKind`]
     /// so the crate maps sensibly on every platform it is tested on.
@@ -1088,14 +1099,6 @@ impl FileStore {
         if matches!(to, RemotePath::Staging { .. }) {
             self.ensure_staging_dirs().await?;
         }
-        // Where an entry lies decides, not how a request spells its path: a
-        // staged file can be named by its staging name or by its full path,
-        // and so can the staging area as a destination.
-        let from_private = self.lies_in_private(&from_path).await;
-        let to_private = self.lies_in_private(&to_path).await;
-        if to_private && !from_private {
-            return Err(FsError::moved_in());
-        }
         // An atomic rename is same-volume only; a copy is composed console-side.
         if !same_volume(&from_path, &to_path) {
             return Err(FsError::new(
@@ -1104,7 +1107,9 @@ impl FileStore {
             ));
         }
         // A move with an end that the request names by its path: inside the
-        // opened, verified folder of that end. A move between two staging
+        // opened, verified folder of that end. Where the two opened folders
+        // really lie also decides what the move means for the private folder
+        // of an elevated program (ST-M006-020). A move between two staging
         // names stays in CretLink's own folder and goes on by path.
         #[cfg(windows)]
         if !(matches!(from, RemotePath::Staging { .. }) && matches!(to, RemotePath::Staging { .. }))
@@ -1114,8 +1119,19 @@ impl FileStore {
                 RemotePath::Staging { .. } => in_folder::Side::Staged(resolved),
             };
             let (out_of, into) = (side(from, from_path), side(to, to_path));
-            blocking(move || in_folder::rename(&out_of, &into, overwrite)).await?;
+            let private = self.private_location().await;
+            blocking(move || in_folder::rename(&out_of, &into, overwrite, private.as_deref()))
+                .await?;
             return Ok(OpResult::Ack {});
+        }
+        // By path from here on: off Windows, and between two staging names.
+        // Where an entry lies decides, not how a request spells its path: a
+        // staged file can be named by its staging name or by its full path,
+        // and so can the staging area as a destination.
+        let from_private = self.lies_in_private(&from_path).await;
+        let to_private = self.lies_in_private(&to_path).await;
+        if to_private && !from_private {
+            return Err(FsError::moved_in());
         }
         match tokio::fs::symlink_metadata(&to_path).await {
             Ok(meta) => {
@@ -1135,23 +1151,18 @@ impl FileStore {
         tokio::fs::rename(&from_path, &to_path)
             .await
             .map_err(|e| FsError::from_io("failed to move the path", &e))?;
-        // What leaves a private staging area must not keep the permissions it
-        // had there, which admit only administrators: it takes the ones of
-        // the folder it arrives in, as if it had been made there.
-        #[cfg(windows)]
-        if from_private && !to_private {
-            let moved = to_path.clone();
-            let inherited =
-                tokio::task::spawn_blocking(move || crate::own::inherit_permissions(&moved)).await;
-            if !matches!(inherited, Ok(Ok(()))) {
-                return Err(FsError::new(
-                    ErrorCode::AccessDenied,
-                    "the entry was moved, but it kept the permissions of the staging area: only \
-                     an administrator can open it",
-                ));
-            }
-        }
         Ok(OpResult::Ack {})
+    }
+
+    /// The real location of the private folder of an elevated program, when
+    /// this store has one and its location can be told. What a move does to
+    /// an entry is decided against it.
+    #[cfg(windows)]
+    async fn private_location(&self) -> Option<PathBuf> {
+        if !self.base.is_private() {
+            return None;
+        }
+        tokio::fs::canonicalize(self.base.outermost()).await.ok()
     }
 
     /// Whether the folder that holds `path` really lies in the private folder

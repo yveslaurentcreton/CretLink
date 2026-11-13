@@ -640,7 +640,6 @@ mod sys {
     use windows::Win32::Storage::FileSystem::{
         CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
-        WRITE_DAC,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
@@ -905,15 +904,10 @@ mod sys {
         }
     }
 
-    /// Replaces the permissions of the entry at `path` by the ones that the
-    /// folder it lies in hands down, as if the entry had been made there. A
-    /// link at `path` is not followed.
-    pub(super) fn inherit_permissions(path: &Path) -> io::Result<()> {
-        inherit_permissions_of(&open(path, WRITE_DAC.0 | READ_CONTROL.0)?)
-    }
-
-    /// The same for an entry that is open with the rights to read and to
-    /// change its permissions: nothing is looked up by name.
+    /// Replaces the permissions of an opened entry by the ones that the
+    /// folder it lies in hands down, as if the entry had been made there. The
+    /// entry must be open with the rights to read and to change its
+    /// permissions: nothing is looked up by name.
     pub(super) fn inherit_permissions_of(entry: &File) -> io::Result<()> {
         let mut none = ACL::default();
         // SAFETY: `none` is a valid place for a list of exactly its own size.
@@ -1143,18 +1137,20 @@ pub(crate) fn tests_can_name_the_administrators() -> bool {
     false
 }
 
-/// Gives the entry at `path`, which was moved out of a private folder, the
+/// Gives an opened entry, which was moved out of a private folder, the
 /// permissions that the folder it lies in now hands down, as if it had been
 /// made there. A move keeps the permissions of an entry, and those of a
-/// private folder admit only the administrators. A link at `path` is not
-/// followed.
+/// private folder admit only the administrators. The entry must be open with
+/// the rights to read and to change its permissions: nothing is looked up by
+/// name, so the permissions that change are those of the entry that was
+/// moved, whatever happens to its path meanwhile.
 ///
 /// # Errors
 ///
-/// When the entry cannot be opened or its permissions cannot be replaced.
+/// When the permissions cannot be replaced.
 #[cfg(windows)]
-pub(crate) fn inherit_permissions(path: &Path) -> io::Result<()> {
-    sys::inherit_permissions(path)
+pub(crate) fn inherit_permissions_of(entry: &std::fs::File) -> io::Result<()> {
+    sys::inherit_permissions_of(entry)
 }
 
 /// The entries of the permissions of `path`, each in the text form of a

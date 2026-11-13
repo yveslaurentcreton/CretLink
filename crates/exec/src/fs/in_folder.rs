@@ -41,6 +41,12 @@
 //! taken as it is ([`Side::Staged`]), and the folder of the other end is
 //! verified.
 //!
+//! The staging area of an elevated program is a private folder, and a move
+//! keeps an entry as it is. So nothing is moved into that folder from
+//! elsewhere, and what is moved out of it is given the permissions of the
+//! folder it arrives in. Both are decided from where the two opened folders
+//! really lie: a request can name the staging area by its full path as well.
+//!
 //! The functions block: they work on the file system, so the caller runs
 //! them off the async runtime.
 
@@ -50,6 +56,7 @@ use std::path::{Path, PathBuf};
 use cretlink_protocol::ErrorCode;
 use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    READ_CONTROL, WRITE_DAC,
 };
 
 use super::anchor::{self, Disposition, Folder, Hold, Kind};
@@ -64,6 +71,11 @@ const TO_LOOK: u32 = FILE_READ_ATTRIBUTES.0;
 /// The rights to rename an entry (which takes the right to delete) and to
 /// read what it is.
 const TO_MOVE: u32 = DELETE.0 | FILE_READ_ATTRIBUTES.0;
+
+/// The rights to read and to replace the permissions of an entry: asked for
+/// with [`TO_MOVE`] when the entry leaves the private folder of an elevated
+/// program.
+const TO_INHERIT: u32 = READ_CONTROL.0 | WRITE_DAC.0;
 
 /// One end of a move.
 #[derive(Debug)]
@@ -192,11 +204,36 @@ pub(super) fn create_dir_in(folder: &Folder, name: &str) -> Result<(), FsError> 
 /// Both folders are taken up before anything changes. The destination comes
 /// first, as it always did: a name that is taken there is said before the
 /// source is looked at.
-pub(super) fn rename(from: &Side, to: &Side, overwrite: bool) -> Result<(), FsError> {
+///
+/// `private` is the real location of the private folder of an elevated
+/// program, when the store has one (ST-M006-020). Where the two opened
+/// folders really lie decides what the move means for it, not how the request
+/// spells a path: a staged file can be named by its staging name or by its
+/// full path. Nothing is moved into the private folder from elsewhere, and
+/// what is moved out of it takes the permissions of the folder it arrives in.
+pub(super) fn rename(
+    from: &Side,
+    to: &Side,
+    overwrite: bool,
+    private: Option<&Path>,
+) -> Result<(), FsError> {
     let (into, new_name) = to.open()?;
     check_destination(&into, new_name, overwrite)?;
     let (out_of, name) = from.open()?;
-    move_between(&out_of, name, &into, new_name, overwrite)
+    let lies_in_private =
+        |folder: &Folder| private.is_some_and(|private| folder.path().starts_with(private));
+    let (leaves, arrives) = (lies_in_private(&out_of), lies_in_private(&into));
+    if arrives && !leaves {
+        return Err(FsError::moved_in());
+    }
+    move_between(
+        &out_of,
+        name,
+        &into,
+        new_name,
+        overwrite,
+        leaves && !arrives,
+    )
 }
 
 /// Moves the entry `name` of the opened folder `out_of` to the name
@@ -211,7 +248,7 @@ pub(super) fn rename_between(
     overwrite: bool,
 ) -> Result<(), FsError> {
     check_destination(into, new_name, overwrite)?;
-    move_between(out_of, name, into, new_name, overwrite)
+    move_between(out_of, name, into, new_name, overwrite, false)
 }
 
 /// Looks at what lies under the destination's name, for the answers that say
@@ -239,17 +276,33 @@ fn check_destination(into: &Folder, new_name: &str, overwrite: bool) -> Result<(
 
 /// Opens the entry `name` in `out_of` and renames it, through its own
 /// handle, to `new_name` in `into`.
+///
+/// With `inherit` the entry leaves the private folder of an elevated program.
+/// A move keeps the permissions of an entry, and those of that folder admit
+/// only administrators: the entry is given the ones that the folder it
+/// arrives in hands down, through the same handle that renamed it, so that
+/// no path is resolved for it again.
 fn move_between(
     out_of: &Folder,
     name: &str,
     into: &Folder,
     new_name: &str,
     overwrite: bool,
+    inherit: bool,
 ) -> Result<(), FsError> {
-    let entry = anchor::open_at(out_of, name, TO_MOVE, SHARED, Disposition::Open, 0)
+    let access = if inherit {
+        TO_MOVE | TO_INHERIT
+    } else {
+        TO_MOVE
+    };
+    let entry = anchor::open_at(out_of, name, access, SHARED, Disposition::Open, 0)
         .map_err(|error| not_found_or(&error, "failed to move the path"))?;
     anchor::rename_into(&entry, into, new_name, overwrite)
-        .map_err(|e| FsError::from_io("failed to move the path", &e))
+        .map_err(|e| FsError::from_io("failed to move the path", &e))?;
+    if inherit {
+        crate::own::inherit_permissions_of(&entry).map_err(|_| FsError::kept_its_permissions())?;
+    }
+    Ok(())
 }
 
 /// The folder that holds the entry at `path`, and the entry's name in it.

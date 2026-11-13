@@ -5429,3 +5429,28 @@ async fn a_file_moved_out_of_a_private_staging_area_takes_the_permissions_of_its
         "and so has the one that was named by its full path"
     );
 }
+
+/// A second name of a file (a hard link) is an entry like any other: a delete
+/// removes that name, and the file stays under its other name.
+#[tokio::test]
+async fn a_delete_of_a_second_name_of_a_file_leaves_the_file_under_its_other_name() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let folder = sb.target();
+    std::fs::write(folder.join("report.txt"), b"kept").expect("write");
+    std::fs::hard_link(folder.join("report.txt"), folder.join("second.txt"))
+        .expect("a second name");
+
+    store
+        .perform(Operation::FsDelete {
+            path: abs(&folder, "second.txt"),
+        })
+        .await
+        .expect("the delete");
+
+    assert_eq!(names_in(&folder), vec!["report.txt"]);
+    assert_eq!(
+        std::fs::read(folder.join("report.txt")).expect("read"),
+        b"kept"
+    );
+}

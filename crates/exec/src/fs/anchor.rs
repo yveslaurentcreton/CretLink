@@ -442,7 +442,10 @@ mod sys {
                 Hold::ForRemoval => open_held(path)?,
             };
             let kind = kind_of(&handle)?;
-            let real = final_path(&handle, VOLUME_NAME_DOS)?;
+            // What was opened but cannot say where it lies — on a volume
+            // without a drive letter, for example — cannot be compared with
+            // the path that was asked.
+            let real = final_path(&handle, VOLUME_NAME_DOS).map_err(|_| Refusal::Elsewhere)?;
             let asked: Vec<u16> = path.as_os_str().encode_wide().collect();
             // A real location on a drive letter reads `\\?\X:\...`. Anything
             // else — a share (`\\?\UNC\...`), a volume without a letter — is

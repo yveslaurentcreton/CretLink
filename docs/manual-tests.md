@@ -873,8 +873,9 @@ cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
       it held: `victim.txt` and `inside\deep.txt` with their content, the
       folder `empty`, and neither `new` nor `planted.txt`. `beside.txt` is
       where it was, and there is no `taken.txt`.
-    - Expected: the same six requests with `real` in the place of `link` all
-      succeed.
+    - Expected: asked again with `real` in the place of `link`, the requests
+      do what they say. Only the fourth fails, and says that the path does
+      not exist: the first one has deleted `victim.txt` by then.
 16. **A folder swapped between two requests.** Prepare a folder with two
     files, and another place with a file of the same name:
 

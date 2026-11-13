@@ -2043,7 +2043,10 @@ Mitigations, on Windows and for an absolute path:
   written out. A path that reaches the folder through a junction or a
   symbolic link, a folder that is itself a link, and a path on a drive made
   with `subst` or on a network drive are refused as `invalid_path` before
-  anything changes.
+  anything changes. So is a folder whose real location the system cannot
+  tell, such as one on a volume without a drive letter. A volume that is
+  mounted in a folder counts as a link here: an entry directly in its top
+  folder cannot be changed by that path.
 - *Delete a file* (`fs_delete`). The entry is opened by its one name relative
   to the folder's handle, as the entry it is and never as what a link points
   at. What it is is read from that handle: a folder is refused, a file or a
@@ -2083,7 +2086,12 @@ Mitigations, on Windows and for an absolute path:
   other account can change a folder in either (FT-7), so there is no link
   another account could have put there. A move between a staging name and a
   path verifies the folder of the path. An elevated program still takes
-  nothing into its staging area by a move.
+  nothing into its staging area by a move, and what it moves out takes the
+  permissions of the folder it arrives in (FT-7). Both are decided from
+  where the two opened folders really lie, so a request that names the
+  staging area by its full path is treated like one that uses a staging
+  name, and the permissions are replaced through the handle that renamed
+  the entry: no path is resolved for it again.
 - *Said to the AI.* The four tools say in their description that a path
   through a link is refused, that nothing changes then, and that the real
   location is to be named. Their inputs and their results are unchanged.
@@ -2094,10 +2102,16 @@ Evidence: `a_delete_removes_a_link_and_never_what_it_points_at`,
 `a_move_moves_a_link_as_the_link`,
 `a_move_that_replaces_never_reaches_what_a_link_points_at`,
 `a_move_into_another_folder_keeps_its_contract`,
-`what_is_not_there_or_not_of_its_kind_is_refused_as_before` and
-`a_file_is_moved_between_the_staging_area_and_a_folder`
+`what_is_not_there_or_not_of_its_kind_is_refused_as_before`,
+`a_delete_of_a_second_name_of_a_file_leaves_the_file_under_its_other_name`
+and `a_file_is_moved_between_the_staging_area_and_a_folder`
 (`crates/exec/src/fs/tests.rs`), which run on every CI platform and pin what
-each operation meant before; with, on Windows,
+each operation meant before; the two rules about the private staging area
+with `nothing_is_moved_into_a_private_staging_area_from_elsewhere` and, on
+Windows,
+`a_file_moved_out_of_a_private_staging_area_takes_the_permissions_of_its_new_folder`
+(the same file), each also with the staging area named by its full path;
+with, on Windows,
 `a_delete_through_a_junction_is_refused_and_what_it_leads_to_stays`,
 `a_folder_removal_through_a_junction_is_refused_and_what_it_leads_to_stays`,
 `a_folder_creation_through_a_junction_is_refused_and_nothing_is_created_behind_it`,
