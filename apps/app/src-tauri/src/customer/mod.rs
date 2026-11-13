@@ -1222,8 +1222,9 @@ fn honest_target_identity() -> TargetIdentity {
 /// minus two entries this build genuinely cannot serve:
 ///
 /// - **reboot-resume** — this window dials via plain [`SessionJoiner::join`],
-///   which installs a `NoRebootResume` armer, so nothing can be armed.
-///   Advertising `reboot_resume.v1` would be a lie the runtime would then let a
+///   which installs a `NoRebootResume` armer, and through a relay with that
+///   same armer ([`dial`]), so nothing can be armed. Advertising
+///   `reboot_resume.v1` would be a lie the runtime would then let a
 ///   technician act on (REQ-N-012, REQ-S-011).
 /// - **desktop** — this crate has no `cretlink-exec` dependency to back
 ///   screenshots and computer actions, so it does not offer the capability.
