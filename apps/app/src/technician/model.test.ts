@@ -18,6 +18,7 @@ import {
   SESSION_ID,
   TARGET,
   VIA_RELAY,
+  VIA_RELAY_ELSEWHERE,
   consoleIn,
 } from "./fixtures";
 import {
@@ -45,6 +46,7 @@ import {
   relayCodeGroups,
   relayFailureTitle,
   relayForm,
+  relayFromFile,
   relayLostWords,
   relayOffer,
   isRelayFailure,
@@ -469,6 +471,18 @@ describe("the relay of this copy (ST-M007-011)", () => {
       { ...RELAY_NONE, file: undefined },
       { ...RELAY_NONE, file: { path: 1 } },
       { ...RELAY_STORED, stored: { path: "x", relay: { host: "h" } } },
+      // A relay without what vouches for its name is no relay of the contract.
+      {
+        ...RELAY_STORED,
+        stored: { path: "x", relay: { host: "h", address: "h:1", keySet: false } },
+      },
+      {
+        ...RELAY_STORED,
+        stored: {
+          path: "x",
+          relay: { host: "h", address: "h:1", trust: "anything", keySet: false },
+        },
+      },
       { ...RELAY_STORED, stored: { path: "x", problem: { message: 3 } } },
     ]) {
       expect(isRelaySettings(bad)).toBe(false);
@@ -518,10 +532,19 @@ describe("a session through the relay (ST-M007-013)", () => {
   });
 
   it("offers the relay this copy uses, names Settings without one, and says a profile's problem", () => {
-    expect(relayOffer(RELAY_STORED)).toEqual({ state: "ready", host: "relay.example.org" });
-    // A file next to the program wins over the settings.
-    expect(relayOffer(RELAY_FILE)).toEqual({ state: "ready", host: "host-01.example.org" });
-    expect(relayOffer(RELAY_RUN_ONCE_FILE)).toEqual({ state: "ready", host: "relay.example.org" });
+    // The whole relay: its name, where this copy connects, and what vouches
+    // for the name.
+    expect(relayOffer(RELAY_STORED)).toEqual({ state: "ready", relay: RELAY });
+    // A file next to the program wins over the settings. In the installed
+    // copy the offer says that the relay comes from that file.
+    expect(relayOffer(RELAY_FILE)).toEqual({
+      state: "ready",
+      relay: RELAY_PRIVATE,
+      fromFile: RELAY_FILE.file.path,
+    });
+    // A copy that runs once has no other place for a relay than the file:
+    // there is nothing to say about where it comes from.
+    expect(relayOffer(RELAY_RUN_ONCE_FILE)).toEqual({ state: "ready", relay: RELAY });
     expect(relayOffer(RELAY_NONE)).toEqual({ state: "none", runOnce: false });
     expect(relayOffer(RELAY_RUN_ONCE)).toEqual({ state: "none", runOnce: true });
     // Until the backend has said: no relay, and nothing claimed about the copy.
@@ -540,6 +563,36 @@ describe("a session through the relay (ST-M007-013)", () => {
       stored: { path: "settings.toml", problem: { file: "settings.toml", message: "Line 2." } },
     });
     expect(unreadable).toEqual({ state: "problem", message: "Line 2.", file: "settings.toml" });
+  });
+
+  it("says that the installed copy takes its relay from the file only when it does", () => {
+    expect(relayFromFile(RELAY_FILE)).toBe(RELAY_FILE.file.path);
+    // From Settings, or no relay at all: nothing to say.
+    expect(relayFromFile(RELAY_STORED)).toBeUndefined();
+    expect(relayFromFile(RELAY_NONE)).toBeUndefined();
+    expect(relayFromFile(null)).toBeUndefined();
+    // A file that cannot be used gives no relay: its problem is said instead.
+    expect(relayFromFile(RELAY_FILE_PROBLEM)).toBeUndefined();
+    // A copy that runs once keeps no settings to prefer.
+    expect(relayFromFile(RELAY_RUN_ONCE_FILE)).toBeUndefined();
+    expect(relayFromFile(RELAY_RUN_ONCE)).toBeUndefined();
+  });
+
+  it("announces a relay with where this copy connects when that is another host", () => {
+    const waiting = consoleIn(
+      { phase: "listening", code: RELAY_CODE, address: "192.0.2.1:9970" },
+      { relay: VIA_RELAY_ELSEWHERE },
+    );
+    expect(phaseAnnouncement(initialSnapshot(waiting, NOW))).toBe(
+      "Waiting for the customer on the relay relay.example.org (reached at 192.0.2.1:9970). Read them the relay code. No access.",
+    );
+    const reaching = consoleIn(
+      { phase: "listening", code: RELAY_CODE, address: "192.0.2.1:9970" },
+      { relay: { ...VIA_RELAY_ELSEWHERE, admitted: false } },
+    );
+    expect(phaseAnnouncement(initialSnapshot(reaching, NOW))).toBe(
+      "Connecting to the relay relay.example.org (reached at 192.0.2.1:9970). No access.",
+    );
   });
 
   it("keeps the waiting screen while the wait changes to the relay", () => {

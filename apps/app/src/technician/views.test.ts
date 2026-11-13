@@ -4,7 +4,14 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import { DISCLOSURE_TEXT } from "./disclosure";
-import { FIXTURES, XSS } from "./fixtures";
+import {
+  FIXTURES,
+  RELAY_CODE,
+  RELAY_RUN_ONCE_FILE,
+  VIA_RELAY_ELSEWHERE,
+  XSS,
+  consoleIn,
+} from "./fixtures";
 import type { TechnicianSnapshot } from "./model";
 import { renderTechnician } from "./views/shell";
 
@@ -326,6 +333,36 @@ describe("not on the same network (ST-M007-013)", () => {
     expect(root.querySelector(".relay-code")).toBeNull();
   });
 
+  it("shows where the copy connects, what vouches for the name and that the relay comes from the file", () => {
+    // The installed copy has a relay in Settings, and a file next to the
+    // program that wins: its relay is reached at another host than its name
+    // says, and checked against a certificate file of its own.
+    const root = show("wait-relay-file");
+    const card = offer(root);
+    expect(text(card?.querySelector(".relay-name"))).toBe("host-01.example.org");
+    expect(text(card?.querySelector(".relay-address"))).toBe("192.0.2.1:9970");
+    expect(text(card)).toContain("Use your relay host-01.example.org (reached at 192.0.2.1:9970).");
+    expect(text(card?.querySelector(".relay-trust"))).toBe(
+      "The relay's certificate is checked against a certificate file of this copy's relay settings, not against the certificate authorities of this computer.",
+    );
+    expect(text(card?.querySelector(".relay-source"))).toBe(
+      "This relay comes from the file C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.toml next to the program, not from Settings.",
+    );
+    // The button says the same to a screen reader.
+    const use = buttonNamed(root, "Use the relay host-01.example.org (reached at 192.0.2.1:9970)");
+    expect(use?.dataset.action).toBe("use-relay");
+
+    // A relay from Settings whose name is the host of its address, checked
+    // against the system's authorities: none of the three is said.
+    const plain = offer(show("wait-relay-ready"));
+    expect(plain?.querySelector(".relay-address")).toBeNull();
+    expect(plain?.querySelector(".relay-trust")).toBeNull();
+    expect(plain?.querySelector(".relay-source")).toBeNull();
+    // A copy that runs once has no Settings that its file could differ from.
+    const runOnce = offer(show("wait-relay-ready", { relay: RELAY_RUN_ONCE_FILE }));
+    expect(runOnce?.querySelector(".relay-source")).toBeNull();
+  });
+
   it("names Settings when this copy has no relay, and offers nothing to press but that", () => {
     const root = show("wait");
     const card = offer(root);
@@ -402,6 +439,35 @@ describe("waiting on the relay (ST-M007-013)", () => {
     expect(text(root.querySelector("#announce"))).toBe(
       "Waiting for the customer on the relay relay.example.org. Read them the relay code. No access.",
     );
+  });
+
+  it("shows where the copy connects, what vouches for the name and where the relay comes from", () => {
+    const root = show("relay-wait-elsewhere");
+    expect(text(root.querySelector("#relay-host"))).toBe(
+      "relay.example.org (reached at 192.0.2.1:9970)",
+    );
+    const facts = root.querySelector("#relay-facts");
+    expect(text(facts?.querySelector(".relay-trust"))).toBe(
+      "The relay's certificate is checked against a certificate file of this copy's relay settings, not against the certificate authorities of this computer.",
+    );
+    expect(text(facts?.querySelector(".relay-source"))).toContain(
+      "next to the program, not from Settings.",
+    );
+    expect(text(root.querySelector("#announce"))).toBe(
+      "Waiting for the customer on the relay relay.example.org (reached at 192.0.2.1:9970). Read them the relay code. No access.",
+    );
+    // While the relay is still being reached, the words name it the same way.
+    const reaching = show("relay-wait-elsewhere", {
+      console: consoleIn(
+        { phase: "listening", code: RELAY_CODE, address: "192.0.2.1:9970" },
+        { displayName: "Sam", relay: { ...VIA_RELAY_ELSEWHERE, admitted: false } },
+      ),
+    });
+    expect(text(reaching.querySelector("#relay-state"))).toBe(
+      "Connecting to the relay relay.example.org (reached at 192.0.2.1:9970)…",
+    );
+    // A relay from Settings whose name says where it is: nothing to add.
+    expect(show("relay-wait").querySelector("#relay-facts")).toBeNull();
   });
 
   it("names and draws the relay code differently from the approval code and the connection code", () => {
@@ -511,6 +577,56 @@ describe("a session through the relay (ST-M007-013)", () => {
       );
     },
   );
+
+  it("shows the address beside the name and what vouches for it on every screen of the session", () => {
+    const trust =
+      "The relay's certificate is checked against a certificate file of this copy's relay settings, not against the certificate authorities of this computer.";
+    const compare = show("relay-compare-elsewhere").querySelector(".via-relay");
+    expect(text(compare)).toBe(
+      `Through the relay relay.example.org (reached at 192.0.2.1:9970) · it only passes encrypted traffic on ${trust}`,
+    );
+    const live = show("relay-live-elsewhere");
+    expect(text(live.querySelector("#session-relay"))).toBe(
+      "Through the relay relay.example.org (reached at 192.0.2.1:9970) · it only passes encrypted traffic on",
+    );
+    const overview = text(live.querySelector("#panel-overview"));
+    expect(overview).toContain(
+      "Connection Through the relay relay.example.org (reached at 192.0.2.1:9970)",
+    );
+    expect(overview).toContain(
+      "Relay certificate Checked against a certificate file of this copy's relay settings, not against the certificate authorities of this computer",
+    );
+    // The end report, from the audit trail: the same three facts.
+    const end = show("relay-end-elsewhere");
+    expect(text(end)).toContain(
+      "Connection Through the relay relay.example.org (reached at 192.0.2.1:9970)",
+    );
+    expect(text(end)).toContain("Relay certificate Checked against a certificate file");
+    expect(text(end.querySelector(".relay-lost"))).toContain(
+      "The connection through the relay relay.example.org (reached at 192.0.2.1:9970) was lost.",
+    );
+    // And the same report opened from the history.
+    const report = show("relay-end-elsewhere", {
+      nav: "sessions",
+      openReport: "7f3a9c51d2e84b6a",
+      endDismissed: true,
+    });
+    expect(text(report)).toContain(
+      "Connection Through the relay relay.example.org (reached at 192.0.2.1:9970)",
+    );
+    expect(text(report)).toContain("Relay certificate Checked against a certificate file");
+    // While the report is still being prepared, the state says it.
+    const preparing = show("relay-end-elsewhere", { sessions: [], reportPending: true });
+    expect(text(preparing)).toContain(
+      "Connection Through the relay relay.example.org (reached at 192.0.2.1:9970)",
+    );
+    expect(text(preparing)).toContain("Relay certificate Checked against a certificate file");
+    // A relay whose name says where it is, checked against the system's
+    // authorities: the report says neither.
+    const plain = text(show("relay-end"));
+    expect(plain).not.toContain("reached at");
+    expect(plain).not.toContain("Relay certificate");
+  });
 
   it("leaves the compare and consent screens of a relayed session what they are on one network", () => {
     const compare = show("relay-compare");

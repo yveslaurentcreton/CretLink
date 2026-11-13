@@ -11,7 +11,14 @@
 
 import type { ActivityEntry, ActivityItem, ActivityKind, CustomerReport } from "../shared/contract";
 import { formatElapsed, isFailure } from "../shared/feed";
-import type { ConsentView, DiscoveredConsoleView, LaunchView, PhaseName } from "./api";
+import { relayWords } from "../shared/relay";
+import type {
+  ConsentView,
+  DiscoveredConsoleView,
+  LaunchView,
+  PhaseName,
+  RelayUseView,
+} from "./api";
 
 export type WindowKind = "main" | "mini";
 
@@ -221,7 +228,7 @@ function endedBeforeControl(view: ConsentView, name: string): string {
       return `${capName(name)} ended the connection before getting access. Nothing was shared.`;
     case "disconnected":
       return view.relay
-        ? `The connection through the relay ${view.relay.host} was lost before anyone got access. Nothing was shared.`
+        ? `The connection through the relay ${relayWords(view.relay)} was lost before anyone got access. Nothing was shared.`
         : "The connection was lost before anyone got access. Nothing was shared.";
     default:
       return "The connection ended before anyone got access. Nothing was shared.";
@@ -230,9 +237,18 @@ function endedBeforeControl(view: ConsentView, name: string): string {
 
 // --- A session through the relay (ST-M007-013) ---
 
-/** The host name of the relay this session runs through, if it runs through one. */
-export function relayHost(s: CustomerSnapshot): string | undefined {
-  return s.view?.relay?.host;
+/** The relay this session runs through, if it runs through one. */
+export function sessionRelay(s: CustomerSnapshot): RelayUseView | undefined {
+  return s.view?.relay ?? undefined;
+}
+
+/**
+ * That relay as a sentence names it: its name, and where this copy connects
+ * when that is another host than the name says (`shared/relay.ts`).
+ */
+export function relayNamed(s: CustomerSnapshot): string | undefined {
+  const relay = sessionRelay(s);
+  return relay ? relayWords(relay) : undefined;
 }
 
 /** The stage of a code that nobody waits on: mistyped, used, or given up. */
@@ -272,11 +288,11 @@ export function relayFailureTitle(stage: string): string {
  * A code that nobody waits on (ST-M007-012): the relay took the connection
  * in, and no technician was there. Nobody had any access.
  */
-export function nobodyWaitsWords(host: string | undefined): UiError {
+export function nobodyWaitsWords(relay: string | undefined): UiError {
   return {
     title: "Nobody is waiting on that code",
-    message: host
-      ? `The relay ${host} found nobody waiting on the code you typed. It may be mistyped or already used, or your technician stopped waiting.`
+    message: relay
+      ? `The relay ${relay} found nobody waiting on the code you typed. It may be mistyped or already used, or your technician stopped waiting.`
       : "Nobody was waiting on the code you typed. It may be mistyped or already used, or your technician stopped waiting.",
     next: "Nobody has access to this computer. Ask your technician for the code on their screen and type it again. A code works once.",
   };
@@ -286,9 +302,9 @@ export function nobodyWaitsWords(host: string | undefined): UiError {
  * A session through a relay whose connection was lost, said with the relay,
  * so that it does not read as a lost session of unknown cause (REQ-N-015).
  */
-export function relayLostWords(host: string): { message: string; next: string } {
+export function relayLostWords(relay: string): { message: string; next: string } {
   return {
-    message: `The connection through the relay ${host} was lost. The relay may have stopped, or one of the two computers went offline.`,
+    message: `The connection through the relay ${relay} was lost. The relay may have stopped, or one of the two computers went offline.`,
     next: "Nobody has access to this computer any more. Nothing connects again by itself: ask your technician for a new code when you want to start again.",
   };
 }
@@ -516,7 +532,7 @@ export function announcement(s: CustomerSnapshot): string {
     case "find":
       return s.ended ? `No access. ${s.ended}` : "No access. Choose your technician.";
     case "connecting": {
-      const relay = relayHost(s);
+      const relay = relayNamed(s);
       return relay ? `Connecting through the relay ${relay}. No access.` : "Connecting. No access.";
     }
     case "compare":

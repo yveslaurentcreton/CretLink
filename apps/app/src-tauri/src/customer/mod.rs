@@ -300,9 +300,7 @@ impl ConsentSession {
     /// up for (ST-M007-011). Nothing is dialled.
     pub(crate) fn resting(relay: &relay::Lookup) -> Self {
         let mut session = Self::idle();
-        session.copy_relay = relay.relay().map(|relay| RelayUseView {
-            host: relay.host().to_owned(),
-        });
+        session.copy_relay = relay.relay().map(RelayUseView::of);
         session
     }
 
@@ -375,17 +373,18 @@ impl ConsentSession {
         }
     }
 
-    /// The host name of the relay this session runs through, if it runs
-    /// through one.
-    pub(crate) fn relay_host(&self) -> Option<&str> {
-        self.relay.as_ref().map(|relay| relay.host.as_str())
+    /// The relay this session runs through, if it runs through one, as a
+    /// sentence names it: its name, with where this copy connects when that
+    /// is another host ([`relay::named`]).
+    pub(crate) fn relay_named(&self) -> Option<String> {
+        self.relay
+            .as_ref()
+            .map(|relay| relay::named(&relay.host, &relay.address))
     }
 
-    /// Says that this session runs through the relay `host` (ST-M007-013).
-    fn through_relay(mut self, host: &str) -> Self {
-        self.relay = Some(RelayUseView {
-            host: host.to_owned(),
-        });
+    /// Says that this session runs through `relay` (ST-M007-013).
+    fn through_relay(mut self, relay: &relay::Relay) -> Self {
+        self.relay = Some(RelayUseView::of(relay));
         self
     }
 
@@ -532,11 +531,37 @@ pub struct TechnicianNameView {
 ///
 /// A label and nothing else: the relay passes the end-to-end encrypted
 /// session on, cannot look inside and grants nothing (ADR-0016). It holds the
-/// relay's host name, never the admission key of this copy or the relay code.
+/// relay's name, where this copy connects to reach it and what its
+/// certificate is checked against, never the admission key of this copy or
+/// the relay code.
+///
+/// The name alone is not enough. The profile file next to this program can
+/// give the relay a name that differs from the host it connects to, with a
+/// certificate file of its own to vouch for that name; whoever wrote the
+/// file chose both. The window therefore shows the address beside the name
+/// when its host is another one, and says when the certificate is checked
+/// against a file of the profile and not against this computer's
+/// authorities.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RelayUseView {
     /// The relay's host name: the name its certificate carries.
     pub host: String,
+    /// Where this copy connects to reach the relay: `host:port`.
+    pub address: String,
+    /// What the relay's certificate is checked against.
+    pub trust: cretlink_console::RelayTrust,
+}
+
+impl RelayUseView {
+    /// The relay `relay` as the window names it.
+    fn of(relay: &relay::Relay) -> Self {
+        let route = relay.route();
+        Self {
+            host: route.host,
+            address: route.address,
+            trust: route.trust,
+        }
+    }
 }
 
 /// What the consent window renders (see [`ConsentSession::view`]).
@@ -573,7 +598,8 @@ pub struct ConsentView {
     /// with the recovery command (ST-M009-010). `None` when nothing was kept
     /// or the sweep has not finished.
     pub startup_cleanup: Option<StartupCleanupView>,
-    /// The relay this session runs through, by its host name; `None` for a
+    /// The relay this session runs through: its name, where this copy
+    /// connects and what its certificate is checked against; `None` for a
     /// session on one network (ST-M007-013).
     pub relay: Option<RelayUseView>,
     /// What to do next about the failure this dial ended with, when the
@@ -581,10 +607,11 @@ pub struct ConsentView {
     /// put right in another way than a key that the relay refuses
     /// (ST-M007-013, REQ-N-015). `None` otherwise.
     pub failure_next: Option<String>,
-    /// The relay this copy is set up for, by its host name; `None` for a
-    /// copy without a relay profile that can be used (ST-M007-011). The
-    /// window shows it beside the code field: both people see the relay's
-    /// host name before they connect through it.
+    /// The relay this copy is set up for; `None` for a copy without a relay
+    /// profile that can be used (ST-M007-011). The window shows it beside
+    /// the code field: the customer sees the relay's name, where this copy
+    /// would connect and what vouches for the name before they connect
+    /// through it.
     pub relay_of_copy: Option<RelayUseView>,
 }
 
@@ -957,8 +984,8 @@ fn prepare_dial(
         let mut next = ConsentSession::live_dialing(tx, Some(settled_rx));
         if let Typed::Relay(join) = &target {
             // Said from the first moment: this connection goes through the
-            // relay, by its host name.
-            next = next.through_relay(join.relay.host());
+            // relay, by its name and where this copy connects.
+            next = next.through_relay(&join.relay);
         }
         session.replace_with(next);
         // Show the "reaching out" state right away; the pump takes over once
@@ -1800,12 +1827,14 @@ mod tests {
         )
         .expect("a relay");
         let (tx, _rx) = session_driver::intent_channel();
-        let mut session = ConsentSession::live_dialing(tx, None).through_relay(relay.host());
+        let mut session = ConsentSession::live_dialing(tx, None).through_relay(&relay);
         // While it connects, the window says which relay it goes through.
         assert_eq!(
             session.view().relay,
             Some(RelayUseView {
-                host: "relay.example.org".to_owned()
+                host: "relay.example.org".to_owned(),
+                address: "relay.example.org:443".to_owned(),
+                trust: cretlink_console::RelayTrust::SystemAuthorities,
             })
         );
         assert_eq!(session.view().failure_next, None);
@@ -1885,7 +1914,9 @@ mod tests {
         assert_eq!(
             view.relay_of_copy,
             Some(RelayUseView {
-                host: "relay.example.org".to_owned()
+                host: "relay.example.org".to_owned(),
+                address: "relay.example.org:443".to_owned(),
+                trust: cretlink_console::RelayTrust::SystemAuthorities,
             })
         );
         // It says what this copy could use, not that a session uses it.

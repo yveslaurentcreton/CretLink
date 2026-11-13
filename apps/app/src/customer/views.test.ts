@@ -247,6 +247,45 @@ describe("a relay code (ST-M007-013)", () => {
     expect(text(plain).toLowerCase()).not.toContain("relay");
   });
 
+  it("shows where this copy connects and what vouches for the relay's name when the profile says so", () => {
+    const trust =
+      "The relay's certificate is checked against a certificate file of this copy's relay settings, not against the certificate authorities of this computer.";
+    // Before any code is typed.
+    const find = show("find-relay-ready-elsewhere");
+    const line = find.querySelector("#relay-ready");
+    expect(text(line?.querySelector(".relay-name"))).toBe("relay.example.org");
+    expect(text(line?.querySelector(".relay-address"))).toBe("192.0.2.1:9970");
+    expect(text(line)).toBe(
+      `If your technician is not on this network, they give you a longer relay code. This copy then connects through the relay relay.example.org (reached at 192.0.2.1:9970 ), which only passes encrypted traffic on. ${trust}`,
+    );
+    // While it connects.
+    const connecting = show("relay-connecting-elsewhere");
+    expect(text(connecting.querySelector("#connecting-h"))).toBe(
+      "Connecting through the relay relay.example.org (reached at 192.0.2.1:9970 )",
+    );
+    expect(text(connecting.querySelector("#relay-trust"))).toBe(trust);
+    expect(text(connecting.querySelector("#announce"))).toBe(
+      "Connecting through the relay relay.example.org (reached at 192.0.2.1:9970). No access.",
+    );
+    // On every screen of the session.
+    for (const name of ["relay-sac-elsewhere", "relay-live-elsewhere", "relay-end-lost-elsewhere"]) {
+      const via = show(name).querySelector(".via-relay");
+      expect(text(via?.querySelector(".relay-address"))).toBe("192.0.2.1:9970");
+      expect(text(via?.querySelector(".relay-trust"))).toBe(trust);
+    }
+    // And in the words of a lost connection.
+    expect(text(show("relay-end-lost-elsewhere").querySelector(".relay-lost"))).toContain(
+      "The connection through the relay relay.example.org (reached at 192.0.2.1:9970) was lost.",
+    );
+    // A relay whose name says where it is, checked against this computer's
+    // authorities: neither is said.
+    for (const name of ["find-relay-ready", "relay-connecting", "relay-sac", "relay-live"]) {
+      const root = show(name);
+      expect(root.querySelector(".relay-address")).toBeNull();
+      expect(root.querySelector(".relay-trust")).toBeNull();
+    }
+  });
+
   it("says Connecting through the relay, by its host name, and what a relay is", () => {
     const root = show("relay-connecting");
     expect(root.dataset.screen).toBe("connecting");

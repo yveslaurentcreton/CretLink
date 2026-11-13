@@ -101,9 +101,12 @@ body {
 .relay-offer-text b { font-size: 14px; }
 .relay-offer-text .muted { font-size: 12.5px; overflow-wrap: anywhere; }
 .relay-offer .btn { flex: none; }
+.relay-offer-text .relay-trust, .relay-offer-text .relay-source { display: block; margin-top: 4px; }
 /* Waiting on the relay. */
 .relay-wait .relay-state { margin: 14px 0 0; font-weight: 600; }
 .relay-wait .relay-note { margin: 6px 0 0; font-size: 12.5px; max-width: 460px; }
+.relay-wait .relay-facts { margin: 6px 0 0; font-size: 12.5px; max-width: 460px; overflow-wrap: anywhere; }
+.relay-wait .relay-facts > span { display: block; }
 .sess-id .via-relay-line { margin-top: 2px; }
 .center-col { align-items: center; justify-content: center; text-align: center; flex: 1; }
 .center-col h2 { margin-top: 4px; }

@@ -6,6 +6,7 @@
 import type { CleanupNote, CleanupResult, EndedBy, SessionSummary } from "../../shared/contract";
 import { type Child, h } from "../../shared/dom";
 import { icon } from "../../shared/icons";
+import { type NamedRelay, relayLabel, relayWords, trustFact } from "../../shared/relay";
 import {
   type TechnicianSnapshot,
   endedByWords,
@@ -91,7 +92,7 @@ export function reportBody(
     ),
     h("h2", null, `${host} · ${formatDuration(summary.durationMs)}`),
     integrityNote(summary),
-    relayLostNote(summary.relay, summary.endedBy),
+    relayLostNote(summaryRelay(summary), summary.endedBy),
     h(
       "div",
       { class: "grid2" },
@@ -121,12 +122,7 @@ export function reportBody(
                 : String(summary.failures),
           ],
           ["Started", formatWhen(summary.startedAt, now)],
-          [
-            "Connection",
-            summary.relay
-              ? ["Through the relay ", h("span", { class: "mono" }, summary.relay)]
-              : "On one network",
-          ],
+          ...connectionRows(summaryRelay(summary)),
           [
             "Audit",
             h(
@@ -151,13 +147,38 @@ export function reportBody(
 }
 
 /**
+ * The relay of a session as its audit log recorded it: the name, where the
+ * technician's copy connected, and what vouched for the name (ST-M007-013).
+ */
+function summaryRelay(summary: SessionSummary): NamedRelay | undefined {
+  if (summary.relay === undefined) return undefined;
+  const relay: NamedRelay = { host: summary.relay };
+  if (summary.relayAddress !== undefined) relay.address = summary.relayAddress;
+  if (summary.relayTrust !== undefined) relay.trust = summary.relayTrust;
+  return relay;
+}
+
+/**
+ * Which way the session went, as rows of the report: on one network, or
+ * through a relay by its name, with where the copy connected when that is
+ * another host, and what its certificate was checked against when that was
+ * a file of the profile (ST-M007-011).
+ */
+function connectionRows(
+  relay: NamedRelay | undefined,
+): ReadonlyArray<readonly [string, Child] | null> {
+  if (!relay) return [["Connection", "On one network"]];
+  return [["Connection", ["Through the relay ", relayLabel(relay)]], trustFact(relay)];
+}
+
+/**
  * A session through a relay whose connection was lost says so with the relay
  * and a next step, so that it does not read as a lost session of unknown
  * cause (ST-M007-013, REQ-N-015).
  */
-function relayLostNote(relay: string | undefined, endedBy: EndedBy | undefined): Child {
+function relayLostNote(relay: NamedRelay | undefined, endedBy: EndedBy | undefined): Child {
   if (!relay || endedBy !== "connection_lost") return null;
-  const words = relayLostWords(relay);
+  const words = relayLostWords(relayWords(relay));
   return h(
     "div",
     { class: "note relay-lost", role: "note" },
@@ -301,7 +322,7 @@ function preparingReport(s: TechnicianSnapshot): HTMLElement {
       ),
     ),
     h("h2", null, duration ? `${host} · ${duration}` : host),
-    relayLostNote(s.console.relay?.host, endedBy),
+    relayLostNote(s.console.relay, endedBy),
     h(
       "div",
       { class: "grid2" },
@@ -352,12 +373,7 @@ function preparingReport(s: TechnicianSnapshot): HTMLElement {
           ],
           counts.notShown > 0 ? ["Not shown", plural(counts.notShown, "item")] : null,
           last?.failure ? ["Failure", `${last.failure.message} (${last.failure.stage})`] : null,
-          [
-            "Connection",
-            s.console.relay
-              ? ["Through the relay ", h("span", { class: "mono" }, s.console.relay.host)]
-              : "On one network",
-          ],
+          ...connectionRows(s.console.relay),
           [
             "Audit",
             h(

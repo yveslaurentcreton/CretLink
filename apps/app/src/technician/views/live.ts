@@ -10,6 +10,7 @@
 
 import { h } from "../../shared/dom";
 import { type IconName, icon } from "../../shared/icons";
+import { relayLabel, trustFact } from "../../shared/relay";
 import { selectedIsSimulated } from "../api";
 import {
   type LiveTab,
@@ -69,7 +70,7 @@ export function liveView(s: TechnicianSnapshot): HTMLElement {
               "div",
               { class: "meta via-relay-line", id: "session-relay" },
               "Through the relay ",
-              h("b", { class: "mono" }, s.console.relay.host),
+              relayLabel(s.console.relay),
               " · it only passes encrypted traffic on",
             )
           : null,
@@ -207,8 +208,11 @@ function overviewPanel(s: TechnicianSnapshot): HTMLElement {
             ["Session", shortId(id)],
             ["Since", formatTime(s.last?.since)],
             s.console.relay
-              ? ["Connection", `Through the relay ${s.console.relay.host}`]
+              ? ["Connection", ["Through the relay ", relayLabel(s.console.relay)]]
               : ["Connection", "On this network"],
+            // What vouches for the relay's name, when it is not the
+            // system's authorities (ST-M007-011).
+            s.console.relay ? trustFact(s.console.relay) : null,
           ])
         : h("p", { class: "muted" }, "The customer computer has not reported its identity."),
     ),

@@ -106,6 +106,11 @@ export interface SessionSummary {
   // The host name of the relay the session ran through; absent for a session
   // on one network (ST-M007-013).
   relay?: string;
+  // Where the technician's copy connected to reach that relay, and what the
+  // relay's certificate was checked against, as the audit recorded them.
+  // Absent in a log from before they were recorded.
+  relayAddress?: string;
+  relayTrust?: RelayTrust;
   startedAt?: string;
   endedAt?: string;
   durationMs?: number;
@@ -415,6 +420,12 @@ export interface ListenNetwork {
 
 // --- The relay of this copy (ST-M007-011) ---
 
+// What the certificate of a relay is checked against: the certificate
+// authorities of the computer, or the certificate file that the relay
+// profile names and nothing else. A screen that names a relay says so when
+// it is the file (`shared/relay.ts`).
+export type RelayTrust = "system_authorities" | "profile_file";
+
 // A relay as a screen shows it. A relay profile is addressing only: it says
 // where two copies meet and grants nothing. The view never holds the
 // admission key, only whether there is one.
@@ -423,6 +434,7 @@ export interface RelayView {
   host: string;
   // Where it is reached: `host:port`.
   address: string;
+  trust: RelayTrust;
   keySet: boolean;
   // The certificate authority file the profile names, next to it.
   ca?: string;

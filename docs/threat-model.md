@@ -3186,7 +3186,17 @@ metadata rather than content.
   §4). Somebody who can write next to the program or into the settings can
   point a copy at a relay of their own, which is then the hostile relay this
   section already models: it sees metadata and can deny service, and the
-  approval codes differ when it puts itself in between. The file may have
+  approval codes differ when it puts itself in between. With `name` and `ca`
+  that person can also give their server the name of the technician's relay
+  and vouch for it with an authority of their own, so the name alone would
+  mislead both people. The application therefore names a relay with what the
+  copy really does: it shows the address beside the name when the copy
+  connects to another host than the name says, and says when the certificate
+  is checked against a file of the profile and not against the system's
+  authorities, on every screen of both roles, in the end report and in the
+  words of every failure. The waiting screen of the installed technician
+  copy says when the relay comes from the file next to the program and not
+  from Settings. The file may have
   been written by somebody else, so it is read up to a fixed size in a small,
   strict form: every unknown section and setting is refused, every setting is
   bounded, the certificate file must be a plain name next to the profile, and
@@ -3246,8 +3256,9 @@ metadata rather than content.
   technician's copy draws a new relay code for every wait and keeps its
   rendezvous open only while the waiting screen is open; **Cancel** closes
   the connection, and the code then leads nowhere. Both windows name the
-  relay by its host name from the first moment to the end report, so neither
-  person is left guessing which way the session goes.
+  relay from the first moment to the end report, by its host name and, when
+  the copy connects to another host than that name says, by that address
+  too, so neither person is left guessing which way the session goes.
 - *A relayed session takes every step of a session on one network.* The
   handle of a relayed session is driven by the same code as one from the
   network listener, on both sides: the approval code is shown and compared,
@@ -3263,8 +3274,13 @@ metadata rather than content.
   screen to be read out and typed on the customer's. The relay never gets it:
   both copies present a ticket derived from the code and from the relay's
   host name. The technician's audit trail records that the session ran
-  through a relay, and the relay's host name (`session_route`); it holds
-  neither the code nor the admission key, and no log or error text does.
+  through a relay, as the first thing it says of the session
+  (`session_route`): the relay's host name, the address the copy connected
+  to and whether the certificate was checked against the system's
+  authorities or against a file of the profile. A reader of the trail can
+  thus tell the relay that was meant from a server that was given its name.
+  The trail holds neither the code nor the admission key, and no log or
+  error text does.
 - *Every relay failure is said, and nothing connects again by itself.* A
   relay that cannot be reached, a certificate that is not trusted, a key the
   relay refuses and a code that nobody waits on each end the wait or the dial

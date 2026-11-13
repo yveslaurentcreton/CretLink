@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use cretlink_console::{
-    AUDIT_CHANNEL_CAPACITY, ChannelAudit, ConsoleState, SessionPhase, prune_audit_dir,
+    AUDIT_CHANNEL_CAPACITY, ChannelAudit, ConsoleState, RelayRoute, SessionPhase, prune_audit_dir,
     relay_route_entry, report_prune, spawn_audit_service, technician_display_name,
 };
 use cretlink_discovery::{Advertiser, ConnectionCode, RelayCode};
@@ -90,14 +90,11 @@ impl RelayWait {
         self.code.encode()
     }
 
-    /// The relay's host name, as both people are shown it.
-    pub(super) fn host(&self) -> &str {
-        self.relay.host()
-    }
-
-    /// Where the relay is reached: `host:port`.
-    pub(super) fn address(&self) -> String {
-        self.relay.view().address
+    /// The relay as both people are shown it and as the audit records it:
+    /// its name, where this copy connects, and what its certificate is
+    /// checked against.
+    pub(super) fn route(&self) -> RelayRoute {
+        self.relay.route()
     }
 
     /// The same wait with other timing, for a test that lets a rendezvous
@@ -494,10 +491,11 @@ async fn wait_on_relay(
     if !waits_on(&lock(shared), &shown) {
         return None;
     }
-    // The audit says first which way the session goes: through this relay.
+    // The audit says first which way the session goes: through this relay,
+    // by its name, where this copy connected and what vouched for the name.
     // Pairing, the approval code and consent follow as their own records,
     // exactly as on one network (ADR-0016).
-    audit.record_entry(relay_route_entry(relay.host()));
+    audit.record_entry(relay_route_entry(&relay.route()));
     let handle = SessionHost::host_over_stream(
         stream,
         hints(),
@@ -558,7 +556,7 @@ mod tests {
     fn waiting(code: &str) -> Mutex<ConsoleState> {
         let mut state = console();
         state
-            .listen_on_relay(code, "relay.example.org", "relay.example.org:443")
+            .listen_on_relay(code, from_settings().route())
             .unwrap();
         Mutex::new(state)
     }
@@ -683,8 +681,14 @@ mod tests {
     fn a_wait_prints_neither_its_code_nor_the_key() {
         let wait = RelayWait::new(from_settings(), RelayCode::parse(CODE).unwrap());
         assert_eq!(wait.code(), CODE);
-        assert_eq!(wait.host(), "relay.example.org");
-        assert_eq!(wait.address(), "relay.example.org:443");
+        assert_eq!(
+            wait.route(),
+            RelayRoute::new(
+                "relay.example.org",
+                "relay.example.org:443",
+                cretlink_console::RelayTrust::SystemAuthorities
+            )
+        );
         let printed = format!("{wait:?}");
         assert!(printed.contains("relay.example.org"), "{printed}");
         assert!(

@@ -306,6 +306,10 @@
   margin: 14px 0 0; font-size: 12.5px; color: var(--ink-2);
 }
 :where(.cl-ui) .via-relay .ic { width: 14px; height: 14px; color: var(--muted); }
+/* What vouches for the relay's name, on a line of its own, and where the
+   copy connects when that is another host than the name says. */
+:where(.cl-ui) .via-relay .relay-trust { flex-basis: 100%; text-align: center; }
+:where(.cl-ui) .relay-address { overflow-wrap: anywhere; }
 :where(.cl-ui) .disclose {
   font-size: 12.5px; line-height: 1.6; color: var(--muted); border-left: 3px solid var(--bad-line);
   padding-left: 12px; margin: 0;

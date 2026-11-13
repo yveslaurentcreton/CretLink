@@ -314,7 +314,7 @@ pub async fn pump(
                 let event = crate::relay::name_lost_connection(
                     event,
                     handle.ended_by(),
-                    session.relay_host(),
+                    session.relay_named().as_deref(),
                 );
                 if is_terminal(&session) {
                     // A local emergency stop or decline already ended the model.

@@ -10,6 +10,7 @@ import {
   NOW,
   REPORT,
   VIA_RELAY,
+  VIA_RELAY_ELSEWHERE,
   viewIn,
 } from "./fixtures";
 import {
@@ -27,10 +28,11 @@ import {
   nobodyWaitsWords,
   outcomeWords,
   relayFailureTitle,
-  relayHost,
   relayLostWords,
+  relayNamed,
   screenFor,
   screenUse,
+  sessionRelay,
   sourceWords,
   technicianName,
 } from "./model";
@@ -192,9 +194,37 @@ describe("a session through the relay (ST-M007-013)", () => {
   const reaching = viewIn({ phase: "announced" }, { technician: null, relay: VIA_RELAY });
 
   it("knows the relay of a session, and none on one network", () => {
-    expect(relayHost(snapshot(reaching))).toBe("relay.example.org");
-    expect(relayHost(snapshot(viewIn({ phase: "announced" })))).toBeUndefined();
-    expect(relayHost(snapshot())).toBeUndefined();
+    expect(sessionRelay(snapshot(reaching))).toEqual(VIA_RELAY);
+    expect(relayNamed(snapshot(reaching))).toBe("relay.example.org");
+    expect(sessionRelay(snapshot(viewIn({ phase: "announced" })))).toBeUndefined();
+    expect(relayNamed(snapshot(viewIn({ phase: "announced" })))).toBeUndefined();
+    expect(relayNamed(snapshot())).toBeUndefined();
+  });
+
+  it("names a relay with where this copy connects when that is another host than its name", () => {
+    // The profile gives the relay's certificate a name of its own: the name
+    // is not where the copy connects, so a sentence says both.
+    const elsewhere = viewIn(
+      { phase: "announced" },
+      { technician: null, relay: VIA_RELAY_ELSEWHERE },
+    );
+    const s = snapshot(elsewhere);
+    expect(relayNamed(s)).toBe("relay.example.org (reached at 192.0.2.1:9970)");
+    expect(announcement(s)).toBe(
+      "Connecting through the relay relay.example.org (reached at 192.0.2.1:9970). No access.",
+    );
+    let lost = applyView(snapshot(), elsewhere, NOW);
+    lost = applyView(
+      lost,
+      viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY_ELSEWHERE }),
+      NOW,
+    );
+    expect(lost.ended).toBe(
+      "The connection through the relay relay.example.org (reached at 192.0.2.1:9970) was lost before anyone got access. Nothing was shared.",
+    );
+    expect(nobodyWaitsWords(relayNamed(s)).message).toContain(
+      "The relay relay.example.org (reached at 192.0.2.1:9970) found nobody waiting",
+    );
   });
 
   it("shows the connecting screen for a relay code and announces the relay", () => {
@@ -237,7 +267,7 @@ describe("a session through the relay (ST-M007-013)", () => {
     s = applyView(s, viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY }), NOW);
     s = applyView(s, viewIn({ phase: "announced" }), NOW);
     expect(s.ended).toBeUndefined();
-    expect(relayHost(s)).toBeUndefined();
+    expect(relayNamed(s)).toBeUndefined();
   });
 
   it("names every relay failure in a few words for a customer", () => {

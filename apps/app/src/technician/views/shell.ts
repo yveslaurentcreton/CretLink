@@ -8,6 +8,7 @@
 
 import { type Child, append, h } from "../../shared/dom";
 import { type IconName, icon } from "../../shared/icons";
+import { relayWords } from "../../shared/relay";
 import {
   type NavPage,
   RELAY_LOST_STAGE,
@@ -160,7 +161,7 @@ function phaseError(
     const relay = s.console.relay;
     return {
       title: "The connection through the relay was lost",
-      ...(relay ? relayLostWords(relay.host) : { message: phase.message, next: everyone }),
+      ...(relay ? relayLostWords(relayWords(relay)) : { message: phase.message, next: everyone }),
     };
   }
   // A relay that could not be used: its own words and its own next step. No

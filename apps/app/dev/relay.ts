@@ -27,9 +27,12 @@
 // lets the relay stop while the code is compared.
 //
 // The simulated backend follows the rules of the real one where the screens
-// depend on them: an address needs a port, a key is never sent back, the
-// certificate file is named by a number, and a copy that runs once refuses
-// to keep anything.
+// depend on them: an address needs a port, a key is never sent back, a kept
+// key stays with its relay (the host of the address, the name in the
+// certificate and the certificate authority), the certificate file is named
+// by a number, and a copy that runs once refuses to keep anything. A relay is
+// named with where it is reached and what vouches for its name, as the real
+// backend names one (`../src/shared/relay`).
 
 import "../src/base.css";
 import { emit } from "@tauri-apps/api/event";
@@ -42,7 +45,8 @@ import type {
   RelayTest,
   RelayView,
 } from "../src/shared/contract";
-import type { ConsoleState } from "../src/technician/api";
+import { addressHost, relayWords } from "../src/shared/relay";
+import type { ConsoleState, RelayRoute } from "../src/technician/api";
 import {
   APP_INSTALLED,
   APP_RUN_ONCE,
@@ -115,21 +119,29 @@ function relayOf(form: RelayForm): RelayView {
     );
   }
   const stored = settings.stored?.relay;
-  const host = (form.name ?? address.slice(0, colon)).toLowerCase();
-  if (form.keyMode === "keep" && keySet && stored && stored.host !== host) {
+  const reached = address.slice(0, colon).toLowerCase();
+  const host = (form.name ?? reached).toLowerCase();
+  const withFile = form.caMode === "chosen" || (form.caMode === "keep" && stored?.ca !== undefined);
+  // A file that is chosen here is another one than the file that is kept.
+  const sameAuthority = form.caMode !== "chosen" && withFile === (stored?.ca !== undefined);
+  if (
+    form.keyMode === "keep" &&
+    keySet &&
+    stored &&
+    (addressHost(stored.address) !== reached || stored.host !== host || !sameAuthority)
+  ) {
     refuse(
       "relay_key",
-      `The key that is kept is the key of the relay ${stored.host}; enter the key of this relay, or remove the key.`,
+      `The key that is kept was saved for the relay ${stored.host} as it was: its host, the name in its certificate and its certificate authority. This form changes one of them, so enter the key again, or remove the key.`,
     );
   }
   const relay: RelayView = {
     host,
     address: address.toLowerCase(),
+    trust: withFile ? "profile_file" : "system_authorities",
     keySet: form.keyMode === "set" || (form.keyMode === "keep" && keySet),
   };
-  if (form.caMode === "chosen" || (form.caMode === "keep" && stored?.ca)) {
-    relay.ca = "relay-ca.pem";
-  }
+  if (withFile) relay.ca = "relay-ca.pem";
   if (form.name) relay.name = form.name.toLowerCase();
   return relay;
 }
@@ -149,8 +161,8 @@ function test(relay: RelayView): RelayTest {
         ok: false,
         kind: relay.keySet ? "key_refused" : "key_required",
         message: relay.keySet
-          ? `The relay ${relay.host} does not know the admission key of this copy. The key may be mistyped, or it was withdrawn.`
-          : `The relay ${relay.host} asks for an admission key, and this copy has none.`,
+          ? `The relay ${relayWords(relay)} does not know the admission key of this copy. The key may be mistyped, or it was withdrawn.`
+          : `The relay ${relayWords(relay)} asks for an admission key, and this copy has none.`,
         next: relay.keySet
           ? "Enter the key again, or ask the relay's operator for a new one."
           : "Enter the key that the relay's operator gave this copy.",
@@ -166,7 +178,7 @@ function test(relay: RelayView): RelayTest {
       return {
         ok: true,
         kind: "admitted",
-        message: `The relay ${relay.host} answered and admits this copy. Its certificate is valid for ${relay.host}, checked against ${relay.ca ? "the certificate file of this profile" : "the certificate authorities of this computer"}.`,
+        message: `The relay ${relayWords(relay)} answered and admits this copy. Its certificate is valid for ${relay.host}, checked against ${relay.trust === "profile_file" ? "the certificate file of this profile, and not against the certificate authorities of this computer" : "the certificate authorities of this computer"}.`,
         next: "",
       };
   }
@@ -234,7 +246,12 @@ function useRelay(): Promise<ConsoleState> {
   show(consoleIn({ phase: "stopped", reason: "technician_requested" }, { displayName: "Sam" }));
   const code = CODES[waits % CODES.length] ?? "";
   waits += 1;
-  const route = { host: relay.host, admitted: false };
+  const route: RelayRoute = {
+    host: relay.host,
+    address: relay.address,
+    trust: relay.trust,
+    admitted: false,
+  };
   const waiting = (admitted: boolean): ConsoleState =>
     consoleIn(
       { phase: "listening", code, address: relay.address },
@@ -276,7 +293,7 @@ function useRelay(): Promise<ConsoleState> {
                 {
                   phase: "failed",
                   stage: "relay_lost",
-                  message: `The connection through the relay ${relay.host} was lost.`,
+                  message: `The connection through the relay ${relayWords(relay)} was lost.`,
                 },
                 { displayName: "Sam", relay: held },
               ),

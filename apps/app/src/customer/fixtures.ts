@@ -3,7 +3,13 @@
 
 import type { ActivityEntry, ActivityItem, CustomerReport } from "../shared/contract";
 import { DISCLOSURE_TEXT } from "../technician/disclosure";
-import type { AgentPhase, ConsentView, DiscoveredConsoleView, LaunchView } from "./api";
+import type {
+  AgentPhase,
+  ConsentView,
+  DiscoveredConsoleView,
+  LaunchView,
+  RelayUseView,
+} from "./api";
 import { type CustomerSnapshot, initialSnapshot } from "./model";
 
 /** 2026-11-03 14:44:00 UTC: the fixtures' "now". */
@@ -51,7 +57,23 @@ export function viewIn(phase: AgentPhase, patch: Partial<ConsentView> = {}): Con
 }
 
 /** The relay of the fixtures. */
-export const VIA_RELAY = { host: "relay.example.org" };
+export const VIA_RELAY: RelayUseView = {
+  host: "relay.example.org",
+  address: "relay.example.org:443",
+  trust: "system_authorities",
+};
+
+/**
+ * A relay whose certificate carries another name than the host this copy
+ * connects to, checked against a certificate file of the profile: the window
+ * then shows the address beside the name and says what vouches for the name
+ * (ST-M007-011).
+ */
+export const VIA_RELAY_ELSEWHERE: RelayUseView = {
+  host: "relay.example.org",
+  address: "192.0.2.1:9970",
+  trust: "profile_file",
+};
 
 export const LAUNCH_READY: LaunchView = {
   step: "ready",
@@ -278,6 +300,14 @@ export const FIXTURES: Record<string, CustomerSnapshot> = {
     { ...idle, relay_of_copy: VIA_RELAY },
     { discovery: { state: "done", consoles: [] } },
   ),
+  // The profile file next to the program names the relay otherwise than the
+  // host this copy connects to, and checks it against a certificate file of
+  // its own: the window shows the address beside the name and says what
+  // vouches for the name (ST-M007-011).
+  "find-relay-ready-elsewhere": base(
+    { ...idle, relay_of_copy: VIA_RELAY_ELSEWHERE },
+    { discovery: { state: "done", consoles: [] } },
+  ),
   "find-none": base(idleUnelevated, {
     discovery: {
       state: "done",
@@ -386,6 +416,25 @@ export const FIXTURES: Record<string, CustomerSnapshot> = {
   ),
   "relay-end-lost": base(
     viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY }),
+    { activity: FEED_DONE, hadControl: true, report: REPORT_UNKNOWN },
+  ),
+  // A session through a relay that is reached at another host than its name
+  // says, checked against a certificate file of the profile.
+  "relay-connecting-elsewhere": base(
+    viewIn({ phase: "announced" }, { technician: null, relay: VIA_RELAY_ELSEWHERE }),
+  ),
+  "relay-sac-elsewhere": base(
+    viewIn(
+      { phase: "awaiting_approval_compare" },
+      { approval_code: "482913", relay: VIA_RELAY_ELSEWHERE },
+    ),
+  ),
+  "relay-live-elsewhere": base(
+    { ...live, relay: VIA_RELAY_ELSEWHERE },
+    { activity: FEED, hadControl: true },
+  ),
+  "relay-end-lost-elsewhere": base(
+    viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY_ELSEWHERE }),
     { activity: FEED_DONE, hadControl: true, report: REPORT_UNKNOWN },
   ),
   connecting: base(viewIn({ phase: "announced" }, { technician: null })),

@@ -780,7 +780,7 @@ fn begin_relay_wait(
         let technician = console.technician.clone();
         *console = ConsoleState::new(technician);
         // A new console state always takes a wait.
-        let _ = console.listen_on_relay(wait.code(), wait.host(), wait.address());
+        let _ = console.listen_on_relay(wait.code(), wait.route());
         sink.emit(&console);
     }
     tauri::async_runtime::spawn(run.drive(Wait::Relay(wait)))
@@ -1359,6 +1359,15 @@ mod tests {
         assert_eq!(setup::app_info().os, host.os);
     }
 
+    /// A relay as a waiting state names it.
+    fn sample_relay() -> cretlink_console::RelayRoute {
+        cretlink_console::RelayRoute::new(
+            "relay.example.org",
+            "relay.example.org:443",
+            cretlink_console::RelayTrust::SystemAuthorities,
+        )
+    }
+
     #[test]
     fn a_relay_can_be_chosen_only_while_waiting_on_a_network() {
         let mut console = ConsoleState::new(TechnicianHost {
@@ -1385,11 +1394,7 @@ mod tests {
         let technician = console.technician.clone();
         let mut console = ConsoleState::new(technician);
         console
-            .listen_on_relay(
-                "53ST-A71D-JKKV-0VGH",
-                "relay.example.org",
-                "relay.example.org:443",
-            )
+            .listen_on_relay("53ST-A71D-JKKV-0VGH", sample_relay())
             .unwrap();
         assert!(relay_can_be_chosen(&console).is_err());
         console.stop(StopReason::TechnicianRequested).unwrap();
@@ -1403,11 +1408,7 @@ mod tests {
         *state.live.lock().unwrap_or_else(PoisonError::into_inner) = Some(intents);
         state
             .guard()
-            .listen_on_relay(
-                "53ST-A71D-JKKV-0VGH",
-                "relay.example.org",
-                "relay.example.org:443",
-            )
+            .listen_on_relay("53ST-A71D-JKKV-0VGH", sample_relay())
             .unwrap_or_default();
         let stopped = stop_now(&state).unwrap_or_else(|error| panic!("{error:?}"));
         assert_eq!(

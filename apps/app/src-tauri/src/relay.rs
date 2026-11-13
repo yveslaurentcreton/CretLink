@@ -19,6 +19,16 @@
 //!   profile names, and must carry the relay's name ([`Relay::host`]). When
 //!   that fails nothing is sent and nothing falls back to a connection
 //!   without TLS.
+//! - **A relay is named with where it is reached** ([`Relay::route`],
+//!   [`named`]). A profile can give the relay a name that differs from the
+//!   host it connects to, and a certificate file of its own to check that
+//!   name against. Whoever can write the profile could give a server of their
+//!   own the name of another relay; they would gain the place of a hostile
+//!   relay, not the session, but both people would read the wrong name. So
+//!   wherever the relay is named to a person, the address stands beside the
+//!   name when its host is another one, and it is said when the certificate
+//!   is checked against a file of the profile and not against the system's
+//!   authorities.
 //! - **Addressing only.** A profile grants nothing (ADR-0016 §2, §4): the
 //!   relay only lets two connections find each other, and pairing, the
 //!   approval code and the customer's consent decide about a session exactly
@@ -36,6 +46,7 @@ use std::path::{Path, PathBuf};
 use cretlink_cli::install::Layout;
 use cretlink_cli::relay_profile::{self, Field, Problem, ProfileError, RelayProfile};
 use cretlink_cli::settings;
+use cretlink_console::{RelayRoute, RelayTrust};
 use cretlink_relay::RelayRefusal;
 use cretlink_session::{
     AdmissionToken, Dial, EndedBy, RELAY_CONNECT_TIMEOUT, RelayFailure, RendezvousTicket,
@@ -151,6 +162,27 @@ impl Relay {
         self.profile.server_name()
     }
 
+    /// What the relay's certificate is checked against: the certificate
+    /// file the profile names and nothing else, or the system's authorities.
+    pub(crate) fn trust(&self) -> RelayTrust {
+        if self.pinned.is_some() {
+            RelayTrust::ProfileFile
+        } else {
+            RelayTrust::SystemAuthorities
+        }
+    }
+
+    /// The relay as the label of a session: its name, where this copy
+    /// connects to reach it, and what its certificate is checked against.
+    /// It is what both people are shown and what the audit records.
+    pub(crate) fn route(&self) -> RelayRoute {
+        RelayRoute::new(
+            self.host(),
+            self.profile.address().to_string(),
+            self.trust(),
+        )
+    }
+
     /// The relay as a screen shows it.
     pub(crate) fn view(&self) -> RelayView {
         RelayView::of(&self.profile)
@@ -215,7 +247,7 @@ impl Relay {
         };
         match self.dial(connector, ticket).dial().await {
             // The leg is dropped at once: the relay then forgets it.
-            Ok(_leg) => TestResult::admitted(&view, self.pinned.is_some()),
+            Ok(_leg) => TestResult::admitted(&view),
             Err(SessionError::Relay(failure)) => failed(&failure),
             Err(other) => failed(&RelayFailure::Settings(other.to_string())),
         }
@@ -338,6 +370,8 @@ pub(crate) struct RelayView {
     pub(crate) host: String,
     /// Where it is reached: `host:port`.
     pub(crate) address: String,
+    /// What its certificate is checked against.
+    pub(crate) trust: RelayTrust,
     /// Whether the profile holds an admission key.
     pub(crate) key_set: bool,
     /// The certificate authority file the profile names.
@@ -353,10 +387,48 @@ impl RelayView {
         Self {
             host: profile.server_name().to_owned(),
             address: profile.address().to_string(),
+            trust: if profile.ca().is_some() {
+                RelayTrust::ProfileFile
+            } else {
+                RelayTrust::SystemAuthorities
+            },
             key_set: profile.key().is_some(),
             ca: profile.ca().map(str::to_owned),
             name: profile.name().map(str::to_owned),
         }
+    }
+
+    /// The relay as a sentence names it ([`named`]).
+    pub(crate) fn named(&self) -> String {
+        named(&self.host, &self.address)
+    }
+}
+
+/// The host of an address `host:port`, without the square brackets of an
+/// IPv6 address.
+fn address_host(address: &str) -> &str {
+    let host = address
+        .rsplit_once(':')
+        .map_or(address, |(host, _port)| host);
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// Whether a copy that reaches the relay `host` at `address` connects to
+/// another host than that name says.
+pub(crate) fn reached_elsewhere(host: &str, address: &str) -> bool {
+    !address.is_empty() && address_host(address) != host
+}
+
+/// A relay as a sentence names it to a person: its name, and where the copy
+/// connects when that is another host than the name says, so that the name
+/// is never read for the place.
+pub(crate) fn named(host: &str, address: &str) -> String {
+    if reached_elsewhere(host, address) {
+        format!("{host} (reached at {address})")
+    } else {
+        host.to_owned()
     }
 }
 
@@ -552,7 +624,8 @@ pub(crate) struct FailureWords {
     pub(crate) next: String,
 }
 
-/// Words for a relay that could not be used.
+/// Words for a relay that could not be used. The relay is named with where
+/// it is reached when that is another host than its name says ([`named`]).
 pub(crate) fn failure_words(
     failure: &RelayFailure,
     relay: &RelayView,
@@ -560,7 +633,9 @@ pub(crate) fn failure_words(
 ) -> FailureWords {
     let host = &relay.host;
     let address = &relay.address;
+    let relay_named = relay.named();
     let technician = audience == Audience::Technician;
+    let pinned = relay.trust == RelayTrust::ProfileFile;
     // What the customer does about anything that only the technician can
     // put right.
     let tell = |what: &str| {
@@ -584,7 +659,7 @@ pub(crate) fn failure_words(
             } else {
                 format!(
                     "Check that this computer is online, then try again. If it stays like this, {}",
-                    lower_first(&tell(&format!("the relay {host} was not found")))
+                    lower_first(&tell(&format!("the relay {relay_named} was not found")))
                 )
             },
         ),
@@ -601,23 +676,34 @@ pub(crate) fn failure_words(
             } else {
                 format!(
                     "Check that this computer is online, then try again. If it stays like this, {}",
-                    lower_first(&tell(&format!("the relay {host} cannot be reached")))
+                    lower_first(&tell(&format!("the relay {relay_named} cannot be reached")))
                 )
             },
         ),
         RelayFailure::Untrusted(_) => words(
             "untrusted",
-            format!(
-                "The relay at {address} showed no certificate that this computer trusts for the \
-                 name {host}, so nothing was sent to it. The certificate may come from an \
-                 authority this computer does not know, be out of date or carry another name; or \
-                 the server at that address is not the relay."
-            ),
+            if pinned {
+                format!(
+                    "The relay at {address} showed no certificate for the name {host} that the \
+                     certificate file of this copy's relay settings vouches for, so nothing was \
+                     sent to it. This copy checks the relay against that file and not against \
+                     the certificate authorities of this computer. The certificate may come \
+                     from another authority, be out of date or carry another name; or the \
+                     server at that address is not the relay."
+                )
+            } else {
+                format!(
+                    "The relay at {address} showed no certificate that this computer trusts for \
+                     the name {host}, so nothing was sent to it. The certificate may come from \
+                     an authority this computer does not know, be out of date or carry another \
+                     name; or the server at that address is not the relay."
+                )
+            },
             if !technician {
                 tell(&format!(
-                    "this computer does not trust the certificate of the relay {host}"
+                    "this computer does not trust the certificate of the relay {relay_named}"
                 ))
-            } else if relay.ca.is_some() {
+            } else if pinned {
                 "Check that the certificate file belongs to the authority that signed the relay's \
                  certificate, and that the name is the one in that certificate."
                     .to_owned()
@@ -639,12 +725,12 @@ pub(crate) fn failure_words(
                  release as this copy of CretLink."
                     .to_owned()
             } else {
-                tell(&format!("the relay {host} did not answer"))
+                tell(&format!("the relay {relay_named} did not answer"))
             },
         ),
         RelayFailure::Refused(RelayRefusal::CredentialRequired) => words(
             "key_required",
-            format!("The relay {host} asks for an admission key, and this copy has none."),
+            format!("The relay {relay_named} asks for an admission key, and this copy has none."),
             if technician {
                 "Enter the key that the relay's operator gave this copy.".to_owned()
             } else {
@@ -655,8 +741,8 @@ pub(crate) fn failure_words(
         RelayFailure::Refused(RelayRefusal::CredentialRejected) => words(
             "key_refused",
             format!(
-                "The relay {host} does not know the admission key of this copy. The key may be \
-                 mistyped, or it was withdrawn."
+                "The relay {relay_named} does not know the admission key of this copy. The key \
+                 may be mistyped, or it was withdrawn."
             ),
             if technician {
                 "Enter the key again, or ask the relay's operator for a new one.".to_owned()
@@ -668,12 +754,12 @@ pub(crate) fn failure_words(
         ),
         RelayFailure::Refused(RelayRefusal::RateLimited) => words(
             "rate_limited",
-            format!("The relay {host} had too many attempts in a short time."),
+            format!("The relay {relay_named} had too many attempts in a short time."),
             "Wait a minute, then try again.".to_owned(),
         ),
         RelayFailure::Refused(RelayRefusal::Busy) => words(
             "busy",
-            format!("The relay {host} has no free place right now."),
+            format!("The relay {relay_named} has no free place right now."),
             if technician {
                 "Try again in a few minutes. If it stays full, look at the limits of the relay \
                  and at who uses it."
@@ -684,24 +770,24 @@ pub(crate) fn failure_words(
         ),
         RelayFailure::Refused(RelayRefusal::Unavailable) => words(
             "unavailable",
-            format!("The relay {host} cannot admit connections right now."),
+            format!("The relay {relay_named} cannot admit connections right now."),
             if technician {
                 "Look at the log of the relay server: it needs its operator.".to_owned()
             } else {
-                tell(&format!("the relay {host} admits nobody right now"))
+                tell(&format!("the relay {relay_named} admits nobody right now"))
             },
         ),
         RelayFailure::Refused(RelayRefusal::UnsupportedVersion { relay: version }) => words(
             "version",
             format!(
-                "The relay {host} and this copy of CretLink come from releases that do not fit \
-                 together: the relay speaks version {version} of the rendezvous."
+                "The relay {relay_named} and this copy of CretLink come from releases that do \
+                 not fit together: the relay speaks version {version} of the rendezvous."
             ),
             if technician {
                 "Update the relay server and CretLink to the same release.".to_owned()
             } else {
                 tell(&format!(
-                    "the relay {host} and this copy of CretLink do not fit together"
+                    "the relay {relay_named} and this copy of CretLink do not fit together"
                 ))
             },
         ),
@@ -733,16 +819,19 @@ pub(crate) const LOST_STAGE: &str = "relay_lost";
 /// a lost session of unknown cause (REQ-N-015). `ended_by` is the runtime's
 /// own verdict, so nothing is read out of a message. Any other event, and
 /// every event of a session on one network, is answered as it is.
+///
+/// `relay` is the relay as a sentence names it ([`named`]): its name, with
+/// where it is reached when that is another host.
 pub(crate) fn name_lost_connection(
     event: SessionEvent,
     ended_by: Option<EndedBy>,
-    relay_host: Option<&str>,
+    relay: Option<&str>,
 ) -> SessionEvent {
-    match (event, ended_by, relay_host) {
-        (SessionEvent::Failed { .. }, Some(EndedBy::ConnectionLost), Some(host)) => {
+    match (event, ended_by, relay) {
+        (SessionEvent::Failed { .. }, Some(EndedBy::ConnectionLost), Some(relay)) => {
             SessionEvent::Failed {
                 stage: LOST_STAGE.to_owned(),
-                message: format!("The connection through the relay {host} was lost."),
+                message: format!("The connection through the relay {relay} was lost."),
             }
         }
         (event, _, _) => event,
@@ -779,18 +868,21 @@ pub(crate) struct TestResult {
 }
 
 impl TestResult {
-    fn admitted(relay: &RelayView, pinned: bool) -> Self {
-        let checked = if pinned {
-            "the certificate file of this profile"
-        } else {
-            "the certificate authorities of this computer"
+    fn admitted(relay: &RelayView) -> Self {
+        let checked = match relay.trust {
+            RelayTrust::ProfileFile => {
+                "the certificate file of this profile, and not against the certificate \
+                 authorities of this computer"
+            }
+            RelayTrust::SystemAuthorities => "the certificate authorities of this computer",
         };
         Self {
             ok: true,
             kind: "admitted",
             message: format!(
-                "The relay {host} answered and admits this copy. Its certificate is valid for \
+                "The relay {named} answered and admits this copy. Its certificate is valid for \
                  {host}, checked against {checked}.",
+                named = relay.named(),
                 host = relay.host
             ),
             next: String::new(),

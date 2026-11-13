@@ -413,6 +413,39 @@ people are shown, and what the relay code is tied to
 ([§7](#the-relay-code-and-the-ticket)). Give every copy of one relay the same
 `name`, or leave it out in all of them.
 
+### The name, the address and what vouches for the name
+
+With `name` and `ca` a profile says three things that need not agree: the name
+the relay is called, the host a copy connects to, and the authority that
+vouches for the name. That is what a relay behind an address of its own with a
+certificate from your own authority needs. It is also what somebody who can
+write the profile could use to give a server of their own the name of your
+relay. They would stand where a hostile relay stands, which sees encrypted
+traffic and its size and can deny service; they would not get into a session,
+and the approval codes differ when they put themselves in between. But a
+screen that showed the name alone would name the wrong relay.
+
+So wherever the application names a relay to a person, it shows what the copy
+really does:
+
+- **The address beside the name, when its host is another one**:
+  `relay.example.org (reached at 192.0.2.1:9970)`. When the name is the host
+  of the address, the name says it all, and another port is not another host.
+- **What vouches for the name, when it is a file of the profile**: "The
+  relay's certificate is checked against a certificate file of this copy's
+  relay settings, not against the certificate authorities of this computer."
+  Nothing is added when the computer's own authorities vouch for it.
+- **Where the relay comes from, in the installed copy**: when a file next to
+  the program wins over Settings, the waiting screen says that the relay
+  comes from that file and not from Settings.
+
+This holds on both sides and on every screen: the offer on the waiting screen,
+the wait on the relay, the customer's code field and connecting screen, the
+comparison of the approval code, the decision, the live session, the end
+report and the words of every failure. The technician's audit trail records
+the same three facts (`session_route`: the name, the address and the kind of
+trust), and the session history shows them.
+
 ### A session through the relay
 
 A session between two networks starts like one on one network and differs in
@@ -436,7 +469,9 @@ one step (ST-M007-013). Both copies need a profile for the **same** relay.
    approval code, the technician confirms it, the customer allows full
    control, and either side stops the session. Every screen says through
    which relay the session runs, and the technician's audit log records it
-   (a record `session_route` with the relay's host name).
+   first, before pairing and consent (a record `session_route` with the
+   relay's host name, the address the copy connected to and what its
+   certificate was checked against).
 
 What to know:
 

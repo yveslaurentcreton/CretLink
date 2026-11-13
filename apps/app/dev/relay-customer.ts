@@ -9,6 +9,7 @@
 // | Value     | The copy |
 // |-----------|----------|
 // | `relay`   | set up for the relay relay.example.org (the default) |
+// | `renamed` | set up for a relay that the profile names relay.example.org, reaches at another host and checks against a certificate file of its own |
 // | `none`    | no profile: a relay code cannot be used |
 // | `problem` | a profile that cannot be used |
 //
@@ -31,7 +32,13 @@ import "../src/base.css";
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type { AgentPhase, ConsentView } from "../src/customer/api";
-import { LAUNCH_READY, VIA_RELAY, viewIn } from "../src/customer/fixtures";
+import {
+  LAUNCH_READY,
+  VIA_RELAY,
+  VIA_RELAY_ELSEWHERE,
+  viewIn,
+} from "../src/customer/fixtures";
+import { relayWords } from "../src/shared/relay";
 import { start } from "../src/customer/main";
 
 const params = new URLSearchParams(window.location.search);
@@ -42,7 +49,8 @@ const pause = Number(params.get("pause") ?? 600);
 /** Counts the dials, so that a late step of an old one is dropped. */
 let generation = 0;
 /** What the profile next to the program says, for a copy that has a relay. */
-const relayOfCopy = copy === "relay" ? VIA_RELAY : null;
+const relayOfCopy =
+  copy === "relay" ? VIA_RELAY : copy === "renamed" ? VIA_RELAY_ELSEWHERE : null;
 let view: ConsentView = viewIn({ phase: "idle" }, { relay_of_copy: relayOfCopy });
 
 /** A refusal as the backend words one. */
@@ -125,7 +133,7 @@ function connect(typed: string): ConsentView {
     );
   }
   generation += 1;
-  const relay = relayCode ? VIA_RELAY : null;
+  const relay = relayCode ? relayOfCopy : null;
   const reaching = show(viewIn({ phase: "announced" }, { technician: null, relay }));
   later(() => {
     const failure = relayCode ? FAILURES[outcome] : undefined;
@@ -141,7 +149,7 @@ function connect(typed: string): ConsentView {
             {
               phase: "failed",
               stage: "relay_lost",
-              message: "The connection through the relay relay.example.org was lost.",
+              message: `The connection through the relay ${relay ? relayWords(relay) : ""} was lost.`,
             },
             { relay },
           ),

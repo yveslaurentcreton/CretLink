@@ -413,7 +413,8 @@ async function saveRelay(): Promise<void> {
       '[data-action="relay-save"]',
     );
   } catch (error) {
-    relayRefused(error, "The relay was not saved", "Nothing was changed. Try again.");
+    // The backend's sentence says whether anything was changed.
+    relayRefused(error, "The relay was not saved", "Try again.");
   }
 }
 
@@ -586,6 +587,9 @@ async function useRelay(): Promise<void> {
     // The keyboard was on **Use relay**, which is gone: on to Cancel.
     focusNext = "#stop";
     set({});
+    // The backend read the profile again for this wait: so does the screen,
+    // which says where the relay comes from (ST-M007-011).
+    void loadRelay();
   } catch (error) {
     // Nothing changed, or the listener is gone already: show what the backend
     // says now, and why the relay was not used.

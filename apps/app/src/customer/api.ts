@@ -9,7 +9,7 @@
 // end report use the shared contract (`../shared/contract`).
 
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivityEntry, CustomerReport } from "../shared/contract";
+import type { ActivityEntry, CustomerReport, RelayTrust } from "../shared/contract";
 
 // Mirrors `cretlink_support_agent::privilege::IntegrityLevel` (snake_case).
 export type IntegrityLevel = "untrusted" | "low" | "medium" | "high" | "system" | "unknown";
@@ -103,25 +103,34 @@ export interface ConsentView {
   technician: TechnicianNameView | null;
   // `null` when the startup sweep kept nothing (or has not finished).
   startup_cleanup: StartupCleanupView | null;
-  // The relay this session runs through, by its host name; `null` for a
-  // session on one network (ST-M007-013). It stays after the end, until the
-  // next dial.
+  // The relay this session runs through: its name, where this copy connects
+  // and what vouches for the name; `null` for a session on one network
+  // (ST-M007-013). It stays after the end, until the next dial.
   relay: RelayUseView | null;
   // What to do next about the failure this dial ended with, when the failure
   // has a next step of its own (a relay that cannot be reached, a key the
   // relay refuses, ...); `null` otherwise.
   failure_next: string | null;
-  // The relay this copy is set up for, by its host name, from the profile
-  // file next to the program; `null` without a profile that can be used
-  // (ST-M007-011). Shown beside the code field: the customer sees the
-  // relay's host name before connecting through it.
+  // The relay this copy is set up for, from the profile file next to the
+  // program; `null` without a profile that can be used (ST-M007-011). Shown
+  // beside the code field: the customer sees the relay's name, where this
+  // copy would connect and what vouches for the name before connecting
+  // through it.
   relay_of_copy: RelayUseView | null;
 }
 
 // The relay of a session (ST-M007-013, ADR-0016): a label. The relay passes
 // the encrypted session on, cannot look inside and grants nothing.
+//
+// `host` is the name the relay's certificate carries, `address` is where
+// this copy connects, and `trust` is what vouches for the name. The window
+// shows the address beside the name when its host is another one, and says
+// when the certificate is checked against a file of the profile
+// (`shared/relay.ts`): whoever wrote the profile file chose both.
 export interface RelayUseView {
   host: string;
+  address: string;
+  trust: RelayTrust;
 }
 
 // One technician console found on the LAN (ADR-0007). Untrusted: never

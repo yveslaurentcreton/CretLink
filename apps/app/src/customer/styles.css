@@ -59,6 +59,7 @@ body {
 /* A session through the relay (ST-M007-013). */
 .cbody .relay-host { overflow-wrap: anywhere; }
 .cbody .relay-explained { max-width: 420px; margin: 0; }
+.cbody p.relay-trust { max-width: 420px; margin: 0; font-size: 12.5px; }
 .cbody .via-relay { margin: 0; }
 .cbody.center .via-relay { margin-top: 6px; }
 .note.relay-lost > span { flex: 1; }

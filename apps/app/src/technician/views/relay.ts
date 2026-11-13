@@ -17,6 +17,7 @@
 import type { RelayPlace, RelaySettings, RelayView } from "../../shared/contract";
 import { type Child, h } from "../../shared/dom";
 import { icon } from "../../shared/icons";
+import { relayLabel, relayWords } from "../../shared/relay";
 import type { RelayDraft, TechnicianSnapshot } from "../model";
 import { button, card, kv, pill, unavailable } from "./common";
 
@@ -26,7 +27,7 @@ const INTRO =
 /** What a relay is checked against, in words. */
 function trust(relay: RelayView): string {
   return relay.ca
-    ? `The certificate file ${relay.ca}`
+    ? `The certificate file ${relay.ca}, and not the certificate authorities of this computer`
     : "The certificate authorities of this computer";
 }
 
@@ -254,7 +255,7 @@ function removeQuestion(s: TechnicianSnapshot, stored: RelayPlace | undefined): 
       "p",
       { class: "confirm-head" },
       stored?.relay
-        ? `Remove the relay ${stored.relay.host} from the settings?`
+        ? `Remove the relay ${relayWords(stored.relay)} from the settings?`
         : "Remove the relay settings?",
     ),
     h(
@@ -305,7 +306,7 @@ function fileRelay(s: TechnicianSnapshot, settings: RelaySettings): Child[] {
             stored.relay
               ? [
                   "Settings also holds the relay ",
-                  h("b", { class: "mono" }, stored.relay.host),
+                  relayLabel(stored.relay),
                   ". It is not used while the file is there.",
                 ]
               : "Settings also holds relay settings that cannot be read. They are not used while the file is there.",

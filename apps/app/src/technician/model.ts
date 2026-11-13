@@ -44,6 +44,7 @@ import {
   trimFeed,
   upsertActivity,
 } from "../shared/feed";
+import { relayWords } from "../shared/relay";
 import {
   type ConsoleState,
   type RelayRoute,
@@ -658,8 +659,8 @@ export function phaseAnnouncement(s: TechnicianSnapshot): string {
       const relay = s.console.relay;
       if (!relay) return "Waiting for the customer. No access.";
       return relay.admitted
-        ? `Waiting for the customer on the relay ${relay.host}. Read them the relay code. No access.`
-        : `Connecting to the relay ${relay.host}. No access.`;
+        ? `Waiting for the customer on the relay ${relayWords(relay)}. Read them the relay code. No access.`
+        : `Connecting to the relay ${relayWords(relay)}. No access.`;
     }
     case "connecting":
       return "The customer is connecting. No access yet.";
@@ -713,17 +714,39 @@ export function spokenCode(code: string): string {
 
 /** What the waiting screen can say about a relay for this copy. */
 export type RelayOffer =
-  // A relay that can be used, by its host name.
-  | { state: "ready"; host: string }
+  // A relay that can be used: its name, where this copy connects and what
+  // vouches for the name. `fromFile` is the profile file next to the program
+  // when the installed copy takes its relay from there and not from
+  // Settings.
+  | { state: "ready"; relay: RelayView; fromFile?: string }
   // No relay. `runOnce`: this copy keeps no settings, so a relay goes into
   // the file next to the program.
   | { state: "none"; runOnce: boolean }
   // A profile that cannot be used: what is wrong, and the file.
   | { state: "problem"; message: string; file: string };
 
+/**
+ * The profile file next to the program, when the installed copy takes its
+ * relay from it (ST-M007-011). Settings is where the technician of an
+ * installed copy sets the relay up; a file next to the program wins over it,
+ * and whoever can write there chose the relay. The waiting screen says so. A
+ * copy that runs once has no other place for a relay: there is nothing to
+ * say.
+ */
+export function relayFromFile(settings: RelaySettings | null): string | undefined {
+  return settings?.editable && settings.source === "file" && settings.file.relay
+    ? settings.file.path
+    : undefined;
+}
+
 export function relayOffer(settings: RelaySettings | null): RelayOffer {
   const relay = activeRelay(settings);
-  if (relay) return { state: "ready", host: relay.host };
+  if (relay) {
+    const fromFile = relayFromFile(settings);
+    return fromFile === undefined
+      ? { state: "ready", relay }
+      : { state: "ready", relay, fromFile };
+  }
   const place = settings?.source === "file" ? settings.file : settings?.stored;
   if (place?.problem) {
     return { state: "problem", message: place.problem.message, file: place.problem.file };
@@ -763,13 +786,14 @@ export function relayFailureTitle(stage: string): string {
 
 /**
  * Why a session through a relay ended, when its connection was lost: said
- * with the relay, so that it does not read as a lost session of unknown
+ * with the relay (`relayWords`: its name, and where it is reached when that
+ * differs), so that it does not read as a lost session of unknown
  * cause (REQ-N-015). The relay may have stopped; either computer may have
  * gone offline. Nothing connects again by itself.
  */
-export function relayLostWords(host: string): { message: string; next: string } {
+export function relayLostWords(relay: string): { message: string; next: string } {
   return {
-    message: `The connection through the relay ${host} was lost. The relay may have stopped, or one of the two computers went offline.`,
+    message: `The connection through the relay ${relay} was lost. The relay may have stopped, or one of the two computers went offline.`,
     next: "Nobody has access to the customer computer any more. Start a new session when you are ready; it gets a new relay code.",
   };
 }
@@ -823,6 +847,7 @@ function isRelayView(value: unknown): value is RelayView {
   return (
     isText(view.host) &&
     isText(view.address) &&
+    (view.trust === "system_authorities" || view.trust === "profile_file") &&
     typeof view.keySet === "boolean" &&
     (view.ca === undefined || isText(view.ca)) &&
     (view.name === undefined || isText(view.name))

@@ -18,8 +18,8 @@ import {
   isRelayFailure,
   nobodyWaitsWords,
   relayFailureTitle,
-  relayHost,
   relayLostWords,
+  relayNamed,
   screenFor,
   technicianName,
 } from "../model";
@@ -36,13 +36,13 @@ function phaseError(s: CustomerSnapshot): UiError | null {
   if (phase?.phase !== "failed") return null;
   const nobody = "Nobody has access to this computer.";
   // A relay code that nobody waits on (ST-M007-012, ST-M007-013).
-  if (phase.stage === RENDEZVOUS_STAGE) return nobodyWaitsWords(relayHost(s));
+  if (phase.stage === RENDEZVOUS_STAGE) return nobodyWaitsWords(relayNamed(s));
   // A session through a relay whose connection was lost before control.
   if (phase.stage === RELAY_LOST_STAGE) {
-    const host = relayHost(s);
+    const relay = relayNamed(s);
     return {
       title: "The connection through the relay was lost",
-      ...(host ? relayLostWords(host) : { message: phase.message, next: nobody }),
+      ...(relay ? relayLostWords(relay) : { message: phase.message, next: nobody }),
     };
   }
   // A relay that could not be used: the backend's words for a customer, and

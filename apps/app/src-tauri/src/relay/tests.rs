@@ -70,6 +70,7 @@ fn a_file_next_to_the_program_is_read_by_either_role() {
             RelayView {
                 host: "relay.example.org".to_owned(),
                 address: "relay.example.org:443".to_owned(),
+                trust: RelayTrust::SystemAuthorities,
                 key_set: true,
                 ca: None,
                 name: None,
@@ -228,10 +229,17 @@ async fn the_test_says_that_the_relay_admits_this_copy() {
     let result = test_of(&program, Audience::Technician).await;
     assert!(result.ok, "{result:?}");
     assert_eq!(result.kind, "admitted");
+    // The profile of the tests gives the relay's certificate a name of its
+    // own and a certificate file of its own: the result says where the relay
+    // was reached and what vouched for that name.
     assert_eq!(
         result.message,
-        "The relay relay.test answered and admits this copy. Its certificate is valid for \
-         relay.test, checked against the certificate file of this profile."
+        format!(
+            "The relay relay.test (reached at {}) answered and admits this copy. Its \
+             certificate is valid for relay.test, checked against the certificate file of this \
+             profile, and not against the certificate authorities of this computer.",
+            relay.addr
+        )
     );
     assert_eq!(result.next, "");
     // The test met nobody: the relay forwarded nothing.
@@ -258,7 +266,11 @@ async fn the_test_tells_a_missing_key_from_a_key_the_relay_does_not_know() {
     assert_eq!(missing.kind, "key_required");
     assert_eq!(
         missing.message,
-        "The relay relay.test asks for an admission key, and this copy has none."
+        format!(
+            "The relay relay.test (reached at {}) asks for an admission key, and this copy has \
+             none.",
+            relay.addr
+        )
     );
     assert_eq!(
         missing.next,
@@ -292,10 +304,15 @@ async fn a_certificate_that_is_not_trusted_ends_the_test_and_nothing_is_sent() {
     folder.write(CA_FILE, &other.cert_pem);
     let result = test_of(&program, Audience::Technician).await;
     assert_eq!(result.kind, "untrusted");
+    // The profile checks the relay against its certificate file, and the
+    // words say that it is that file which does not vouch for the relay.
     assert!(
-        result
-            .message
-            .contains("showed no certificate that this computer trusts")
+        result.message.contains(
+            "showed no certificate for the name relay.test that the certificate file of this \
+             copy's relay settings vouches for"
+        ),
+        "{}",
+        result.message
     );
     assert!(
         result.message.contains("nothing was sent"),
@@ -475,9 +492,25 @@ fn sample() -> RelayView {
     RelayView {
         host: "relay.example.org".to_owned(),
         address: "relay.example.org:443".to_owned(),
+        trust: RelayTrust::SystemAuthorities,
         key_set: true,
         ca: None,
         name: None,
+    }
+}
+
+/// A relay whose certificate carries another name than the host this copy
+/// connects to, checked against a certificate file of the profile: what
+/// somebody who can write the profile would use to give a server of their own
+/// the name of another relay.
+fn renamed() -> RelayView {
+    RelayView {
+        host: "relay.example.org".to_owned(),
+        address: "192.0.2.1:9970".to_owned(),
+        trust: RelayTrust::ProfileFile,
+        key_set: true,
+        ca: Some("relay-ca.pem".to_owned()),
+        name: Some("relay.example.org".to_owned()),
     }
 }
 
@@ -554,14 +587,30 @@ fn the_customer_is_told_what_to_pass_on_and_the_technician_what_to_change() {
     );
     // With a certificate file in the profile the technician is pointed at it.
     let pinned = RelayView {
+        trust: RelayTrust::ProfileFile,
         ca: Some(CA_FILE.to_owned()),
         ..sample()
     };
+    let words = failure_words(&untrusted, &pinned, Audience::Technician);
     assert!(
-        failure_words(&untrusted, &pinned, Audience::Technician)
+        words
             .next
-            .contains("certificate file belongs to the authority")
+            .contains("certificate file belongs to the authority"),
+        "{}",
+        words.next
     );
+    // And both people are told what the certificate was checked against.
+    for audience in [Audience::Technician, Audience::Customer] {
+        let message = failure_words(&untrusted, &pinned, audience).message;
+        assert!(
+            message.contains(
+                "This copy checks the relay against that file and not against the certificate \
+                 authorities of this computer."
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("  "), "{message:?}");
+    }
 
     let version = RelayFailure::Refused(RelayRefusal::UnsupportedVersion { relay: 3 });
     assert!(
@@ -577,6 +626,137 @@ fn the_customer_is_told_what_to_pass_on_and_the_technician_what_to_change() {
          technician that the relay relay.example.org was not found. Nobody has access to this \
          computer."
     );
+}
+
+// --- The name and the place ---
+
+#[test]
+fn a_relay_is_named_with_where_it_is_reached_when_that_is_another_host() {
+    // The name is the host of the address: the name says it all. Another
+    // port is not another host.
+    assert_eq!(
+        named("relay.example.org", "relay.example.org:443"),
+        "relay.example.org"
+    );
+    assert_eq!(
+        named("relay.example.org", "relay.example.org:9970"),
+        "relay.example.org"
+    );
+    assert_eq!(named("192.0.2.1", "192.0.2.1:443"), "192.0.2.1");
+    assert_eq!(named("2001:db8::1", "[2001:db8::1]:443"), "2001:db8::1");
+    // The copy connects somewhere else than the name says: both are said.
+    assert_eq!(
+        named("relay.example.org", "192.0.2.1:9970"),
+        "relay.example.org (reached at 192.0.2.1:9970)"
+    );
+    assert_eq!(
+        named("relay.example.org", "host-01.example.org:443"),
+        "relay.example.org (reached at host-01.example.org:443)"
+    );
+    assert_eq!(
+        named("relay.example.org", "[2001:db8::1]:443"),
+        "relay.example.org (reached at [2001:db8::1]:443)"
+    );
+    assert_eq!(
+        named("2001:db8::2", "[2001:db8::1]:443"),
+        "2001:db8::2 (reached at [2001:db8::1]:443)"
+    );
+    assert_eq!(sample().named(), "relay.example.org");
+    assert_eq!(
+        renamed().named(),
+        "relay.example.org (reached at 192.0.2.1:9970)"
+    );
+}
+
+#[test]
+fn the_route_of_a_relay_says_where_this_copy_connects_and_what_vouches_for_the_name() {
+    let relay = |text: &str, ca: Option<&[u8]>| {
+        Relay::with_ca(
+            Source::File(std::path::PathBuf::from("cretlink.toml")),
+            profile(text),
+            ca,
+        )
+        .unwrap()
+    };
+    // A profile with an address and nothing else: the name is the host, and
+    // the system's authorities vouch for it.
+    let plain = relay(SAM, None);
+    assert_eq!(plain.trust(), RelayTrust::SystemAuthorities);
+    assert_eq!(
+        plain.route(),
+        RelayRoute::new(
+            "relay.example.org",
+            "relay.example.org:443",
+            RelayTrust::SystemAuthorities
+        )
+    );
+    assert_eq!(plain.view().trust, RelayTrust::SystemAuthorities);
+
+    // A profile that names the relay otherwise than the host it connects to,
+    // with a certificate file of its own: the route says all three, so that
+    // no screen and no audit record shows the name alone.
+    let (cert, _key) = cretlink_wss::testcert::self_signed("relay.example.org").unwrap();
+    let pem = super::testing::pem(cert.as_ref());
+    let renamed = relay(
+        "[relay]\naddress = \"192.0.2.1:9970\"\nname = \"relay.example.org\"\nca = \"relay-ca.pem\"\n",
+        Some(pem.as_bytes()),
+    );
+    assert_eq!(renamed.host(), "relay.example.org");
+    assert_eq!(renamed.trust(), RelayTrust::ProfileFile);
+    assert_eq!(
+        renamed.route(),
+        RelayRoute::new(
+            "relay.example.org",
+            "192.0.2.1:9970",
+            RelayTrust::ProfileFile
+        )
+    );
+    assert_eq!(
+        serde_json::to_value(renamed.view()).unwrap(),
+        serde_json::json!({
+            "host": "relay.example.org",
+            "address": "192.0.2.1:9970",
+            "trust": "profile_file",
+            "keySet": false,
+            "ca": "relay-ca.pem",
+            "name": "relay.example.org",
+        })
+    );
+}
+
+#[test]
+fn no_sentence_names_a_renamed_relay_without_where_it_is_reached() {
+    for audience in [Audience::Technician, Audience::Customer] {
+        for failure in every_failure() {
+            let words = failure_words(&failure, &renamed(), audience);
+            if words.kind == "settings" {
+                continue;
+            }
+            // Every message that names the relay says where this copy
+            // connects: by the address alone, or by the name with it.
+            assert!(
+                words.message.contains("192.0.2.1:9970"),
+                "{}: {}",
+                words.kind,
+                words.message
+            );
+            // And what the customer passes on to the technician does too.
+            if words.next.contains("relay.example.org") {
+                assert!(
+                    words
+                        .next
+                        .contains("relay.example.org (reached at 192.0.2.1:9970)"),
+                    "{}: {}",
+                    words.kind,
+                    words.next
+                );
+            }
+            for text in [&words.message, &words.next] {
+                assert!(text.ends_with('.'), "{text:?}");
+                assert!(!text.contains("  "), "{text:?}");
+            }
+        }
+    }
 }
 
 // --- What never leaves this side ---
@@ -601,6 +781,7 @@ fn no_view_and_no_debug_output_holds_the_key() {
             "relay": {
                 "host": "relay.example.org",
                 "address": "relay.example.org:443",
+                "trust": "system_authorities",
                 "keySet": true,
             },
         })

@@ -1180,7 +1180,9 @@ has the relay in **Settings → Relay**; the customer's copy has a
 
 1. **The relay admits this copy.** In **Settings → Relay** press **Test**.
    - Expected: the relay answers and admits this copy, and its certificate is
-     valid for its host name.
+     valid for its host name. The result says what the certificate was
+     checked against, and where the relay was reached when the profile gives
+     its certificate another name than the host of the address.
 2. **The offer.** Start a session (Give help).
    - Expected: the waiting screen shows the connection code of this network
      as before, and under it **Not on the same network?** with the relay's
@@ -1210,8 +1212,10 @@ has the relay in **Settings → Relay**; the customer's copy has a
    - Expected: both sides end at once with their end reports, as on one
      network. The second wait shows another relay code than the first. The
      technician's report and the session history name the relay; the audit
-     log has a record `session_route` with the relay's host name and holds
-     neither the relay code nor an admission key.
+     log has a record `session_route` right after its first line, with the
+     relay's host name, the address the copy connected to and what the
+     certificate was checked against, and holds neither the relay code nor an
+     admission key.
 7. **A code that nobody waits on.** On the customer computer type the first
    relay code again; then, while the technician waits, cancel on the
    technician's side and type the code that was on screen.

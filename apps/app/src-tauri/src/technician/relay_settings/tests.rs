@@ -91,6 +91,7 @@ fn saving_keeps_the_relay_and_the_key_never_comes_back() {
                 "relay": {
                     "host": "relay.example.org",
                     "address": "relay.example.org:443",
+                    "trust": "system_authorities",
                     "keySet": true,
                 },
             },

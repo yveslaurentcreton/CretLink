@@ -50,6 +50,7 @@ use crate::audit::{
     CLEANUP_REPORT_ACTION, SESSION_ENDED_ACTION, SESSION_ROUTE_ACTION, TARGET_IDENTITY_ACTION,
     cleanup_source,
 };
+use crate::state::RelayTrust;
 
 /// Whether an audit file's chain and seal verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +96,15 @@ pub struct SessionSummary {
     /// session on one network (ST-M007-013).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
+    /// Where the technician's copy connected to reach that relay
+    /// (`host:port`), as the audit recorded it. A report shows it beside the
+    /// relay's name when its host is another one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_address: Option<String>,
+    /// What the relay's certificate was checked against, as the audit
+    /// recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_trust: Option<RelayTrust>,
     /// When the session log was opened, RFC 3339 UTC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
@@ -232,6 +242,8 @@ struct SummaryFold {
     hostname: Option<String>,
     os: Option<String>,
     relay: Option<String>,
+    relay_address: Option<String>,
+    relay_trust: Option<RelayTrust>,
     cleanup: Option<CleanupResult>,
     activity: TechnicianActivity,
     seen: HashSet<String>,
@@ -258,7 +270,12 @@ impl SummaryFold {
                 self.hostname = text(record, "hostname");
                 self.os = text(record, "os_version");
             }
-            SESSION_ROUTE_ACTION => self.relay = text(record, "relay_host"),
+            SESSION_ROUTE_ACTION => {
+                self.relay = text(record, "relay_host");
+                self.relay_address = text(record, "relay_address");
+                self.relay_trust =
+                    text(record, "relay_trust").and_then(|name| RelayTrust::parse(&name));
+            }
             SESSION_ENDED_ACTION => {
                 self.ended_by = text(record, "ended_by").and_then(|name| EndedBy::parse(&name));
                 self.ended.clone_from(&stamp);
@@ -348,6 +365,8 @@ impl SummaryFold {
             hostname: self.hostname,
             os: self.os,
             relay: self.relay,
+            relay_address: self.relay_address,
+            relay_trust: self.relay_trust,
             started_at: self.started.map(|(ts, _)| ts),
             ended_at: ended.map(|(ts, _)| ts),
             duration_ms,

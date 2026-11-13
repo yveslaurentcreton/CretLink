@@ -92,20 +92,86 @@ pub struct TechnicianHost {
     pub display_name: Option<String>,
 }
 
+/// What the certificate of a relay is checked against (ST-M007-011).
+///
+/// A screen says so when it is not the system's authorities: a copy whose
+/// relay profile names a certificate file trusts whoever made that file, and
+/// the person at the screen should know that the name they read is vouched
+/// for by that file and by nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayTrust {
+    /// The certificate authorities of the computer.
+    #[default]
+    SystemAuthorities,
+    /// The certificate file that the relay profile names, and nothing else.
+    ProfileFile,
+}
+
+impl RelayTrust {
+    /// The name of this kind of trust in an audit record and in the state a
+    /// window gets.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SystemAuthorities => "system_authorities",
+            Self::ProfileFile => "profile_file",
+        }
+    }
+
+    /// Reads a name written by [`Self::as_str`].
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        [Self::SystemAuthorities, Self::ProfileFile]
+            .into_iter()
+            .find(|trust| trust.as_str() == name)
+    }
+}
+
 /// The relay a session waits on or runs through (ST-M007-013, ADR-0016).
 ///
 /// A label for the screens and nothing else: the relay only passes the
 /// end-to-end encrypted session on, and no transition of this model depends
 /// on it.
+///
+/// The label is more than a name. A relay profile can give the relay a name
+/// that differs from the host it connects to, and a certificate file of its
+/// own to check that name against; whoever can write the profile could then
+/// give a server of their own the name of another relay. So a screen that
+/// names the relay also shows where the copy connects when that differs from
+/// the name, and says when the certificate is checked against a file of the
+/// profile ([`Self::address`], [`Self::trust`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayRoute {
-    /// The relay's host name: the name its certificate carries, as both
-    /// people are shown it.
+    /// The relay's host name: the name its certificate carries.
     pub host: String,
+    /// Where this copy connects to reach the relay: `host:port`, an IPv6
+    /// address in square brackets. Its host is [`Self::host`] unless the
+    /// profile gives the certificate another name.
+    #[serde(default)]
+    pub address: String,
+    /// What the relay's certificate is checked against.
+    #[serde(default)]
+    pub trust: RelayTrust,
     /// Whether the relay has taken this console's waiting connection in.
     /// `false` while the relay is still being reached; `true` once it holds
     /// the rendezvous that the customer's relay code leads to.
+    #[serde(default)]
     pub admitted: bool,
+}
+
+impl RelayRoute {
+    /// A relay that is not reached yet: its name, where this copy connects,
+    /// and what its certificate is checked against.
+    #[must_use]
+    pub fn new(host: impl Into<String>, address: impl Into<String>, trust: RelayTrust) -> Self {
+        Self {
+            host: host.into(),
+            address: address.into(),
+            trust,
+            admitted: false,
+        }
+    }
 }
 
 /// How a target came to be known to the console.
@@ -469,11 +535,12 @@ impl ConsoleState {
     }
 
     /// Begins waiting for the customer on a relay (ST-M007-013): the console
-    /// reaches out to the relay `host` at `address` and keeps the rendezvous
-    /// of `code`, the relay code the technician reads aloud, open there. Like
-    /// [`Self::listen`] it clears what an earlier session left, shows no
-    /// target, and confers no authority: the relay only lets the two
-    /// connections find each other (ADR-0016 §2).
+    /// reaches out to `relay` and keeps the rendezvous of `code`, the relay
+    /// code the technician reads aloud, open there. Like [`Self::listen`] it
+    /// clears what an earlier session left, shows no target, and confers no
+    /// authority: the relay only lets the two connections find each other
+    /// (ADR-0016 §2). The relay is not reached yet: it starts as one that has
+    /// not taken the waiting connection in.
     ///
     /// # Errors
     ///
@@ -481,13 +548,12 @@ impl ConsoleState {
     pub fn listen_on_relay(
         &mut self,
         code: impl Into<String>,
-        host: impl Into<String>,
-        address: impl Into<String>,
+        relay: RelayRoute,
     ) -> Result<(), StateError> {
-        self.listen(code, address)?;
+        self.listen(code, relay.address.clone())?;
         self.relay = Some(RelayRoute {
-            host: host.into(),
             admitted: false,
+            ..relay
         });
         Ok(())
     }
@@ -1087,6 +1153,16 @@ mod tests {
 
     // --- A relay (ST-M007-013) ---
 
+    /// A relay whose certificate carries another name than the host it is
+    /// reached at, checked against a certificate file of the profile.
+    fn sample_relay() -> RelayRoute {
+        RelayRoute::new(
+            "relay.example.org",
+            "192.0.2.1:443",
+            RelayTrust::ProfileFile,
+        )
+    }
+
     #[test]
     fn waiting_on_a_relay_names_the_relay_and_says_when_it_holds_the_rendezvous() {
         let mut state = ConsoleState::new(technician());
@@ -1095,7 +1171,7 @@ mod tests {
         assert!(!state.relay_admitted());
 
         state
-            .listen_on_relay("53ST-A71D-JKKV-0VGH", "relay.example.org", "192.0.2.1:443")
+            .listen_on_relay("53ST-A71D-JKKV-0VGH", sample_relay())
             .unwrap();
         assert_eq!(
             state.phase,
@@ -1108,9 +1184,24 @@ mod tests {
             state.relay,
             Some(RelayRoute {
                 host: "relay.example.org".to_string(),
+                address: "192.0.2.1:443".to_string(),
+                trust: RelayTrust::ProfileFile,
                 admitted: false,
             })
         );
+        // A relay that was said to be admitted starts as one that is not:
+        // only this console's own waiting connection says so.
+        let mut again = ConsoleState::new(technician());
+        again
+            .listen_on_relay(
+                "53ST-A71D-JKKV-0VGH",
+                RelayRoute {
+                    admitted: true,
+                    ..sample_relay()
+                },
+            )
+            .unwrap();
+        assert!(!again.relay.unwrap().admitted);
         // No authority, and no target that could be selected.
         assert_eq!(state.control_level(), ControlLevel::None);
         assert!(state.targets.is_empty());
@@ -1125,7 +1216,7 @@ mod tests {
     fn a_session_through_a_relay_takes_every_step_of_one_on_a_network() {
         let mut state = ConsoleState::new(technician());
         state
-            .listen_on_relay("53ST-A71D-JKKV-0VGH", "relay.example.org", "192.0.2.1:443")
+            .listen_on_relay("53ST-A71D-JKKV-0VGH", sample_relay())
             .unwrap();
         state.relay_admitted();
         let id = TargetId::new();
@@ -1166,7 +1257,7 @@ mod tests {
     fn a_failure_can_say_what_to_do_next() {
         let mut state = ConsoleState::new(technician());
         state
-            .listen_on_relay("53ST-A71D-JKKV-0VGH", "relay.example.org", "192.0.2.1:443")
+            .listen_on_relay("53ST-A71D-JKKV-0VGH", sample_relay())
             .unwrap();
         state.fail_with_next(
             "relay_unreachable",
@@ -1217,7 +1308,7 @@ mod tests {
         state.select(ids[0]).unwrap();
         state.begin_connect().unwrap();
         assert!(matches!(
-            state.listen_on_relay("53ST-A71D-JKKV-0VGH", "relay.example.org", "192.0.2.1:443"),
+            state.listen_on_relay("53ST-A71D-JKKV-0VGH", sample_relay()),
             Err(StateError::InvalidTransition { .. })
         ));
         assert_eq!(state.relay, None);
@@ -1228,12 +1319,26 @@ mod tests {
         let mut state = ConsoleState::new(technician());
         assert!(serde_json::to_value(&state).unwrap().get("relay").is_none());
         state
-            .listen_on_relay("53ST-A71D-JKKV-0VGH", "relay.example.org", "192.0.2.1:443")
+            .listen_on_relay("53ST-A71D-JKKV-0VGH", sample_relay())
             .unwrap();
         assert_eq!(
             serde_json::to_value(&state).unwrap()["relay"],
-            serde_json::json!({ "host": "relay.example.org", "admitted": false })
+            serde_json::json!({
+                "host": "relay.example.org",
+                "address": "192.0.2.1:443",
+                "trust": "profile_file",
+                "admitted": false,
+            })
         );
+        // Every kind of trust has a name that is read back.
+        for trust in [RelayTrust::SystemAuthorities, RelayTrust::ProfileFile] {
+            assert_eq!(RelayTrust::parse(trust.as_str()), Some(trust));
+            assert_eq!(
+                serde_json::to_value(trust).unwrap(),
+                serde_json::json!(trust.as_str())
+            );
+        }
+        assert_eq!(RelayTrust::parse("anything else"), None);
         // A state from before this field is read without it.
         let old: ConsoleState = serde_json::from_value(serde_json::json!({
             "technician": { "label": "x", "hostname": "TECH-LAPTOP", "os": "Windows 11" },

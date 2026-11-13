@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-use cretlink_console::{ConsoleState, SessionPhase, StopReason};
+use cretlink_console::{ConsoleState, RelayRoute, RelayTrust, SessionPhase, StopReason};
 use cretlink_discovery::RelayCode;
 use cretlink_mcp::{DownloadParams, ExecParams, TargetError, UploadParams};
 use cretlink_protocol::{CleanupPolicy, JobOutcome, RemotePath, Shell};
@@ -98,14 +98,36 @@ fn relay_holds_the_code(state: &ConsoleState) -> bool {
         && state.relay.as_ref().is_some_and(|relay| relay.admitted)
 }
 
-fn through_the_test_relay() -> Option<RelayUseView> {
+/// The test relay as the customer's window names it. The profile of the
+/// tests reaches it by its loopback address, gives the name of its
+/// certificate and names that certificate as its authority file: the window
+/// says all three.
+fn through(relay: &TestRelay) -> Option<RelayUseView> {
     Some(RelayUseView {
         host: RELAY_NAME.to_owned(),
+        address: relay.addr.to_string(),
+        trust: RelayTrust::ProfileFile,
     })
 }
 
 fn relay_of(state: &ConsoleState) -> Option<&str> {
     state.relay.as_ref().map(|relay| relay.host.as_str())
+}
+
+/// The test relay as the technician's state names it, apart from whether
+/// the relay holds the code yet: its name, where the copy connects, and the
+/// certificate file of the profile that vouches for the name.
+fn route_of(relay: &TestRelay) -> RelayRoute {
+    RelayRoute::new(RELAY_NAME, relay.addr.to_string(), RelayTrust::ProfileFile)
+}
+
+/// The action of every record of an audit trail, in the order written.
+fn actions_of(trail: &str) -> Vec<String> {
+    trail
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|record| record["action"].as_str().map(str::to_owned))
+        .collect()
 }
 
 fn failed_at(view: &ConsentView) -> Option<(String, String)> {
@@ -204,6 +226,10 @@ async fn a_relay_code_leads_to_a_session_like_on_one_network_and_the_technician_
         unreachable!();
     };
     assert_eq!(address, &relay.addr.to_string());
+    // The name is not all the screen is given: the copy connects to another
+    // host than the name says, and a certificate file of the profile vouches
+    // for the name. The state says both, from the first moment.
+    assert_eq!(waiting.relay, Some(route_of(&relay)));
     assert!(RelayCode::parse(&code).is_ok(), "{code}");
     assert_eq!(code.len(), 19, "four groups of four: {code}");
     assert!(waiting.targets.is_empty());
@@ -217,7 +243,7 @@ async fn a_relay_code_leads_to_a_session_like_on_one_network_and_the_technician_
     // Before anything is typed, the customer's window names the relay this
     // copy is set up for, and no session exists.
     let resting = customer.view();
-    assert_eq!(resting.relay_of_copy, through_the_test_relay());
+    assert_eq!(resting.relay_of_copy, through(&relay));
     assert_eq!(resting.relay, None);
     assert!(!resting.session_active);
 
@@ -225,7 +251,7 @@ async fn a_relay_code_leads_to_a_session_like_on_one_network_and_the_technician_
     let typed = code.to_lowercase().replace('-', " ");
     let reaching = customer.connect(&typed).expect("the code is taken");
     // From the first moment the window says which relay this goes through.
-    assert_eq!(reaching.relay, through_the_test_relay());
+    assert_eq!(reaching.relay, through(&relay));
     assert!(reaching.session_active);
     assert!(!reaching.status.control_active);
 
@@ -251,7 +277,7 @@ async fn a_relay_code_leads_to_a_session_like_on_one_network_and_the_technician_
     );
     assert_ne!(approval, &code);
     assert_eq!(relay_of(&on_console), Some(RELAY_NAME));
-    assert_eq!(on_customer.relay, through_the_test_relay());
+    assert_eq!(on_customer.relay, through(&relay));
     // Connected through the relay, and nobody has control: the relay grants
     // nothing, and no relay is offered again while a customer is connected.
     assert!(!on_console.can_issue_actions());
@@ -284,8 +310,14 @@ async fn a_relay_code_leads_to_a_session_like_on_one_network_and_the_technician_
         .wait_for("full control", |view| view.status.control_active)
         .await;
     assert!(live.can_issue_actions());
-    assert_eq!(relay_of(&live), Some(RELAY_NAME));
-    assert_eq!(under_control.relay, through_the_test_relay());
+    assert_eq!(
+        live.relay,
+        Some(RelayRoute {
+            admitted: true,
+            ..route_of(&relay)
+        })
+    );
+    assert_eq!(under_control.relay, through(&relay));
 
     // A command, through the relay.
     let service = technician.service().await;
@@ -374,7 +406,7 @@ async fn a_relay_code_leads_to_a_session_like_on_one_network_and_the_technician_
     );
     assert!(!ended.status.control_active);
     // The end still says which way the session went.
-    assert_eq!(ended.relay, through_the_test_relay());
+    assert_eq!(ended.relay, through(&relay));
     technician.finished().await;
     customer.settled().await;
     let console = technician.console();
@@ -392,13 +424,43 @@ async fn a_relay_code_leads_to_a_session_like_on_one_network_and_the_technician_
         Err(TargetError::NoConsentedSession)
     ));
 
-    // The audit records the relay; the session's history names it.
+    // The audit records the relay; the session's history names it, with
+    // where the copy connected and what vouched for the name.
     let summary = technician.sealed_session().await;
     assert_eq!(summary.relay.as_deref(), Some(RELAY_NAME));
+    assert_eq!(summary.relay_address, Some(relay.addr.to_string()));
+    assert_eq!(summary.relay_trust, Some(RelayTrust::ProfileFile));
     assert_eq!(summary.ended_by, Some(EndedBy::Technician));
     let trail = technician.audit_text();
-    assert!(trail.contains("session_route"), "{trail}");
-    assert!(trail.contains("consent_granted"), "{trail}");
+    // Which way the session goes is the first thing the trail says of it:
+    // right after the line that opens the log, and before pairing, the
+    // approval code and the consent.
+    let actions = actions_of(&trail);
+    assert_eq!(
+        actions.get(..2),
+        Some(&["session_opened".to_owned(), "session_route".to_owned()][..]),
+        "{actions:?}"
+    );
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| *action == "session_route")
+            .count(),
+        1,
+        "{actions:?}"
+    );
+    assert!(actions.iter().any(|action| action == "consent_granted"));
+    let route: serde_json::Value = serde_json::from_str(trail.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(
+        route["args"],
+        serde_json::json!({
+            "transport": { "string": "relay" },
+            "relay_host": { "string": RELAY_NAME },
+            "relay_address": { "string": relay.addr.to_string() },
+            "relay_trust": { "string": "profile_file" },
+        }),
+        "{route}"
+    );
     // Neither a key nor the relay code is in the trail.
     for secret in [TECHNICIAN_KEY, CUSTOMER_KEY, &code, &code.replace('-', "")] {
         assert!(!trail.contains(secret), "the audit trail holds {secret}");
@@ -441,7 +503,7 @@ async fn the_customer_stops_a_session_through_the_relay() {
     let view = customer.view();
     assert!(!view.status.control_active);
     assert!(!view.session_active);
-    assert_eq!(view.relay, through_the_test_relay());
+    assert_eq!(view.relay, through(&relay));
     let summary = technician.sealed_session().await;
     assert_eq!(summary.ended_by, Some(EndedBy::Customer));
     assert_eq!(summary.relay.as_deref(), Some(RELAY_NAME));
@@ -496,7 +558,7 @@ async fn a_relay_that_stops_in_the_middle_ends_the_session_on_both_sides() {
         view.status.phase
     );
     assert!(!view.status.control_active);
-    assert_eq!(view.relay, through_the_test_relay());
+    assert_eq!(view.relay, through(&relay));
 
     // Nothing reconnects by itself: both tasks have ended, no session exists,
     // and the handle of the lost session does nothing.
@@ -585,7 +647,7 @@ async fn a_code_that_nobody_waits_on_is_said_and_a_code_leads_to_one_session_onl
         .await;
     let (stage, _) = failed_at(&view).unwrap();
     assert_eq!(stage, "rendezvous");
-    assert_eq!(view.relay, through_the_test_relay());
+    assert_eq!(view.relay, through(&relay));
     assert!(!view.session_active);
     nobody.settled().await;
 
@@ -765,7 +827,7 @@ async fn a_key_the_relay_does_not_know_is_said_on_either_side() {
     assert!(message.contains(RELAY_NAME), "{message}");
     let next = view.failure_next.clone().expect("a next step");
     assert!(next.contains("technician"), "{next}");
-    assert_eq!(view.relay, through_the_test_relay());
+    assert_eq!(view.relay, through(&relay));
     customer.settled().await;
     let shown = format!("{:?}", customer.rendered());
     assert!(!shown.contains(UNKNOWN_KEY), "{shown}");
@@ -788,7 +850,14 @@ async fn a_certificate_that_is_not_trusted_is_said_on_either_side_and_nothing_is
         .await;
     let (stage, message, next) = console_failure(&failed).unwrap();
     assert_eq!(stage, "relay_untrusted");
-    assert!(message.contains("trusts"), "{message}");
+    assert!(message.contains("vouches for"), "{message}");
+    // The words say what the certificate was checked against, and where the
+    // copy connected.
+    assert!(
+        message.contains("not against the certificate authorities of this computer"),
+        "{message}"
+    );
+    assert!(message.contains(&relay.addr.to_string()), "{message}");
     assert!(next.is_some());
     technician.finished().await;
 

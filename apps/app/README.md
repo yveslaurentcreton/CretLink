@@ -211,12 +211,23 @@ cannot be used is said with its file (`relayOffer` in
 | `use_relay` | only while waiting on a network: stops the listener, waits until it is gone, draws a new relay code and waits on the relay of this copy. Answers the waiting state; rejects with the stage `relay_none` or `relay_profile` when this copy has no relay that can be used |
 
 - The waiting state is the `listening` phase with `ConsoleState.relay`
-  (`RelayRoute { host, admitted }`): `code` is the relay code to read out,
-  `address` where the relay is reached, and `admitted` whether the relay
-  holds the code yet. The screen shows the relay's host name, the code in
-  four outlined groups with **Copy**, and the state in words; **Cancel**
-  (`Escape`) ends it. The relay code is named a relay code and drawn unlike
-  the connection code and the approval code.
+  (`RelayRoute { host, address, trust, admitted }`): `code` is the relay code
+  to read out, `address` where the relay is reached, and `admitted` whether
+  the relay holds the code yet. The screen shows the relay's host name, the
+  code in four outlined groups with **Copy**, and the state in words;
+  **Cancel** (`Escape`) ends it. The relay code is named a relay code and
+  drawn unlike the connection code and the approval code.
+- **A relay is named with where it is reached and what vouches for its
+  name** (`src/shared/relay.ts` for both windows, `relay::named` for the
+  backend's sentences). A profile can give the relay a name that differs
+  from the host it connects to, with a certificate file of its own; whoever
+  can write the profile could give a server of their own the name of another
+  relay. So every screen and every sentence that names a relay shows the
+  address beside the name when its host is another one, and says when the
+  certificate is checked against a file of the profile (`trust:
+  "profile_file"`) and not against the system's authorities. The waiting
+  screen of the installed copy also says when the relay comes from the file
+  next to the program and not from Settings (`relayFromFile`).
 - The wait runs in the session's own task
   (`src-tauri/src/technician/session_task.rs`), because a session handle
   exists only once the customer is heard: `WaitingDial` keeps the rendezvous
@@ -227,14 +238,18 @@ cannot be used is said with its file (`relayOffer` in
   the console waits again. Compare, consent, the live session and the end
   report each say **Through the relay** with the host name. No transition of
   the console state reads it. The audit gets a record `session_route` with
-  the relay's host name before the records of pairing and consent, and
-  `SessionSummary.relay` carries it into the history.
+  the relay's host name, the address the copy connected to and the kind of
+  trust, right after the line that opens the log and before the records of
+  pairing and consent; `SessionSummary.relay`, `relayAddress` and
+  `relayTrust` carry them into the history.
 
 **Get help.** The code field (`#c-find`) takes a connection code, an address
 and a relay code and tells them apart (`customer::typed_target`). In a copy
 with a profile that can be used, a line under the field names the relay a
-relay code would connect through (`ConsentView.relay_of_copy`), so the
-customer sees its host name before connecting. A relay
+relay code would connect through (`ConsentView.relay_of_copy`:
+`RelayUseView { host, address, trust }`), so the customer sees its host
+name, where the copy would connect and what vouches for the name before
+connecting. A relay
 code joins the rendezvous on the relay of the profile next to the program
 (`JoiningDial`), which gives the technician ten seconds to be heard. The
 connecting screen then reads **Connecting through the relay** with the

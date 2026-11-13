@@ -281,6 +281,8 @@ mod tests {
             hostname: None,
             os: None,
             relay: None,
+            relay_address: None,
+            relay_trust: None,
             started_at: None,
             ended_at: None,
             duration_ms: None,

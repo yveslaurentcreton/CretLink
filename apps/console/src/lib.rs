@@ -65,6 +65,6 @@ pub use service::{
 };
 pub use session::{ExecCollection, ExecRequest, SessionClient, SessionError, SessionTarget};
 pub use state::{
-    ConsoleState, ControlLevel, DiscoveredTarget, DiscoverySource, RelayRoute, SessionPhase,
-    StateError, StopReason, TargetId, TechnicianHost,
+    ConsoleState, ControlLevel, DiscoveredTarget, DiscoverySource, RelayRoute, RelayTrust,
+    SessionPhase, StateError, StopReason, TargetId, TechnicianHost,
 };

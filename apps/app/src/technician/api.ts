@@ -25,6 +25,7 @@ import type {
   RelayForm,
   RelaySettings,
   RelayTest,
+  RelayTrust,
   SessionSummary,
   TransferCheck,
   TransferEntry,
@@ -95,8 +96,16 @@ export type SessionPhase =
 // the `listening` phase with a relay, `code` is the relay code the technician
 // reads aloud and `address` is where the relay is reached; `admitted` says
 // whether the relay holds that code yet.
+//
+// `host` is the name the relay's certificate carries, `address` is where
+// this copy connects, and `trust` is what vouches for the name. A screen
+// shows the address beside the name when its host is another one, and says
+// when the certificate is checked against a file of the profile
+// (`shared/relay.ts`).
 export interface RelayRoute {
   host: string;
+  address: string;
+  trust: RelayTrust;
   admitted: boolean;
 }
 

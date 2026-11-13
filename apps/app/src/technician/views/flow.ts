@@ -12,6 +12,7 @@
 
 import { type Child, h } from "../../shared/dom";
 import { icon } from "../../shared/icons";
+import { relayLabel, relayWords, trustNote, viaRelay } from "../../shared/relay";
 import { type RelayRoute, selectedIsSimulated } from "../api";
 import { DISCLOSURE_TEXT } from "../disclosure";
 import type { ListenNetwork } from "../../shared/contract";
@@ -22,6 +23,7 @@ import {
   groupCode,
   otherNetworks,
   relayCodeGroups,
+  relayFromFile,
   relayOffer,
   spokenCode,
   targetName,
@@ -124,18 +126,18 @@ function networkChoice(s: TechnicianSnapshot): HTMLElement | null {
 }
 
 /**
- * That the session runs through a relay, and through which: on every screen
- * from the comparison of the approval code to the end (ST-M007-013). The
- * relay passes the encrypted session on; it grants nothing.
+ * That the installed copy takes its relay from the file next to the program
+ * and not from Settings (ST-M007-011): whoever can write next to the program
+ * chose this relay, so the waiting screen says where it comes from.
  */
-export function viaRelay(relay: RelayRoute | undefined): HTMLElement | null {
-  if (!relay) return null;
+function fromFileNote(file: string | undefined): HTMLElement | null {
+  if (file === undefined) return null;
   return h(
-    "p",
-    { class: "via-relay", "data-key": "via-relay" },
-    icon("wifi", "sm"),
-    h("span", null, "Through the relay ", h("b", { class: "mono" }, relay.host)),
-    h("span", { class: "muted" }, " · it only passes encrypted traffic on"),
+    "span",
+    { class: "relay-source", "data-key": "relay-source" },
+    "This relay comes from the file ",
+    h("span", { class: "mono" }, file),
+    " next to the program, not from Settings.",
   );
 }
 
@@ -152,13 +154,18 @@ function relayOfferCard(s: TechnicianSnapshot): HTMLElement {
     case "ready":
       text = [
         "Use your relay ",
-        h("b", { class: "mono" }, offer.host),
+        relayLabel(offer.relay),
         ". It only passes encrypted traffic on and cannot look into the session.",
+        // What vouches for the relay's name, when it is not the system's
+        // authorities, and where the relay comes from, when it is not
+        // Settings.
+        trustNote(offer.relay),
+        fromFileNote(offer.fromFile),
       ];
       action = button("Use relay…", "use-relay", {
         id: "use-relay",
         disabled: busy,
-        label: `Use the relay ${offer.host}`,
+        label: `Use the relay ${relayWords(offer.relay)}`,
       });
       break;
     case "problem":
@@ -198,6 +205,14 @@ function relayOfferCard(s: TechnicianSnapshot): HTMLElement {
     ),
     action,
   );
+}
+
+/** The trust and the source of the relay that is waited on, when there is something to say. */
+function relayFacts(relay: RelayRoute, fromFile: string | undefined): HTMLElement | null {
+  const trust = trustNote(relay);
+  const source = fromFileNote(fromFile);
+  if (!trust && !source) return null;
+  return h("p", { class: "muted relay-facts", id: "relay-facts" }, trust, source);
 }
 
 // Waiting on the relay (ST-M007-013): the relay's host name, the relay code
@@ -244,7 +259,7 @@ function relayWaitView(s: TechnicianSnapshot, relay: RelayRoute): HTMLElement {
         "p",
         { class: "muted conn-addr" },
         "Relay ",
-        h("b", { class: "mono", id: "relay-host" }, relay.host),
+        h("span", { id: "relay-host" }, relayLabel(relay)),
         " · ",
         h(
           "button",
@@ -258,12 +273,15 @@ function relayWaitView(s: TechnicianSnapshot, relay: RelayRoute): HTMLElement {
           "Copy",
         ),
       ),
+      // What vouches for the relay's name, and where the relay comes from,
+      // when either is not what a technician expects (ST-M007-011).
+      relayFacts(relay, relayFromFile(s.relay)),
       h(
         "p",
         { class: "relay-state", id: "relay-state", role: "status" },
         relay.admitted
           ? "The relay holds this code. It works once, for as long as this screen is open."
-          : `Connecting to the relay ${relay.host}…`,
+          : `Connecting to the relay ${relayWords(relay)}…`,
       ),
       h(
         "p",

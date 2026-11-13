@@ -57,7 +57,25 @@ export const SESSION_ID = "7f3a9c51d2e84b6a";
 export const RELAY_CODE = "53ST-A71D-JKKV-0VGH";
 
 /** The relay of the fixtures, holding the code of a waiting session. */
-export const VIA_RELAY: RelayRoute = { host: "relay.example.org", admitted: true };
+export const VIA_RELAY: RelayRoute = {
+  host: "relay.example.org",
+  address: "relay.example.org:443",
+  trust: "system_authorities",
+  admitted: true,
+};
+
+/**
+ * A relay whose certificate carries another name than the host this copy
+ * connects to, checked against a certificate file of the profile: the screens
+ * then show the address beside the name and say what vouches for the name
+ * (ST-M007-011).
+ */
+export const VIA_RELAY_ELSEWHERE: RelayRoute = {
+  host: "relay.example.org",
+  address: "192.0.2.1:9970",
+  trust: "profile_file",
+  admitted: true,
+};
 
 export function consoleIn(
   phase: SessionPhase,
@@ -133,6 +151,7 @@ export const APP_RUN_ONCE: AppInfo = {
 export const RELAY: RelayView = {
   host: "relay.example.org",
   address: "relay.example.org:443",
+  trust: "system_authorities",
   keySet: true,
 };
 
@@ -140,6 +159,7 @@ export const RELAY: RelayView = {
 export const RELAY_PRIVATE: RelayView = {
   host: "host-01.example.org",
   address: "192.0.2.1:9970",
+  trust: "profile_file",
   keySet: false,
   ca: "relay-ca.pem",
   name: "host-01.example.org",
@@ -911,6 +931,19 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
     ),
     relay: RELAY_STORED,
   },
+  // The installed copy takes its relay from the file next to the program,
+  // and that relay is reached at another host than its name says and checked
+  // against a certificate file of the profile (ST-M007-011): the offer says
+  // all three.
+  "wait-relay-file": {
+    ...base(
+      consoleIn(
+        { phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" },
+        { displayName: "Sam" },
+      ),
+    ),
+    relay: RELAY_FILE,
+  },
   "wait-relay-problem": {
     ...base(consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" })),
     relay: RELAY_FILE_PROBLEM,
@@ -948,6 +981,17 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
       ),
     ),
     relay: RELAY_STORED,
+  },
+  // The same wait on a relay that the profile file next to the program
+  // names otherwise than the host it connects to.
+  "relay-wait-elsewhere": {
+    ...base(
+      consoleIn(
+        { phase: "listening", code: RELAY_CODE, address: "192.0.2.1:9970" },
+        { displayName: "Sam", relay: VIA_RELAY_ELSEWHERE },
+      ),
+    ),
+    relay: RELAY_FILE,
   },
   // A relay that could not be used: each failure with its own words.
   "relay-failed-unreachable": {
@@ -1032,6 +1076,44 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
     ),
     activity: FEED,
     last: { id: SESSION_ID, target: TARGET, since: NOW - minutes(28) },
+  },
+  // A session through a relay that is reached at another host than its name
+  // says, and checked against a certificate file of the profile: every
+  // screen shows the address beside the name and says what vouches for it.
+  "relay-compare-elsewhere": base(
+    consoleIn(
+      { phase: "awaiting_approval_code", code: "482913" },
+      { session: true, target: true, relay: VIA_RELAY_ELSEWHERE },
+    ),
+  ),
+  "relay-live-elsewhere": {
+    ...base(
+      consoleIn(
+        { phase: "full_control" },
+        { session: true, target: true, displayName: "Sam", relay: VIA_RELAY_ELSEWHERE },
+      ),
+    ),
+    activity: FEED,
+    last: { id: SESSION_ID, target: TARGET, since: NOW - minutes(28) },
+  },
+  "relay-end-elsewhere": {
+    ...base(
+      consoleIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY_ELSEWHERE }),
+    ),
+    sessions: [
+      {
+        ...SUMMARY_UNKNOWN,
+        id: SESSION_ID,
+        hostname: "ACME-PC-07",
+        endedAt: iso(NOW),
+        relay: "relay.example.org",
+        relayAddress: "192.0.2.1:9970",
+        relayTrust: "profile_file",
+      },
+      ...SESSIONS,
+    ],
+    activity: FEED,
+    last: { ...last, reason: "disconnected" },
   },
   "relay-end": {
     ...base(consoleIn({ phase: "stopped", reason: "technician_requested" }, { relay: VIA_RELAY })),
@@ -1351,7 +1433,14 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
       source: "file",
       file: {
         path: `C:\\${XSS_NAME}\\cretlink.toml`,
-        relay: { host: XSS, address: XSS, keySet: true, ca: XSS, name: XSS },
+        relay: {
+          host: XSS,
+          address: XSS,
+          trust: "profile_file",
+          keySet: true,
+          ca: XSS,
+          name: XSS,
+        },
       },
       stored: {
         path: SETTINGS_PATH,

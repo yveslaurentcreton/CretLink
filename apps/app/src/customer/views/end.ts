@@ -9,15 +9,17 @@ import type { CleanupNote, CleanupResult, CustomerReport, EndedBy } from "../../
 import { h } from "../../shared/dom";
 import { plural } from "../../shared/feed";
 import { icon } from "../../shared/icons";
+import { viaRelay } from "../../shared/relay";
 import {
   type CustomerSnapshot,
   capName,
   liveCounts,
-  relayHost,
   relayLostWords,
+  relayNamed,
+  sessionRelay,
   technicianName,
 } from "../model";
-import { button, viaRelay } from "./common";
+import { button } from "./common";
 
 export function endHeading(endedBy: EndedBy | undefined, name: string): string {
   switch (endedBy) {
@@ -159,13 +161,13 @@ function record(s: CustomerSnapshot, report: CustomerReport | null): HTMLElement
  * relay, and that nothing connects again by itself (ST-M007-013).
  */
 function relayLost(s: CustomerSnapshot): HTMLElement | null {
-  const host = relayHost(s);
+  const relay = relayNamed(s);
   const phase = s.view?.status.phase;
   const lost =
     s.report?.endedBy === "connection_lost" ||
     (phase?.phase === "stopped" && phase.reason === "disconnected");
-  if (!host || !lost) return null;
-  const words = relayLostWords(host);
+  if (!relay || !lost) return null;
+  const words = relayLostWords(relay);
   return h(
     "p",
     { class: "note relay-lost", role: "note", "data-key": "relay-lost" },
@@ -190,7 +192,7 @@ export function endView(s: CustomerSnapshot): HTMLElement[] {
           { class: "lead" },
           `${capName(name)} can no longer reach this computer. A new session needs a new code and your permission again.`,
         ),
-        viaRelay(relayHost(s)),
+        viaRelay(sessionRelay(s)),
       ),
       relayLost(s),
       stats(s, report),
