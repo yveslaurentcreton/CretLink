@@ -53,6 +53,22 @@ export function band(b: Band, since?: Child): HTMLElement {
   );
 }
 
+/**
+ * That the session runs through a relay, and through which: on every screen
+ * from the comparison of the code to the end (ST-M007-013). The relay passes
+ * the encrypted session on; it cannot look inside.
+ */
+export function viaRelay(host: string | undefined): HTMLElement | null {
+  if (!host) return null;
+  return h(
+    "p",
+    { class: "via-relay", "data-key": "via-relay" },
+    icon("wifi", "sm"),
+    h("span", null, "Through the relay ", h("b", { class: "mono" }, host)),
+    h("span", { class: "muted" }, " · it only passes encrypted traffic on"),
+  );
+}
+
 /** The footer of the screens before a session. */
 export function nothingInstalled(): HTMLElement {
   return h(

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CretLink relay code, customer (dev)</title>
+  </head>
+  <body>
+    <!-- Development only (ST-M007-013): the customer's window with a copy,
+         a relay and a technician that are held in memory, with Tauri
+         replaced by its own mocks. The real controller and views run;
+         nothing is read, written or dialled. Not part of the production
+         build, which builds only ../index.html. Serve with `npx vite` and
+         open /dev/relay-customer.html, then type a relay code such as
+         53ST-A71D-JKKV-0VGH. `?copy=` picks the copy (relay, none,
+         problem), `?outcome=` what comes of the code (pair, nobody,
+         unreachable, untrusted, key, lost). -->
+    <div id="app" aria-busy="true"></div>
+    <script type="module" src="./relay-customer.ts"></script>
+  </body>
+</html>

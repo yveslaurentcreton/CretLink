@@ -217,6 +217,56 @@ fn a_full_session_is_summarized_from_its_records() {
 }
 
 #[test]
+fn a_session_through_a_relay_names_the_relay_and_one_on_a_network_names_none() {
+    let dir = temp_dir("relay");
+    // On one network there is no route record, and the summary names no relay.
+    let lan = SessionId::new();
+    let on_a_network = read_session(&write_session(&dir, T0, lan, full_session(lan), true));
+    assert_eq!(on_a_network.relay, None);
+    assert!(
+        serde_json::to_value(&on_a_network)
+            .unwrap()
+            .get("relay")
+            .is_none()
+    );
+
+    // Through a relay the record stands before pairing and consent.
+    let relayed = SessionId::new();
+    let mut entries = vec![crate::audit::relay_route_entry("relay.example.org")];
+    entries.extend(full_session(relayed));
+    let through = read_session(&write_session(&dir, T0 + 60_000, relayed, entries, true));
+    assert_eq!(through.relay.as_deref(), Some("relay.example.org"));
+    assert_eq!(
+        serde_json::to_value(&through).unwrap()["relay"],
+        "relay.example.org"
+    );
+    // It is where the session travelled, and no action on the customer
+    // computer: everything else of the summary is what it is on one network.
+    assert_eq!(through.actions, on_a_network.actions);
+    assert_eq!(through.failures, on_a_network.failures);
+    assert_eq!(through.ended_by, on_a_network.ended_by);
+    assert_eq!(through.cleanup, on_a_network.cleanup);
+    assert_eq!(through.hostname, on_a_network.hostname);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_route_record_holds_the_transport_and_the_host_and_nothing_else() {
+    let entry = crate::audit::relay_route_entry("relay.example.org");
+    assert_eq!(entry.actor, Actor::Console);
+    assert_eq!(entry.action, crate::audit::SESSION_ROUTE_ACTION);
+    assert_eq!(entry.outcome, Outcome::Ok);
+    assert_eq!(
+        serde_json::to_value(&entry.args).unwrap(),
+        serde_json::json!({
+            "transport": { "string": "relay" },
+            "relay_host": { "string": "relay.example.org" },
+        })
+    );
+    assert!(entry.digests.is_empty());
+}
+
+#[test]
 fn several_sessions_are_listed_newest_first() {
     let dir = temp_dir("several");
     let ids: Vec<SessionId> = (0..3).map(|_| SessionId::new()).collect();

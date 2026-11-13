@@ -13,6 +13,7 @@ import type {
   AppInfo,
   AuditEntryView,
   BridgeStatus,
+  ChosenCa,
   ChosenFolder,
   ClientId,
   ConflictChoice,
@@ -21,6 +22,9 @@ import type {
   ExplorerEntryKind,
   ExplorerListing,
   ListenNetwork,
+  RelayForm,
+  RelaySettings,
+  RelayTest,
   SessionSummary,
   TransferCheck,
   TransferEntry,
@@ -81,13 +85,29 @@ export type SessionPhase =
   | { phase: "full_control" }
   | { phase: "stopping" }
   | { phase: "stopped"; reason: StopReason }
-  | { phase: "failed"; stage: string; message: string };
+  // `next` is what to do about the failure, when the failure has a next step
+  // of its own (ST-M007-013): a relay that cannot be reached is put right in
+  // another way than a key the relay refuses.
+  | { phase: "failed"; stage: string; message: string; next?: string };
+
+// The relay a session waits on or runs through (ST-M007-013, ADR-0016). A
+// label for the screens: the relay only passes the encrypted session on. In
+// the `listening` phase with a relay, `code` is the relay code the technician
+// reads aloud and `address` is where the relay is reached; `admitted` says
+// whether the relay holds that code yet.
+export interface RelayRoute {
+  host: string;
+  admitted: boolean;
+}
 
 export interface ConsoleState {
   technician: TechnicianHost;
   targets: DiscoveredTarget[];
   selected?: string;
   session?: string;
+  // Absent for a session on one network. It stays after the session has
+  // ended, until the console waits again.
+  relay?: RelayRoute;
   phase: SessionPhase;
 }
 
@@ -165,6 +185,13 @@ export const api = {
   listenNetworks: () => invoke<ListenNetwork[]>("get_listen_networks"),
   switchListenNetwork: (address: string) =>
     invoke<ConsoleState>("switch_listen_network", { address }),
+  // **Use relay** on the waiting screen (ST-M007-013): stops waiting on the
+  // network and waits for the customer on the relay of this copy, with a new
+  // relay code. Answers the new waiting state; that the relay holds the code,
+  // or why it cannot be used, then arrives as `console-state`. Rejects with
+  // the stage `relay_none` or `relay_profile` when this copy has no relay
+  // that can be used.
+  useRelay: () => invoke<ConsoleState>("use_relay"),
   // Interactive terminal panel (ST-M008-001). All four fail closed with
   // `no_consented_session` when no session is under full control — the panel
   // never fabricates a shell. `open_terminal` streams output on the
@@ -246,6 +273,17 @@ export const api = {
     invoke<void>("open_audit", session === undefined ? {} : { session }),
   uninstallPlan: () => invoke<string[]>("uninstall_plan"),
   uninstallApp: () => invoke<void>("uninstall_app"),
+  // Settings → Relay (ST-M007-011). Only the installed copy keeps a relay;
+  // `save_relay` and `remove_relay` refuse in a copy that runs once. The
+  // certificate authority file is chosen in the system's dialog, opened by
+  // the backend. `test_relay` reaches the relay of the form as it stands,
+  // or without a form the one this copy uses, and saves nothing.
+  relaySettings: () => invoke<RelaySettings>("get_relay_settings"),
+  chooseRelayCa: () => invoke<ChosenCa | null>("choose_relay_ca"),
+  saveRelay: (form: RelayForm) => invoke<RelaySettings>("save_relay", { form }),
+  testRelay: (form?: RelayForm) =>
+    invoke<RelayTest>("test_relay", form === undefined ? {} : { form }),
+  removeRelay: () => invoke<RelaySettings>("remove_relay"),
 };
 
 // The Tauri event name the backend emits a whole `ConsoleState` on during a
@@ -275,6 +313,11 @@ export const CONSOLE_TRANSFERS_EVENT = "console-transfers";
 
 // Where a delete stands (ST-M010-002): one `RemovalProgress` each.
 export const CONSOLE_REMOVAL_EVENT = "console-removal";
+
+// Something the technician should know that is not the failure of a command
+// (ST-M007-011): one `ConsoleNotice` of the shared contract, shown in the
+// window's alert.
+export const CONSOLE_NOTICE_EVENT = "console-notice";
 
 // The raw terminal frame channel (ST-M008-001). Distinct again so high-frequency
 // VT output never re-renders state or the activity feed; the terminal panel

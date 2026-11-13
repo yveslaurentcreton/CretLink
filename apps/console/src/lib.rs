@@ -44,10 +44,10 @@ pub mod state;
 pub use activity::{TechnicianActivity, UNKNOWN_CLIENT_LABEL, client_label};
 pub use audit::{
     AUDIT_CHANNEL_CAPACITY, AuditServiceConfig, CLEANUP_REPORT_ACTION, ManualActivity, PruneReport,
-    SESSION_ENDED_ACTION, SessionAuditStart, TARGET_IDENTITY_ACTION, console_cancel,
-    console_exec_finished, console_exec_refused, console_exec_started, default_audit_dir,
-    open_session_log, prune_audit_dir, report_prune, spawn_audit_service, terminal_closed,
-    terminal_open_started, terminal_opened,
+    SESSION_ENDED_ACTION, SESSION_ROUTE_ACTION, SessionAuditStart, TARGET_IDENTITY_ACTION,
+    console_cancel, console_exec_finished, console_exec_refused, console_exec_started,
+    default_audit_dir, open_session_log, prune_audit_dir, relay_route_entry, report_prune,
+    spawn_audit_service, terminal_closed, terminal_open_started, terminal_opened,
 };
 pub use audit_entries::{AuditActorView, AuditEntryView, session_entries};
 pub use display_name::technician_display_name;
@@ -65,6 +65,6 @@ pub use service::{
 };
 pub use session::{ExecCollection, ExecRequest, SessionClient, SessionError, SessionTarget};
 pub use state::{
-    ConsoleState, ControlLevel, DiscoveredTarget, DiscoverySource, SessionPhase, StateError,
-    StopReason, TargetId, TechnicianHost,
+    ConsoleState, ControlLevel, DiscoveredTarget, DiscoverySource, RelayRoute, SessionPhase,
+    StateError, StopReason, TargetId, TechnicianHost,
 };

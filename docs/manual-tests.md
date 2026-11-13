@@ -1168,6 +1168,100 @@ cmd /c mklink /J C:\CretLinkTest\via C:\CretLinkTest\outside
       their folders: they are the customer's to keep, and the list of staged
       files never named them. `C:\CretLinkTest` can be deleted by hand.
 
+### MT-15 — A session through the relay between two networks (ST-M007-013)
+
+Run this with the technician computer and the customer computer on **two
+different networks**, for example the customer computer on a phone's hotspot.
+It needs a relay server that both can reach, set up as
+[`relay-server.md`](relay-server.md) describes: with TLS, and with one key
+for each of the two copies in its key file. The technician's installed copy
+has the relay in **Settings → Relay**; the customer's copy has a
+`cretlink.toml` next to `CretLink-Support.exe`.
+
+1. **The relay admits this copy.** In **Settings → Relay** press **Test**.
+   - Expected: the relay answers and admits this copy, and its certificate is
+     valid for its host name.
+2. **The offer.** Start a session (Give help).
+   - Expected: the waiting screen shows the connection code of this network
+     as before, and under it **Not on the same network?** with the relay's
+     host name and **Use relay…**.
+3. **The wait on the relay.** Press **Use relay…** and leave the screen open
+   for two minutes.
+   - Expected: the screen shows the relay's host name, a relay code in four
+     outlined groups with **Copy**, and first that it connects to the relay,
+     then that the relay holds the code. The code does not change while the
+     screen is open. The customer's list of technicians nearby does not show
+     this technician.
+4. **The code.** On the customer computer open Get help and type the relay
+   code into the code field, in lower case and with blanks instead of dashes.
+   - Expected: before anything is typed, a line under the code field names
+     the relay this copy connects through. After **Connect** the screen says
+     **Connecting through the relay** with the relay's host name and that the
+     relay only passes encrypted traffic on.
+     Then both screens show the same six-digit approval code, drawn unlike
+     the relay code, and each names the relay.
+5. **Consent and the session.** Confirm the code, allow full control, run a
+   command, send a file and copy it back, and open the terminal.
+   - Expected: everything works as on one network; the customer's window
+     lists each action; the copied file has the SHA-256 of the one that was
+     sent; both windows keep naming the relay.
+6. **Stop from each side.** Stop from the technician's side. Repeat steps 2
+   to 5 and stop from the customer's side.
+   - Expected: both sides end at once with their end reports, as on one
+     network. The second wait shows another relay code than the first. The
+     technician's report and the session history name the relay; the audit
+     log has a record `session_route` with the relay's host name and holds
+     neither the relay code nor an admission key.
+7. **A code that nobody waits on.** On the customer computer type the first
+   relay code again; then, while the technician waits, cancel on the
+   technician's side and type the code that was on screen.
+   - Expected: each time the customer's window says after about ten seconds
+     that nobody is waiting on that code, with the relay's host name and what
+     to do. A code with one character changed is refused at once as a code
+     that did not work.
+8. **A key that was withdrawn.** Delete the customer copy's line from the
+   relay's key file and type a new relay code; put it back and delete the
+   technician's line, then press **Use relay…**.
+   - Expected: the customer's window says that the relay did not let this
+     copy in, and to ask the technician; the technician's window says that
+     the relay refused the admission key, and where the relay is changed. No
+     window shows a key.
+9. **A relay that is off.** Stop the relay server. Press **Use relay…**; on
+   the customer computer type a relay code.
+   - Expected: each window says that the relay cannot be reached, with a next
+     step. Nothing is tried again by itself.
+10. **A certificate that is not trusted.** Start the relay with a certificate
+    that the customer computer does not trust, without a `ca` file in the
+    customer's profile, and type a relay code.
+    - Expected: the customer's window says that this computer does not trust
+      the relay. The relay's log shows no admission for that attempt: nothing
+      was sent to it.
+11. **The relay stops in the middle.** During a session under full control,
+    with a long command running, stop the relay server. Run it once more and
+    instead take the customer computer off its network.
+    - Expected: both sessions end on both sides at once. Each window says
+      that the connection through the relay was lost and that the relay may
+      have stopped, the technician's report shows the cleanup as unknown,
+      the customer's report shows the cleanup it did, no process of the
+      session survives (as in MT-2), and neither copy connects again.
+12. **The network first.** Put both computers on one network, with both
+    profiles in place, and start a session without **Use relay…**.
+    - Expected: the customer finds the technician in the list and the
+      connection code connects, as before. The relay's metrics show no
+      session for it.
+13. **A copy without a relay.** Remove `cretlink.toml` from the customer's
+    copy, start it again and type a relay code.
+    - Expected: the window says that this copy cannot use a relay code and
+      does not ask to type the code again.
+14. **Escape and the screen reader.** On the relay's waiting screen press
+    Escape. With Narrator on, open the waiting screen on the relay again.
+    - Expected: Escape cancels the wait. Narrator reads the relay code
+      character by character and announces when the relay holds the code.
+
+What the relay's log and metrics show for all of this is the labels of the
+two keys, the sizes and the times (ST-M007-014), never a command, a file name
+or a code.
+
 ### MT-E2E — Full attended-LAN acceptance walk-through (ST-M006-006)
 
 The scenarios above are targeted failure and edge slices; this one is the single
@@ -1263,4 +1357,5 @@ hardware.
 | _pending_ | | | MT-11 steps 2, 4, 5 and 7 to 9 on Windows, and all of it on macOS (ST-M009-006) | not yet recorded on hardware |
 | _pending_ | | | MT-12 step 10 (files left from an earlier session and `cretlink recover`) and the Narrator pass (ST-M009-009, ST-M009-010) | not yet recorded on hardware |
 | _pending_ | | | MT-13 (a technician's computer on several networks, ST-M009-016) | not yet recorded on hardware |
+| _pending_ | | | MT-15 (a session through the relay between two networks: the offer, the wait and its code, pairing through a typed code, a session with a stop from each side, a code that nobody waits on, a withdrawn key, a relay that is off, a certificate that is not trusted, a relay that stops in the middle, the network first, a copy without a relay, ST-M007-013) | not yet recorded on hardware |
 | _pending_ | | | MT-14 (the file operations of the explorer: the drives, a folder with links / through a junction / a held file / cancel and stop / swapped while it is removed, a file sent to a folder on two drives and refused for a junction, ST-M010-001; browsing in the Files tab: nothing before the tab is opened, from folder to folder with one item for the customer, a typed path under its real name, links, a refused folder, a folder of thousands of entries, views, selection, keys and the context menu, a stop while a folder arrives, and the Narrator pass of the grid, ST-M010-002; a delete, a folder removal, a new folder and a move refused through a junction, after a swap and on a substituted drive, ST-M010-004) | not yet recorded on hardware |

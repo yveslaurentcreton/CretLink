@@ -62,6 +62,17 @@ export function liveView(s: TechnicianSnapshot): HTMLElement {
         { class: "sess-id" },
         h("h2", { class: "host" }, host),
         h("div", { class: "meta" }, identityLine(s)),
+        // Which way the session goes, when it is not on one network
+        // (ST-M007-013).
+        s.console.relay
+          ? h(
+              "div",
+              { class: "meta via-relay-line", id: "session-relay" },
+              "Through the relay ",
+              h("b", { class: "mono" }, s.console.relay.host),
+              " · it only passes encrypted traffic on",
+            )
+          : null,
       ),
       target?.simulated || simulated ? pill("wait", "Simulated target") : null,
       h("span", { class: "spacer" }),
@@ -195,6 +206,9 @@ function overviewPanel(s: TechnicianSnapshot): HTMLElement {
             ["Agent", target.agent_version],
             ["Session", shortId(id)],
             ["Since", formatTime(s.last?.since)],
+            s.console.relay
+              ? ["Connection", `Through the relay ${s.console.relay.host}`]
+              : ["Connection", "On this network"],
           ])
         : h("p", { class: "muted" }, "The customer computer has not reported its identity."),
     ),

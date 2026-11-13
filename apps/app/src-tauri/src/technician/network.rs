@@ -9,14 +9,20 @@
 //!
 //! Which address is taken without a choice is decided by
 //! [`cretlink_discovery::first_choice`]. A choice of the technician holds for
-//! the later sessions of this run ([`NetworkChoice`]) and is kept in memory
-//! only: nothing is written to disk.
+//! the later sessions ([`NetworkChoice`]). The installed copy keeps it in its
+//! settings, so that it holds after the program is closed (ST-M007-011); a
+//! copy that runs once keeps it in memory only and writes nothing but its
+//! audit trail.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use cretlink_cli::install::Layout;
+use cretlink_cli::settings;
 use cretlink_discovery::{ListenCandidate, first_choice, listen_candidates};
 use serde::Serialize;
+
+use crate::relay::ThisCopy;
 
 /// One network the technician can wait on, as the waiting screen lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -40,22 +46,67 @@ impl From<&ListenCandidate> for ListenNetwork {
     }
 }
 
-/// The adapter the technician chose earlier in this run, by name.
+/// The adapter the technician chose to wait on, by name.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct NetworkChoice(Arc<Mutex<Option<String>>>);
+pub(crate) struct NetworkChoice {
+    chosen: Arc<Mutex<Option<String>>>,
+    /// The install whose settings keep the choice. `None` in a copy that
+    /// runs once: the choice then holds for this run and nothing is written.
+    kept_in: Option<Layout>,
+}
 
 impl NetworkChoice {
+    /// The choice of this process: what the settings of the installed copy
+    /// hold, and none yet in a copy that runs once.
+    pub(crate) fn of_this_copy() -> Self {
+        Self::of(ThisCopy::current().and_then(|copy| copy.installed))
+    }
+
+    /// The choice kept in the settings of the install `kept_in`; without an
+    /// install, a choice for this run only. Settings that cannot be read hold
+    /// no choice: Settings says what is wrong with them.
+    pub(crate) fn of(kept_in: Option<Layout>) -> Self {
+        let chosen = kept_in
+            .as_ref()
+            .and_then(|layout| settings::read(layout).ok())
+            .and_then(|settings| settings.network_adapter);
+        Self {
+            chosen: Arc::new(Mutex::new(chosen)),
+            kept_in,
+        }
+    }
+
     /// The name of the chosen adapter, if the technician chose one.
     pub(crate) fn get(&self) -> Option<String> {
-        self.0
+        self.chosen
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
-    /// Remembers the adapter for the later sessions of this run.
-    pub(crate) fn set(&self, adapter: &str) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(adapter.to_string());
+    /// Remembers the adapter for the later sessions. The installed copy
+    /// writes it to its settings, next to the relay, which stays as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the installed copy could not keep the choice, as a
+    /// sentence. The choice then still holds for this run.
+    pub(crate) fn set(&self, adapter: &str) -> Result<(), String> {
+        *self.chosen.lock().unwrap_or_else(PoisonError::into_inner) = Some(adapter.to_string());
+        let Some(layout) = &self.kept_in else {
+            return Ok(());
+        };
+        // Settings that cannot be read are not written over: they may hold a
+        // relay that the technician still wants to put right.
+        let mut kept = settings::read(layout).map_err(|error| {
+            format!(
+                "The settings file cannot be read, so it was left as it is: {}.",
+                error.problem
+            )
+        })?;
+        kept.network_adapter = Some(adapter.to_string());
+        settings::write(layout, &kept)
+            .map_err(|error| format!("The settings could not be written: {error}."))
     }
 }
 
@@ -212,10 +263,121 @@ mod tests {
     fn the_choice_is_remembered_for_this_run() {
         let choice = NetworkChoice::default();
         assert_eq!(choice.get(), None);
-        choice.set("Wi-Fi");
+        choice.set("Wi-Fi").unwrap();
         assert_eq!(choice.get().as_deref(), Some("Wi-Fi"));
         // A clone shares the choice, as the application state does.
-        choice.clone().set("VPN");
+        choice.clone().set("VPN").unwrap();
         assert_eq!(choice.get().as_deref(), Some("VPN"));
+    }
+
+    /// The layout of an install in a home folder of its own, removed when
+    /// the guard is dropped.
+    struct Home {
+        root: std::path::PathBuf,
+        layout: Layout,
+    }
+
+    impl Home {
+        fn new(test: &str) -> Self {
+            use cretlink_cli::install::{BaseDirs, Platform};
+            let root = std::env::temp_dir().join(format!(
+                "cretlink-app-network-{test}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let home = root.join("home");
+            let dirs = BaseDirs {
+                home: home.clone(),
+                local_app_data: Some(home.join("AppData").join("Local")),
+                app_data: Some(home.join("AppData").join("Roaming")),
+                data_home: None,
+            };
+            let layout = Layout::new(Platform::current(), &dirs).unwrap();
+            Self { root, layout }
+        }
+    }
+
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn the_installed_copy_keeps_the_choice_after_the_program_is_closed() {
+        let home = Home::new("kept");
+        let choice = NetworkChoice::of(Some(home.layout.clone()));
+        assert_eq!(choice.get(), None);
+        choice.set("vEthernet (Default Switch)").unwrap();
+        assert!(home.layout.settings.is_file());
+
+        // The program is started again: the choice is there.
+        let again = NetworkChoice::of(Some(home.layout.clone()));
+        assert_eq!(again.get().as_deref(), Some("vEthernet (Default Switch)"));
+        // And it still follows its adapter, or falls back when that is gone.
+        let networks = three_networks();
+        assert_eq!(
+            pick(&networks, again.get().as_deref(), ip([192, 168, 1, 20]))
+                .unwrap()
+                .adapter,
+            "vEthernet (Default Switch)"
+        );
+    }
+
+    #[test]
+    fn keeping_the_choice_leaves_the_relay_in_the_settings_as_it_is() {
+        use cretlink_cli::relay_profile::RelayProfile;
+        let home = Home::new("with-relay");
+        let relay =
+            RelayProfile::from_fields("relay.example.org:443", Some("key-of-sam"), None, None)
+                .unwrap();
+        settings::write(
+            &home.layout,
+            &settings::Settings {
+                relay: Some(relay),
+                network_adapter: None,
+            },
+        )
+        .unwrap();
+        NetworkChoice::of(Some(home.layout.clone()))
+            .set("Wi-Fi")
+            .unwrap();
+        let kept = settings::read(&home.layout).unwrap();
+        assert_eq!(kept.network_adapter.as_deref(), Some("Wi-Fi"));
+        let relay = kept.relay.unwrap();
+        assert_eq!(relay.address().to_string(), "relay.example.org:443");
+        assert_eq!(relay.key().unwrap().as_bytes(), b"key-of-sam");
+    }
+
+    #[test]
+    fn a_copy_that_runs_once_writes_nothing() {
+        let home = Home::new("run-once");
+        // No install: the choice holds in memory, and no file appears.
+        let choice = NetworkChoice::of(None);
+        choice.set("Wi-Fi").unwrap();
+        assert_eq!(choice.get().as_deref(), Some("Wi-Fi"));
+        assert!(!home.root.exists());
+        assert!(!home.layout.settings.exists());
+        // This test program is no installed copy either.
+        assert!(NetworkChoice::of_this_copy().kept_in.is_none());
+    }
+
+    #[test]
+    fn a_choice_that_cannot_be_kept_still_holds_for_this_run_and_says_why() {
+        let home = Home::new("unreadable");
+        std::fs::create_dir_all(home.layout.settings.parent().unwrap()).unwrap();
+        // Settings that cannot be read are left as they are.
+        let broken = "[relay]\naddress = \"relay.example.org\"\n";
+        std::fs::write(&home.layout.settings, broken).unwrap();
+        let choice = NetworkChoice::of(Some(home.layout.clone()));
+        assert_eq!(choice.get(), None);
+        let reason = choice.set("Wi-Fi").unwrap_err();
+        assert!(reason.contains("cannot be read"), "{reason}");
+        assert!(reason.contains("`address` needs a port"), "{reason}");
+        assert_eq!(choice.get().as_deref(), Some("Wi-Fi"));
+        assert_eq!(
+            std::fs::read_to_string(&home.layout.settings).unwrap(),
+            broken
+        );
     }
 }

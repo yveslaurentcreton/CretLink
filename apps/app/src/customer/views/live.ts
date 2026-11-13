@@ -21,11 +21,12 @@ import {
   happeningNow,
   liveCounts,
   plainLine,
+  relayHost,
   screenUse,
   screenWords,
   technicianName,
 } from "../model";
-import { button, operationLine, timelineItem, whoChip } from "./common";
+import { button, operationLine, timelineItem, viaRelay, whoChip } from "./common";
 
 /** "since 14:02" and the elapsed time, for the band. */
 export function since(s: CustomerSnapshot): HTMLElement[] | null {
@@ -197,6 +198,7 @@ export function liveView(s: CustomerSnapshot): HTMLElement[] {
         : null,
       now(s, name),
       tiles(s),
+      viaRelay(relayHost(s)),
       h("div", { class: "tlhead" }, h("h4", { id: "tl-h" }, "What happened"), filterBar(s)),
       timeline(s, name),
       h(

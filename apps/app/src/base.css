@@ -292,6 +292,20 @@
   font: 600 38px/72px var(--mono); text-align: center; box-shadow: inset 0 -3px 0 rgba(255, 255, 255, 0.08);
 }
 :where(.cl-ui) .sac i { width: 14px; }
+/* The relay code (ST-M007-013): four outlined groups on a light ground. It
+   looks like neither the connection code (one dashed box) nor the approval
+   code (dark digit boxes): it says where two copies meet and grants nothing. */
+:where(.cl-ui) .relay-code { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin: 0; }
+:where(.cl-ui) .relay-code span {
+  font: 600 22px/1 var(--mono); letter-spacing: 0.12em; padding: 11px 12px 10px; border: 2px solid var(--role-line);
+  border-radius: var(--r-md); background: #fff; color: var(--role-deep);
+}
+/* That a session runs through a relay, on the screens after the code. */
+:where(.cl-ui) .via-relay {
+  display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: center;
+  margin: 14px 0 0; font-size: 12.5px; color: var(--ink-2);
+}
+:where(.cl-ui) .via-relay .ic { width: 14px; height: 14px; color: var(--muted); }
 :where(.cl-ui) .disclose {
   font-size: 12.5px; line-height: 1.6; color: var(--muted); border-left: 3px solid var(--bad-line);
   padding-left: 12px; margin: 0;

@@ -3033,6 +3033,12 @@ are the rules the shipped code satisfies, not merely a future commitment. The
 end-to-end trust model is unchanged by the relay's presence (REQ-F-022,
 REQ-S-021).
 
+The application itself runs a session through the relay (ST-M007-013): the
+technician's copy waits on the relay of its profile when the technician
+chooses **Use relay**, and the customer's copy joins when a relay code is
+typed. Until then the relay path existed only in the headless development
+tools. The paragraphs below that name the application say what this adds.
+
 Equally important is what the endpoints expose: neither the console nor the
 support agent opens an internet-reachable listener (REQ-S-010). On the LAN path
 discovery and control traffic are limited to the intended local interfaces,
@@ -3170,6 +3176,41 @@ metadata rather than content.
   relay's log, events and metrics name the label and never the key, and a key
   file that breaks a rule is refused as a whole, so a typing error neither
   opens the relay nor locks everybody out.
+- *A relay profile is addressing, and its file is untrusted input.* A copy
+  learns its relay from a relay profile: the relay's address, an optional
+  admission key, an optional certificate authority file and an optional name
+  in the certificate (ST-M007-011). It is read from `cretlink.toml` next to
+  the program, by both roles, or from the settings of the installed technician
+  copy; the customer role reads the file next to its program and nothing
+  else, and writes nothing. Nothing in a profile grants control (ADR-0016 §2,
+  §4). Somebody who can write next to the program or into the settings can
+  point a copy at a relay of their own, which is then the hostile relay this
+  section already models: it sees metadata and can deny service, and the
+  approval codes differ when it puts itself in between. The file may have
+  been written by somebody else, so it is read up to a fixed size in a small,
+  strict form: every unknown section and setting is refused, every setting is
+  bounded, the certificate file must be a plain name next to the profile, and
+  a file that cannot be used is explained before any connection and never
+  passed over for another relay. An explanation names the line and the
+  setting and never repeats text from the file.
+- *The application speaks only `wss` to a relay.* A profile has no setting
+  that turns TLS off and an address with a scheme is refused. The relay's
+  certificate is validated against the system's authorities, or against the
+  profile's certificate file and nothing else when it names one, for the
+  profile's name or else the host of its address. A certificate that is not
+  trusted, or that carries another name, ends the dial before the rendezvous
+  preamble is written, so neither the admission key nor the ticket leaves the
+  computer, and the application never falls back to a connection without TLS.
+- *The admission key stays where it is needed.* It is held in a type that is
+  erased when dropped and redacted in debug output. The application never
+  shows it again once it is saved, never logs it, puts it in no audit record
+  and in no error text; a form that leaves the key alone tells the backend to
+  keep it instead of sending it back. A kept key stays with the relay it was
+  saved for: when the form names another relay, by another host name for its
+  certificate, the application refuses to keep the key and asks for that
+  relay's own, so a test or a save never presents one relay's key to
+  another. The test of a relay in Settings presents a ticket of its own,
+  meets nobody and carries nothing of a session.
 - *A relay code grants nothing.* It holds a random seed of 64 bits and a
   typing check, no address and no key. Someone who overhears or guesses a code
   can at most reach the rendezvous before the customer does: the approval
@@ -3181,6 +3222,48 @@ metadata rather than content.
   the relay's host name enters the derivation, a code read
   aloud names nothing on any other relay. The code is named and drawn
   differently from the approval code, which alone establishes trust.
+- *The relay is chosen by the technician, for one session.* The application
+  reaches a relay only when the technician presses **Use relay** on the
+  waiting screen, or when the customer types a relay code into a copy that
+  has a profile (ST-M007-013). Nothing reaches out before that, and discovery
+  and the connection code of one network work as before with a profile
+  present. A wait on a relay opens no listener: the technician's copy dials
+  out, and the listener of the network it waited on is closed first. The
+  technician's copy draws a new relay code for every wait and keeps its
+  rendezvous open only while the waiting screen is open; **Cancel** closes
+  the connection, and the code then leads nowhere. Both windows name the
+  relay by its host name from the first moment to the end report, so neither
+  person is left guessing which way the session goes.
+- *A relayed session takes every step of a session on one network.* The
+  handle of a relayed session is driven by the same code as one from the
+  network listener, on both sides: the approval code is shown and compared,
+  the technician confirms, the customer decides, either side stops, and the
+  cleanup is reported (REQ-F-005, REQ-F-006, REQ-F-018, REQ-F-019). The
+  relay's part ends when the two connections have found each other. The
+  console state names the relay as a label and no transition reads it. An
+  end-to-end test runs both roles of the application against the real relay
+  server with TLS inside the test: pairing through a typed code, a command, a
+  transfer there and back, a stop from each side, and a relay that stops in
+  the middle.
+- *The relay code stays on the two screens.* It is shown on the technician's
+  screen to be read out and typed on the customer's. The relay never gets it:
+  both copies present a ticket derived from the code and from the relay's
+  host name. The technician's audit trail records that the session ran
+  through a relay, and the relay's host name (`session_route`); it holds
+  neither the code nor the admission key, and no log or error text does.
+- *Every relay failure is said, and nothing connects again by itself.* A
+  relay that cannot be reached, a certificate that is not trusted, a key the
+  relay refuses and a code that nobody waits on each end the wait or the dial
+  with words of their own and a next step (REQ-N-008, REQ-N-015); the
+  customer is told what to pass on, the technician what to change. A relay
+  that drops the connection ends the session on both sides, fail closed, and
+  both windows say that the connection through the relay was lost and that
+  the relay may have stopped. Neither copy dials again after a failure or an
+  end: a relay cannot keep an endpoint reconnecting, and a session never
+  comes back without a new code, a new comparison and a new consent
+  (REQ-S-009). The one thing that is repeated is the technician's waiting
+  connection while nobody has joined, with the same code, for as long as the
+  waiting screen is open.
 - *The relay's answer says only what admission decided.* The reasons it can
   name (no key, an unknown key, the rate limit, the quota, not available,
   another preamble version) concern the use of the forwarder, never a session
@@ -3207,6 +3290,29 @@ metadata rather than content.
 - Availability is not defended. A hostile relay can always refuse, delay, or
   degrade service. The guarantee is fail-closed denial of control, not
   liveness.
+- The admission key stands in readable form on disk: in `cretlink.toml` next
+  to a copy, and in the settings of the installed technician copy. The
+  settings file is created for the user only where the system has file modes
+  (`0600` on macOS and Linux) and has the access rules of the user's
+  `%LOCALAPPDATA%` folder on Windows; a customer copy is a folder that is
+  handed over, and whoever has it has its key. A key admits to the forwarder
+  and nothing else, and one key per customer bounds what a leaked one is
+  worth until its line is deleted.
+- The relay code is read over the same call as the approval code. Somebody
+  who listens to that call learns the relay code; to use it they also need a
+  copy that the relay admits. If they join before the customer, the
+  technician's screen shows an approval code that the customer cannot
+  confirm, and the customer's copy says that nobody waits on the code. The
+  protection is the comparison: a technician who confirms a code that the
+  customer did not read back gives the listener the consent screen, and only
+  the listener's own computer is then at stake, never the customer's.
+- A lost connection has no cause that an endpoint can see. When a relayed
+  session ends because the connection is gone, neither copy can tell a relay
+  that stopped from a computer that went offline; the windows say both.
+- The relay in the application has not been run between real computers on
+  two networks yet. Its behaviour is covered by automated tests against a
+  relay inside the test process; the manual scenario MT-15 in
+  [`manual-tests.md`](manual-tests.md) is pending.
 - Third-party relay deployments. As MIT-licensed software, relay code can be
   self-hosted by anyone; the project cannot police hostile or negligent
   deployments beyond making endpoint security independent of relay honesty.

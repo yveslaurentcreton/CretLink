@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActivityEvent } from "../shared/contract";
 import { type TimerTracker, trackTimers } from "../shared/test-timers";
 import type { ConsentView, LaunchView } from "./api";
-import { CONSOLES, FEED, LAUNCH_READY, REPORT, viewIn } from "./fixtures";
+import { CONSOLES, FEED, LAUNCH_READY, REPORT, VIA_RELAY, viewIn } from "./fixtures";
 
 type Handler = (args?: Record<string, unknown>) => unknown;
 
@@ -313,5 +313,143 @@ describe("customer controller", () => {
     expect(alert).toContain("This is a relay code");
     expect(alert).toContain("set up for their relay");
     expect(alert).not.toContain("type it again");
+  });
+
+  it("says what is wrong with the relay settings of this copy, and what to tell the technician", async () => {
+    // The profile file next to the program cannot be used (ST-M007-011).
+    const message =
+      "This is a relay code, but the relay settings of this copy of CretLink cannot be used. Line 2: `address` needs a port. The file is E:\\cretlink.toml.";
+    await boot({
+      start_live_session: () => {
+        throw { stage: "relay_profile", message };
+      },
+    });
+    const input = app().querySelector<HTMLInputElement>("#code");
+    if (input) input.value = "53ST-A71D-JKKV-0VGH";
+    click('[data-action="connect-code"]');
+    await flush();
+    const alert = app().querySelector('[role="alert"]')?.textContent ?? "";
+    expect(alert).toContain("The relay settings of this copy cannot be used");
+    expect(alert).toContain(message);
+    expect(alert).toContain("ask for a new copy of CretLink");
+    expect(alert).toContain("You can still connect while you are on the same network.");
+    expect(alert).not.toContain("type it again");
+    // The window is where it was: nothing was dialled.
+    expect(app().querySelector("#code")).not.toBeNull();
+  });
+
+  it("connects through the relay of this copy when a relay code is typed, and says so at once", async () => {
+    const reaching = viewIn({ phase: "announced" }, { technician: null, relay: VIA_RELAY });
+    await boot({ start_live_session: () => reaching });
+    const input = app().querySelector<HTMLInputElement>("#code");
+    // Typed as people type what is read to them; the backend reads it.
+    if (input) input.value = " 53st a71d jkkv 0vgh ";
+    click('[data-action="connect-code"]');
+    await flush();
+    expect(called("start_live_session")).toEqual([{ code: "53st a71d jkkv 0vgh" }]);
+    expect(app().querySelector("#connecting-h")?.textContent).toBe(
+      "Connecting through the relay relay.example.org",
+    );
+    expect(app().textContent).toContain("The relay only passes encrypted traffic on.");
+    expect(app().querySelector("#announce")?.textContent).toBe(
+      "Connecting through the relay relay.example.org. No access.",
+    );
+    expect(app().querySelector('[role="alert"]')?.textContent).toBe("");
+    // Cancel (Escape) is there while it connects.
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flush();
+    expect(called("stop_session")).toHaveLength(1);
+  });
+
+  it("says that nobody waits on a relay code, and searches no network for it", async () => {
+    await boot({
+      start_live_session: () =>
+        viewIn({ phase: "announced" }, { technician: null, relay: VIA_RELAY }),
+    });
+    const input = app().querySelector<HTMLInputElement>("#code");
+    if (input) input.value = "53ST-A71D-JKKV-0VGH";
+    click('[data-action="connect-code"]');
+    await flush();
+    // Ten seconds later, on the backend: nobody was heard.
+    push(
+      viewIn(
+        { phase: "failed", stage: "rendezvous", message: "nobody joined the rendezvous on the relay" },
+        { technician: null, relay: VIA_RELAY },
+      ),
+    );
+    await flush();
+    const alert = app().querySelector('[role="alert"]')?.textContent ?? "";
+    expect(alert).toContain("Nobody is waiting on that code");
+    expect(alert).toContain("The relay relay.example.org found nobody waiting on the code you typed.");
+    expect(alert).toContain("A code works once.");
+    // Not the jargon of the backend, and not a session that failed.
+    expect(alert).not.toContain("rendezvous");
+    expect(alert).not.toContain("The session failed");
+    // Back at the code field, to type the code again.
+    expect(app().querySelector("#code")).not.toBeNull();
+    // Nothing tries again by itself.
+    expect(called("start_live_session")).toHaveLength(1);
+  });
+
+  it("shows why the relay could not be used with the backend's next step", async () => {
+    await boot({
+      start_live_session: () =>
+        viewIn({ phase: "announced" }, { technician: null, relay: VIA_RELAY }),
+    });
+    const input = app().querySelector<HTMLInputElement>("#code");
+    if (input) input.value = "53ST-A71D-JKKV-0VGH";
+    click('[data-action="connect-code"]');
+    await flush();
+    push(
+      viewIn(
+        {
+          phase: "failed",
+          stage: "relay_untrusted",
+          message: "The relay at relay.example.org:443 showed no certificate that this computer trusts.",
+        },
+        {
+          technician: null,
+          relay: VIA_RELAY,
+          failure_next:
+            "Tell your technician that this computer does not trust the certificate of the relay relay.example.org. Nobody has access to this computer.",
+        },
+      ),
+    );
+    await flush();
+    const alert = app().querySelector('[role="alert"]')?.textContent ?? "";
+    expect(alert).toContain("This computer does not trust the relay");
+    expect(alert).toContain("showed no certificate that this computer trusts");
+    expect(alert).toContain("Tell your technician that this computer does not trust the certificate");
+    expect(alert).not.toContain("The session failed");
+    expect(called("start_live_session")).toHaveLength(1);
+  });
+
+  it("goes from a relay code to the approval code and the decision as on one network", async () => {
+    await boot({
+      start_live_session: () =>
+        viewIn({ phase: "announced" }, { technician: null, relay: VIA_RELAY }),
+      grant_consent: () => view,
+    });
+    const input = app().querySelector<HTMLInputElement>("#code");
+    if (input) input.value = "53ST-A71D-JKKV-0VGH";
+    click('[data-action="connect-code"]');
+    await flush();
+    push(viewIn({ phase: "awaiting_approval_compare" }, { approval_code: "482913", relay: VIA_RELAY }));
+    await flush();
+    expect(app().querySelector(".sac")?.getAttribute("aria-label")).toBe("Approval code 482 913");
+    expect(app().querySelector(".via-relay")?.textContent).toContain("relay.example.org");
+    push(viewIn({ phase: "awaiting_consent" }, { relay: VIA_RELAY }));
+    await flush();
+    // The decision is the customer's, and neither button is focused.
+    expect(app().querySelector('[data-action="allow"]')).not.toBeNull();
+    expect(app().querySelector('[data-action="decline"]')).not.toBeNull();
+    expect(document.activeElement?.getAttribute("data-action")).toBeNull();
+    click('[data-action="allow"]');
+    await flush();
+    expect(called("grant_consent")).toHaveLength(1);
+    push(viewIn({ phase: "full_control", session: "s" }, { relay: VIA_RELAY }));
+    await flush();
+    expect(app().querySelector("#state-band")?.textContent).toContain("UNDER FULL CONTROL");
+    expect(app().querySelector(".via-relay")?.textContent).toContain("relay.example.org");
   });
 });
