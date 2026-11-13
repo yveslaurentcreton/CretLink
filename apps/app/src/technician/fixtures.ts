@@ -7,10 +7,29 @@ import type {
   AiClientStatus,
   AppInfo,
   AuditEntryView,
+  ExplorerDrive,
+  ExplorerEntry,
   ListenNetwork,
   SessionSummary,
 } from "../shared/contract";
 import type { ConsoleState, SessionPhase, TargetIdentity } from "./api";
+import {
+  DRIVES,
+  type ExplorerState,
+  ROW_HEIGHT,
+  applyDrives,
+  applyEvent,
+  applyFailure,
+  applyListing,
+  folder,
+  initialExplorer,
+  opening,
+  selectOnly,
+  toggleSelected,
+  withSort,
+  withView,
+  withViewport,
+} from "./explorer";
 import { type TechnicianSnapshot, initialSnapshot } from "./model";
 
 /** 2026-11-03 14:30:00 UTC: the fixtures' "now". */
@@ -328,6 +347,9 @@ export const FEED: ActivityEntry[] = [
 
 export const XSS = '<img src=x onerror="alert(1)"><script>alert(2)</script>';
 
+/** A folder name that holds markup: a name is whatever the customer computer has. */
+export const XSS_NAME = "<b>bold</b>&amp;";
+
 export const FEED_XSS: ActivityEntry[] = [
   item({ id: "x1", purpose: XSS, operation: XSS, path: XSS, description: XSS }),
 ];
@@ -345,6 +367,152 @@ export const AUDIT: AuditEntryView[] = [
 export const AUDIT_XSS: AuditEntryView[] = [
   { seq: 0, at: iso(NOW), actor: "ai", action: XSS, outcome: "unknown", summary: XSS },
 ];
+
+// --- The file explorer (ST-M010-002) ---
+
+/** The drives of the customer computer: a disk, a drive without a disc, a stick, a share. */
+export const EXPLORER_DRIVES: ExplorerDrive[] = [
+  {
+    root: "C:\\",
+    kind: "fixed",
+    label: "Windows",
+    totalBytes: 511_000_000_000,
+    freeBytes: 128_400_000_000,
+  },
+  { root: "D:\\", kind: "optical" },
+  { root: "E:\\", kind: "removable", label: "TOOLS", totalBytes: 31_900_000_000, freeBytes: 9_200_000_000 },
+  { root: "Z:\\", kind: "network" },
+];
+
+export const EXPLORER_FOLDER = "C:\\Users\\ann\\Documents";
+
+function entry(
+  name: string,
+  kind: ExplorerEntry["kind"],
+  len: number,
+  ago: number,
+  readonly = false,
+): ExplorerEntry {
+  return { name, kind, len, modifiedMs: NOW - minutes(ago), readonly };
+}
+
+/** A customer's Documents folder, in the order the customer computer lists it. */
+export const EXPLORER_ENTRIES: ExplorerEntry[] = [
+  entry("Budget 2026.xlsx", "file", 48_213, 60 * 24 * 3),
+  entry("Invoices", "dir", 0, 60 * 5),
+  entry("Old laptop", "symlink", 0, 60 * 24 * 400),
+  entry("Photos", "dir", 0, 60 * 24 * 30),
+  entry("Scans", "dir", 0, 60 * 24 * 2),
+  entry("desktop.ini", "file", 402, 60 * 24 * 700, true),
+  entry("letter to the bank.docx", "file", 18_944, 90),
+  entry("notes.txt", "file", 1_204, 12),
+  entry("report.pdf", "file", 1_258_291, 60 * 24),
+  entry("setup-log-10.txt", "file", 88_100, 60 * 26),
+  entry("setup-log-2.txt", "file", 91_300, 60 * 50),
+];
+
+/** A folder of `count` files, as the pages of a listing bring them. */
+export function explorerFiles(count: number): ExplorerEntry[] {
+  return Array.from({ length: count }, (_, n) =>
+    entry(`driver-${String(n).padStart(5, "0")}.dll`, "file", 4096 + ((n * 7919) % 900_000), n),
+  );
+}
+
+/** The explorer standing at the drives. */
+export function explorerAtDrives(): ExplorerState {
+  return applyDrives(
+    opening(initialExplorer(), { listing: 1, place: DRIVES, how: "push" }),
+    1,
+    EXPLORER_DRIVES,
+  );
+}
+
+/** The explorer standing in `path`, opened from the drives with these entries. */
+export function explorerIn(
+  path: string,
+  entries: ExplorerEntry[],
+  end = true,
+  from: ExplorerState = explorerAtDrives(),
+): ExplorerState {
+  const listing = (from.listing ?? 0) + 1;
+  return applyEvent(opening(from, { listing, place: folder(path), how: "push" }), {
+    kind: "opened",
+    listing,
+    path,
+    entries,
+    end,
+  });
+}
+
+const documents = explorerIn(EXPLORER_FOLDER, EXPLORER_ENTRIES);
+
+/** Every state of the explorer, by name. */
+export const EXPLORERS: Record<string, ExplorerState> = {
+  // The tab was never opened: nothing was asked of the customer computer.
+  "files-closed": initialExplorer(),
+  "files-opening-first": opening(initialExplorer(), { listing: 1, place: DRIVES, how: "push" }),
+  "files-drives": explorerAtDrives(),
+  "files-details": toggleSelected(selectOnly(documents, "Invoices"), "report.pdf"),
+  "files-list": withView(selectOnly(documents, "notes.txt"), "list"),
+  "files-sorted": withSort(documents, "size"),
+  "files-empty": explorerIn("E:\\Backup", []),
+  "files-loading": explorerIn("C:\\Windows\\System32", [], false),
+  "files-loading-more": explorerIn("C:\\Windows\\System32", explorerFiles(256), false),
+  "files-large": withViewport(explorerIn("C:\\Windows\\System32", explorerFiles(5000)), {
+    top: 2500 * ROW_HEIGHT,
+  }),
+  "files-large-list": withView(explorerIn("C:\\Windows\\System32", explorerFiles(5000)), "list"),
+  "files-opening": opening(documents, {
+    listing: 9,
+    place: folder("C:\\Users\\ann\\Documents\\Invoices"),
+    how: "push",
+  }),
+  "files-refused": applyFailure(
+    opening(documents, { listing: 9, place: folder("C:\\Users\\jdoe"), how: "push" }),
+    9,
+    { stage: "access_denied", message: "access was denied" },
+  ),
+  "files-refused-first": applyFailure(
+    opening(initialExplorer(), { listing: 1, place: DRIVES, how: "push" }),
+    1,
+    { stage: "unsupported", message: "not supported on this computer" },
+  ),
+  "files-incomplete": applyFailure(
+    explorerIn("C:\\Windows\\System32", explorerFiles(256), false),
+    2,
+    { stage: "access_denied", message: "access was denied" },
+  ),
+  "files-limit": applyListing(explorerIn("C:\\Windows\\System32", explorerFiles(300), false), {
+    listing: 2,
+    path: "C:\\Windows\\System32",
+    entries: 300,
+    state: "limit",
+  }),
+  "files-ended": applyFailure(
+    explorerIn("C:\\Windows\\System32", explorerFiles(256), false),
+    2,
+    { stage: "no_consented_session", message: "no session is under full control" },
+  ),
+  "files-refreshing": applyEvent(
+    opening(selectOnly(documents, "notes.txt"), {
+      listing: 9,
+      place: folder(EXPLORER_FOLDER),
+      how: "replace",
+    }),
+    { kind: "opened", listing: 9, path: EXPLORER_FOLDER, entries: EXPLORER_ENTRIES.slice(0, 4), end: false },
+  ),
+  "files-menu": { ...selectOnly(documents, "Invoices"), menu: { x: 320, y: 260, keys: ["Invoices"] } },
+  "files-menu-file": {
+    ...selectOnly(documents, "report.pdf"),
+    menu: { x: 320, y: 300, keys: ["report.pdf"] },
+  },
+  "files-menu-place": { ...documents, menu: { x: 400, y: 380, keys: [] } },
+  "files-path": { ...documents, editing: EXPLORER_FOLDER },
+  "files-xss": explorerIn(`C:\\${XSS_NAME}`, [
+    entry(XSS, "file", 12, 5),
+    entry(`${XSS}.dir`, "dir", 0, 5),
+  ]),
+};
 
 function base(console: ConsoleState): TechnicianSnapshot {
   return {
@@ -618,4 +786,19 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
       next: "Check that this computer is connected to the network, then try again.",
     },
   },
+  // The Files tab in every state of the explorer (ST-M010-002).
+  ...Object.fromEntries(
+    Object.entries(EXPLORERS).map(([name, explorer]): [string, TechnicianSnapshot] => [
+      name,
+      {
+        ...base(
+          consoleIn({ phase: "full_control" }, { session: true, target: true, displayName: "Sam" }),
+        ),
+        activity: name === "files-details" ? FEED : [],
+        tab: "files",
+        explorer,
+        last: { id: SESSION_ID, target: TARGET, since: NOW - minutes(28) },
+      },
+    ]),
+  ),
 };

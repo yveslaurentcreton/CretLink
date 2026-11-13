@@ -146,7 +146,123 @@ body {
 .sh-badge.warn { color: #fde68a; background: rgba(255, 180, 60, 0.13); }
 .sh-badge.bad { color: #fca5a5; background: rgba(255, 80, 80, 0.14); }
 
-/* Files and audit */
+/* Files: the explorer (ST-M010-002). The toolbar, the grid and the status
+ * line fill the tab; the transfers of the session lie under them. A row is
+ * 28 pixels high and a column of the List view 260 wide: `explorer.ts` draws
+ * only the rows in view from those two numbers. */
+.panel-files { overflow: hidden; }
+.xp { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #fff; }
+.xp-bar {
+  display: flex; align-items: center; gap: 2px; padding: 8px 12px; flex: none;
+  border-bottom: 1px solid var(--line);
+}
+.xp-tool { padding: 6px; }
+.xp-path {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 2px; margin: 0 8px;
+  border: 1px solid var(--line); border-radius: var(--r); background: var(--bg); padding: 2px;
+}
+.xp-path ol {
+  list-style: none; margin: 0; padding: 0; flex: 1; min-width: 0; display: flex; align-items: center;
+  overflow-x: auto; scrollbar-width: none; white-space: nowrap;
+}
+.xp-path ol::-webkit-scrollbar { display: none; }
+.xp-path li { display: flex; align-items: center; flex: none; }
+.xp-crumb {
+  display: inline-flex; align-items: center; gap: 6px; border: 0; background: none; padding: 4px 7px;
+  border-radius: var(--r-sm); font-size: 13px; color: var(--ink-2); max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.xp-crumb:hover { background: var(--line-2); }
+.xp-crumb[aria-current] { color: var(--ink); font-weight: 600; }
+.xp-sep { color: var(--faint); }
+.xp-path.edit { gap: 6px; }
+.xp-path.edit:focus-within { border-color: var(--tech); box-shadow: 0 0 0 2px var(--tech-line); }
+.xp-input {
+  flex: 1; min-width: 0; border: 0; background: transparent; padding: 5px 8px; font-size: 13px; color: var(--ink);
+}
+.xp-input:focus { outline: none; }
+.xp .seg {
+  display: inline-flex; border: 1px solid var(--line); border-radius: var(--r); padding: 2px;
+  background: var(--bg); gap: 2px; flex: none;
+}
+.xp .seg button {
+  border: 0; background: transparent; padding: 5px 12px; font-size: 13px; border-radius: 7px; color: var(--muted);
+}
+.xp .seg button.on { background: #fff; color: var(--ink); font-weight: 600; box-shadow: var(--shadow); }
+.xp > .alert { margin: 8px 12px; flex: none; }
+.xp > .alert .alert-body { flex: 1; }
+.xp > .alert .next { margin-top: 4px; font-weight: 600; }
+
+.xp-body { flex: 1; min-height: 0; display: flex; position: relative; }
+.xp-grid { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; font-size: 13px; }
+.xp-grid:focus { outline: none; }
+.xp-grid:focus-visible { outline: 2.5px solid var(--tech); outline-offset: -2.5px; }
+.xp-scroll { flex: 1; min-height: 0; overflow: auto; position: relative; }
+.xp-head,
+.xp-grid.details .xp-row {
+  display: grid; grid-template-columns: minmax(180px, 1fr) 150px 130px 100px; align-items: center;
+}
+.xp-head {
+  position: sticky; top: 0; z-index: 2; height: 30px; background: var(--bg);
+  border-bottom: 1px solid var(--line); font-size: 11.5px; font-weight: 700; color: var(--muted);
+}
+.xp-rows { position: relative; }
+.xp-row { position: absolute; left: 0; right: 0; height: 28px; cursor: default; user-select: none; }
+.xp-grid.list .xp-row { right: auto; width: 260px; display: flex; align-items: center; }
+.xp-cell { padding: 0 10px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.xp-cell.num { text-align: right; font-variant-numeric: tabular-nums; }
+.xp-cell.name { display: flex; align-items: center; gap: 8px; }
+.xp-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.xp-icon { display: inline-flex; flex: none; color: var(--muted); }
+.xp-icon.dir, .xp-icon.drive { color: var(--tech); }
+.xp-row:hover { background: var(--line-2); }
+/* A selected row is marked by a bar as well as by its colour. */
+.xp-row.sel { background: var(--tech-soft); box-shadow: inset 3px 0 0 var(--tech); }
+.xp-grid:focus .xp-row.focus { outline: 1.5px solid var(--tech); outline-offset: -1.5px; }
+.xp-sort {
+  display: inline-flex; align-items: center; gap: 5px; width: 100%; border: 0; background: none;
+  padding: 0; font: inherit; color: inherit; text-align: left;
+}
+.xp-cell.num .xp-sort { justify-content: flex-end; }
+.xp-sort.on { color: var(--ink); }
+.xp-arrow { font-size: 9px; }
+/* What stands in the place of the rows when there are none. */
+.xp-state {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 12px; padding: 24px; text-align: center; pointer-events: none;
+}
+.xp-state p { margin: 0; max-width: 440px; color: var(--muted); }
+.xp-state .btn { pointer-events: auto; }
+.xp-note { margin: 8px 12px 0; flex: none; align-items: center; }
+.xp-note p { flex: 1; }
+.xp-status {
+  flex: none; min-height: 27px; padding: 5px 14px; font-size: 12px; color: var(--muted);
+  border-top: 1px solid var(--line-2);
+}
+.xp-menu {
+  position: fixed; z-index: 50; list-style: none; margin: 0; padding: 4px; min-width: 190px;
+  background: #fff; border: 1px solid var(--line); border-radius: var(--r);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
+}
+.xp-menu button {
+  display: flex; align-items: center; justify-content: space-between; gap: 24px; width: 100%;
+  border: 0; background: none; padding: 7px 10px; border-radius: var(--r-sm); font-size: 13px; text-align: left;
+}
+.xp-menu button:hover:not(:disabled),
+.xp-menu button:focus-visible { background: var(--tech-soft); }
+.xp-menu button:disabled { color: var(--faint); cursor: default; }
+.xp-menu kbd { font: 600 11px var(--mono); color: var(--muted); }
+.xp-transfers {
+  flex: none; max-height: 32%; overflow: auto; padding: 10px 14px; border-top: 1px solid var(--line);
+  background: var(--bg);
+}
+.xp-h {
+  margin: 0 0 6px; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+  font-weight: 700;
+}
+.xp-transfers p { margin: 0; font-size: 12.5px; }
+
+/* Transfers and audit */
 .list.files .it { align-items: flex-start; }
 .list.files .k {
   width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center; flex: none;

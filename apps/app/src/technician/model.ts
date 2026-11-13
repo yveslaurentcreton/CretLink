@@ -5,8 +5,9 @@
 // stays authoritative for the session (`ConsoleState`); the snapshot adds what
 // the window itself remembers: the activity feed of the current or last
 // session, the session history, the AI clients, this copy's details, which
-// page or tab is shown, and a pending confirmation. Nothing here talks to
-// Tauri, so all of it is tested in jsdom.
+// page or tab is shown, a pending confirmation, and where the file explorer
+// stands (`./explorer`, ST-M010-002). Nothing here talks to Tauri, so all of
+// it is tested in jsdom.
 
 import type {
   ActivityEntry,
@@ -37,6 +38,7 @@ import {
   upsertActivity,
 } from "../shared/feed";
 import { type ConsoleState, type StopReason, type TargetIdentity, selectedTarget } from "./api";
+import { type ExplorerState, initialExplorer } from "./explorer";
 
 // The role-neutral feed helpers live in `../shared/feed` (ST-M009-009).
 export {
@@ -118,6 +120,10 @@ export interface TechnicianSnapshot {
   // The uninstall plan, shown before anything is removed; `null` while loading.
   uninstall?: { plan: string[] | null };
   uninstalled?: boolean;
+  // The file explorer of the Files tab (ST-M010-002): where it stands in the
+  // customer computer's files, and what is listed there. It belongs to one
+  // session: it starts empty with full control and is dropped when that ends.
+  explorer: ExplorerState;
   // An action in flight, to disable its control.
   busy?: string;
   // A polite announcement of the last change (aria-live).
@@ -157,6 +163,7 @@ export function initialSnapshot(console: ConsoleState, now: number): TechnicianS
     tab: "overview",
     endDismissed: false,
     reportPending: false,
+    explorer: initialExplorer(),
     now,
   };
 }
@@ -242,6 +249,9 @@ export function screenFor(s: TechnicianSnapshot): Screen {
  * - The session id and the target identity are remembered, because the
  *   console clears them when the session ends.
  * - A phase change of a session brings the session screen back to the front.
+ * - The file explorer belongs to one session's full control: it starts
+ *   empty when full control begins and is dropped when it ends, so no file
+ *   name of one customer computer outlives its session (ST-M010-002).
  */
 export function applyConsole(
   s: TechnicianSnapshot,
@@ -277,6 +287,9 @@ export function applyConsole(
   if (after === "full_control" && before !== "full_control" && out.last) {
     out.last = { ...out.last, since: out.last.since ?? now };
     out.tab = "overview";
+  }
+  if ((after === "full_control") !== (before === "full_control")) {
+    out.explorer = initialExplorer();
   }
   if (isEndPhase(after) && !isEndPhase(before)) {
     ended = true;
