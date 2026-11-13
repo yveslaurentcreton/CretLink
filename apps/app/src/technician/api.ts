@@ -26,6 +26,7 @@ import type {
   RelaySettings,
   RelayTest,
   RelayTrust,
+  UninstallPlan,
   SessionSummary,
   TransferCheck,
   TransferEntry,
@@ -280,7 +281,7 @@ export const api = {
   // Without a session: opens the audit folder; with one: that session's file.
   openAudit: (session?: string) =>
     invoke<void>("open_audit", session === undefined ? {} : { session }),
-  uninstallPlan: () => invoke<string[]>("uninstall_plan"),
+  uninstallPlan: () => invoke<UninstallPlan>("uninstall_plan"),
   uninstallApp: () => invoke<void>("uninstall_app"),
   // Settings → Relay (ST-M007-011). Only the installed copy keeps a relay;
   // `save_relay` and `remove_relay` refuse in a copy that runs once. The

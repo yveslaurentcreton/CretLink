@@ -29,6 +29,7 @@ import type {
   RelaySettings,
   RelayTest,
   RelayView,
+  UninstallPlan,
   SessionSummary,
 } from "../shared/contract";
 import {
@@ -151,8 +152,10 @@ export interface TechnicianSnapshot {
   // The end report is still being read from the sealed audit file.
   reportPending: boolean;
   confirm?: AiConfirm;
-  // The uninstall plan, shown before anything is removed; `null` while loading.
-  uninstall?: { plan: string[] | null };
+  // The uninstall plan, shown before anything is removed; `null` while
+  // loading. `stays` is what uninstall leaves in place, beside the audit
+  // trail: a relay profile next to the program, for one (ST-M007-011).
+  uninstall?: { plan: string[] | null; stays?: string[] };
   uninstalled?: boolean;
   // Which relay this copy uses and where that comes from (ST-M007-011);
   // `null` until the backend has said.
@@ -879,6 +882,14 @@ export function isRelaySettings(value: unknown): value is RelaySettings {
     isRelayPlace(settings.file) &&
     (settings.stored === undefined || isRelayPlace(settings.stored))
   );
+}
+
+/** Whether a value is an `UninstallPlan` of the contract. */
+export function isUninstallPlan(value: unknown): value is UninstallPlan {
+  if (typeof value !== "object" || value === null) return false;
+  const plan = value as Record<string, unknown>;
+  const lines = (list: unknown): boolean => Array.isArray(list) && list.every(isText);
+  return lines(plan.removes) && lines(plan.stays);
 }
 
 /** Whether a value is a `RelayTest` of the contract (ST-M007-011). */

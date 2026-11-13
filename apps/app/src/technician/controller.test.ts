@@ -6,6 +6,7 @@ import type { ActivityEvent } from "../shared/contract";
 import { type TimerTracker, trackTimers } from "../shared/test-timers";
 import type { ConsoleState } from "./api";
 import {
+  APP_INSTALLED,
   AUDIT,
   CLIENTS,
   FEED,
@@ -1138,5 +1139,51 @@ describe("Settings → Relay (ST-M007-011)", () => {
     backend.listeners["console-notice"]?.({ payload: { title: 1 } });
     await flush();
     expect(alert()).toBe("");
+  });
+});
+
+describe("Settings: what uninstall leaves in place (ST-M007-011)", () => {
+  const asked = (cmd: string): number => backend.calls.filter(([name]) => name === cmd).length;
+  const alert = (): string => app().querySelector('[role="alert"]')?.textContent ?? "";
+  const lines = (selector: string): string[] =>
+    Array.from(app().querySelectorAll(selector)).map((line) => line.textContent ?? "");
+
+  async function openUninstall(plan: unknown): Promise<void> {
+    await boot({
+      get_app_info: () => APP_INSTALLED,
+      get_relay_settings: () => RELAY_FILE,
+      uninstall_plan: () => plan,
+    });
+    click('nav.side [data-arg="settings"]');
+    await flush();
+    click('[data-action="uninstall-plan"]');
+    await flush();
+  }
+
+  it("shows what goes and what stays before anything is removed", async () => {
+    const stays =
+      "The relay profile C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.toml, which CretLink did not write and does not remove. It holds the admission key of a relay in readable form: remove the file yourself when nobody else should be able to read that key";
+    await openUninstall({ removes: ["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink"], stays: [stays] });
+    expect(asked("uninstall_plan")).toBe(1);
+    expect(lines(".plan:not(.stays) li")).toEqual(["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink"]);
+    expect(lines(".plan.stays li")).toEqual([stays]);
+    // Nothing was removed by looking, and the question is where the focus is.
+    expect(asked("uninstall_app")).toBe(0);
+    expect((document.activeElement as HTMLElement | null)?.id).toBe("uninstall-step");
+  });
+
+  it("says nothing about what stays when nothing does but the audit trail", async () => {
+    await openUninstall({ removes: ["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink"], stays: [] });
+    expect(app().querySelector(".plan.stays")).toBeNull();
+    expect(app().textContent).toContain("The audit trail stays");
+  });
+
+  it("does not show a plan that it cannot read", async () => {
+    // What an earlier backend answered: the lines to remove alone.
+    await openUninstall(["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink"]);
+    expect(app().querySelector("#uninstall-step")).toBeNull();
+    expect(alert()).toContain("CretLink could not check what to uninstall");
+    expect(alert()).toContain("Nothing was changed.");
+    expect(asked("uninstall_app")).toBe(0);
   });
 });

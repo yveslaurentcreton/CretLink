@@ -369,7 +369,9 @@ settings:
   macOS and Linux the file can be read and written by your account only (mode
   `0600`); on Windows it lies in your own `%LOCALAPPDATA%` folder and has the
   access rules of that folder. `cretlink uninstall` removes both files and
-  says so before it does.
+  says so before it does. A `cretlink.toml` next to the installed program is
+  not one of them: uninstall leaves it, and says that it stays, where it lies
+  and whether it holds a key.
 - `relay-ca.pem` holds **the certificates of the file you chose and nothing
   else**, written anew. Some tools keep the private key of an authority in
   the same file as its certificate; that key is not copied.

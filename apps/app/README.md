@@ -105,8 +105,10 @@ The start-screen process registers, besides `get_role` and `choose_role`, only
 (`technician/setup.rs`). The technician process registers `get_app_info`,
 `ai_clients`, `ai_client_install`, `ai_client_uninstall`, `uninstall_plan` and
 `uninstall_app` for the AI assistants and Settings screens. Settings offers
-**Uninstall** only in the installed copy; it shows the plan first, and on
-Windows the folder is removed once the window closes.
+**Uninstall** only in the installed copy; it shows the plan first
+(`UninstallPlan`: what is removed, and what stays in place, such as a relay
+profile next to the program with whether it holds a key), and on Windows the
+folder is removed once the window closes.
 
 | | Windows | macOS | Linux |
 | --- | --- | --- | --- |
@@ -125,7 +127,7 @@ authority file `ca` and an optional `name` in the certificate
 
 | Read from | By | Rules |
 | --- | --- | --- |
-| `cretlink.toml` next to the program | both roles | the one place the customer role reads; nothing is written there |
+| `cretlink.toml` next to the program | both roles | the one place the customer role reads; nothing is written there. Next to the installed program it is left in place by `cretlink uninstall`, which says that it stays and whether it holds a key |
 | `settings.toml` next to the install record | the installed technician copy | written by **Settings → Relay**; removed by `cretlink uninstall` |
 
 - **The lookup** is `relay::TechnicianRelays::active` for Give help and

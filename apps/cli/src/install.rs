@@ -24,7 +24,9 @@
 //!
 //! The settings of the installed copy — its relay and the network it waits on
 //! (ST-M007-011, [`crate::settings`]) — are kept next to the record, and
-//! uninstall removes them with it.
+//! uninstall removes them with it. A relay profile `cretlink.toml` next to the
+//! installed program is not part of the install: uninstall leaves it, and the
+//! plan says that it stays, where it lies and whether it holds a key.
 //!
 //! Everything that touches the operating system beyond plain files — the
 //! Windows shortcut and registry entry, the process list, removing a running
@@ -40,6 +42,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::relay_profile;
 use crate::setup::{self, Action, Client, RegistrationState, Runner};
 
 #[cfg(windows)]
@@ -1188,7 +1191,9 @@ pub struct UninstallPlan {
     /// The recorded registrations that still point at the installed program.
     pub registrations: Vec<PlannedRemoval>,
     /// What stays, in words: recorded registrations that point elsewhere now,
-    /// a record that could not be read.
+    /// a record that could not be read, and a relay profile next to the
+    /// installed program, with whether it holds an admission key
+    /// (ST-M007-011).
     pub kept: Vec<String>,
     /// The audit trail, which stays.
     pub audit_dir: PathBuf,
@@ -1265,6 +1270,29 @@ fn settings_label(file: &Path) -> &'static str {
     }
 }
 
+/// What the uninstall plan says about a relay profile next to the installed
+/// program: that it stays, where it lies, and what it holds. The file is read
+/// to say whether it holds a key; nothing of what it holds is repeated.
+fn kept_profile_words(profile: &Path) -> String {
+    let holds = match relay_profile::read_file(profile) {
+        Ok(Some(relay)) if relay.key().is_some() => {
+            "It holds the admission key of a relay in readable form: remove the file yourself \
+             when nobody else should be able to read that key"
+        }
+        Ok(Some(_)) => "It holds the address of a relay and no admission key",
+        Ok(None) => "It holds no relay",
+        Err(_) => {
+            "It could not be read as a relay profile and may hold the admission key of a relay: \
+             look at it, and remove it yourself when nobody else should be able to read such a \
+             key"
+        }
+    };
+    format!(
+        "The relay profile {}, which CretLink did not write and does not remove. {holds}",
+        profile.display()
+    )
+}
+
 /// Plans an uninstall from the record. `current_exe` is the running program:
 /// when it is the installed one on Windows, the folder goes after it exits.
 ///
@@ -1314,6 +1342,16 @@ pub fn uninstall_plan(
         && record.is_none()
     {
         return Err(InstallError::NotInstalled(layout.location.clone()));
+    }
+
+    // A relay profile next to the installed program is not part of the
+    // install: a person put it there, and it wins over Settings while it is
+    // there (ST-M007-011). Uninstall leaves it, and says so, because it may
+    // hold the admission key of a relay in readable form.
+    if let Some(profile) =
+        relay_profile::path_next_to(&layout.exe).filter(|profile| profile.exists())
+    {
+        kept.push(kept_profile_words(&profile));
     }
 
     let mut context = context.clone();
@@ -1987,6 +2025,149 @@ mod tests {
         );
         // The audit trail stays, in the same folder.
         assert!(audit.join("session.jsonl").exists());
+    }
+
+    #[test]
+    fn uninstall_leaves_a_relay_profile_next_to_the_program_and_says_what_it_holds() {
+        let fixture = Fixture::new("profile-kept", Platform::Linux);
+        let layout = &fixture.layout;
+        fixture.install(false, &[]).unwrap();
+        let profile = relay_profile::path_next_to(&layout.exe).unwrap();
+        let elsewhere = fixture.downloads.join("cretlink");
+        let about_the_profile = |plan: &UninstallPlan| -> Vec<String> {
+            plan.kept
+                .iter()
+                .filter(|line| line.contains("relay profile"))
+                .cloned()
+                .collect()
+        };
+        // Without such a file the plan says nothing about one.
+        assert!(about_the_profile(&fixture.plan(&elsewhere)).is_empty());
+
+        // A profile with a key: it stays, the plan says where it lies and
+        // that it holds a key, and never repeats the key.
+        let stays = format!(
+            "The relay profile {}, which CretLink did not write and does not remove. ",
+            profile.display()
+        );
+        write_file(
+            &profile,
+            b"[relay]\naddress = \"relay.example.org:443\"\nkey = \"abcabcabcabc\"\n",
+            false,
+        )
+        .unwrap();
+        let plan = fixture.plan(&elsewhere);
+        assert_eq!(
+            about_the_profile(&plan),
+            [format!(
+                "{stays}It holds the admission key of a relay in readable form: remove the file \
+                 yourself when nobody else should be able to read that key"
+            )]
+        );
+        assert!(!format!("{plan:?}").contains("abcabcabcabc"));
+        // It is not among what is removed.
+        assert!(!plan.files.contains(&profile));
+        assert!(!plan.settings.contains(&profile));
+        assert!(
+            plan.lines()
+                .iter()
+                .all(|line| !line.contains(relay_profile::PROFILE_FILE)),
+            "{:?}",
+            plan.lines()
+        );
+
+        // Without a key, without a relay, and a file that cannot be read as
+        // a profile: each is said as what it is.
+        for (content, says) in [
+            (
+                &b"[relay]\naddress = \"relay.example.org:443\"\n"[..],
+                "It holds the address of a relay and no admission key",
+            ),
+            (&b"# nothing yet\n"[..], "It holds no relay"),
+            (
+                &b"[relay]\naddress = \"relay.example.org:443\"\nkey = abcabcabcabc\n"[..],
+                "It could not be read as a relay profile and may hold the admission key of a \
+                 relay: look at it, and remove it yourself when nobody else should be able to \
+                 read such a key",
+            ),
+        ] {
+            write_file(&profile, content, false).unwrap();
+            let plan = fixture.plan(&elsewhere);
+            assert_eq!(about_the_profile(&plan), [format!("{stays}{says}")]);
+            assert!(!format!("{plan:?}").contains("abcabcabcabc"));
+        }
+
+        // Uninstall leaves the file and reports it among what stays.
+        let before = fs::read(&profile).unwrap();
+        let report = fixture.uninstall(&elsewhere);
+        assert!(report.complete(), "{report:?}");
+        assert_eq!(fs::read(&profile).unwrap(), before);
+        assert!(
+            report
+                .kept
+                .iter()
+                .any(|line| line.starts_with(&stays) && line.contains("may hold the admission key")),
+            "{:?}",
+            report.kept
+        );
+        assert!(!layout.exe.exists());
+    }
+
+    #[test]
+    fn the_relay_profile_stays_on_windows_and_macos_too() {
+        // Windows, uninstalling from the installed copy itself: the folder
+        // goes once the program has closed, but only the files of the
+        // install are removed from it, and the profile is none of them.
+        let fixture = Fixture::new("profile-windows", Platform::Windows);
+        let layout = &fixture.layout;
+        fixture.install(false, &[]).unwrap();
+        let profile = relay_profile::path_next_to(&layout.exe).unwrap();
+        assert_eq!(profile.parent(), Some(layout.location.as_path()));
+        write_file(
+            &profile,
+            b"[relay]\naddress = \"relay.example.org:443\"\nkey = \"abcabcabcabc\"\n",
+            false,
+        )
+        .unwrap();
+        let plan = fixture.plan(&layout.exe);
+        assert!(plan.after_exit);
+        assert!(
+            plan.kept
+                .iter()
+                .any(|line| line.contains(&profile.display().to_string())
+                    && line.contains("holds the admission key")),
+            "{:?}",
+            plan.kept
+        );
+        fixture.uninstall(&layout.exe);
+        let scheduled = fixture.system.after_exit.borrow().clone();
+        let (files, _dir) = &scheduled[0];
+        assert!(!files.contains(&profile));
+        assert!(profile.exists());
+
+        // macOS: the program lies inside the application, and so would the
+        // profile next to it. It is named all the same.
+        let fixture = Fixture::new("profile-macos", Platform::MacOs);
+        let layout = &fixture.layout;
+        fixture.install(false, &[]).unwrap();
+        let profile = relay_profile::path_next_to(&layout.exe).unwrap();
+        write_file(
+            &profile,
+            b"[relay]\naddress = \"relay.example.org:443\"\n",
+            false,
+        )
+        .unwrap();
+        let current = fixture.downloads.join("cretlink");
+        let plan = fixture.plan(&current);
+        assert!(
+            plan.kept
+                .iter()
+                .any(|line| line.contains(&profile.display().to_string())),
+            "{:?}",
+            plan.kept
+        );
+        assert!(fixture.uninstall(&current).complete());
+        assert!(profile.exists());
     }
 
     #[test]

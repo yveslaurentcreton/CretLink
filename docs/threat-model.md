@@ -3507,6 +3507,15 @@ writes nothing of its own but the audit trail.
   desktop entry, the uninstall entry and the recorded registrations, and
   reports anything it could not remove instead of claiming success. The audit
   trail stays on purpose, and the uninstall says so.
+- *A relay profile next to the installed program outlives the install.* The
+  installed copy keeps its relay in its settings, which uninstall removes with
+  the key in them. A file `cretlink.toml` next to the installed program is not
+  part of the install: a person put it there, and it may hold an admission
+  key in readable form. Uninstall leaves it, and both the command and the
+  Settings screen say before anything is removed that it stays, where it lies
+  and whether it holds a key, so that a key is never left behind without the
+  technician knowing. The key admits to the relay and controls no session;
+  its operator can withdraw it.
 - *A tampered `install.json` turns uninstall into a deletion primitive.*
   Uninstall deletes only the fixed paths of the layout, never a path read from
   the record, and reads at most 64 KiB of it. The record decides only which

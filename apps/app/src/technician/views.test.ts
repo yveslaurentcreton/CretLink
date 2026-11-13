@@ -1144,6 +1144,27 @@ describe("settings", () => {
     expect(buttonNamed(root, "Cancel")?.dataset.action).toBe("uninstall-cancel");
   });
 
+  it("says what uninstall leaves in place: a relay profile next to the program, and that it holds a key", () => {
+    const root = show("settings-uninstall-profile");
+    const stays = root.querySelector(".plan.stays");
+    expect(text(root.querySelector("#uninstall-stays-h"))).toBe("This stays:");
+    expect(stays?.getAttribute("aria-labelledby")).toBe("uninstall-stays-h");
+    const lines = Array.from(stays?.querySelectorAll("li") ?? []).map(text);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("cretlink.toml, which CretLink did not write and does not remove.");
+    expect(lines[0]).toContain("It holds the admission key of a relay in readable form");
+    // It is not among what is removed, and the audit trail is still said.
+    expect(
+      Array.from(root.querySelectorAll(".plan:not(.stays) li")).map(text),
+    ).toEqual(["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.exe"]);
+    expect(text(root)).toContain("The audit trail stays");
+    // Without anything of the kind, the step says nothing about it.
+    const plain = show("settings-uninstall");
+    expect(plain.querySelector(".plan.stays")).toBeNull();
+    expect(plain.querySelector("#uninstall-stays-h")).toBeNull();
+    expect(Array.from(plain.querySelectorAll(".plan li")).map(text)).toHaveLength(4);
+  });
+
   it("offers no uninstall for a run-once copy and names the folder it runs from", () => {
     const root = show("settings-run-once");
     expect(text(root)).toContain("Runs from C:\\Users\\sam\\Downloads");

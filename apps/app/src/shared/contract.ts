@@ -201,6 +201,15 @@ export interface AiClientStatus {
   uninstallPlan: string[];
 }
 
+// `uninstall_plan`: what uninstalling this copy would remove and what it
+// would leave in place, one line each, before anything changes. What stays
+// includes a relay profile next to the installed program, with whether it
+// holds an admission key (ST-M007-011). The audit trail stays too.
+export interface UninstallPlan {
+  removes: string[];
+  stays: string[];
+}
+
 // --- The local MCP bridge, for the technician's rail (ST-M009-008) ---
 
 // `get_bridge_status`, and the `console-bridge` event on every change.

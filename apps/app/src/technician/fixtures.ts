@@ -1330,6 +1330,18 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
       ],
     },
   },
+  // A relay profile next to the installed program stays, and the plan says
+  // that it holds a key (ST-M007-011).
+  "settings-uninstall-profile": {
+    ...base(idle),
+    nav: "settings",
+    uninstall: {
+      plan: ["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.exe"],
+      stays: [
+        `The relay profile ${PROFILE_PATH}, which CretLink did not write and does not remove. It holds the admission key of a relay in readable form: remove the file yourself when nobody else should be able to read that key`,
+      ],
+    },
+  },
   "settings-run-once": {
     ...base(idle),
     nav: "settings",

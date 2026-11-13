@@ -433,8 +433,10 @@ Commands:
   uninstall [--yes]   Remove CretLink installed for this user: its files, its
                       settings (the relay and its key), menu entry, uninstall
                       entry and the AI client registrations it made. Shows
-                      what it removes and asks first, unless --yes. The audit
-                      trail stays.
+                      what it removes and what stays, and asks first, unless
+                      --yes. The audit trail stays, and so does a relay
+                      profile cretlink.toml next to the program: uninstall
+                      says where it lies and whether it holds a key.
   recover [--remove]  List what CretLink left on this computer (staged files,
                       reboot-resume tickets); with --remove, remove it. Exits
                       with an error when something could not be removed.
@@ -600,10 +602,27 @@ mod tests {
             entry: None,
             uninstall_entry: false,
             registrations: vec![],
-            kept: vec!["The Codex CLI registration, which now starts /x mcp".to_owned()],
+            kept: vec![
+                "The Codex CLI registration, which now starts /x mcp".to_owned(),
+                "The relay profile /home/ann/.local/bin/cretlink.toml, which CretLink did not \
+                 write and does not remove. It holds the admission key of a relay in readable \
+                 form: remove the file yourself when nobody else should be able to read that key"
+                    .to_owned(),
+            ],
             audit_dir: std::path::PathBuf::from("/home/ann/.local/share/CretLink/audit"),
         };
         let text = uninstall_plan_text(&plan);
+        // A relay profile next to the program stays, and the plan says so
+        // under what stays, with where it lies and that it holds a key.
+        let stays = text.split_once("This stays:\n").map(|(_, stays)| stays);
+        assert!(
+            stays.is_some_and(|stays| stays.contains(
+                "  - The relay profile /home/ann/.local/bin/cretlink.toml, which CretLink did \
+                 not write and does not remove. It holds the admission key of a relay in \
+                 readable form"
+            )),
+            "{text}"
+        );
         assert!(
             text.contains("This removes:\n  - /home/ann/.local/bin/cretlink\n"),
             "{text}"
@@ -631,6 +650,18 @@ mod tests {
         );
         assert!(text.contains("The audit trail in /home/ann/.local/share/CretLink/audit"));
         assert!(text.contains("not completely uninstalled"));
+        // What stayed is said again once the uninstall is done.
+        let report = install::UninstallReport {
+            kept: plan.kept.clone(),
+            ..install::UninstallReport::default()
+        };
+        let text = uninstall_report_text(&report, &plan.audit_dir);
+        let left = text.split_once("Left in place:\n").map(|(_, left)| left);
+        assert!(
+            left.is_some_and(|left| left
+                .contains("  - The relay profile /home/ann/.local/bin/cretlink.toml, which")),
+            "{text}"
+        );
     }
 
     #[test]

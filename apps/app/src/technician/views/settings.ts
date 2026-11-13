@@ -109,6 +109,19 @@ function uninstallCard(s: TechnicianSnapshot): HTMLElement {
           step.plan.map((line) => h("li", { class: "mono" }, line)),
         )
       : null,
+    // What uninstall leaves in place: a relay profile next to the program
+    // with whether it holds a key, a registration that points elsewhere now
+    // (ST-M007-011). Said before anything is removed, like what goes.
+    step.stays && step.stays.length > 0
+      ? [
+          h("p", { id: "uninstall-stays-h" }, "This stays:"),
+          h(
+            "ul",
+            { class: "plan stays", "aria-labelledby": "uninstall-stays-h" },
+            step.stays.map((line) => h("li", null, line)),
+          ),
+        ]
+      : null,
     h(
       "div",
       { class: "note" },

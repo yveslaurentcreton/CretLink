@@ -52,6 +52,7 @@ import {
   isListenNetwork,
   isRelaySettings,
   isRelayTest,
+  isUninstallPlan,
   listenHost,
   placeholderConsole,
   relayForm,
@@ -908,8 +909,9 @@ async function loadUninstallPlan(): Promise<void> {
   set({ uninstall: { plan: null }, busy: "uninstall-plan", error: undefined });
   try {
     const plan = await api.uninstallPlan();
+    if (!isUninstallPlan(plan)) throw new Error("The plan could not be read.");
     focusNext = "#uninstall-step";
-    set({ uninstall: { plan: Array.isArray(plan) ? plan : [] }, busy: undefined });
+    set({ uninstall: { plan: plan.removes, stays: plan.stays }, busy: undefined });
   } catch (error) {
     set({
       uninstall: undefined,
