@@ -289,6 +289,12 @@ would otherwise decide what step 2 shows.
    rights; let the technician upload a file into staging.
    - Expected: the upload works, and its staging tree lies under
      `%LOCALAPPDATA%\CretLink\staging`.
+11. Start **Get help** and accept the UAC prompt. Let the technician upload a
+   text file into staging and move it to the desktop of the account that is
+   signed in (`remote_move`). Open the file from the desktop, and run
+   `icacls` on it in the PowerShell that is not elevated.
+   - Expected: the file opens without a prompt, and `icacls` lists the same
+     accounts as for a file that was made on that desktop.
 
 ### MT-5 — Locked-file cleanup failure and retry
 

@@ -1674,8 +1674,17 @@ that is already open. Mitigations:
   library and nothing it starts later begins there.
 - *Nothing is moved in.* A move keeps a file as it is, with its permissions
   and with every handle a program opened on it before. An elevated program
-  therefore refuses to move a file from elsewhere into its staging area. A
-  file gets there by an upload, which makes it new.
+  therefore refuses to move a file from elsewhere into its staging area,
+  whether the request names the staging area by a staging name or by its
+  full path: where the file would lie decides. A file gets there by an
+  upload, which makes it new.
+- *What is moved out takes the permissions of where it arrives.* For the same
+  reason a file that an elevated program moves from its staging area to
+  another place would stay closed to everybody but the administrators, the
+  customer included. It is given the permissions that the folder it arrives
+  in hands down, as if it had been made there, also when the request names
+  the staged file by its full path; if that fails, the move is answered as
+  failed and says so.
 - *Said, not passed over.* A session whose cleanup failed, a staging area
   that could not be made private (with the reason), a folder of an earlier
   release that is still there, and a lock that another program holds for
@@ -1696,8 +1705,9 @@ Evidence: `a_planted_manifest_removes_nothing_outside_the_staging_area`,
 `the_temporary_file_of_a_manifest_is_never_written_through_a_link`,
 `a_manifest_larger_than_a_manifest_can_be_is_not_read`,
 `a_session_with_a_damaged_manifest_is_named_and_never_called_clean`,
-`a_sweep_and_a_census_make_nothing_where_nothing_was_kept` and
-`nothing_is_moved_into_a_private_staging_area_from_elsewhere`
+`a_sweep_and_a_census_make_nothing_where_nothing_was_kept`,
+`nothing_is_moved_into_a_private_staging_area_from_elsewhere` and, on Windows,
+`a_file_moved_out_of_a_private_staging_area_takes_the_permissions_of_its_new_folder`
 (`crates/exec/src/fs/tests.rs`); the rule about private permissions, the
 chain of folders, and what happens when something else stands in the place
 of a folder (`crates/exec/src/own/tests.rs`);

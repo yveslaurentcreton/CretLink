@@ -270,6 +270,16 @@ impl FsError {
         )
     }
 
+    /// The refusal to move an entry from elsewhere into the private folder of
+    /// an elevated program.
+    fn moved_in() -> Self {
+        Self::new(
+            ErrorCode::Unsupported,
+            "a move into the staging area of a program with administrator rights is not \
+             supported: upload the file",
+        )
+    }
+
     /// Maps a raw I/O error onto a wire [`ErrorCode`], preferring the precise
     /// Windows status code and falling back to the portable [`std::io::ErrorKind`]
     /// so the crate maps sensibly on every platform it is tested on.
@@ -1071,16 +1081,20 @@ impl FileStore {
             && matches!(to, RemotePath::Staging { .. })
             && !matches!(from, RemotePath::Staging { .. })
         {
-            return Err(FsError::new(
-                ErrorCode::Unsupported,
-                "a move into the staging area of a program with administrator rights is not \
-                 supported: upload the file",
-            ));
+            return Err(FsError::moved_in());
         }
         let from_path = self.resolve(from)?;
         let to_path = self.resolve(to)?;
         if matches!(to, RemotePath::Staging { .. }) {
             self.ensure_staging_dirs().await?;
+        }
+        // Where an entry lies decides, not how a request spells its path: a
+        // staged file can be named by its staging name or by its full path,
+        // and so can the staging area as a destination.
+        let from_private = self.lies_in_private(&from_path).await;
+        let to_private = self.lies_in_private(&to_path).await;
+        if to_private && !from_private {
+            return Err(FsError::moved_in());
         }
         // An atomic rename is same-volume only; a copy is composed console-side.
         if !same_volume(&from_path, &to_path) {
@@ -1121,7 +1135,44 @@ impl FileStore {
         tokio::fs::rename(&from_path, &to_path)
             .await
             .map_err(|e| FsError::from_io("failed to move the path", &e))?;
+        // What leaves a private staging area must not keep the permissions it
+        // had there, which admit only administrators: it takes the ones of
+        // the folder it arrives in, as if it had been made there.
+        #[cfg(windows)]
+        if from_private && !to_private {
+            let moved = to_path.clone();
+            let inherited =
+                tokio::task::spawn_blocking(move || crate::own::inherit_permissions(&moved)).await;
+            if !matches!(inherited, Ok(Ok(()))) {
+                return Err(FsError::new(
+                    ErrorCode::AccessDenied,
+                    "the entry was moved, but it kept the permissions of the staging area: only \
+                     an administrator can open it",
+                ));
+            }
+        }
         Ok(OpResult::Ack {})
+    }
+
+    /// Whether the folder that holds `path` really lies in the private folder
+    /// of an elevated program, however the path is spelled: by another
+    /// letter case, by short names or through a link. `false` for a store
+    /// whose folders need not be private, and when either location cannot be
+    /// told (the move then fails on its own account).
+    async fn lies_in_private(&self, path: &Path) -> bool {
+        if !self.base.is_private() {
+            return false;
+        }
+        let Some(folder) = path.parent() else {
+            return false;
+        };
+        let (Ok(folder), Ok(private)) = (
+            tokio::fs::canonicalize(folder).await,
+            tokio::fs::canonicalize(self.base.outermost()).await,
+        ) else {
+            return false;
+        };
+        folder.starts_with(private)
     }
 
     async fn delete(&self, path: &RemotePath) -> Result<OpResult, FsError> {
