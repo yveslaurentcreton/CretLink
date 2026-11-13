@@ -250,19 +250,39 @@ function connectCode(): void {
     });
     return;
   }
-  void viewCommand("connect", () => api.startLiveSession(code), (error) =>
-    // A relay code is not a mistyped code: typing it again would not help
-    // (ST-M007-012).
-    isCommandError(error) && error.stage === "relay"
-      ? {
-          title: "This copy cannot use a relay code",
-          next: "Ask your technician for a copy of CretLink that is set up for their relay, or connect while you are on the same network.",
-        }
-      : {
-          title: "That code did not work",
-          next: "Check the code with your technician and type it again.",
-        },
-  );
+  void viewCommand("connect", () => api.startLiveSession(code), relayCodeFailure);
+}
+
+/**
+ * What to say around the backend's message when a typed code was not taken.
+ * A relay code is not a mistyped code: typing it again would not help
+ * (ST-M007-012). Why this copy cannot use it decides the next step
+ * (ST-M007-011).
+ */
+export function relayCodeFailure(error: unknown): Omit<UiError, "message"> {
+  const stage = isCommandError(error) ? error.stage : "";
+  switch (stage) {
+    case "relay":
+      return {
+        title: "This copy cannot use a relay code",
+        next: "Ask your technician for a copy of CretLink that is set up for their relay, or connect while you are on the same network.",
+      };
+    case "relay_profile":
+      return {
+        title: "The relay settings of this copy cannot be used",
+        next: "Tell your technician what this says and ask for a new copy of CretLink. You can still connect while you are on the same network.",
+      };
+    case "relay_later":
+      return {
+        title: "This copy cannot connect through a relay yet",
+        next: "Connect while you are on the same network as your technician.",
+      };
+    default:
+      return {
+        title: "That code did not work",
+        next: "Check the code with your technician and type it again.",
+      };
+  }
 }
 
 async function relaunch(): Promise<void> {

@@ -314,4 +314,47 @@ describe("customer controller", () => {
     expect(alert).toContain("set up for their relay");
     expect(alert).not.toContain("type it again");
   });
+
+  it("says what is wrong with the relay settings of this copy, and what to tell the technician", async () => {
+    // The profile file next to the program cannot be used (ST-M007-011).
+    const message =
+      "This is a relay code, but the relay settings of this copy of CretLink cannot be used. Line 2: `address` needs a port. The file is E:\\cretlink.toml.";
+    await boot({
+      start_live_session: () => {
+        throw { stage: "relay_profile", message };
+      },
+    });
+    const input = app().querySelector<HTMLInputElement>("#code");
+    if (input) input.value = "53ST-A71D-JKKV-0VGH";
+    click('[data-action="connect-code"]');
+    await flush();
+    const alert = app().querySelector('[role="alert"]')?.textContent ?? "";
+    expect(alert).toContain("The relay settings of this copy cannot be used");
+    expect(alert).toContain(message);
+    expect(alert).toContain("ask for a new copy of CretLink");
+    expect(alert).toContain("You can still connect while you are on the same network.");
+    expect(alert).not.toContain("type it again");
+    // The window is where it was: nothing was dialled.
+    expect(app().querySelector("#code")).not.toBeNull();
+  });
+
+  it("does not send the customer back to the code when the copy knows its relay", async () => {
+    await boot({
+      start_live_session: () => {
+        throw {
+          stage: "relay_later",
+          message:
+            "This is a relay code, and this copy of CretLink is set up for the relay relay.example.org. This version cannot connect through a relay yet.",
+        };
+      },
+    });
+    const input = app().querySelector<HTMLInputElement>("#code");
+    if (input) input.value = "53ST-A71D-JKKV-0VGH";
+    click('[data-action="connect-code"]');
+    await flush();
+    const alert = app().querySelector('[role="alert"]')?.textContent ?? "";
+    expect(alert).toContain("This copy cannot connect through a relay yet");
+    expect(alert).toContain("set up for the relay relay.example.org");
+    expect(alert).not.toContain("type it again");
+  });
 });
