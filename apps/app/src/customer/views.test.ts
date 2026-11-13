@@ -3,8 +3,10 @@
 // snapshot, rendered in jsdom without Tauri.
 
 import { afterEach, describe, expect, it } from "vitest";
+import type { ActivityEntry } from "../shared/contract";
+import { upsertActivity } from "../shared/feed";
 import { DISCLOSURE_TEXT } from "../technician/disclosure";
-import { FIXTURES, MINI_FIXTURES, NOW, XSS, viewIn } from "./fixtures";
+import { FEED_DONE, FIXTURES, MINI_FIXTURES, NOW, XSS, viewIn } from "./fixtures";
 import type { CustomerSnapshot } from "./model";
 import { renderMini } from "./views/mini";
 import { renderCustomer } from "./views/shell";
@@ -322,6 +324,45 @@ describe("under full control (#c-live)", () => {
     expect(text(items[5])).toContain("Sam · terminal");
     expect(text(items[2])).toMatch(/Sam finished 18\.4 MB/);
     expect(text(items[0])).toContain("14:43:48");
+  });
+
+  it("shows that the technician looks through files, with the folder, as one item that follows along (ST-M010-002)", () => {
+    // The item as the customer's side builds it from the technician's looks:
+    // one id for as long as the looks follow one another.
+    const looking = (folder: string): ActivityEntry => ({
+      entry: "item",
+      item: {
+        id: "browse-1",
+        source: "technician",
+        description: "Looked through files and folders",
+        kind: "file_operation",
+        operation: `list the folder ${folder}`,
+        path: folder,
+        state: { state: "done" },
+        startedAt: new Date(NOW - 180_000).toISOString(),
+        durationMs: 170_000,
+      },
+    });
+    let feed = upsertActivity(FEED_DONE, looking("C:\\Users\\ann"));
+    feed = upsertActivity(feed, looking("C:\\Users\\ann\\Documents"));
+    expect(feed).toHaveLength(FEED_DONE.length + 1);
+
+    const root = show("live-none", { activity: feed });
+    const items = Array.from(root.querySelectorAll(".tl .ti"));
+    // One item, the newest, and it names the folder that is looked at now.
+    expect(items.filter((li) => text(li).includes("Looked through files and folders"))).toHaveLength(1);
+    const item = items[0];
+    expect(text(item?.querySelector(".t"))).toBe("Looked through files and folders");
+    expect(text(item?.querySelector(".who"))).toBe("Sam");
+    expect(text(item?.querySelector(".res"))).toBe("finished");
+    expect(text(item?.querySelector("code"))).toBe(
+      "Operation: list the folder C:\\Users\\ann\\Documents",
+    );
+    expect(text(item)).not.toContain("left this computer");
+    // It is among the files, and it is not something that is running.
+    const files = Array.from(show("live-none", { activity: feed, filter: "files" }).querySelectorAll(".tl .ti"));
+    expect(text(files[0])).toContain("Looked through files and folders");
+    expect(text(root.querySelector(".now"))).toContain("Nothing is running");
   });
 
   it("says a file left this computer in words, and marks it amber", () => {
