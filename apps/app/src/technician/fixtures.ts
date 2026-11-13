@@ -10,10 +10,12 @@ import type {
   ExplorerDrive,
   ExplorerEntry,
   ListenNetwork,
+  RelaySettings,
+  RelayView,
   SessionSummary,
   TransferEntry,
 } from "../shared/contract";
-import type { ConsoleState, SessionPhase, TargetIdentity } from "./api";
+import type { ConsoleState, RelayRoute, SessionPhase, TargetIdentity } from "./api";
 import {
   DRIVES,
   type ExplorerState,
@@ -51,9 +53,22 @@ export const TARGET: TargetIdentity = {
 
 export const SESSION_ID = "7f3a9c51d2e84b6a";
 
+/** The relay code of the fixtures, as a technician reads it out. */
+export const RELAY_CODE = "53ST-A71D-JKKV-0VGH";
+
+/** The relay of the fixtures, holding the code of a waiting session. */
+export const VIA_RELAY: RelayRoute = { host: "relay.example.org", admitted: true };
+
 export function consoleIn(
   phase: SessionPhase,
-  options: { session?: boolean; target?: boolean; simulated?: boolean; displayName?: string } = {},
+  options: {
+    session?: boolean;
+    target?: boolean;
+    simulated?: boolean;
+    displayName?: string;
+    // The relay the session waits on or runs through (ST-M007-013).
+    relay?: RelayRoute;
+  } = {},
 ): ConsoleState {
   const withTarget = options.target ?? false;
   const identity: TargetIdentity = options.simulated
@@ -85,6 +100,7 @@ export function consoleIn(
       : [],
     ...(withTarget ? { selected: "t1" } : {}),
     ...(options.session ? { session: SESSION_ID } : {}),
+    ...(options.relay ? { relay: options.relay } : {}),
     phase,
   };
 }
@@ -109,6 +125,81 @@ export const APP_RUN_ONCE: AppInfo = {
   ...APP_INSTALLED,
   install: "run_once",
   location: "C:\\Users\\sam\\Downloads",
+};
+
+// --- The relay of this copy (ST-M007-011) ---
+
+/** The relay Sam hosts. Its key is never part of a view. */
+export const RELAY: RelayView = {
+  host: "relay.example.org",
+  address: "relay.example.org:443",
+  keySet: true,
+};
+
+/** A relay with a certificate from an authority of the technician's own. */
+export const RELAY_PRIVATE: RelayView = {
+  host: "host-01.example.org",
+  address: "192.0.2.1:9970",
+  keySet: false,
+  ca: "relay-ca.pem",
+  name: "host-01.example.org",
+};
+
+const SETTINGS_PATH = "C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\settings.toml";
+const PROFILE_PATH = "C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.toml";
+const PORTABLE_PROFILE_PATH = "C:\\Users\\sam\\Downloads\\cretlink.toml";
+
+/** The installed copy without a relay. */
+export const RELAY_NONE: RelaySettings = {
+  editable: true,
+  source: "none",
+  file: { path: PROFILE_PATH },
+  stored: { path: SETTINGS_PATH },
+};
+
+/** The installed copy with a relay in its settings. */
+export const RELAY_STORED: RelaySettings = {
+  ...RELAY_NONE,
+  source: "settings",
+  stored: { path: SETTINGS_PATH, relay: RELAY },
+};
+
+/** A file next to the program, which wins over the relay of the settings. */
+export const RELAY_FILE: RelaySettings = {
+  editable: true,
+  source: "file",
+  file: { path: PROFILE_PATH, relay: RELAY_PRIVATE },
+  stored: { path: SETTINGS_PATH, relay: RELAY },
+};
+
+/** A file next to the program that cannot be used. */
+export const RELAY_FILE_PROBLEM: RelaySettings = {
+  editable: true,
+  source: "file",
+  file: {
+    path: PROFILE_PATH,
+    problem: {
+      file: PROFILE_PATH,
+      field: "address",
+      message:
+        "Line 2: `address` needs a port; write the relay's host name and port, like relay.example.org:443.",
+    },
+  },
+  stored: { path: SETTINGS_PATH },
+};
+
+/** A copy that runs once: no settings, and no file next to it. */
+export const RELAY_RUN_ONCE: RelaySettings = {
+  editable: false,
+  source: "none",
+  file: { path: PORTABLE_PROFILE_PATH },
+};
+
+/** A copy that runs once with a profile file next to it. */
+export const RELAY_RUN_ONCE_FILE: RelaySettings = {
+  editable: false,
+  source: "file",
+  file: { path: PORTABLE_PROFILE_PATH, relay: RELAY },
 };
 
 export const CLIENTS: AiClientStatus[] = [
@@ -732,6 +823,7 @@ function base(console: ConsoleState): TechnicianSnapshot {
     clients: CLIENTS,
     sessions: SESSIONS.slice(0, 3),
     networks: NETWORKS,
+    relay: RELAY_NONE,
   };
 }
 
@@ -807,7 +899,177 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
     ...base(consoleIn({ phase: "stopped", reason: "technician_requested" })),
     busy: "network",
   },
+  // Not on the same network? (ST-M007-013): with a relay, with a profile
+  // that cannot be used, in a copy that runs once, and while the wait changes
+  // from the network to the relay.
+  "wait-relay-ready": {
+    ...base(
+      consoleIn(
+        { phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" },
+        { displayName: "Sam" },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  "wait-relay-problem": {
+    ...base(consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" })),
+    relay: RELAY_FILE_PROBLEM,
+  },
+  "wait-relay-run-once": {
+    ...base(consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" })),
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE,
+  },
+  "wait-relay-unknown": {
+    ...base(consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" })),
+    relay: null,
+  },
+  "wait-relay-changing": {
+    ...base(consoleIn({ phase: "stopped", reason: "technician_requested" })),
+    relay: RELAY_STORED,
+    busy: "relay",
+  },
+  // Waiting on the relay: while it is being reached, and once it holds the
+  // code.
+  "relay-wait-connecting": {
+    ...base(
+      consoleIn(
+        { phase: "listening", code: RELAY_CODE, address: "relay.example.org:443" },
+        { displayName: "Sam", relay: { ...VIA_RELAY, admitted: false } },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  "relay-wait": {
+    ...base(
+      consoleIn(
+        { phase: "listening", code: RELAY_CODE, address: "relay.example.org:443" },
+        { displayName: "Sam", relay: VIA_RELAY },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  // A relay that could not be used: each failure with its own words.
+  "relay-failed-unreachable": {
+    ...base(
+      consoleIn(
+        {
+          phase: "failed",
+          stage: "relay_unreachable",
+          message:
+            "CretLink could not connect to the relay at relay.example.org:443. The relay may be off, the address may be wrong, or this network does not let this computer reach it.",
+          next: "Check that the relay is running and that its address and port are right, then try again. You can change and test the relay in Settings, under Relay.",
+        },
+        { relay: { ...VIA_RELAY, admitted: false } },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  "relay-failed-untrusted": {
+    ...base(
+      consoleIn(
+        {
+          phase: "failed",
+          stage: "relay_untrusted",
+          message:
+            "The relay at relay.example.org:443 showed no certificate that this computer trusts for the name relay.example.org, so nothing was sent to it. The certificate may come from an authority this computer does not know, be out of date or carry another name; or the server at that address is not the relay.",
+          next: "If the relay's certificate comes from an authority of your own, give its certificate file. If it carries another name than the host of the address, give that name. You can change and test the relay in Settings, under Relay.",
+        },
+        { relay: { ...VIA_RELAY, admitted: false } },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  "relay-failed-key": {
+    ...base(
+      consoleIn(
+        {
+          phase: "failed",
+          stage: "relay_key_refused",
+          message:
+            "The relay relay.example.org does not know the admission key of this copy. The key may be mistyped, or it was withdrawn.",
+          next: "Enter the key again, or ask the relay's operator for a new one. You can change and test the relay in Settings, under Relay.",
+        },
+        { relay: { ...VIA_RELAY, admitted: false } },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  // The relay stopped while the approval code was being compared.
+  "relay-lost-early": {
+    ...base(
+      consoleIn(
+        {
+          phase: "failed",
+          stage: "relay_lost",
+          message: "The connection through the relay relay.example.org was lost.",
+        },
+        { relay: VIA_RELAY },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
   connecting: base(consoleIn({ phase: "connecting" }, { session: true })),
+  // A session through the relay: every screen after the code says so.
+  "relay-connecting": base(
+    consoleIn({ phase: "connecting" }, { session: true, relay: VIA_RELAY }),
+  ),
+  "relay-compare": base(
+    consoleIn(
+      { phase: "awaiting_approval_code", code: "482913" },
+      { session: true, target: true, relay: VIA_RELAY },
+    ),
+  ),
+  "relay-consent": base(
+    consoleIn({ phase: "awaiting_consent" }, { session: true, target: true, relay: VIA_RELAY }),
+  ),
+  "relay-live": {
+    ...base(
+      consoleIn(
+        { phase: "full_control" },
+        { session: true, target: true, displayName: "Sam", relay: VIA_RELAY },
+      ),
+    ),
+    activity: FEED,
+    last: { id: SESSION_ID, target: TARGET, since: NOW - minutes(28) },
+  },
+  "relay-end": {
+    ...base(consoleIn({ phase: "stopped", reason: "technician_requested" }, { relay: VIA_RELAY })),
+    sessions: [
+      {
+        ...SUMMARY_CLEAN,
+        id: SESSION_ID,
+        endedBy: "technician",
+        endedAt: iso(NOW),
+        relay: "relay.example.org",
+      },
+      ...SESSIONS,
+    ],
+    activity: FEED,
+    last: { ...last, reason: "technician_requested" },
+  },
+  // The relay stopped during the session.
+  "relay-end-lost": {
+    ...base(consoleIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY })),
+    sessions: [
+      {
+        ...SUMMARY_UNKNOWN,
+        id: SESSION_ID,
+        hostname: "ACME-PC-07",
+        endedAt: iso(NOW),
+        relay: "relay.example.org",
+      },
+      ...SESSIONS,
+    ],
+    activity: FEED,
+    last: { ...last, reason: "disconnected" },
+  },
+  "relay-end-lost-preparing": {
+    ...base(consoleIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY })),
+    activity: FEED,
+    reportPending: true,
+    last: { ...last, reason: "disconnected" },
+  },
   compare: base(
     consoleIn({ phase: "awaiting_approval_code", code: "482913" }, { session: true, target: true }),
   ),
@@ -986,8 +1248,117 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
       ],
     },
   },
-  "settings-run-once": { ...base(idle), nav: "settings", app: APP_RUN_ONCE },
-  "settings-unavailable": { ...base(idle), nav: "settings", app: null },
+  "settings-run-once": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE,
+  },
+  "settings-unavailable": { ...base(idle), nav: "settings", app: null, relay: null },
+  // Settings → Relay (ST-M007-011).
+  "settings-relay": { ...base(idle), nav: "settings", relay: RELAY_STORED },
+  "settings-relay-private": {
+    ...base(idle),
+    nav: "settings",
+    relay: { ...RELAY_STORED, stored: { path: SETTINGS_PATH, relay: RELAY_PRIVATE } },
+  },
+  "settings-relay-chosen": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: { ca: { mode: "chosen", pick: 4, name: "authority.pem" }, round: 0 },
+  },
+  "settings-relay-testing": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: { ca: { mode: "keep" }, round: 0, test: { state: "running" } },
+  },
+  "settings-relay-admitted": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: {
+      ca: { mode: "keep" },
+      round: 0,
+      test: {
+        state: "done",
+        result: {
+          ok: true,
+          kind: "admitted",
+          message:
+            "The relay relay.example.org answered and admits this copy. Its certificate is valid for relay.example.org, checked against the certificate authorities of this computer.",
+          next: "",
+        },
+      },
+    },
+  },
+  "settings-relay-refused": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: {
+      ca: { mode: "keep" },
+      round: 0,
+      test: {
+        state: "done",
+        result: {
+          ok: false,
+          kind: "key_refused",
+          message:
+            "The relay relay.example.org does not know the admission key of this copy. The key may be mistyped, or it was withdrawn.",
+          next: "Enter the key again, or ask the relay's operator for a new one.",
+        },
+      },
+    },
+  },
+  "settings-relay-removing": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: { ca: { mode: "keep" }, round: 0, removing: true },
+  },
+  "settings-relay-unreadable": {
+    ...base(idle),
+    nav: "settings",
+    relay: {
+      ...RELAY_NONE,
+      source: "settings",
+      stored: {
+        path: SETTINGS_PATH,
+        problem: {
+          file: SETTINGS_PATH,
+          field: "key",
+          message: "Line 3: the value of `key` must be text in double quotes.",
+        },
+      },
+    },
+  },
+  "settings-relay-file": { ...base(idle), nav: "settings", relay: RELAY_FILE },
+  "settings-relay-file-problem": { ...base(idle), nav: "settings", relay: RELAY_FILE_PROBLEM },
+  "settings-relay-run-once-file": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE_FILE,
+  },
+  // A profile's texts come from a file that somebody else may have written.
+  "settings-relay-xss": {
+    ...base(idle),
+    nav: "settings",
+    relay: {
+      editable: true,
+      source: "file",
+      file: {
+        path: `C:\\${XSS_NAME}\\cretlink.toml`,
+        relay: { host: XSS, address: XSS, keySet: true, ca: XSS, name: XSS },
+      },
+      stored: {
+        path: SETTINGS_PATH,
+        problem: { file: XSS, message: XSS },
+      },
+    },
+  },
   error: {
     ...base(idle),
     error: {

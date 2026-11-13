@@ -18,33 +18,32 @@
 //! to reach a simulated driver (AC #4).
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use cretlink_console::{
-    AUDIT_CHANNEL_CAPACITY, AuditServiceConfig, ChannelAudit, ConsoleSessionService, ConsoleState,
-    SessionPhase, StopReason, TechnicianActivity, TechnicianHost, TermAttachment, TermEvent,
-    prune_audit_dir, report_prune, spawn_audit_service, technician_display_name, terminal_closed,
-    terminal_open_started, terminal_opened,
+    ChannelAudit, ConsoleSessionService, ConsoleState, SessionPhase, StopReason,
+    TechnicianActivity, TechnicianHost, TermAttachment, TermEvent, technician_display_name,
+    terminal_closed, terminal_open_started, terminal_opened,
 };
 // The simulated seed targets are developer-only: the shipped console listens and
 // never picks a target, so these compile only under `dev-simulate`.
 #[cfg(feature = "dev-simulate")]
 use cretlink_console::{DiscoveredTarget, DiscoverySource, TargetId};
-use cretlink_discovery::{Advertiser, ConnectionCode, default_route_addr, listen_candidates};
+use cretlink_discovery::{RelayCode, default_route_addr, listen_candidates};
 // The technician terminal (ST-M008-001) addresses a hosted terminal by `JobId`,
 // picks a `Shell`, and reports its end via `JobOutcome`; `TargetError` is the
 // service's fail-closed error surface, mapped straight to a frontend
 // `CommandError` so `no_consented_session` stays legible in the UI.
 use cretlink_mcp::TargetError;
-use cretlink_protocol::{JobId, JobOutcome, PROTOCOL_V1, RevokeReason, Shell};
+use cretlink_protocol::{JobId, JobOutcome, RevokeReason, Shell};
 // Only the fabricated-consent developer command binds a synthetic session id and
 // simulated identity; they leave the shipped build entirely (ST-M002-009).
 #[cfg(feature = "dev-simulate")]
 use cretlink_protocol::{SessionId, TargetIdentity};
-use cretlink_session::{ActivityEntry, ConsoleHints, SessionHost};
+use cretlink_session::ActivityEntry;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -58,14 +57,19 @@ mod history;
 mod host_os;
 // The network the technician waits on (ST-M009-016).
 mod network;
+// Settings → Relay (ST-M007-011).
+mod relay_settings;
 mod session_driver;
+// The task of one session: waiting on a network or on a relay (ST-M007-013).
+mod session_task;
 // This copy, its AI clients, and run once or install (ST-M009-006); the start
 // screen registers part of it too.
 pub(crate) mod setup;
 use session_driver::{
-    ActivitySlot, Intent, IntentSender, ServiceSlot, StateSink, intent_channel, lock,
-    lock_activity, lock_service, pump,
+    ActivitySlot, Intent, IntentSender, Place, ServiceSlot, StateSink, intent_channel, lock,
+    lock_activity, lock_service,
 };
+use session_task::{RelayWait, Run, Wait};
 
 /// The console's single source of truth, shared across command invocations and
 /// the background live-session pump. Both hold the same `Arc<Mutex<..>>`, so the
@@ -100,9 +104,14 @@ pub struct AppState {
     /// The local MCP bridge as the rail shows it: its endpoint and the AI
     /// clients that called during this session (ST-M009-008).
     bridge: bridge::BridgeSlot,
-    /// The network adapter the technician chose to wait on earlier in this
-    /// run (ST-M009-016). Kept in memory only.
+    /// The network adapter the technician chose to wait on (ST-M009-016).
+    /// The installed copy keeps it in its settings, so that it holds after
+    /// the program is closed (ST-M007-011); a copy that runs once keeps it
+    /// in memory only.
     network: network::NetworkChoice,
+    /// The certificate authority file the technician chose in Settings →
+    /// Relay and has not saved yet (ST-M007-011).
+    relay_ca: relay_settings::PendingCa,
     /// The task of the session that is live or was live last, so that a
     /// change of network can wait until the old listener is gone before it
     /// starts the new one (ST-M009-016).
@@ -143,7 +152,8 @@ impl AppState {
             audit: Arc::new(Mutex::new(None)),
             audit_log: history::OpenLog::default(),
             bridge: bridge::BridgeSlot::default(),
-            network: network::NetworkChoice::default(),
+            network: network::NetworkChoice::of_this_copy(),
+            relay_ca: relay_settings::PendingCa::default(),
             pump: PumpSlot::default(),
             listings: explorer::Listings::default(),
             transfers: explorer::Transfers::default(),
@@ -165,7 +175,8 @@ impl AppState {
             audit: Arc::new(Mutex::new(None)),
             audit_log: history::OpenLog::default(),
             bridge: bridge::BridgeSlot::default(),
-            network: network::NetworkChoice::default(),
+            network: network::NetworkChoice::of_this_copy(),
+            relay_ca: relay_settings::PendingCa::default(),
             pump: PumpSlot::default(),
             listings: explorer::Listings::default(),
             transfers: explorer::Transfers::default(),
@@ -198,6 +209,43 @@ impl AppState {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()?;
         Some((service, audit))
+    }
+
+    /// Prepares the task of the next session: a new intent channel, an empty
+    /// feed, an empty bridge status and an empty transfer queue, and the
+    /// slots the task shares with the commands. `place` is where that task
+    /// writes outside this process.
+    fn next_run(&self, sink: Arc<dyn StateSink>, place: Place) -> Run {
+        // Open the intent channel so the compare-gate confirm/mismatch
+        // buttons and the emergency stop can reach the session's task, which
+        // exclusively owns the handle (ST-M002-013). The task takes the
+        // receiver; the sender lives in `live` and replaces any stale sender
+        // from a prior session.
+        let (intent_tx, intents) = intent_channel();
+        *self.live.lock().unwrap_or_else(PoisonError::into_inner) = Some(intent_tx);
+        // A new session starts a new feed; the previous one was kept until
+        // now (ST-M009-011).
+        *lock_activity(&self.activity) = TechnicianActivity::new();
+        // A new session starts with no bridge endpoint and no AI clients.
+        bridge::lock_bridge(&self.bridge).reset();
+        // And with an empty transfer queue: what the session before it sent,
+        // copied or was offered is dropped (ST-M010-002).
+        self.transfers.reset();
+        Run {
+            shared: self.inner.clone(),
+            sink,
+            intents,
+            // The task publishes the hosted service here at full-control
+            // hand-off, making the technician terminal reachable in-process
+            // (ST-M008-001). Any stale service from a prior session was
+            // cleared on that session's fail-closed teardown.
+            service: self.service.clone(),
+            activity: self.activity.clone(),
+            bridge: self.bridge.clone(),
+            audit: self.audit.clone(),
+            audit_log: self.audit_log.clone(),
+            place,
+        }
     }
 
     /// Sends a technician [`Intent`] to the running pump task, if a session is
@@ -294,6 +342,22 @@ impl Default for AppState {
     }
 }
 
+/// The event a [`Notice`] is emitted on.
+pub(crate) const NOTICE_EVENT: &str = "console-notice";
+
+/// Something the technician should know that is not the failure of a command
+/// (`ConsoleNotice` of the contract): what happened and a next step, in plain
+/// words (REQ-N-015). The window shows it in its alert.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Notice {
+    /// What this is about.
+    pub title: String,
+    /// What happened.
+    pub message: String,
+    /// What to do next.
+    pub next: String,
+}
+
 /// A command failure shaped for the frontend: a stage and a plain-language,
 /// secret-free message (REQ-N-015).
 #[derive(Debug, Clone, Serialize)]
@@ -340,6 +404,11 @@ fn get_activity(state: State<'_, AppState>) -> Vec<ActivityEntry> {
 /// pump) it advances the local model directly.
 #[tauri::command]
 fn confirm_code(state: State<'_, AppState>) -> Result<ConsoleState, CommandError> {
+    confirm_now(&state)
+}
+
+/// [`confirm_code`], without Tauri.
+fn confirm_now(state: &AppState) -> Result<ConsoleState, CommandError> {
     {
         let console = state.guard();
         if !matches!(console.phase, SessionPhase::AwaitingApprovalCode { .. }) {
@@ -433,6 +502,13 @@ fn simulate_target_lost(state: State<'_, AppState>) -> Result<ConsoleState, Comm
 /// model. Without a live pump this is a purely local stop.
 #[tauri::command]
 fn stop_session(state: State<'_, AppState>) -> Result<ConsoleState, CommandError> {
+    stop_now(&state)
+}
+
+/// [`stop_session`], without Tauri. While the console waits on a relay there
+/// is no wire yet: the session's task then drops its waiting connection, and
+/// the relay code leads to no session any more (ST-M007-013).
+fn stop_now(state: &AppState) -> Result<ConsoleState, CommandError> {
     // Best-effort wire revoke; the local stop below is authoritative and safe.
     let _ = state.send_intent(Intent::Stop(RevokeReason::TechnicianRequested));
     let mut console = state.guard();
@@ -503,11 +579,15 @@ async fn switch_listen_network(
     state: State<'_, AppState>,
     address: String,
 ) -> Result<ConsoleState, CommandError> {
-    if !matches!(state.guard().phase, SessionPhase::Listening { .. }) {
-        return Err(CommandError::new(
-            "network",
-            "the network can be changed only while waiting for the customer",
-        ));
+    {
+        let console = state.guard();
+        // A wait on a relay listens on no network of this computer.
+        if !matches!(console.phase, SessionPhase::Listening { .. }) || console.relay.is_some() {
+            return Err(CommandError::new(
+                "network",
+                "the network can be changed only while waiting for the customer on a network",
+            ));
+        }
     }
     let candidates = listen_candidates().map_err(|e| CommandError::new("network", e))?;
     let chosen = network::requested(&candidates, &address)
@@ -531,7 +611,20 @@ async fn switch_listen_network(
         let _ = tokio::time::timeout(NETWORK_SWITCH_TIMEOUT, task).await;
     }
 
-    state.network.set(&chosen.adapter);
+    if let Err(reason) = state.network.set(&chosen.adapter) {
+        // The choice holds for this run; that it will not be there next time
+        // is said, not kept quiet (REQ-N-008).
+        let _ = app.emit(
+            NOTICE_EVENT,
+            Notice {
+                title: "The network choice could not be saved".to_string(),
+                message: reason,
+                next: "It holds until CretLink closes. Choose the network again next time, or \
+                       check that your settings can be written."
+                    .to_string(),
+            },
+        );
+    }
     begin_listening(app, &state, chosen.addr);
 
     // The new listener reports from its own task: wait for it, so that the
@@ -566,171 +659,131 @@ fn listen_ip(choice: &network::NetworkChoice) -> IpAddr {
 /// Starts the listener on `bind_ip` and the task that drives the session it
 /// accepts; shared by [`start_live_session`] and [`switch_listen_network`].
 fn begin_listening(app: AppHandle, state: &AppState, bind_ip: IpAddr) {
-    let shared = state.inner.clone();
-    let bind_addr = SocketAddr::new(bind_ip, 0);
-
-    // Open the intent channel so the compare-gate confirm/mismatch buttons and
-    // the emergency stop can reach the live pump task, which exclusively owns the
-    // handle (ST-M002-013). The pump takes the receiver; the sender lives in
-    // `state.live` and replaces any stale sender from a prior session.
-    let (intent_tx, intent_rx) = intent_channel();
-    *state.live.lock().unwrap_or_else(PoisonError::into_inner) = Some(intent_tx);
-    // Hand the pump the shared service slot so it can publish the hosted service
-    // at full-control hand-off, making the technician terminal reachable in-process
-    // (ST-M008-001). Any stale service from a prior session was cleared on that
-    // session's fail-closed teardown.
-    let service_slot = state.service.clone();
-    // A new session starts a new feed; the previous one was kept until now
-    // (ST-M009-011).
-    *lock_activity(&state.activity) = TechnicianActivity::new();
-    let activity = state.activity.clone();
-    // A new session starts with no bridge endpoint and no AI clients.
-    bridge::lock_bridge(&state.bridge).reset();
-    // And with an empty transfer queue: what the session before it sent,
-    // copied or was offered is dropped (ST-M010-002).
-    state.transfers.reset();
-    let bridge_slot = state.bridge.clone();
-    let audit_slot = state.audit.clone();
-    let audit_log = state.audit_log.clone();
-
-    let task = tauri::async_runtime::spawn(async move {
-        let sink: Arc<dyn StateSink> = Arc::new(TauriSink { app });
-
-        // Stand up the audit backbone the console CLI runs (ST-M003-006): one
-        // bounded channel feeds one drain that owns the durable, hash-chained
-        // per-session log. Retention pruning runs first so the log directory
-        // stays bounded. The GUI is now the real host, so it — not only the CLI
-        // — owns this spine (ST-M004-007).
-        let audit_config = AuditServiceConfig::default();
-        report_prune(prune_audit_dir(
-            &audit_config.dir,
-            &audit_config.retention,
-            None,
-        ));
-        let (audit, audit_rx) = ChannelAudit::bounded(AUDIT_CHANNEL_CAPACITY);
-        // Lend the terminal commands this session's audit sink; the guard
-        // takes it back on every exit path so the log can still be sealed.
-        *audit_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(audit.clone());
-        let audit_lent = AuditLent(audit_slot);
-        // The history leaves this log out until it is sealed (ST-M009-012).
-        let (start_tx, start_rx) = audit_log.track();
-        let audit_task = spawn_audit_service(audit_config.clone(), audit_rx, start_rx);
-
-        // 1. Bind the listener on a private interface, recording lifecycle
-        //    outcomes (pairing, consent, cleanup) to that same log via
-        //    `host_with_audit` (REQ-F-017). A bind failure is an honest terminal
-        //    state, never a silent no-op.
-        let handle = match SessionHost::host_with_audit(
-            bind_addr,
-            ConsoleHints {
-                label: "This computer (technician)".to_string(),
-                // The account's full name, else its user name, sent in the
-                // pairing handshake as what this computer says (ST-M009-011).
-                display_name: technician_display_name(),
-            },
-            PROTOCOL_V1,
-            Vec::new(),
-            Arc::new(audit.clone()),
-        )
-        .await
-        {
-            Ok(handle) => handle,
-            Err(error) => {
-                let mut console = lock(&shared);
-                console.fail("listen", format!("could not start the listener: {error}"));
-                sink.emit(&console);
-                return;
-            }
-        };
-        let local_addr = match handle.local_addr() {
-            Some(addr) => addr,
-            None => {
-                let mut console = lock(&shared);
-                console.fail(
-                    "listen",
-                    "the listener reported no local address".to_string(),
-                );
-                sink.emit(&console);
-                return;
-            }
-        };
-
-        // 2. Best-effort mDNS advertising. Discovery is convenience only and
-        //    grants no authority; the manual code below always works.
-        //    The advertised name is the technician's display name (ST-M009-011),
-        //    an untrusted hint on the customer side; without one, the product
-        //    name.
-        let advertised_name = technician_display_name().map_or_else(
-            || "CretLink Console".to_string(),
-            |name| name.as_str().to_string(),
-        );
-        //    The instance name is this computer's host name, so the customer's
-        //    list shows the name and host name the waiting screen tells them
-        //    to pick (ST-M009-009); equally untrusted on their side.
-        let instance = advertised_instance(&lock(&shared).technician.hostname);
-        //    Only the address the listener is bound to is announced, on its
-        //    own adapter (ST-M009-016).
-        let _advertiser =
-            Advertiser::advertise(&instance, local_addr, PROTOCOL_V1, &advertised_name).ok();
-
-        // 3. Enter the listening phase carrying the connection code the customer
-        //    types in and the private listen address to read out. No target is
-        //    fabricated here: the customer materialises only when a real
-        //    `Connected` event arrives over the pump (ST-M002-012), so the
-        //    console never shows a target it has not actually heard from.
-        let code = match local_addr {
-            SocketAddr::V4(v4) => ConnectionCode::encode(v4).to_string(),
-            SocketAddr::V6(addr) => addr.to_string(),
-        };
-        {
-            let mut console = lock(&shared);
-            let technician = console.technician.clone();
-            *console = ConsoleState::new(technician);
-            if let Err(error) = console.listen(code, local_addr.to_string()) {
-                console.fail("listen", error.to_string());
-                sink.emit(&console);
-                return;
-            }
-            sink.emit(&console);
-        }
-
-        // 4. Fold the live event stream into the shared state until it ends,
-        //    dispatching compare/stop intents from the UI to the handle. At
-        //    full control the pump hands the handle to the hosted service so the
-        //    MCP bridge and the interactive terminal both route through this one
-        //    consented session (ST-M004-007).
-        pump(
-            handle,
-            shared,
-            sink,
-            intent_rx,
-            audit.clone(),
-            audit_config,
-            start_tx,
-            service_slot,
-            activity,
-            bridge_slot,
-        )
-        .await;
-
-        // Seal the durable log: release the terminal commands' sender, then
-        // drop the last one so the drain observes
-        // channel close, then wait a bounded moment for the seal record to land.
-        // A timeout is recorded honestly — the log verifies as unsealed rather
-        // than the exit blocking forever (REQ-N cleanup honesty).
-        drop(audit_lent);
-        drop(audit);
-        if tokio::time::timeout(AUDIT_SEAL_TIMEOUT, audit_task)
-            .await
-            .is_err()
-        {
-            eprintln!(
-                "note: the audit log could not be sealed before exit; it will verify as unsealed"
-            );
-        }
-        audit_log.closed();
-    });
+    let sink: Arc<dyn StateSink> = Arc::new(TauriSink { app });
+    let task = begin_network_wait(state, sink, Place::of_this_user(), bind_ip);
     *state.pump.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
+}
+
+/// Starts the task of a session that waits for the customer on `bind_ip`.
+/// The task enters the listening state itself, once the listener is bound
+/// and its connection code is known.
+fn begin_network_wait(
+    state: &AppState,
+    sink: Arc<dyn StateSink>,
+    place: Place,
+    bind_ip: IpAddr,
+) -> tauri::async_runtime::JoinHandle<()> {
+    let run = state.next_run(sink, place);
+    tauri::async_runtime::spawn(run.drive(Wait::Network(bind_ip)))
+}
+
+// --- A session through the relay (ST-M007-013) ---
+
+/// Refuses a relay unless the console waits for the customer on a network:
+/// that is the one moment the waiting screen offers it.
+fn relay_can_be_chosen(console: &ConsoleState) -> Result<(), CommandError> {
+    if matches!(console.phase, SessionPhase::Listening { .. }) && console.relay.is_none() {
+        Ok(())
+    } else {
+        Err(CommandError::new(
+            "relay",
+            "A relay can be chosen only while waiting for the customer.",
+        ))
+    }
+}
+
+/// The technician chose **Use relay** on the waiting screen: stop waiting on
+/// this network, and wait for the customer on the relay of this copy instead
+/// (ST-M007-013).
+///
+/// Allowed only while the console waits on a network and nobody is
+/// connecting. The relay is the one of this copy's profile: the file next to
+/// the program, or the settings of the installed copy. Without a profile, or
+/// with one that cannot be used, nothing changes and the answer says what to
+/// do (REQ-N-015). The old listener is stopped and awaited first, as for a
+/// change of network, so that its last events cannot reach the new wait.
+///
+/// A new relay code is drawn for this wait; it is what the technician reads
+/// to the customer. The answer is the new waiting state. Reaching the relay
+/// happens in the session's own task: what comes of it arrives as
+/// `console-state`, first that the relay holds the code, or the failure in
+/// words.
+///
+/// The relay only lets the two copies find each other (ADR-0016): the
+/// approval code is compared and the customer consents exactly as on one
+/// network.
+#[tauri::command]
+async fn use_relay(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ConsoleState, CommandError> {
+    relay_can_be_chosen(&state.guard())?;
+    // Reading the profile touches the disk: not on this task.
+    let relay = setup::blocking(relay_settings::relay_in_use).await?;
+    let code = RelayCode::generate().map_err(|_| {
+        CommandError::new(
+            "relay",
+            "This computer gave no randomness for a relay code. Try again.",
+        )
+    })?;
+
+    // Stop waiting on the network, exactly as Cancel does: the wire revoke
+    // is best effort and the local stop is authoritative. The customer may
+    // have connected while the profile was read, so the check is made again
+    // under the same lock that stops the wait.
+    {
+        let mut console = state.guard();
+        relay_can_be_chosen(&console)?;
+        let _ = state.send_intent(Intent::Stop(RevokeReason::TechnicianRequested));
+        console
+            .stop(StopReason::TechnicianRequested)
+            .map_err(|e| CommandError::new("relay", e))?;
+    }
+    let previous = state
+        .pump
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some(task) = previous {
+        // Bounded: a listener that does not let go must not hold the window.
+        let _ = tokio::time::timeout(NETWORK_SWITCH_TIMEOUT, task).await;
+    }
+
+    let sink: Arc<dyn StateSink> = Arc::new(TauriSink { app });
+    let task = begin_relay_wait(
+        &state,
+        sink,
+        Place::of_this_user(),
+        RelayWait::new(relay, code),
+    );
+    *state.pump.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
+    Ok(state.guard().clone())
+}
+
+/// Enters the waiting state of a session through a relay and starts the task
+/// that keeps the rendezvous open there.
+///
+/// The state is entered here, before the task runs, so that the answer to
+/// [`use_relay`] already shows the relay and the code: the relay code is
+/// drawn on this side and needs nothing from the relay. The state says that
+/// the relay is still being reached until the task reports that the relay
+/// holds the code.
+fn begin_relay_wait(
+    state: &AppState,
+    sink: Arc<dyn StateSink>,
+    place: Place,
+    wait: RelayWait,
+) -> tauri::async_runtime::JoinHandle<()> {
+    let run = state.next_run(Arc::clone(&sink), place);
+    {
+        let mut console = state.guard();
+        let technician = console.technician.clone();
+        *console = ConsoleState::new(technician);
+        // A new console state always takes a wait.
+        let _ = console.listen_on_relay(wait.code(), wait.host(), wait.address());
+        sink.emit(&console);
+    }
+    tauri::async_runtime::spawn(run.drive(Wait::Relay(wait)))
 }
 
 // --- Interactive terminal (ST-M008-001) ---
@@ -1004,6 +1057,7 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         stop_session,
         start_live_session,
         switch_listen_network,
+        use_relay,
         network::get_listen_networks,
         open_terminal,
         term_input,
@@ -1032,7 +1086,12 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         setup::ai_client_install,
         setup::ai_client_uninstall,
         setup::uninstall_plan,
-        setup::uninstall_app
+        setup::uninstall_app,
+        relay_settings::get_relay_settings,
+        relay_settings::choose_relay_ca,
+        relay_settings::save_relay,
+        relay_settings::test_relay,
+        relay_settings::remove_relay
     ]);
     #[cfg(not(feature = "dev-simulate"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -1045,6 +1104,7 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         stop_session,
         start_live_session,
         switch_listen_network,
+        use_relay,
         network::get_listen_networks,
         open_terminal,
         term_input,
@@ -1073,7 +1133,12 @@ pub(crate) fn attach(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         setup::ai_client_install,
         setup::ai_client_uninstall,
         setup::uninstall_plan,
-        setup::uninstall_app
+        setup::uninstall_app,
+        relay_settings::get_relay_settings,
+        relay_settings::choose_relay_ca,
+        relay_settings::save_relay,
+        relay_settings::test_relay,
+        relay_settings::remove_relay
     ]);
     builder
 }
@@ -1183,6 +1248,9 @@ fn seed_state() -> ConsoleState {
 }
 
 #[cfg(test)]
+pub(crate) mod testing;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1289,6 +1357,75 @@ mod tests {
         assert!(!host.hostname.is_empty());
         assert_eq!(host.os, host_os::name());
         assert_eq!(setup::app_info().os, host.os);
+    }
+
+    #[test]
+    fn a_relay_can_be_chosen_only_while_waiting_on_a_network() {
+        let mut console = ConsoleState::new(TechnicianHost {
+            label: "This computer (technician)".to_string(),
+            hostname: "TECH-LAPTOP".to_string(),
+            os: "Windows 11".to_string(),
+            display_name: None,
+        });
+        // Not before a session was started.
+        assert_eq!(relay_can_be_chosen(&console).unwrap_err().stage, "relay");
+        // While waiting on a network: yes.
+        console.listen("6RRR-2H8F", "10.0.0.42:7000").unwrap();
+        assert!(relay_can_be_chosen(&console).is_ok());
+        // Not once a customer is connecting: their session is not dropped
+        // for a relay.
+        console
+            .customer_arrived(
+                cretlink_console::TargetId::new(),
+                "Incoming customer computer",
+            )
+            .unwrap();
+        assert!(relay_can_be_chosen(&console).is_err());
+        // Not while already waiting on a relay, and not after the end.
+        let technician = console.technician.clone();
+        let mut console = ConsoleState::new(technician);
+        console
+            .listen_on_relay(
+                "53ST-A71D-JKKV-0VGH",
+                "relay.example.org",
+                "relay.example.org:443",
+            )
+            .unwrap();
+        assert!(relay_can_be_chosen(&console).is_err());
+        console.stop(StopReason::TechnicianRequested).unwrap();
+        assert!(relay_can_be_chosen(&console).is_err());
+    }
+
+    #[test]
+    fn stop_while_waiting_on_a_relay_ends_the_wait_and_tells_its_task() {
+        let state = AppState::live_idle();
+        let (intents, mut received) = intent_channel();
+        *state.live.lock().unwrap_or_else(PoisonError::into_inner) = Some(intents);
+        state
+            .guard()
+            .listen_on_relay(
+                "53ST-A71D-JKKV-0VGH",
+                "relay.example.org",
+                "relay.example.org:443",
+            )
+            .unwrap_or_default();
+        let stopped = stop_now(&state).unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(
+            stopped.phase,
+            SessionPhase::Stopped {
+                reason: StopReason::TechnicianRequested
+            }
+        );
+        // The task that waits on the relay is told: it drops the connection.
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Intent::Stop(RevokeReason::TechnicianRequested))
+        ));
+        // There is no approval code to confirm in a wait.
+        assert_eq!(
+            confirm_now(&state).map(|_| ()).map_err(|e| e.stage),
+            Err("compare".to_owned())
+        );
     }
 
     #[test]

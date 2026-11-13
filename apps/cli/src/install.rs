@@ -22,6 +22,10 @@
 //! than in `~/.local/bin`, which is a shared `PATH` directory; on macOS it is
 //! inside the bundle, `Contents/Resources/install.json`.
 //!
+//! The settings of the installed copy — its relay and the network it waits on
+//! (ST-M007-011, [`crate::settings`]) — are kept next to the record, and
+//! uninstall removes them with it.
+//!
 //! Everything that touches the operating system beyond plain files — the
 //! Windows shortcut and registry entry, the process list, removing a running
 //! program after it exits — goes through [`System`], so the logic is tested
@@ -43,6 +47,14 @@ mod win;
 
 /// The record's file name.
 pub const RECORD_FILE: &str = "install.json";
+
+/// The file name of the installed copy's settings, next to the record
+/// (ST-M007-011).
+pub const SETTINGS_FILE: &str = "settings.toml";
+
+/// The file name of the certificate authority file of the relay in the
+/// settings, next to them (ST-M007-011).
+pub const RELAY_CA_FILE: &str = "relay-ca.pem";
 
 /// The uninstall entry's key, under `HKEY_CURRENT_USER`.
 pub const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CretLink";
@@ -176,6 +188,11 @@ pub struct Layout {
     pub cli: PathBuf,
     /// The install record.
     pub record: PathBuf,
+    /// The settings of the installed copy, next to the record (ST-M007-011).
+    pub settings: PathBuf,
+    /// The certificate authority file of the relay in the settings, next to
+    /// them (ST-M007-011).
+    pub relay_ca: PathBuf,
     /// The Start-menu shortcut or desktop entry, where the platform has one.
     pub entry: Option<PathBuf>,
     /// The bundle's `Info.plist` (macOS).
@@ -209,6 +226,8 @@ impl Layout {
                     exe: location.join(&exe_name),
                     cli: location.join(&cli_name),
                     record: location.join(RECORD_FILE),
+                    settings: location.join(SETTINGS_FILE),
+                    relay_ca: location.join(RELAY_CA_FILE),
                     entry: Some(menu.join("CretLink.lnk")),
                     info_plist: None,
                     location,
@@ -217,11 +236,14 @@ impl Layout {
             Platform::MacOs => {
                 let location = dirs.home.join("Applications").join("CretLink.app");
                 let contents = location.join("Contents");
+                let resources = contents.join("Resources");
                 Self {
                     platform,
                     exe: contents.join("MacOS").join(&exe_name),
                     cli: contents.join("MacOS").join(&cli_name),
-                    record: contents.join("Resources").join(RECORD_FILE),
+                    record: resources.join(RECORD_FILE),
+                    settings: resources.join(SETTINGS_FILE),
+                    relay_ca: resources.join(RELAY_CA_FILE),
                     entry: None,
                     info_plist: Some(contents.join("Info.plist")),
                     location,
@@ -233,11 +255,14 @@ impl Layout {
                     .data_home
                     .clone()
                     .unwrap_or_else(|| dirs.home.join(".local").join("share"));
+                let own = data.join("CretLink");
                 Self {
                     platform,
                     exe: location.join(&exe_name),
                     cli: location.join(&cli_name),
-                    record: data.join("CretLink").join(RECORD_FILE),
+                    record: own.join(RECORD_FILE),
+                    settings: own.join(SETTINGS_FILE),
+                    relay_ca: own.join(RELAY_CA_FILE),
                     entry: Some(data.join("applications").join("cretlink.desktop")),
                     info_plist: None,
                     location,
@@ -297,12 +322,26 @@ impl Layout {
         }
     }
 
-    /// The program files of an install, the record last.
+    /// The files of an install: the programs, the settings of the installed
+    /// copy, and the record last.
     fn files(&self) -> Vec<PathBuf> {
         let mut files = vec![self.exe.clone(), self.cli.clone()];
         files.extend(self.info_plist.clone());
+        files.extend(self.settings_files());
         files.push(self.record.clone());
         files
+    }
+
+    /// The settings of the installed copy and the certificate authority file
+    /// of their relay (ST-M007-011), each with the temporary file it is
+    /// written through: a key must not stay behind in one of those either.
+    fn settings_files(&self) -> Vec<PathBuf> {
+        vec![
+            self.settings.clone(),
+            temporary_name(&self.settings),
+            self.relay_ca.clone(),
+            temporary_name(&self.relay_ca),
+        ]
     }
 }
 
@@ -1005,7 +1044,7 @@ fn write_file(path: &Path, bytes: &[u8], executable: bool) -> io::Result<()> {
     result
 }
 
-fn temporary_name(path: &Path) -> PathBuf {
+pub(crate) fn temporary_name(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
         .map(|name| name.to_os_string())
@@ -1026,7 +1065,7 @@ fn set_executable(_path: &Path, _executable: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn remove_file_if_exists(path: &Path) -> io::Result<bool> {
+pub(crate) fn remove_file_if_exists(path: &Path) -> io::Result<bool> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -1135,6 +1174,10 @@ pub struct UninstallPlan {
     pub location: PathBuf,
     /// The program files that exist, the record last.
     pub files: Vec<PathBuf>,
+    /// The settings of the installed copy that exist: its relay with the
+    /// admission key, the relay's certificate file and the network it waits
+    /// on (ST-M007-011).
+    pub settings: Vec<PathBuf>,
     /// Whether the folder is removed only after this process exits (Windows,
     /// when uninstall runs from the installed copy).
     pub after_exit: bool,
@@ -1156,12 +1199,12 @@ impl UninstallPlan {
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
+        let after = if self.after_exit {
+            " (removed once CretLink has closed)"
+        } else {
+            ""
+        };
         if !self.files.is_empty() {
-            let after = if self.after_exit {
-                " (removed once CretLink has closed)"
-            } else {
-                ""
-            };
             if self.location.extension().is_some_and(|ext| ext == "app") {
                 lines.push(format!(
                     "The application {}{after}",
@@ -1172,6 +1215,15 @@ impl UninstallPlan {
                     lines.push(format!("{}{after}", file.display()));
                 }
             }
+        }
+        // Named for themselves on every system: they hold the relay's
+        // admission key, and the technician should see that it goes too.
+        for file in &self.settings {
+            lines.push(format!(
+                "{} {}{after}",
+                settings_label(file),
+                file.display()
+            ));
         }
         if let Some((kind, path)) = &self.entry {
             let label = match kind {
@@ -1197,9 +1249,19 @@ impl UninstallPlan {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
+            && self.settings.is_empty()
             && self.entry.is_none()
             && !self.uninstall_entry
             && self.registrations.is_empty()
+    }
+}
+
+/// What a file of the installed copy's settings is, for the uninstall plan.
+fn settings_label(file: &Path) -> &'static str {
+    match file.file_name().and_then(|name| name.to_str()) {
+        Some(SETTINGS_FILE) => "Your settings (the relay with its key, the network to wait on):",
+        Some(RELAY_CA_FILE) => "The certificate file of your relay:",
+        _ => "An unfinished copy of your settings:",
     }
 }
 
@@ -1229,10 +1291,15 @@ pub fn uninstall_plan(
             None
         }
     };
+    let settings: Vec<PathBuf> = layout
+        .settings_files()
+        .into_iter()
+        .filter(|file| file.exists())
+        .collect();
     let files: Vec<PathBuf> = layout
         .files()
         .into_iter()
-        .filter(|file| file.exists())
+        .filter(|file| file.exists() && !settings.contains(file))
         .collect();
     let entry = layout
         .platform
@@ -1240,7 +1307,12 @@ pub fn uninstall_plan(
         .zip(layout.entry.clone())
         .filter(|(_, path)| path.exists());
     let uninstall_entry = layout.platform == Platform::Windows && system.has_uninstall_entry();
-    if files.is_empty() && entry.is_none() && !uninstall_entry && record.is_none() {
+    if files.is_empty()
+        && settings.is_empty()
+        && entry.is_none()
+        && !uninstall_entry
+        && record.is_none()
+    {
         return Err(InstallError::NotInstalled(layout.location.clone()));
     }
 
@@ -1292,6 +1364,7 @@ pub fn uninstall_plan(
         location: layout.location.clone(),
         after_exit: layout.platform == Platform::Windows && layout.runs_from_install(current_exe),
         files,
+        settings,
         entry,
         uninstall_entry,
         registrations,
@@ -1836,6 +1909,155 @@ mod tests {
             ),
             Err(InstallError::NotInstalled(_))
         ));
+    }
+
+    /// Writes what Settings of the installed copy keeps: the settings file
+    /// and the certificate file of its relay (ST-M007-011).
+    fn keep_settings(layout: &Layout) {
+        write_file(
+            &layout.settings,
+            b"[relay]\naddress = \"relay.example.org:443\"\nkey = \"abc\"\n",
+            false,
+        )
+        .unwrap();
+        write_file(&layout.relay_ca, b"-----BEGIN CERTIFICATE-----\n", false).unwrap();
+    }
+
+    #[test]
+    fn uninstall_removes_the_settings_of_the_installed_copy() {
+        let fixture = Fixture::new("settings", Platform::Linux);
+        let layout = &fixture.layout;
+        fixture.install(false, &[]).unwrap();
+        keep_settings(layout);
+        // A temporary file of an interrupted write would hold the key too.
+        write_file(&temporary_name(&layout.settings), b"key", false).unwrap();
+        let audit = layout.record.parent().unwrap().join("audit");
+        write_file(&audit.join("session.jsonl"), b"{}", false).unwrap();
+        let elsewhere = fixture.downloads.join("cretlink");
+
+        let plan = fixture.plan(&elsewhere);
+        assert_eq!(
+            plan.settings,
+            vec![
+                layout.settings.clone(),
+                temporary_name(&layout.settings),
+                layout.relay_ca.clone()
+            ]
+        );
+        // The settings are not listed a second time among the program files.
+        assert_eq!(
+            plan.files,
+            vec![
+                layout.exe.clone(),
+                layout.cli.clone(),
+                layout.record.clone()
+            ]
+        );
+        let lines = plan.lines();
+        assert!(
+            lines.contains(&format!(
+                "Your settings (the relay with its key, the network to wait on): {}",
+                layout.settings.display()
+            )),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&format!(
+                "The certificate file of your relay: {}",
+                layout.relay_ca.display()
+            )),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("An unfinished copy of your settings: ")),
+            "{lines:?}"
+        );
+
+        let report = fixture.uninstall(&elsewhere);
+        assert!(report.complete(), "{report:?}");
+        assert!(!layout.settings.exists());
+        assert!(!layout.relay_ca.exists());
+        assert!(!temporary_name(&layout.settings).exists());
+        assert!(
+            report
+                .removed
+                .contains(&layout.settings.display().to_string())
+        );
+        // The audit trail stays, in the same folder.
+        assert!(audit.join("session.jsonl").exists());
+    }
+
+    #[test]
+    fn settings_that_outlived_the_program_are_still_removed() {
+        // The program files are gone already; the settings, with the relay's
+        // key, are what is left of the install.
+        let fixture = Fixture::new("settings-left", Platform::Linux);
+        let layout = &fixture.layout;
+        keep_settings(layout);
+        let elsewhere = fixture.downloads.join("cretlink");
+        let plan = fixture.plan(&elsewhere);
+        assert!(plan.files.is_empty());
+        assert!(!plan.is_empty());
+        let report = fixture.uninstall(&elsewhere);
+        assert!(report.complete(), "{report:?}");
+        assert!(!layout.settings.exists());
+        assert!(!layout.relay_ca.exists());
+        assert!(matches!(
+            uninstall_plan(layout, &fixture.system, &fixture.context, &elsewhere),
+            Err(InstallError::NotInstalled(_))
+        ));
+    }
+
+    #[test]
+    fn an_update_in_place_keeps_the_settings() {
+        let fixture = Fixture::new("settings-update", Platform::Windows);
+        fixture.install(true, &[]).unwrap();
+        keep_settings(&fixture.layout);
+        write_file(&fixture.source(), b"cretlink v2", true).unwrap();
+        assert!(fixture.install(true, &[]).unwrap().update);
+        assert!(fixture.layout.settings.is_file());
+        assert!(fixture.layout.relay_ca.is_file());
+    }
+
+    #[test]
+    fn the_settings_go_with_the_folder_on_windows_and_with_the_bundle_on_macos() {
+        // Windows, uninstalling from the installed copy itself: the settings
+        // are among the files that go once it has closed.
+        let fixture = Fixture::new("settings-windows", Platform::Windows);
+        let layout = &fixture.layout;
+        fixture.install(false, &[]).unwrap();
+        keep_settings(layout);
+        let plan = fixture.plan(&layout.exe);
+        assert!(plan.after_exit);
+        assert!(plan.lines().contains(&format!(
+            "Your settings (the relay with its key, the network to wait on): {} \
+             (removed once CretLink has closed)",
+            layout.settings.display()
+        )));
+        fixture.uninstall(&layout.exe);
+        let scheduled = fixture.system.after_exit.borrow().clone();
+        let (files, dir) = &scheduled[0];
+        assert!(files.contains(&layout.settings));
+        assert!(files.contains(&layout.relay_ca));
+        assert!(files.contains(&temporary_name(&layout.settings)));
+        assert_eq!(dir, &layout.location);
+
+        // macOS: they lie inside the application, and are named all the same.
+        let fixture = Fixture::new("settings-macos", Platform::MacOs);
+        let layout = &fixture.layout;
+        fixture.install(false, &[]).unwrap();
+        keep_settings(layout);
+        let current = fixture.downloads.join("cretlink");
+        let lines = fixture.plan(&current).lines();
+        assert_eq!(
+            lines[0],
+            format!("The application {}", layout.location.display())
+        );
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(fixture.uninstall(&current).complete());
+        assert!(!layout.location.exists());
     }
 
     #[test]

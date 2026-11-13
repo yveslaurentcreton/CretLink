@@ -16,7 +16,8 @@ apps/
   cli/              The subcommands of `cretlink` and their console build
                     `cretlink-cli`: the stdio MCP bridge (`mcp`), AI-client
                     registration, the experimental terminal client (`shell`),
-                    version and uninstall; the MCP conformance harness
+                    version and uninstall; the relay profile of a copy and the
+                    settings of the installed copy; the MCP conformance harness
   console/          Technician role library (session state, audit, MCP host)
                     and the `cretlink-console` development tool
   relay-server/     Operator-hosted relay server (`cretlink-relay-server`)

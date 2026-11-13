@@ -38,6 +38,19 @@
 //! `dev-simulate` build offers the demo from the technician list
 //! ([`reset_demo`]).
 //!
+//! # A session through a relay (ST-M007-013)
+//!
+//! The code field takes a LAN connection code, a raw address and a relay code
+//! and tells them apart ([`typed_target`]). A relay code joins the rendezvous
+//! on the relay of this copy's profile ([`relay`]), over `wss` with the
+//! relay's certificate checked, and gives the technician ten seconds to be
+//! heard ([`JoiningDial`]). The window says that the connection runs through
+//! the relay, by its host name ([`ConsentView::relay`]). The relay is
+//! addressing only (ADR-0016): the approval code is compared and the customer
+//! decides exactly as on one network, and a relay that cannot be used ends
+//! the dial in plain words with a next step ([`ConsentView::failure_next`]),
+//! never as a session that was lost for no known reason.
+//!
 //! # Before the session, and the two windows (ST-M009-009)
 //!
 //! An unelevated window first explains the UAC prompt ([`admin`]). During a
@@ -47,22 +60,29 @@
 //! resting window a stop is refused, never turned into a "stopped" session.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use cretlink_discovery::{
-    Browser, DiscoveredConsole, DiscoveryError, ManualEntry, parse_entry, parse_manual_entry,
+    Browser, DiscoveredConsole, DiscoveryError, ManualEntry, RelayCode, parse_entry,
+    parse_manual_entry,
 };
 use cretlink_protocol::{
     CAP_FS_V1, CAP_FS_V2, PROTOCOL_V1, RevokeReason, SessionId, TargetIdentity,
 };
-use cretlink_session::{ActivityEntry, CustomerActivity, DisclosureSummary, SessionJoiner};
+use cretlink_session::{
+    ActivityEntry, CustomerActivity, DEFAULT_JOIN_LIMIT, DisclosureSummary, JoinHandle,
+    JoiningDial, NoAudit, NoRebootResume, RelayFailure, RendezvousTicket, SessionError,
+    SessionJoiner,
+};
 use cretlink_support_agent::{AgentPhase, AgentState, VisibleStatus, current_identity, sysinfo};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::watch;
 
 use crate::launch::Entry;
+use crate::relay;
 
 // Before the UAC prompt (ST-M009-009).
 mod admin;
@@ -105,17 +125,26 @@ pub struct AppState {
     saved_reports: report::SavedReports,
     /// This process's startup sweep, which a dial waits for (ST-M009-010).
     pub(crate) startup: startup::StartupSweep,
+    /// What the profile file next to this program says about a relay
+    /// (ST-M007-011), read once when the window starts.
+    relay: Arc<relay::Lookup>,
 }
 
 impl AppState {
     /// Builds the initial window of both builds: a resting, honest consent
-    /// window ready to dial a real technician.
+    /// window ready to dial a real technician. It knows no relay.
     #[must_use]
     pub fn idle() -> Self {
+        Self::with_relay(relay::Lookup::None)
+    }
+
+    /// The initial window of a copy whose profile file says `relay`.
+    fn with_relay(relay: relay::Lookup) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ConsentSession::idle())),
+            inner: Arc::new(Mutex::new(ConsentSession::resting(&relay))),
             saved_reports: report::SavedReports::default(),
             startup: startup::StartupSweep::default(),
+            relay: Arc::new(relay),
         }
     }
 
@@ -213,6 +242,21 @@ pub(crate) struct ConsentSession {
     /// generation, so a finished dial never writes into the next session
     /// ([`session_driver::lock_current`]).
     pub(crate) generation: u64,
+    /// The relay this session runs through; `None` for a session on one
+    /// network (ST-M007-013). It stays after the session has ended, so that
+    /// the end can say which way the session went, and goes with the next
+    /// dial.
+    relay: Option<RelayUseView>,
+    /// What the customer can do about the failure this dial ended with, when
+    /// the failure has a next step of its own (ST-M007-013, REQ-N-015).
+    failure_next: Option<String>,
+    /// The relay this copy is set up for, by its host name: what the profile
+    /// file next to the program says (ST-M007-011). The window names it
+    /// beside the code field, so that the customer sees through which relay
+    /// a relay code would connect before typing one. It belongs to the
+    /// process, not to one session, so it is carried into every new session
+    /// state ([`Self::replace_with`]).
+    copy_relay: Option<RelayUseView>,
 }
 
 /// The generation of the next live dial (see [`ConsentSession::generation`]).
@@ -245,7 +289,21 @@ impl ConsentSession {
             settled: None,
             startup_cleanup: None,
             generation: 0,
+            relay: None,
+            failure_next: None,
+            copy_relay: None,
         }
+    }
+
+    /// The resting window of a copy whose profile file says `relay`: with a
+    /// profile that can be used, the window names the relay this copy is set
+    /// up for (ST-M007-011). Nothing is dialled.
+    pub(crate) fn resting(relay: &relay::Lookup) -> Self {
+        let mut session = Self::idle();
+        session.copy_relay = relay.relay().map(|relay| RelayUseView {
+            host: relay.host().to_owned(),
+        });
+        session
     }
 
     /// A fresh, clearly-labelled simulated consent session, driven to
@@ -278,6 +336,9 @@ impl ConsentSession {
             settled: None,
             startup_cleanup: None,
             generation: 0,
+            relay: None,
+            failure_next: None,
+            copy_relay: None,
         }
     }
 
@@ -308,13 +369,39 @@ impl ConsentSession {
             settled,
             startup_cleanup: None,
             generation: next_generation(),
+            relay: None,
+            failure_next: None,
+            copy_relay: None,
         }
     }
 
+    /// The host name of the relay this session runs through, if it runs
+    /// through one.
+    pub(crate) fn relay_host(&self) -> Option<&str> {
+        self.relay.as_ref().map(|relay| relay.host.as_str())
+    }
+
+    /// Says that this session runs through the relay `host` (ST-M007-013).
+    fn through_relay(mut self, host: &str) -> Self {
+        self.relay = Some(RelayUseView {
+            host: host.to_owned(),
+        });
+        self
+    }
+
+    /// Ends this dial as failed before a session existed: what happened, and
+    /// what the customer can do next when the failure has a step of its own.
+    fn fail_dial(&mut self, failure: DialFailure) {
+        self.agent.fail(failure.stage, failure.message);
+        self.failure_next = failure.next;
+    }
+
     /// Replaces this state with `next`, a new session's, keeping what belongs
-    /// to the process: the startup sweep's notice.
+    /// to the process: the startup sweep's notice, and the relay this copy
+    /// is set up for.
     pub(crate) fn replace_with(&mut self, mut next: Self) {
         next.startup_cleanup = self.startup_cleanup.take();
+        next.copy_relay = self.copy_relay.take();
         *self = next;
     }
 
@@ -392,6 +479,9 @@ impl ConsentSession {
                     provenance: TECHNICIAN_NAME_PROVENANCE,
                 }),
             startup_cleanup: self.startup_cleanup.clone(),
+            relay: self.relay.clone(),
+            failure_next: self.failure_next.clone(),
+            relay_of_copy: self.copy_relay.clone(),
         }
     }
 }
@@ -438,6 +528,17 @@ pub struct TechnicianNameView {
     pub provenance: &'static str,
 }
 
+/// The relay of a session, as the customer's window shows it (ST-M007-013).
+///
+/// A label and nothing else: the relay passes the end-to-end encrypted
+/// session on, cannot look inside and grants nothing (ADR-0016). It holds the
+/// relay's host name, never the admission key of this copy or the relay code.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RelayUseView {
+    /// The relay's host name: the name its certificate carries.
+    pub host: String,
+}
+
 /// What the consent window renders (see [`ConsentSession::view`]).
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsentView {
@@ -472,6 +573,19 @@ pub struct ConsentView {
     /// with the recovery command (ST-M009-010). `None` when nothing was kept
     /// or the sweep has not finished.
     pub startup_cleanup: Option<StartupCleanupView>,
+    /// The relay this session runs through, by its host name; `None` for a
+    /// session on one network (ST-M007-013).
+    pub relay: Option<RelayUseView>,
+    /// What to do next about the failure this dial ended with, when the
+    /// failure has a next step of its own: a relay that cannot be reached is
+    /// put right in another way than a key that the relay refuses
+    /// (ST-M007-013, REQ-N-015). `None` otherwise.
+    pub failure_next: Option<String>,
+    /// The relay this copy is set up for, by its host name; `None` for a
+    /// copy without a relay profile that can be used (ST-M007-011). The
+    /// window shows it beside the code field: both people see the relay's
+    /// host name before they connect through it.
+    pub relay_of_copy: Option<RelayUseView>,
 }
 
 /// One console the customer may pick from the discovered list (ADR-0007).
@@ -588,7 +702,11 @@ fn get_activity(state: State<'_, AppState>) -> Vec<ActivityEntry> {
 /// the pump folds it. In the demo it binds the simulated session id directly.
 #[tauri::command]
 fn grant_consent(state: State<'_, AppState>) -> Result<ConsentView, CommandError> {
-    let mut session = state.guard();
+    grant_now(&mut state.guard())
+}
+
+/// [`grant_consent`], without Tauri.
+fn grant_now(session: &mut ConsentSession) -> Result<ConsentView, CommandError> {
     if !matches!(session.agent.phase(), AgentPhase::AwaitingConsent) {
         return Err(CommandError::new(
             "consent",
@@ -720,73 +838,179 @@ fn ensure_can_connect(session: &ConsentSession, ready: bool) -> Result<(), Comma
     Ok(())
 }
 
-/// Begins a live dial to an already-validated address: announces this machine's
-/// honest identity locally, shows the "reaching out" state, and spawns the pump
-/// that folds the real wire lifecycle.
+/// What the customer typed or picked, resolved to where the technician is
+/// reached. Holding one performs no I/O and grants nothing.
+#[derive(Debug)]
+enum Typed {
+    /// A technician on this network: the address to dial.
+    Network(SocketAddr),
+    /// A technician who waits on the relay of this copy.
+    Relay(Box<RelayJoin>),
+}
+
+/// A join through the relay of this copy (ST-M007-013): the relay of the
+/// profile, the code the technician read out, and how long the technician is
+/// given to be heard.
+#[derive(Debug)]
+struct RelayJoin {
+    relay: relay::Relay,
+    code: RelayCode,
+    limit: Duration,
+}
+
+/// Why a dial ended before a session existed, for the window: the stage, what
+/// happened, and what to do next when the failure has a step of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialFailure {
+    stage: String,
+    message: String,
+    next: Option<String>,
+}
+
+impl DialFailure {
+    /// A relay that could not be used, in the words for a customer
+    /// ([`relay::failure_words`]). The stage names the failure:
+    /// `relay_unreachable`, `relay_untrusted`, `relay_key_refused`, and so on.
+    fn of_relay(failure: &RelayFailure, relay: &relay::Relay) -> Self {
+        let words = relay::failure_words(failure, &relay.view(), relay::Audience::Customer);
+        Self {
+            stage: format!("relay_{}", words.kind),
+            message: words.message,
+            next: Some(words.next),
+        }
+    }
+}
+
+/// Reaches the technician as `target` says and answers the handle of the
+/// session that begins. Nothing here grants anything: pairing, the approval
+/// code and the customer's consent follow on the handle (REQ-S-001).
+async fn dial(target: Typed, identity: TargetIdentity) -> Result<JoinHandle, DialFailure> {
+    match target {
+        Typed::Network(addr) => {
+            SessionJoiner::join(addr, identity, PROTOCOL_V1, honest_capabilities())
+                .await
+                .map_err(|error| DialFailure {
+                    stage: "connect".to_owned(),
+                    message: format!("could not reach the technician: {error}"),
+                    next: None,
+                })
+        }
+        Typed::Relay(join) => {
+            let RelayJoin { relay, code, limit } = *join;
+            let failed = |failure: &RelayFailure| DialFailure::of_relay(failure, &relay);
+            // The TLS settings first: a profile without usable authorities
+            // is said before anything is dialled.
+            let connector = relay
+                .connector()
+                .await
+                .map_err(|failure| failed(&failure))?;
+            // Both copies derive the ticket from the code that was read out
+            // and from the relay's host name (ST-M007-012). The code itself
+            // never reaches the relay.
+            let ticket = RendezvousTicket::derive(code.seed(), relay.host()).map_err(|_| {
+                failed(&RelayFailure::Settings(
+                    "the name of the relay cannot be used for a rendezvous".to_owned(),
+                ))
+            })?;
+            // The joining side gives the technician a limit to be heard, so
+            // that a code nobody waits on is said, and soon (ST-M007-012).
+            // Reboot-resume stays off, as for a dial on one network.
+            SessionJoiner::join_with_reboot_resume_over(
+                JoiningDial::with_limit(relay.dial(connector, ticket), limit),
+                identity,
+                PROTOCOL_V1,
+                honest_capabilities(),
+                Arc::new(NoAudit),
+                Arc::new(|| false),
+                Arc::new(NoRebootResume),
+            )
+            .await
+            .map_err(|error| match error {
+                SessionError::Relay(failure) => failed(&failure),
+                other => failed(&RelayFailure::Settings(other.to_string())),
+            })
+        }
+    }
+}
+
+/// Enters the "reaching out" state of a new dial on `shared`, and answers the
+/// future that dials `target` and drives the session to its end.
 ///
-/// This is the **single** dial path. A hand-typed connection code
-/// ([`start_live_session`]) and a console picked from discovery
-/// ([`connect_console`]) both resolve to a [`SocketAddr`] through the same
-/// [`parse_manual_entry`] and then arrive here, so a discovered console is dialed
-/// with exactly the authority of a typed address: none until the Session Approval
-/// Code (REQ-S-006). Control never appears locally — it shows only when the wire's
-/// `ConsentGranted` echoes back through the pump (REQ-S-001).
-fn begin_live_dial(app: AppHandle, state: &State<'_, AppState>, addr: SocketAddr) -> ConsentView {
+/// This is the **single** dial path. A hand-typed connection code, a console
+/// picked from discovery and a relay code all arrive here, so each is dialed
+/// with exactly the authority of a typed address: none until the Session
+/// Approval Code (REQ-S-006). Control never appears locally: it shows only
+/// when the wire's `ConsentGranted` echoes back through the pump (REQ-S-001).
+fn prepare_dial(
+    shared: &Arc<Mutex<ConsentSession>>,
+    sink: Arc<dyn ViewSink>,
+    target: Typed,
+) -> impl Future<Output = ()> + Send + 'static + use<> {
     // The honest, effective-identity-derived identity this agent presents. The
     // wire never overrides it (REQ-S-011, REQ-F-016).
     let identity = honest_target_identity();
 
     let (tx, rx) = session_driver::intent_channel();
     let (settled_tx, settled_rx) = watch::channel(false);
-    let app_for_sweep = app.clone();
-    let sink: Arc<dyn ViewSink> = Arc::new(TauriSink { app });
-
     let generation = {
-        let mut session = state.guard();
-        session.replace_with(ConsentSession::live_dialing(tx, Some(settled_rx)));
-        // Show the "reaching out" state right away; the pump takes over once the
-        // dial resolves.
+        let mut session = lock(shared);
+        let mut next = ConsentSession::live_dialing(tx, Some(settled_rx));
+        if let Typed::Relay(join) = &target {
+            // Said from the first moment: this connection goes through the
+            // relay, by its host name.
+            next = next.through_relay(join.relay.host());
+        }
+        session.replace_with(next);
+        // Show the "reaching out" state right away; the pump takes over once
+        // the dial resolves.
         sink.emit(&session.view());
         session.generation
     };
 
-    let shared = state.inner.clone();
+    let shared = Arc::clone(shared);
+    async move {
+        // A dial failure is an honest terminal state, never a silent no-op.
+        match dial(target, identity).await {
+            // Fold the live event stream (and route button intents) until it
+            // ends, the session task's teardown included.
+            Ok(handle) => pump(handle, shared, generation, sink, rx).await,
+            Err(failure) => {
+                // Only this dial's state: a stopped dial may already have
+                // been replaced by the next one.
+                if let Some(mut session) = session_driver::lock_current(&shared, generation) {
+                    // A dial the customer cancelled meanwhile stays stopped.
+                    if !is_terminal(&session) {
+                        session.fail_dial(failure);
+                    }
+                    sink.emit(&session.view());
+                }
+            }
+        }
+        let _ = settled_tx.send(true);
+    }
+}
+
+/// Begins a live dial of `target` from the window: shows the "reaching out"
+/// state, and spawns the task that dials and then folds the real wire
+/// lifecycle ([`prepare_dial`]).
+fn begin_live_dial(app: AppHandle, state: &State<'_, AppState>, target: Typed) -> ConsentView {
+    let sink: Arc<dyn ViewSink> = Arc::new(TauriSink { app: app.clone() });
+    let session = prepare_dial(&state.inner, sink, target);
     // Never connect before the startup sweep has finished (ST-M009-010); it is
     // normally long done, having started with the window.
-    state.startup.start(&app_for_sweep, state);
+    state.startup.start(&app, state);
     let startup = state.startup.clone();
     tauri::async_runtime::spawn(async move {
         startup.finished().await;
-        // Dial the listening console. A dial failure is an honest terminal
-        // state, never a silent no-op.
-        let handle =
-            match SessionJoiner::join(addr, identity, PROTOCOL_V1, honest_capabilities()).await {
-                Ok(handle) => handle,
-                Err(error) => {
-                    // Only this dial's state: a stopped dial may already have
-                    // been replaced by the next one.
-                    if let Some(mut session) = session_driver::lock_current(&shared, generation) {
-                        session.agent.fail(
-                            "connect",
-                            format!("could not reach the technician: {error}"),
-                        );
-                        sink.emit(&session.view());
-                    }
-                    let _ = settled_tx.send(true);
-                    return;
-                }
-            };
-        // Fold the live event stream (and route button intents) until it ends,
-        // the session task's teardown included.
-        pump(handle, shared, generation, sink, rx).await;
-        let _ = settled_tx.send(true);
+        session.await;
     });
 
     state.guard().view()
 }
 
 /// Dials a real listening technician console from a typed connection code and
-/// drives the session live (ST-M002-009).
+/// drives the session live (ST-M002-009). A relay code reaches the technician
+/// through the relay of this copy instead (ST-M007-013).
 ///
 /// The agent is the Noise **initiator** (ADR-0003): it parses the connection
 /// code the technician reads out, dials the console, and announces this
@@ -809,7 +1033,7 @@ fn start_live_session(
     // Parse the technician's connection code into a dialable address *before*
     // mutating any state, so a typo leaves the window untouched. This grants no
     // authority; trust is established later by the Session Approval Code.
-    let target = typed_target(&code)?;
+    let target = typed_target(&code, &state.relay)?;
 
     Ok(begin_live_dial(app, &state, target))
 }
@@ -821,14 +1045,49 @@ const RELAY_CODE_WITHOUT_RELAY: &str = "This is a relay code, for a technician w
     your network. This copy of CretLink is not set up for a relay, so it connects only on the \
     same network.";
 
-/// Resolves what the customer typed into the code field to the address to
-/// dial (REQ-F-004, ST-M007-012): a LAN connection code or a raw address. A
-/// relay code is told apart from a mistyped code and answered in plain words;
-/// its stage is `relay`, so the window can say what to do next.
-fn typed_target(code: &str) -> Result<SocketAddr, CommandError> {
+/// What the profile file next to the program `exe` says about a relay
+/// (ST-M007-011). It is the one place the customer role reads: no settings of
+/// an installed copy, and nothing is written.
+fn relay_next_to(exe: Option<&Path>) -> relay::Lookup {
+    exe.map_or(relay::Lookup::None, relay::next_to_program)
+}
+
+/// What a relay code gets in a copy whose relay profile cannot be used
+/// (ST-M007-011): the file and what is wrong with it, in plain words, before
+/// anything is dialled (REQ-N-015). The customer passes it on.
+fn unusable_profile_message(error: &cretlink_cli::relay_profile::ProfileError) -> String {
+    let problem = relay::ProblemView::of(error);
+    format!(
+        "This is a relay code, but the relay settings of this copy of CretLink cannot be used. \
+         {} The file is {}.",
+        problem.message, problem.file
+    )
+}
+
+/// Resolves what the customer typed into the code field to where the
+/// technician is reached (REQ-F-004, ST-M007-012, ST-M007-013): a LAN
+/// connection code or a raw address is an address on this network; a relay
+/// code is a rendezvous on the relay of this copy.
+///
+/// A relay code is told apart from a mistyped code. In a copy without a relay
+/// profile it is answered in plain words with the stage `relay`, and in a copy
+/// whose profile cannot be used with `relay_profile`, so the window can say
+/// what to do next. Nothing is dialled here.
+fn typed_target(code: &str, relay: &relay::Lookup) -> Result<Typed, CommandError> {
     match parse_entry(code.trim()).map_err(|e| CommandError::new("connect", e))? {
-        ManualEntry::Lan(target) => Ok(target.addr()),
-        ManualEntry::Relay(_) => Err(CommandError::new("relay", RELAY_CODE_WITHOUT_RELAY)),
+        ManualEntry::Lan(target) => Ok(Typed::Network(target.addr())),
+        ManualEntry::Relay(code) => match relay {
+            relay::Lookup::None => Err(CommandError::new("relay", RELAY_CODE_WITHOUT_RELAY)),
+            relay::Lookup::Unusable(error) => Err(CommandError::new(
+                "relay_profile",
+                unusable_profile_message(error),
+            )),
+            relay::Lookup::Relay(relay) => Ok(Typed::Relay(Box::new(RelayJoin {
+                relay: (**relay).clone(),
+                code,
+                limit: DEFAULT_JOIN_LIMIT,
+            }))),
+        },
     }
 }
 
@@ -874,7 +1133,7 @@ fn connect_console(
     // uses; a malformed or address-less candidate leaves the window untouched.
     let target = parse_manual_entry(address.trim()).map_err(|e| CommandError::new("connect", e))?;
 
-    Ok(begin_live_dial(app, &state, target.addr()))
+    Ok(begin_live_dial(app, &state, Typed::Network(target.addr())))
 }
 
 /// Adds the customer role's state and commands to the application. Only this
@@ -887,8 +1146,11 @@ pub(crate) fn attach(
     entry: Entry,
 ) -> tauri::Builder<tauri::Wry> {
     let elevated = current_identity().elevated;
+    // The relay of this copy: the profile file next to this program, read
+    // once and never written (ST-M007-011).
+    let relay = relay_next_to(std::env::current_exe().ok().as_deref());
     let builder = builder
-        .manage(AppState::default())
+        .manage(AppState::with_relay(relay))
         .manage(admin::AdminState::new(entry, elevated))
         .on_window_event(windows::on_window_event);
 
@@ -989,8 +1251,9 @@ fn honest_target_identity() -> TargetIdentity {
 /// minus two entries this build genuinely cannot serve:
 ///
 /// - **reboot-resume** — this window dials via plain [`SessionJoiner::join`],
-///   which installs a `NoRebootResume` armer, so nothing can be armed.
-///   Advertising `reboot_resume.v1` would be a lie the runtime would then let a
+///   which installs a `NoRebootResume` armer, and through a relay with that
+///   same armer ([`dial`]), so nothing can be armed. Advertising
+///   `reboot_resume.v1` would be a lie the runtime would then let a
 ///   technician act on (REQ-N-012, REQ-S-011).
 /// - **desktop** — this crate has no `cretlink-exec` dependency to back
 ///   screenshots and computer actions, so it does not offer the capability.
@@ -1051,8 +1314,19 @@ fn approval_code(session: SessionId) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod testing;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The address a typed code or address names on this network.
+    fn network(typed: Result<Typed, CommandError>) -> SocketAddr {
+        match typed {
+            Ok(Typed::Network(addr)) => addr,
+            other => panic!("expected an address on this network, got {other:?}"),
+        }
+    }
 
     #[cfg(feature = "dev-simulate")]
     #[test]
@@ -1331,8 +1605,10 @@ mod tests {
         // receives the discovered "ip:port" string. Both end in the same parser
         // of the discovery crate and the same `begin_live_dial`, so a discovered
         // console is dialed by exactly the code path — no shortcut.
-        let from_code =
-            typed_target(&ConnectionCode::encode(addr)).expect("a freshly encoded code parses");
+        let from_code = network(typed_target(
+            &ConnectionCode::encode(addr),
+            &relay::Lookup::None,
+        ));
         let from_pick = parse_manual_entry(&SocketAddr::V4(addr).to_string())
             .expect("a discovered ip:port parses")
             .addr();
@@ -1342,7 +1618,7 @@ mod tests {
         // The field also takes a raw address, typed loosely.
         let typed = format!("  {} ", SocketAddr::V4(addr));
         assert_eq!(
-            typed_target(&typed).expect("a raw address parses"),
+            network(typed_target(&typed, &relay::Lookup::None)),
             SocketAddr::V4(addr)
         );
     }
@@ -1350,7 +1626,8 @@ mod tests {
     #[test]
     fn a_relay_code_in_a_copy_without_a_relay_is_answered_in_plain_words() {
         // A well-formed relay code (ST-M007-012), typed loosely.
-        let error = typed_target("53st a71d jkkv 0vgh").expect_err("this copy has no relay");
+        let none = relay::Lookup::None;
+        let error = typed_target("53st a71d jkkv 0vgh", &none).expect_err("this copy has no relay");
         assert_eq!(error.stage, "relay");
         assert!(error.message.contains("relay code"), "{}", error.message);
         assert!(
@@ -1363,8 +1640,273 @@ mod tests {
 
         // A relay code with a typing error is a mistyped code, not a relay
         // matter: the customer checks it with the technician.
-        let error = typed_target("53ST-A71D-JKKV-0VGJ").expect_err("a typing error");
+        let error = typed_target("53ST-A71D-JKKV-0VGJ", &none).expect_err("a typing error");
         assert_eq!(error.stage, "connect");
         assert!(error.message.contains("checksum"), "{}", error.message);
+    }
+
+    /// A key as the relay's operator gives a customer copy.
+    const KEY: &str = "9a41c7b35f2c9d0e7a1b4c3d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1";
+
+    #[test]
+    fn the_customer_role_reads_the_profile_next_to_its_program_and_writes_nothing() {
+        use cretlink_cli::relay_profile::RelayProfile;
+        use cretlink_cli::settings::{self, Settings};
+
+        use crate::relay::testing::Home;
+
+        // A technician's installed copy on the same computer keeps a relay
+        // and a network in its settings.
+        let home = Home::new("customer-reads");
+        settings::write(
+            &home.layout,
+            &Settings {
+                relay: Some(
+                    RelayProfile::from_fields("relay.example.org:443", Some(KEY), None, None)
+                        .expect("a profile"),
+                ),
+                network_adapter: Some("Wi-Fi".to_owned()),
+            },
+        )
+        .expect("write the settings");
+        let program = home.folder.path("usb/CretLink-Support.exe");
+        home.folder.write("usb/CretLink-Support.exe", "program");
+        let before = home.folder.snapshot();
+
+        // No file next to the program: no relay, whatever those settings say,
+        // and also when the installed program itself runs the customer role.
+        assert!(matches!(relay_next_to(Some(&program)), relay::Lookup::None));
+        assert!(matches!(
+            relay_next_to(Some(&home.layout.exe)),
+            relay::Lookup::None
+        ));
+        assert!(matches!(relay_next_to(None), relay::Lookup::None));
+        assert_eq!(home.folder.snapshot(), before, "looking wrote something");
+
+        // The file next to the program is the relay of this copy.
+        home.folder.write(
+            "usb/cretlink.toml",
+            format!("[relay]\naddress = \"host-01.example.org:9970\"\nkey = \"{KEY}\"\n"),
+        );
+        let before = home.folder.snapshot();
+        let found = relay_next_to(Some(&program));
+        assert_eq!(
+            found.relay().map(relay::Relay::host),
+            Some("host-01.example.org")
+        );
+        // The window that starts with it, and every code typed into it, read
+        // and never write: not the profile, no settings, nothing.
+        let state = AppState::with_relay(found);
+        for code in [
+            "53st a71d jkkv 0vgh",
+            "6RRR-2H8F-0000",
+            "192.168.1.20:7000",
+            "",
+        ] {
+            let _ = typed_target(code, &state.relay);
+        }
+        let _ = state.guard().view();
+        assert_eq!(
+            home.folder.snapshot(),
+            before,
+            "the customer role wrote something"
+        );
+
+        // A file that cannot be used stays as it is, too.
+        home.folder.write(
+            "usb/cretlink.toml",
+            "[relay]\naddress = \"host-01.example.org\"\n",
+        );
+        let before = home.folder.snapshot();
+        let broken = relay_next_to(Some(&program));
+        assert!(matches!(broken, relay::Lookup::Unusable(_)));
+        let _ = typed_target("53st a71d jkkv 0vgh", &broken);
+        assert_eq!(home.folder.snapshot(), before);
+    }
+
+    #[test]
+    fn a_relay_code_in_a_copy_whose_profile_cannot_be_used_says_what_is_wrong_with_it() {
+        use crate::relay::testing::Folder;
+
+        let folder = Folder::new("customer-unusable");
+        let file = folder.write(
+            "cretlink.toml",
+            format!("[relay]\naddress = \"relay.example.org:443\"\nkey = {KEY}\n"),
+        );
+        let relay = relay_next_to(Some(&folder.path("CretLink-Support.exe")));
+        let error = typed_target("53ST-A71D-JKKV-0VGH", &relay).expect_err("no usable profile");
+        assert_eq!(error.stage, "relay_profile");
+        assert_eq!(
+            error.message,
+            format!(
+                "This is a relay code, but the relay settings of this copy of CretLink cannot \
+                 be used. Line 3: the value of `key` must be text in double quotes. The file is \
+                 {}.",
+                file.display()
+            )
+        );
+        // The key that stands in the file the wrong way is not repeated.
+        assert!(!error.message.contains(KEY));
+        // A code of the same network needs no relay: it is read as before.
+        assert!(typed_target("192.168.1.20:7000", &relay).is_ok());
+    }
+
+    #[test]
+    fn a_relay_code_in_a_copy_with_a_profile_is_a_join_on_the_relay_of_that_profile() {
+        use crate::relay::testing::Folder;
+
+        let folder = Folder::new("customer-profile");
+        folder.write(
+            "cretlink.toml",
+            format!("[relay]\naddress = \"relay.example.org:443\"\nkey = \"{KEY}\"\n"),
+        );
+        let relay = relay_next_to(Some(&folder.path("CretLink-Support.exe")));
+        // Typed loosely, as people type what is read to them.
+        let typed = typed_target(" 53st a71d jkkv 0vgh ", &relay);
+        let Ok(Typed::Relay(join)) = typed else {
+            panic!("expected a join on the relay, got {typed:?}");
+        };
+        assert_eq!(join.relay.host(), "relay.example.org");
+        assert_eq!(join.code.encode(), "53ST-A71D-JKKV-0VGH");
+        // The technician is given ten seconds to be heard (ST-M007-012).
+        assert_eq!(join.limit, Duration::from_secs(10));
+        // What is printed of it holds neither the key nor the code.
+        let printed = format!("{join:?}");
+        assert!(!printed.contains(KEY), "{printed}");
+        assert!(!printed.contains("53ST"), "{printed}");
+
+        // The same field takes a code or an address of this network, and
+        // then nothing about the relay is used: LAN first.
+        assert_eq!(
+            network(typed_target("192.168.1.20:7000", &relay)),
+            "192.168.1.20:7000".parse::<SocketAddr>().unwrap()
+        );
+        assert!(matches!(
+            typed_target("6RRR-2H8F", &relay),
+            Ok(Typed::Network(_)) | Err(_)
+        ));
+    }
+
+    #[test]
+    fn a_relay_that_cannot_be_used_ends_the_dial_in_words_with_a_next_step() {
+        use cretlink_cli::relay_profile::RelayProfile;
+
+        let profile = RelayProfile::from_fields("relay.example.org:443", Some(KEY), None, None)
+            .expect("a profile");
+        let relay = relay::Relay::with_ca(
+            relay::Source::File(std::path::PathBuf::from("cretlink.toml")),
+            profile,
+            None,
+        )
+        .expect("a relay");
+        let (tx, _rx) = session_driver::intent_channel();
+        let mut session = ConsentSession::live_dialing(tx, None).through_relay(relay.host());
+        // While it connects, the window says which relay it goes through.
+        assert_eq!(
+            session.view().relay,
+            Some(RelayUseView {
+                host: "relay.example.org".to_owned()
+            })
+        );
+        assert_eq!(session.view().failure_next, None);
+
+        let refused = RelayFailure::Refused(cretlink_relay::RelayRefusal::CredentialRejected);
+        session.fail_dial(DialFailure::of_relay(&refused, &relay));
+        let view = session.view();
+        let AgentPhase::Failed { stage, message } = session.agent.phase() else {
+            panic!("the dial did not fail: {:?}", session.agent.phase());
+        };
+        assert_eq!(stage, "relay_key_refused");
+        assert!(message.contains("relay.example.org"), "{message}");
+        // The next step is one a customer can take, and it is the window's.
+        let next = view.failure_next.as_deref().expect("a next step");
+        assert!(next.contains("technician"), "{next}");
+        // The relay stays named, and no session exists.
+        assert_eq!(
+            view.relay.map(|relay| relay.host),
+            Some("relay.example.org".to_owned())
+        );
+        assert!(!view.session_active);
+        assert!(!view.status.control_active);
+        // Nothing of it holds the key.
+        let shown = serde_json::to_string(&session.view()).unwrap();
+        assert!(!shown.contains(KEY), "{shown}");
+
+        // The next dial starts without the relay and without that next step.
+        let (tx, _rx) = session_driver::intent_channel();
+        session.replace_with(ConsentSession::live_dialing(tx, None));
+        assert_eq!(session.view().relay, None);
+        assert_eq!(session.view().failure_next, None);
+    }
+
+    #[test]
+    fn a_dial_on_one_network_names_no_relay() {
+        let (tx, _rx) = session_driver::intent_channel();
+        let session = ConsentSession::live_dialing(tx, None);
+        let json = serde_json::to_value(session.view()).unwrap();
+        assert!(json["relay"].is_null());
+        assert!(json["failure_next"].is_null());
+        assert!(json["relay_of_copy"].is_null());
+    }
+
+    #[test]
+    fn the_resting_window_names_the_relay_this_copy_is_set_up_for() {
+        use crate::relay::testing::Folder;
+
+        // Without a profile, and with one that cannot be used, the window
+        // names no relay: nothing is offered that would not work.
+        assert_eq!(
+            ConsentSession::resting(&relay::Lookup::None)
+                .view()
+                .relay_of_copy,
+            None
+        );
+        let folder = Folder::new("customer-resting");
+        folder.write(
+            "cretlink.toml",
+            "[relay]\naddress = \"relay.example.org\"\n",
+        );
+        let unusable = relay_next_to(Some(&folder.path("CretLink-Support.exe")));
+        assert!(matches!(unusable, relay::Lookup::Unusable(_)));
+        assert_eq!(
+            ConsentSession::resting(&unusable).view().relay_of_copy,
+            None
+        );
+
+        // With a profile, the customer sees the relay's host name before
+        // typing a code, and nothing is dialled for it.
+        folder.write(
+            "cretlink.toml",
+            format!("[relay]\naddress = \"relay.example.org:443\"\nkey = \"{KEY}\"\n"),
+        );
+        let lookup = relay_next_to(Some(&folder.path("CretLink-Support.exe")));
+        let mut session = ConsentSession::resting(&lookup);
+        let view = session.view();
+        assert_eq!(
+            view.relay_of_copy,
+            Some(RelayUseView {
+                host: "relay.example.org".to_owned()
+            })
+        );
+        // It says what this copy could use, not that a session uses it.
+        assert_eq!(view.relay, None);
+        assert!(!view.session_active);
+        assert!(matches!(session.agent.phase(), AgentPhase::Idle));
+        assert!(!serde_json::to_string(&view).unwrap().contains(KEY));
+
+        // It belongs to the process: a dial on one network keeps it, and
+        // names no relay for that session.
+        let (tx, _rx) = session_driver::intent_channel();
+        session.replace_with(ConsentSession::live_dialing(tx, None));
+        let dialing = session.view();
+        assert_eq!(dialing.relay, None);
+        assert_eq!(
+            dialing.relay_of_copy.map(|relay| relay.host),
+            Some("relay.example.org".to_owned())
+        );
+        // The state that was replaced gave it away: the window has one.
+        let (tx, _rx) = session_driver::intent_channel();
+        session.replace_with(ConsentSession::live_dialing(tx, None));
+        assert!(session.view().relay_of_copy.is_some());
     }
 }

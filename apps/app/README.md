@@ -112,7 +112,151 @@ Windows the folder is removed once the window closes.
 | --- | --- | --- | --- |
 | Program | `%LOCALAPPDATA%\Programs\CretLink\cretlink.exe` | `~/Applications/CretLink.app/Contents/MacOS/cretlink` | `~/.local/bin/cretlink` |
 | Record | `…\CretLink\install.json` | `…/Contents/Resources/install.json` | `~/.local/share/CretLink/install.json` |
+| Settings | `settings.toml` and `relay-ca.pem` next to the record (ST-M007-011) | the same | the same |
 | Entry | Start-menu `CretLink.lnk`, HKCU uninstall entry | the bundle | `~/.local/share/applications/cretlink.desktop` |
+
+## The relay of this copy (ST-M007-011)
+
+When the two computers are not on one network, their copies meet on a relay
+that the technician hosts. A **relay profile** tells a copy which one: the
+relay's `address`, an optional admission `key`, an optional certificate
+authority file `ca` and an optional `name` in the certificate
+([`docs/relay-server.md`](../../docs/relay-server.md), section 3).
+
+| Read from | By | Rules |
+| --- | --- | --- |
+| `cretlink.toml` next to the program | both roles | the one place the customer role reads; nothing is written there |
+| `settings.toml` next to the install record | the installed technician copy | written by **Settings → Relay**; removed by `cretlink uninstall` |
+
+- **The lookup** is `relay::TechnicianRelays::active` for Give help and
+  `relay::next_to_program` for Get help (`src-tauri/src/relay.rs`). A file
+  next to the program wins over the settings, also when that file cannot be
+  used: a profile that is wrong is explained and never passed over for
+  another relay. A copy that runs once reads no settings. Without a profile
+  nothing about a relay is offered or dialled (REQ-N-003).
+- **The file is input that somebody else may have written**
+  (`cretlink_cli::relay_profile`): a small form of TOML, read up to 16 KiB,
+  with every unknown section and setting refused. A problem names the line and
+  the setting in plain words and never repeats text from the file.
+- **The key never comes back.** It is held as an admission token
+  (`cretlink_relay::AdmissionToken`: erased when dropped, redacted in
+  `Debug`). No view sent to the window holds it — `RelayView.keySet` says
+  only whether there is one — and a form that leaves the key alone says
+  `keep`. It is not logged and is no argument of any audit record. `keep` is
+  honoured only while the relay's host name is the one the key was saved
+  for: a form that names another relay must bring that relay's key or none,
+  so a kept key is never presented to another relay.
+- **Always TLS** (`relay::EndpointDial`). A relay is reached over `wss` only,
+  with its certificate checked against the system's authorities or the
+  profile's `ca` file, for the profile's `name` or else the host of its
+  address. A check that fails ends the dial before anything is sent; nothing
+  falls back to a connection without TLS.
+- **Addressing only** (ADR-0016 §2, §4). A profile grants nothing. Saving one
+  opens no connection.
+
+| Command (Give help) | What it does |
+| --- | --- |
+| `get_relay_settings` | which relay this copy uses and where it comes from (`RelaySettings` in `src/shared/contract.ts`): the file next to the program and, in the installed copy, the settings; a profile that cannot be used with its file, setting and what is wrong |
+| `choose_relay_ca` | the system's dialog for the certificate authority file, opened from Rust; the file is read, checked and kept under a number (`ChosenCa`), so the window names no path of this computer |
+| `save_relay` `{ form }` | keeps the relay of the form (`RelayForm`) in the settings, and a copy of a chosen certificate file next to them; refuses in a copy that runs once |
+| `test_relay` `{ form? }` | reaches the relay once and answers in words (`RelayTest`): the relay of the form as it stands, or without a form the one this copy uses. It presents a ticket of its own, meets nobody and saves nothing |
+| `remove_relay` | removes the relay from the settings, with its key and its certificate file |
+
+**Settings → Relay** (`src/technician/views/relay.ts`) shows the form in the
+installed copy, the relay of the file when a file wins (with what the settings
+hold as the relay that is not used), and in a copy that runs once where its
+relay goes. The key field is always empty; after **Save** the form is drawn
+anew so that no typed key stays in a field, and the keyboard focus is put back
+where it was. **Remove** asks first. A refusal names the setting it is about
+and moves the focus there.
+
+On the customer's side a relay code typed into a copy whose profile cannot be
+used is answered with the file and what is wrong with it, before anything is
+dialled (`customer::typed_target`, stage `relay_profile`).
+
+The settings file is created for this user only where the system has file
+modes (`0600` on macOS and Linux); on Windows it has the access rules of the
+user's `%LOCALAPPDATA%` folder.
+
+To try the screen without a backend, run `npx vite` and open
+`/dev/relay.html` (`?copy=installed|kept|file|file-problem|run-once`,
+`?relay=admit|key|down`): the real controller against a copy and a relay held
+in memory.
+
+## A session through the relay (ST-M007-013)
+
+With a profile in both copies the technician helps someone who is not on
+their network. The relay only lets the two copies find each other; pairing,
+the approval code, consent, the stop and the cleanup are those of a session
+on one network (ADR-0016, REQ-F-022).
+
+**Give help.** The waiting screen (`#t-wait`) has a card **Not on the same
+network?** under the connection code. With a relay it offers **Use relay…**
+and names the relay's host; without one it names Settings, and a profile that
+cannot be used is said with its file (`relayOffer` in
+`src/technician/model.ts`).
+
+| Command (Give help) | What it does |
+| --- | --- |
+| `use_relay` | only while waiting on a network: stops the listener, waits until it is gone, draws a new relay code and waits on the relay of this copy. Answers the waiting state; rejects with the stage `relay_none` or `relay_profile` when this copy has no relay that can be used |
+
+- The waiting state is the `listening` phase with `ConsoleState.relay`
+  (`RelayRoute { host, admitted }`): `code` is the relay code to read out,
+  `address` where the relay is reached, and `admitted` whether the relay
+  holds the code yet. The screen shows the relay's host name, the code in
+  four outlined groups with **Copy**, and the state in words; **Cancel**
+  (`Escape`) ends it. The relay code is named a relay code and drawn unlike
+  the connection code and the approval code.
+- The wait runs in the session's own task
+  (`src-tauri/src/technician/session_task.rs`), because a session handle
+  exists only once the customer is heard: `WaitingDial` keeps the rendezvous
+  open for as long as the screen is, and **Cancel** drops it, so the code
+  leads to no session any more. No listener is open during a wait on a
+  relay, and `switch_listen_network` is refused.
+- `ConsoleState.relay` stays through the session and after its end, until
+  the console waits again. Compare, consent, the live session and the end
+  report each say **Through the relay** with the host name. No transition of
+  the console state reads it. The audit gets a record `session_route` with
+  the relay's host name before the records of pairing and consent, and
+  `SessionSummary.relay` carries it into the history.
+
+**Get help.** The code field (`#c-find`) takes a connection code, an address
+and a relay code and tells them apart (`customer::typed_target`). In a copy
+with a profile that can be used, a line under the field names the relay a
+relay code would connect through (`ConsentView.relay_of_copy`), so the
+customer sees its host name before connecting. A relay
+code joins the rendezvous on the relay of the profile next to the program
+(`JoiningDial`), which gives the technician ten seconds to be heard. The
+connecting screen then reads **Connecting through the relay** with the
+relay's host name and says that the relay only passes encrypted traffic on;
+`ConsentView.relay` names the relay on every later screen.
+
+**Failures** have words of their own and a next step, and none reads as a
+session that was lost for no known reason (REQ-N-008, REQ-N-015). Nothing
+connects again by itself.
+
+| Stage | Where | What it says |
+| --- | --- | --- |
+| `relay_unreachable`, `relay_name_not_found`, `relay_untrusted`, `relay_no_answer`, `relay_key_required`, `relay_key_refused`, `relay_rate_limited`, `relay_busy`, `relay_unavailable`, `relay_version`, `relay_settings` | both | the relay could not be used: the words of `relay::failure_words` for the technician or for the customer. The technician's next step is `next` of the failed phase, with the place where the relay of this copy is set; the customer's is `ConsentView.failure_next` |
+| `rendezvous` | Get help | nobody waits on the code: it is mistyped or used, or the technician stopped waiting |
+| `relay_lost` | both | the connection of a relayed session was lost before full control: the relay may have stopped. Taken from the session's own verdict (`EndedBy::ConnectionLost`), never from a message text |
+| `relay`, `relay_profile` | Get help, as a refusal of the command | this copy has no relay, or its profile cannot be used |
+
+A relayed session that loses its connection under full control ends as any
+session does (`stopped`, `disconnected`); the end screens of both roles then
+say that the connection through the relay was lost.
+
+The end-to-end tests (`src-tauri/src/relayed_session_tests.rs`) run both
+roles as the application does, without their windows, over the real relay
+server with TLS inside the test: pairing through a typed code, a command, a
+transfer there and back, a stop from each side, a relay that stops in the
+middle, and each failure above.
+
+To try the screens without a backend, run `npx vite` and open
+`/dev/relay.html` (**Start a session**, then **Use relay…**;
+`?customer=arrives|lost` lets a customer type the code) and
+`/dev/relay-customer.html` (`?copy=relay|none|problem`,
+`?outcome=pair|nobody|unreachable|untrusted|key|lost`).
 
 ## Live by default
 
@@ -140,14 +284,17 @@ waiting screen (`#t-wait`) names its adapter.
 | --- | --- |
 | `get_listen_networks` | this computer's private addresses that are up, each with the name of its network adapter (`ListenNetwork` in `src/shared/contract.ts`), in the order of `cretlink_discovery::listen_candidates` |
 | `start_live_session` | waits on the adapter chosen earlier in this run while it still has an address, otherwise on the first choice of `cretlink_discovery::first_choice`: the address of the default route unless that adapter is a point-to-point link |
-| `switch_listen_network` `{ address }` | only while waiting: stops the listener, waits until it is gone, and starts one on `address` with a new connection code; `address` must be one that `get_listen_networks` lists |
+| `switch_listen_network` `{ address }` | only while waiting on a network: stops the listener, waits until it is gone, and starts one on `address` with a new connection code; `address` must be one that `get_listen_networks` lists |
 
 - With more than one network the waiting screen offers the others under
   **Wait on another network**. While the listener moves it shows no code. The
   first Escape closes the open list; Escape then cancels as always.
-- The choice is kept for the later sessions of the same run, by adapter name
-  and in memory only (`src-tauri/src/technician/network.rs`): nothing is
-  written to disk.
+- The choice is kept for the later sessions, by adapter name
+  (`src-tauri/src/technician/network.rs`). The installed copy writes it to its
+  settings, next to the relay, so that it holds after the program is closed
+  (ST-M007-011); when that cannot be written the window says so (the
+  `console-notice` event). A copy that runs once keeps it in memory only and
+  writes nothing to disk.
 - Discovery announces the bound address alone, on its adapter alone
   (`cretlink_discovery::Advertiser`), so the customer's list never holds an
   address that nobody listens on.
@@ -475,6 +622,10 @@ apps/app/
   dev/gallery.html every screen of both roles from its fixtures (development only)
   dev/explorer.html the file explorer against a simulated customer computer
                     (development only)
+  dev/relay.html   Settings → Relay and a session through the relay against
+                   a simulated copy and relay (development only)
+  dev/relay-customer.html a relay code in the customer's window against a
+                   simulated relay and technician (development only)
   vitest.config.ts frontend tests (jsdom)
   src-tauri/
     Cargo.toml     detached crate; binary `cretlink`
@@ -484,7 +635,14 @@ apps/app/
     src/lib.rs     window per screen, process start and elevated relaunch
     src/start.rs   get_role, choose_role
     src/opener.rs  opens a validated file or folder with the platform opener
-    src/technician/  console state, commands, live-session driver, the
+    src/relay.rs   the relay of this copy, for both roles: where its profile
+                   comes from, the dial over wss, and the words of a failure
+    src/relayed_session_tests.rs  a session through the relay with both
+                   roles' drivers (tests only)
+    src/technician/  console state, commands, live-session driver, the task
+                     of one session that waits on a network or on a relay
+                     (session_task.rs), Settings → Relay
+                     (relay_settings.rs), the
                      session history (history.rs) and the file explorer
                      (explorer.rs; in explorer/: commands.rs, the queue in
                      transfers.rs, rename and delete in changes.rs, the rules
@@ -694,6 +852,14 @@ filter and the end report.
   drive, which no path the wire accepts can name, so the explorer shows that
   drive and a refusal there, and the queue is tested against a customer
   computer held in memory; the way through a real session runs on Windows.
+- A session through the relay has not been run between real computers on
+  two networks, and no screen reader has read the relay code or the state of
+  the wait yet: the steps of scenario MT-15 in `docs/manual-tests.md`
+  (ST-M007-013). Its backend was tested with both roles against the real
+  relay server with TLS inside the test process, and its screens in jsdom and
+  in Chromium through `dev/relay.html` and `dev/relay-customer.html`, not in
+  the application's own window. The compact bar (`#c-mini`) does not name the
+  relay; the main window does, on every screen.
 - While a file is being sent or copied, the session serves nothing else: a
   folder that is opened, the terminal and an AI assistant's call wait until
   that file has ended. Cancelling the transfer frees the session at the

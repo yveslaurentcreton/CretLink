@@ -103,6 +103,9 @@ export interface SessionSummary {
   integrity: "verified" | "unsealed" | "broken";
   hostname?: string;
   os?: string;
+  // The host name of the relay the session ran through; absent for a session
+  // on one network (ST-M007-013).
+  relay?: string;
   startedAt?: string;
   endedAt?: string;
   durationMs?: number;
@@ -408,6 +411,93 @@ export interface ListenNetwork {
   adapter: string;
   // A point-to-point link, as many VPN tunnels are.
   pointToPoint: boolean;
+}
+
+// --- The relay of this copy (ST-M007-011) ---
+
+// A relay as a screen shows it. A relay profile is addressing only: it says
+// where two copies meet and grants nothing. The view never holds the
+// admission key, only whether there is one.
+export interface RelayView {
+  // The relay's host name: the name its certificate must carry.
+  host: string;
+  // Where it is reached: `host:port`.
+  address: string;
+  keySet: boolean;
+  // The certificate authority file the profile names, next to it.
+  ca?: string;
+  // The name in the certificate, when the profile gives one.
+  name?: string;
+}
+
+export type RelayField = "address" | "key" | "ca" | "name";
+
+// A relay profile that cannot be used: the file, the setting and what is
+// wrong as a sentence. It never holds text from the file.
+export interface RelayProblem {
+  file: string;
+  field?: RelayField;
+  message: string;
+}
+
+// What one place says about a relay: the profile file next to the program,
+// or the settings of the installed copy.
+export interface RelayPlace {
+  path: string;
+  relay?: RelayView;
+  problem?: RelayProblem;
+}
+
+// `get_relay_settings`, and the answer of `save_relay` and `remove_relay`.
+export interface RelaySettings {
+  // Whether this copy keeps settings: only the installed copy does. A copy
+  // that runs once takes its relay from the file next to the program.
+  editable: boolean;
+  // Which profile this copy uses. A file next to the program wins over the
+  // settings, also when that file cannot be used.
+  source: "file" | "settings" | "none";
+  file: RelayPlace;
+  // What the settings hold; absent in a copy that keeps none.
+  stored?: RelayPlace;
+}
+
+// The relay as the form of Settings → Relay gives it (`save_relay`,
+// `test_relay`). A key travels to the backend only; none ever comes back:
+// `keep` leaves the kept key alone. The certificate authority file is chosen
+// in the system's dialog, opened by the backend, and named here by its
+// number: the window never holds a path of this computer.
+export interface RelayForm {
+  address: string;
+  keyMode: "keep" | "none" | "set";
+  key?: string;
+  caMode: "keep" | "none" | "chosen";
+  caPick?: number;
+  name?: string;
+}
+
+// `choose_relay_ca`: the number a form names the chosen file by, and its
+// file name for the words. `null` when the dialog was closed.
+export interface ChosenCa {
+  pick: number;
+  name: string;
+}
+
+// `test_relay`: what reaching the relay once came to, in words. `kind` is
+// `admitted`, or the name of the failure.
+export interface RelayTest {
+  ok: boolean;
+  kind: string;
+  message: string;
+  // What to do next; empty when the relay admits this copy.
+  next: string;
+}
+
+// The `console-notice` event: something the technician should know that is
+// not the failure of a command, with a next step.
+export interface ConsoleNotice {
+  title: string;
+  message: string;
+  next: string;
 }
 
 // --- This copy of the application (ST-M009-006, ST-M009-008) ---

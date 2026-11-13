@@ -43,6 +43,12 @@ tokio = { workspace = true, features = ["net"] }
 # `build.rs` elevation manifest applies only to its own development binary,
 # never to a dependent (the application already depends on it the same way).
 cretlink-support-agent = { path = "../support-agent", version = "0.0.0" }
+# The relay profile of a copy (ST-M007-011): the form of a relay's host name
+# that two copies agree on, the bound of an admission key, and the type that
+# holds a key without ever printing it. `zeroize` erases the text of a profile
+# file once it is read, because it may hold that key.
+cretlink-relay.workspace = true
+zeroize.workspace = true
 
 # Attaching a GUI-subsystem process to its parent's console, and the elevated
 # relaunch through UAC (ST-M009-001); the Start-menu shortcut (COM ShellLink),

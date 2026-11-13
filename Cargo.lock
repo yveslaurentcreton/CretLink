@@ -366,6 +366,7 @@ dependencies = [
  "cretlink-console",
  "cretlink-mcp",
  "cretlink-protocol",
+ "cretlink-relay",
  "cretlink-session",
  "cretlink-shared",
  "cretlink-support-agent",
@@ -374,6 +375,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "windows",
+ "zeroize",
 ]
 
 [[package]]

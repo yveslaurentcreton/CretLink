@@ -82,6 +82,9 @@ function consoles(s: CustomerSnapshot): HTMLElement {
 }
 
 function codeField(s: CustomerSnapshot): HTMLElement {
+  // A copy that is set up for a relay says through which one a relay code
+  // connects, before any code is typed (ST-M007-011, ST-M007-013).
+  const relay = s.view?.relay_of_copy?.host;
   return h(
     "div",
     { class: "code-field" },
@@ -99,7 +102,7 @@ function codeField(s: CustomerSnapshot): HTMLElement {
         maxlength: CODE_MAX,
         placeholder: "6RRR-2H8F",
         "data-key": "code",
-        "aria-describedby": "code-hint",
+        "aria-describedby": relay ? "code-hint relay-ready" : "code-hint",
       }),
       button("Connect", "connect-code", { disabled: s.busy !== undefined }),
     ),
@@ -108,6 +111,15 @@ function codeField(s: CustomerSnapshot): HTMLElement {
       { class: "muted", id: "code-hint" },
       "The code only says where to connect. It grants nothing.",
     ),
+    relay
+      ? h(
+          "p",
+          { class: "muted relay-ready", id: "relay-ready", "data-key": "relay-ready" },
+          "If your technician is not on this network, they give you a longer relay code. This copy then connects through the relay ",
+          h("b", { class: "mono" }, relay),
+          ", which only passes encrypted traffic on.",
+        )
+      : null,
   );
 }
 

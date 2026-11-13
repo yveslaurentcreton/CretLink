@@ -103,6 +103,25 @@ export interface ConsentView {
   technician: TechnicianNameView | null;
   // `null` when the startup sweep kept nothing (or has not finished).
   startup_cleanup: StartupCleanupView | null;
+  // The relay this session runs through, by its host name; `null` for a
+  // session on one network (ST-M007-013). It stays after the end, until the
+  // next dial.
+  relay: RelayUseView | null;
+  // What to do next about the failure this dial ended with, when the failure
+  // has a next step of its own (a relay that cannot be reached, a key the
+  // relay refuses, ...); `null` otherwise.
+  failure_next: string | null;
+  // The relay this copy is set up for, by its host name, from the profile
+  // file next to the program; `null` without a profile that can be used
+  // (ST-M007-011). Shown beside the code field: the customer sees the
+  // relay's host name before connecting through it.
+  relay_of_copy: RelayUseView | null;
+}
+
+// The relay of a session (ST-M007-013, ADR-0016): a label. The relay passes
+// the encrypted session on, cannot look inside and grants nothing.
+export interface RelayUseView {
+  host: string;
 }
 
 // One technician console found on the LAN (ADR-0007). Untrusted: never

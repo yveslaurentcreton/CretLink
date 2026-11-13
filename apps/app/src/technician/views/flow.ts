@@ -2,9 +2,17 @@
 // (`#t-wait`), connecting, comparing the approval code (`#t-sac`), the
 // customer deciding (`#t-consent`), and stopping. Each shows the access state
 // in words, and Stop (Escape) is always available (REQ-F-018).
+//
+// A customer who is not on the technician's network is reached through the
+// relay of this copy (ST-M007-013): the waiting screen offers **Use relay**,
+// then shows the relay's host name and a relay code to read out. The relay
+// only lets the two copies find each other; every screen after it is the one
+// of a session on one network, with a line that says which relay the session
+// runs through.
 
-import { h } from "../../shared/dom";
-import { selectedIsSimulated } from "../api";
+import { type Child, h } from "../../shared/dom";
+import { icon } from "../../shared/icons";
+import { type RelayRoute, selectedIsSimulated } from "../api";
 import { DISCLOSURE_TEXT } from "../disclosure";
 import type { ListenNetwork } from "../../shared/contract";
 import {
@@ -13,9 +21,13 @@ import {
   currentTarget,
   groupCode,
   otherNetworks,
+  relayCodeGroups,
+  relayOffer,
+  spokenCode,
   targetName,
   technicianPick,
   waitingNetwork,
+  waitingRelay,
 } from "../model";
 import { button, card, pill } from "./common";
 
@@ -111,8 +123,164 @@ function networkChoice(s: TechnicianSnapshot): HTMLElement | null {
   );
 }
 
+/**
+ * That the session runs through a relay, and through which: on every screen
+ * from the comparison of the approval code to the end (ST-M007-013). The
+ * relay passes the encrypted session on; it grants nothing.
+ */
+export function viaRelay(relay: RelayRoute | undefined): HTMLElement | null {
+  if (!relay) return null;
+  return h(
+    "p",
+    { class: "via-relay", "data-key": "via-relay" },
+    icon("wifi", "sm"),
+    h("span", null, "Through the relay ", h("b", { class: "mono" }, relay.host)),
+    h("span", { class: "muted" }, " · it only passes encrypted traffic on"),
+  );
+}
+
+// **Not on the same network?** under the waiting card (ST-M007-013). With a
+// relay it offers **Use relay**; without one it names Settings, where a relay
+// is set up; a profile that cannot be used is said as such, with its file.
+function relayOfferCard(s: TechnicianSnapshot): HTMLElement {
+  const offer = relayOffer(s.relay);
+  const busy = s.busy !== undefined;
+  const settings = button("Open Settings", "nav", { arg: "settings", variant: "sm" });
+  let text: Child;
+  let action: HTMLElement;
+  switch (offer.state) {
+    case "ready":
+      text = [
+        "Use your relay ",
+        h("b", { class: "mono" }, offer.host),
+        ". It only passes encrypted traffic on and cannot look into the session.",
+      ];
+      action = button("Use relay…", "use-relay", {
+        id: "use-relay",
+        disabled: busy,
+        label: `Use the relay ${offer.host}`,
+      });
+      break;
+    case "problem":
+      text = [
+        h("b", null, "The relay settings of this copy cannot be used. "),
+        offer.message,
+        " The file is ",
+        h("span", { class: "mono" }, offer.file),
+        ". Settings, under Relay, shows it.",
+      ];
+      action = settings;
+      break;
+    default:
+      text = offer.runOnce
+        ? [
+            "This copy has no relay. To help someone on another network, put a file ",
+            h("span", { class: "mono" }, "cretlink.toml"),
+            " for your relay next to the program; Settings, under Relay, shows how.",
+          ]
+        : "This copy has no relay. To help someone on another network, set up your relay in Settings, under Relay.";
+      action = settings;
+  }
+  return h(
+    "div",
+    {
+      class: "card row relay-offer",
+      id: "relay-offer",
+      role: "group",
+      "aria-labelledby": "relay-offer-h",
+    },
+    icon("wifi"),
+    h(
+      "div",
+      { class: "relay-offer-text" },
+      h("b", { id: "relay-offer-h" }, "Not on the same network?"),
+      h("div", { class: "muted" }, text),
+    ),
+    action,
+  );
+}
+
+// Waiting on the relay (ST-M007-013): the relay's host name, the relay code
+// to read out with Copy, and in words whether the relay holds it yet. The
+// code is drawn in four outlined groups and named a relay code, so that it is
+// not taken for the approval code that follows.
+function relayWaitView(s: TechnicianSnapshot, relay: RelayRoute): HTMLElement {
+  const phase = s.console.phase;
+  const code = phase.phase === "listening" ? phase.code : "";
+  return h(
+    "div",
+    { class: "screen wait relay-wait" },
+    h(
+      "div",
+      { class: "row" },
+      pill("none", "○ No access"),
+      h("span", { class: "spacer" }),
+      stopButton("Cancel", s),
+    ),
+    h(
+      "div",
+      { class: "card center" },
+      h("span", { class: "spinner", "aria-hidden": "true" }),
+      h("h2", null, "Waiting for the customer on your relay"),
+      h(
+        "p",
+        null,
+        "Ask them to open CretLink, choose ",
+        h("b", null, "Get help"),
+        " and type this code into the code field.",
+      ),
+      h("div", { class: "label", id: "relay-code-label" }, "Relay code · read it to the customer"),
+      h(
+        "p",
+        {
+          class: "relay-code",
+          id: "relay-code",
+          role: "img",
+          "aria-label": `Relay code ${spokenCode(code)}`,
+        },
+        relayCodeGroups(code).map((group) => h("span", null, group)),
+      ),
+      h(
+        "p",
+        { class: "muted conn-addr" },
+        "Relay ",
+        h("b", { class: "mono", id: "relay-host" }, relay.host),
+        " · ",
+        h(
+          "button",
+          {
+            type: "button",
+            class: "linkbtn",
+            "data-action": "copy",
+            "data-arg": code,
+            "aria-label": "Copy the relay code",
+          },
+          "Copy",
+        ),
+      ),
+      h(
+        "p",
+        { class: "relay-state", id: "relay-state", role: "status" },
+        relay.admitted
+          ? "The relay holds this code. It works once, for as long as this screen is open."
+          : `Connecting to the relay ${relay.host}…`,
+      ),
+      h(
+        "p",
+        { class: "muted relay-note" },
+        "The code only says where to meet. You compare the approval code and the customer gives permission next, as on one network.",
+      ),
+    ),
+  );
+}
+
 function waitView(s: TechnicianSnapshot): HTMLElement {
   const phase = s.console.phase;
+  // The change to the relay stops the listener first: until the relay's
+  // waiting state is there, the screen shows no code at all.
+  if (s.busy === "relay") return changingView(s, "Changing to your relay…");
+  const relay = waitingRelay(s.console);
+  if (relay) return relayWaitView(s, relay);
   // While the network changes there is no listener for a moment: the screen
   // then shows no code at all rather than the one that no longer works.
   const switching = s.busy === "network" || phase.phase !== "listening";
@@ -175,6 +343,29 @@ function waitView(s: TechnicianSnapshot): HTMLElement {
           ),
       switching ? null : networkChoice(s),
     ),
+    switching ? null : relayOfferCard(s),
+  );
+}
+
+/** The waiting screen while one way of waiting gives way to another. */
+function changingView(s: TechnicianSnapshot, words: string): HTMLElement {
+  return h(
+    "div",
+    { class: "screen wait" },
+    h(
+      "div",
+      { class: "row" },
+      pill("none", "○ No access"),
+      h("span", { class: "spacer" }),
+      stopButton("Cancel", s),
+    ),
+    h(
+      "div",
+      { class: "card center" },
+      h("span", { class: "spinner", "aria-hidden": "true" }),
+      h("h2", null, "Waiting for the customer"),
+      h("p", { class: "muted conn-switching", role: "status" }, words),
+    ),
   );
 }
 
@@ -195,6 +386,7 @@ function connectingView(s: TechnicianSnapshot): HTMLElement {
       h("span", { class: "spinner", "aria-hidden": "true" }),
       h("h2", null, "The customer is connecting"),
       h("p", null, "Setting up the encrypted connection. Nothing is shared yet."),
+      viaRelay(s.console.relay),
     ),
   );
 }
@@ -242,6 +434,7 @@ function compareView(s: TechnicianSnapshot): HTMLElement {
       }),
     ),
     h("p", { class: "muted" }, "Press Esc to stop at any time."),
+    viaRelay(s.console.relay),
   );
 }
 
@@ -269,6 +462,7 @@ function consentView(s: TechnicianSnapshot): HTMLElement {
             disabled: s.busy === "consent",
           })
         : null,
+      viaRelay(s.console.relay),
     ),
     card(
       h("h4", { id: "disclosure-head" }, "What the customer reads"),
