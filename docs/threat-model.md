@@ -1362,6 +1362,14 @@ run on real hardware is scenario MT-14 in
 these operations through the console library; the explorer screen that calls
 them is ST-M010-002. The AI tool surface does not contain them.
 
+The four operations that change one entry of a folder — delete a file, remove
+an empty folder, create a folder, move or rename (M003; the AI tools
+`remote_delete`, `remote_remove_dir`, `remote_make_dir` and `remote_move`) —
+take up the folder that holds the entry as a verified folder on Windows
+(ST-M010-004, FT-11). Their tests with junctions and with a folder that is
+swapped run on the Windows CI runner only; the run on real hardware is steps
+15 to 17 of scenario MT-14, not yet recorded.
+
 **Entry points.**
 
 - The MCP bridge file and transfer tools on the technician computer
@@ -1666,8 +1674,17 @@ that is already open. Mitigations:
   library and nothing it starts later begins there.
 - *Nothing is moved in.* A move keeps a file as it is, with its permissions
   and with every handle a program opened on it before. An elevated program
-  therefore refuses to move a file from elsewhere into its staging area. A
-  file gets there by an upload, which makes it new.
+  therefore refuses to move a file from elsewhere into its staging area,
+  whether the request names the staging area by a staging name or by its
+  full path: where the file would lie decides. A file gets there by an
+  upload, which makes it new.
+- *What is moved out takes the permissions of where it arrives.* For the same
+  reason a file that an elevated program moves from its staging area to
+  another place would stay closed to everybody but the administrators, the
+  customer included. It is given the permissions that the folder it arrives
+  in hands down, as if it had been made there, also when the request names
+  the staged file by its full path; if that fails, the move is answered as
+  failed and says so.
 - *Said, not passed over.* A session whose cleanup failed, a staging area
   that could not be made private (with the reason), a folder of an earlier
   release that is still there, and a lock that another program holds for
@@ -1688,8 +1705,9 @@ Evidence: `a_planted_manifest_removes_nothing_outside_the_staging_area`,
 `the_temporary_file_of_a_manifest_is_never_written_through_a_link`,
 `a_manifest_larger_than_a_manifest_can_be_is_not_read`,
 `a_session_with_a_damaged_manifest_is_named_and_never_called_clean`,
-`a_sweep_and_a_census_make_nothing_where_nothing_was_kept` and
-`nothing_is_moved_into_a_private_staging_area_from_elsewhere`
+`a_sweep_and_a_census_make_nothing_where_nothing_was_kept`,
+`nothing_is_moved_into_a_private_staging_area_from_elsewhere` and, on Windows,
+`a_file_moved_out_of_a_private_staging_area_takes_the_permissions_of_its_new_folder`
 (`crates/exec/src/fs/tests.rs`); the rule about private permissions, the
 chain of folders, and what happens when something else stands in the place
 of a folder (`crates/exec/src/own/tests.rs`);
@@ -2002,6 +2020,120 @@ guessed (REQ-N-006, REQ-N-008). Evidence:
 `drive_texts_are_single_lines` and `too_many_drives_rejected`
 (`crates/protocol/src/tests.rs`).
 
+*FT-11 — A change to one entry is led to another place (ST-M010-004).*
+Deleting a file, removing an empty folder, creating a folder and moving or
+renaming an entry each change one entry of a folder. The operations exist
+since M003, the AI reaches them through `remote_delete`, `remote_remove_dir`,
+`remote_make_dir` and `remote_move`, and the explorer makes them everyday
+actions. Up to release 0.24.1 the agent resolved their paths by name. The
+agent is elevated, and the folder may belong to an account that is not. A
+program of that account can make a folder on the way a junction — also one
+that leads into a directory of the object manager, where a symbolic link
+sends one file name to any path — or swap the folder for a junction between
+two requests, or between a check and the change. The delete, the new folder
+or the moved file then lands where the junction leads: with administrator
+rights, in a place the account could not change itself (REQ-S-024).
+Mitigations, on Windows and for an absolute path:
+
+- *The folder that holds the entry is the one that lies at the path.* Each of
+  the four operations takes up that folder once, as a verified folder (FT-8):
+  it is opened without following a link in the last part of its path, where
+  it really lies is read from the opened handle, and that is compared with
+  the path that was asked, without regard to letter case and with short names
+  written out. A path that reaches the folder through a junction or a
+  symbolic link, a folder that is itself a link, and a path on a drive made
+  with `subst` or on a network drive are refused as `invalid_path` before
+  anything changes. So is a folder whose real location the system cannot
+  tell, such as one on a volume without a drive letter. A volume that is
+  mounted in a folder counts as a link here: an entry directly in its top
+  folder cannot be changed by that path.
+- *Delete a file* (`fs_delete`). The entry is opened by its one name relative
+  to the folder's handle, as the entry it is and never as what a link points
+  at. What it is is read from that handle: a folder is refused, a file or a
+  link is removed through that same handle.
+- *Remove an empty folder* (`remove_dir`). The entry is opened the same way.
+  Only a real folder is removed, through its own handle, and only when it is
+  empty.
+- *Create a folder* (`create_dir`). One level, as before: the folder is
+  created relative to the handle of the folder it is created in, never by a
+  path, and gets the permissions that folder hands down. A folder above it
+  that is missing is not created.
+- *Move or rename* (`fs_move`). Both folders are taken up before anything
+  changes. The entry is opened relative to the handle of its folder and
+  renamed through its own handle into the handle of the destination's
+  folder: the system puts the entry into the directory that handle stands
+  for, and no path names the destination. It stays a rename on one volume,
+  never a copy; a name that is taken is refused, in one step with the
+  rename, unless the caller asked to replace it, and a folder under that
+  name is never replaced.
+- *Nothing is resolved by path a second time.* The check of the folder and
+  the change are about the folder that was opened. A folder that is swapped
+  for a junction after it was taken up changes nothing: the operation acts
+  in the folder it opened. A folder that is swapped before the next request
+  is a link when that request takes it up, and the request is refused.
+- *A link as the entry itself keeps its meaning.* Only the way to the entry
+  must be free of links. A delete removes a link — a symbolic link to a file
+  or to a folder, a junction, a link to nothing — as the link, never what it
+  points at. The removal of an empty folder refuses a link. No folder is
+  created under a name that a link has, and none where the link points. A
+  move moves the link, and a move that may replace never reaches what a link
+  under the destination's name points at.
+- *The staging area goes on by path.* An operation on a staging name works
+  by path, as the staging area's own operations do (part, commit, discard,
+  delete, cleanup). Since ST-M006-020 the staging area of an elevated
+  program is a private folder of the administrators, and that of a program
+  without administrator rights lies in the folder of its own account: no
+  other account can change a folder in either (FT-7), so there is no link
+  another account could have put there. A move between a staging name and a
+  path verifies the folder of the path. An elevated program still takes
+  nothing into its staging area by a move, and what it moves out takes the
+  permissions of the folder it arrives in (FT-7). Both are decided from
+  where the two opened folders really lie, so a request that names the
+  staging area by its full path is treated like one that uses a staging
+  name, and the permissions are replaced through the handle that renamed
+  the entry: no path is resolved for it again.
+- *Said to the AI.* The four tools say in their description that a path
+  through a link is refused, that nothing changes then, and that the real
+  location is to be named. Their inputs and their results are unchanged.
+
+Evidence: `a_delete_removes_a_link_and_never_what_it_points_at`,
+`a_link_is_not_removed_as_an_empty_folder`,
+`a_folder_is_not_created_under_the_name_of_a_link`,
+`a_move_moves_a_link_as_the_link`,
+`a_move_that_replaces_never_reaches_what_a_link_points_at`,
+`a_move_into_another_folder_keeps_its_contract`,
+`what_is_not_there_or_not_of_its_kind_is_refused_as_before`,
+`a_delete_of_a_second_name_of_a_file_leaves_the_file_under_its_other_name`
+and `a_file_is_moved_between_the_staging_area_and_a_folder`
+(`crates/exec/src/fs/tests.rs`), which run on every CI platform and pin what
+each operation meant before; the two rules about the private staging area
+with `nothing_is_moved_into_a_private_staging_area_from_elsewhere` and, on
+Windows,
+`a_file_moved_out_of_a_private_staging_area_takes_the_permissions_of_its_new_folder`
+(the same file), each also with the staging area named by its full path;
+with, on Windows,
+`a_delete_through_a_junction_is_refused_and_what_it_leads_to_stays`,
+`a_folder_removal_through_a_junction_is_refused_and_what_it_leads_to_stays`,
+`a_folder_creation_through_a_junction_is_refused_and_nothing_is_created_behind_it`,
+`a_move_through_a_junction_on_either_side_is_refused_and_nothing_moves`,
+`a_folder_swapped_for_a_junction_between_two_deletes_is_not_followed`,
+`a_folder_swapped_for_a_junction_between_two_folder_removals_is_not_followed`,
+`a_folder_swapped_for_a_junction_between_two_folder_creations_is_not_followed`,
+`a_folder_swapped_for_a_junction_between_two_moves_is_not_followed`,
+`a_change_is_made_in_the_folder_that_was_opened_whatever_its_path_leads_to`,
+`a_junction_as_the_entry_keeps_its_meaning_for_every_operation`,
+`a_move_between_the_staging_area_and_a_folder_behind_a_junction_is_refused`,
+`a_folder_spelled_by_a_short_name_or_in_another_letter_case_is_the_same_folder`,
+`a_held_file_is_in_use_and_read_only_entries_are_removed` and
+`the_root_of_a_drive_is_no_entry_to_change` (the same file);
+`a_move_through_handles_lands_in_the_opened_folder_and_replaces_only_when_asked`
+and `a_folder_of_cretlinks_own_is_taken_up_as_it_is` on Windows
+(`crates/exec/src/fs/anchor/tests.rs`); and
+`the_tools_that_change_one_entry_say_that_a_path_through_a_link_is_refused`
+(`crates/mcp/tests/bridge_mock.rs`). The tests that need Windows run on the
+Windows CI runner only; the run on real hardware is steps 15 to 17 of
+scenario MT-14 in [`manual-tests.md`](manual-tests.md), not yet recorded.
+
 **Residual risks.**
 
 - A release up to 0.24.0 has the weakness of FT-7 whenever it is started,
@@ -2121,22 +2253,31 @@ guessed (REQ-N-006, REQ-N-008). Evidence:
   the same files from the cloud, as it does when the folder is removed in
   Windows itself.
 - Where a folder really lies is verified on Windows only. Elsewhere the
-  removal of a folder and a file sent to a folder work on the path they are
-  given, without following a link in the last part of a name; a non-Windows
-  agent is a development and test tool that is never elevated on a customer
-  computer.
-- A path through a link is refused, also when the link is harmless. A removal
-  or a transfer whose path leads through a junction or a symbolic link — the
-  ones Windows keeps itself, such as `C:\Documents and Settings`, included —
-  or that lies on a drive made with `subst` or on a network drive is refused
-  as `invalid_path`. The technician uses the path where the folder really
-  lies.
-- The folder is the one that lies at the path when the operation begins. The
-  agent refuses a link in the path and a folder that is swapped during a
-  removal; it cannot know which real folder the technician saw under that
-  path a moment earlier. A program that may rename a folder can put it where
-  the technician is about to act, as it could before these operations
-  existed.
+  removal of a folder, a file sent to a folder and a change to one entry (a
+  delete, the removal of an empty folder, a new folder, a move) work on the
+  path they are given, without following a link in the last part of a name;
+  a non-Windows agent is a development and test tool that is never elevated
+  on a customer computer.
+- A path through a link is refused, also when the link is harmless. A
+  removal, a transfer or a change to one entry whose path leads through a
+  junction or a symbolic link — the ones Windows keeps itself, such as
+  `C:\Documents and Settings`, included — or that lies on a drive made with
+  `subst` or on a network drive is refused as `invalid_path`. The technician
+  and the AI use the path where the folder really lies. Since ST-M010-004
+  this also holds for the four AI tools that change one entry, which worked
+  through such a path before.
+- The folder is the one that lies at the path when the operation begins, and
+  the entry is the one that has its name in that folder when the operation
+  opens it. The agent refuses a link in the path and a folder that is
+  swapped during a removal; it cannot know which real folder, or which file
+  under a name, the technician saw a moment earlier. A program that may
+  rename a folder or a file can put it where the technician is about to act,
+  as it could before these operations existed.
+- Reading goes on by name. A stat, a folder listing, a file read and a
+  digest resolve their path as before: they change nothing on the customer
+  computer, and what they answer is the target's own account of that path.
+- An operation on a staging name works by path (FT-11). That rests on the
+  staging area being a place that no other account can change (FT-7).
 - The identity of a folder is only as good as its file system. On FAT and
   exFAT it is the volume serial number and a file index that such a file
   system can hand to another folder later. Those file systems have neither

@@ -59,6 +59,31 @@
 //! following a link in the last part of its name: a non-Windows agent is a
 //! development and test tool that is never elevated on a customer computer.
 //!
+//! # A change to one entry (ST-M010-004)
+//!
+//! [`Operation::FsDelete`], [`Operation::RemoveDir`], [`Operation::CreateDir`]
+//! and [`Operation::FsMove`] each change one entry of a folder. On an
+//! absolute path they take up the folder that holds the entry as a verified
+//! folder, on Windows (see the `anchor` and `in_folder` modules): the folder
+//! must lie where the request says, so a path that reaches it through a link
+//! is refused ([`ErrorCode::InvalidPath`]) before anything changes; the entry
+//! is opened by its one name relative to the folder's handle and removed or
+//! renamed through its own handle, and a new folder is created relative to
+//! the handle of the folder it is created in. A move takes up both folders
+//! and renames through the entry's handle into the destination folder's
+//! handle. Nothing is resolved by path a second time, so a folder that is
+//! swapped for a junction between two requests, or between a check and the
+//! change, does not lead the operation elsewhere.
+//!
+//! A link that is the entry itself keeps its meaning: a delete removes the
+//! link and never what it points at, the removal of an empty folder refuses
+//! it, no folder is created under its name, and a move moves the link.
+//!
+//! On a staging name these operations go on by path: the staging area is
+//! CretLink's own (below). A move between a staging name and a path of the
+//! request verifies the folder of that path. Off Windows all of them work by
+//! name, as the rest of a non-Windows agent does.
+//!
 //! # Drives and folder removal (ST-M010-001)
 //!
 //! [`Operation::FsDrives`] lists the drives (see the `drives` module), and
@@ -102,6 +127,8 @@
 
 mod anchor;
 mod drives;
+#[cfg(windows)]
+mod in_folder;
 mod manifest;
 #[cfg(windows)]
 mod to_folder;
@@ -240,6 +267,27 @@ impl FsError {
         Self::new(
             ErrorCode::PathNotFound,
             "the folder of this transfer is no longer in its place; its part was not removed",
+        )
+    }
+
+    /// The refusal to move an entry from elsewhere into the private folder of
+    /// an elevated program.
+    fn moved_in() -> Self {
+        Self::new(
+            ErrorCode::Unsupported,
+            "a move into the staging area of a program with administrator rights is not \
+             supported: upload the file",
+        )
+    }
+
+    /// An entry left the private folder of an elevated program and kept the
+    /// permissions it had there.
+    #[cfg(windows)]
+    fn kept_its_permissions() -> Self {
+        Self::new(
+            ErrorCode::AccessDenied,
+            "the entry was moved, but it kept the permissions of the staging area: only an \
+             administrator can open it",
         )
     }
 
@@ -1017,6 +1065,13 @@ impl FileStore {
             self.ensure_staging_dirs().await?;
         }
         let resolved = self.resolve(path)?;
+        // In a folder that the request names: inside the opened, verified
+        // folder.
+        #[cfg(windows)]
+        if matches!(path, RemotePath::Absolute { .. }) {
+            blocking(move || in_folder::create_dir(&resolved)).await?;
+            return Ok(OpResult::Ack {});
+        }
         match tokio::fs::create_dir(&resolved).await {
             Ok(()) => Ok(OpResult::Ack {}),
             Err(e) => Err(FsError::from_io("failed to create the directory", &e)),
@@ -1037,11 +1092,7 @@ impl FileStore {
             && matches!(to, RemotePath::Staging { .. })
             && !matches!(from, RemotePath::Staging { .. })
         {
-            return Err(FsError::new(
-                ErrorCode::Unsupported,
-                "a move into the staging area of a program with administrator rights is not \
-                 supported: upload the file",
-            ));
+            return Err(FsError::moved_in());
         }
         let from_path = self.resolve(from)?;
         let to_path = self.resolve(to)?;
@@ -1054,6 +1105,33 @@ impl FileStore {
                 ErrorCode::Unsupported,
                 "a cross-volume move is not supported",
             ));
+        }
+        // A move with an end that the request names by its path: inside the
+        // opened, verified folder of that end. Where the two opened folders
+        // really lie also decides what the move means for the private folder
+        // of an elevated program (ST-M006-020). A move between two staging
+        // names stays in CretLink's own folder and goes on by path.
+        #[cfg(windows)]
+        if !(matches!(from, RemotePath::Staging { .. }) && matches!(to, RemotePath::Staging { .. }))
+        {
+            let side = |path: &RemotePath, resolved: PathBuf| match path {
+                RemotePath::Absolute { .. } => in_folder::Side::Named(resolved),
+                RemotePath::Staging { .. } => in_folder::Side::Staged(resolved),
+            };
+            let (out_of, into) = (side(from, from_path), side(to, to_path));
+            let private = self.private_location().await;
+            blocking(move || in_folder::rename(&out_of, &into, overwrite, private.as_deref()))
+                .await?;
+            return Ok(OpResult::Ack {});
+        }
+        // By path from here on: off Windows, and between two staging names.
+        // Where an entry lies decides, not how a request spells its path: a
+        // staged file can be named by its staging name or by its full path,
+        // and so can the staging area as a destination.
+        let from_private = self.lies_in_private(&from_path).await;
+        let to_private = self.lies_in_private(&to_path).await;
+        if to_private && !from_private {
+            return Err(FsError::moved_in());
         }
         match tokio::fs::symlink_metadata(&to_path).await {
             Ok(meta) => {
@@ -1076,8 +1154,51 @@ impl FileStore {
         Ok(OpResult::Ack {})
     }
 
+    /// The real location of the private folder of an elevated program, when
+    /// this store has one and its location can be told. What a move does to
+    /// an entry is decided against it.
+    #[cfg(windows)]
+    async fn private_location(&self) -> Option<PathBuf> {
+        if !self.base.is_private() {
+            return None;
+        }
+        tokio::fs::canonicalize(self.base.outermost()).await.ok()
+    }
+
+    /// Whether the folder that holds `path` really lies in the private folder
+    /// of an elevated program, however the path is spelled: by another
+    /// letter case, by short names or through a link. `false` for a store
+    /// whose folders need not be private, and when either location cannot be
+    /// told (the move then fails on its own account).
+    async fn lies_in_private(&self, path: &Path) -> bool {
+        if !self.base.is_private() {
+            return false;
+        }
+        let Some(folder) = path.parent() else {
+            return false;
+        };
+        let (Ok(folder), Ok(private)) = (
+            tokio::fs::canonicalize(folder).await,
+            tokio::fs::canonicalize(self.base.outermost()).await,
+        ) else {
+            return false;
+        };
+        folder.starts_with(private)
+    }
+
     async fn delete(&self, path: &RemotePath) -> Result<OpResult, FsError> {
         let resolved = self.resolve(path)?;
+        // In a folder that the request names: inside the opened, verified
+        // folder.
+        #[cfg(windows)]
+        if matches!(path, RemotePath::Absolute { .. }) {
+            let asked = resolved.clone();
+            blocking(move || in_folder::delete(&asked)).await?;
+            // Keep the manifest consistent if the path named a tracked
+            // staging artifact.
+            self.forget_if_staged(&resolved).await;
+            return Ok(OpResult::Ack {});
+        }
         let meta = match tokio::fs::symlink_metadata(&resolved).await {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1104,6 +1225,13 @@ impl FileStore {
 
     async fn remove_dir(&self, path: &RemotePath) -> Result<OpResult, FsError> {
         let resolved = self.resolve(path)?;
+        // In a folder that the request names: inside the opened, verified
+        // folder.
+        #[cfg(windows)]
+        if matches!(path, RemotePath::Absolute { .. }) {
+            blocking(move || in_folder::remove_dir(&resolved)).await?;
+            return Ok(OpResult::Ack {});
+        }
         match tokio::fs::symlink_metadata(&resolved).await {
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => return Err(FsError::wrong_kind("the path is not a directory")),

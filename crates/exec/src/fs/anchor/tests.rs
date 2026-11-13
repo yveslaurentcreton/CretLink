@@ -306,7 +306,8 @@ mod windows {
     use super::super::super::io_error_code;
     use super::super::super::testing::{junction, reported, short_name};
     use super::super::{
-        Disposition, Folder, Hold, Kind, Refusal, link_count, open_at, plain, rename_in_folder,
+        Disposition, Folder, Hold, Kind, Refusal, create_dir_at, link_count, open_at,
+        open_at_for_removal, plain, rename_in_folder, rename_into,
     };
     use super::Sandbox;
 
@@ -581,6 +582,132 @@ mod windows {
             b"third"
         );
         assert!(!sb.root.join("outside.txt").exists());
+    }
+
+    /// A move through handles puts the entry into the folder that was opened
+    /// as its destination — also when that folder has been moved away and a
+    /// junction stands in its place — and replaces a file of that name only
+    /// when asked. A new folder is created relative to a handle the same
+    /// way, and a taken name is refused (ST-M010-004).
+    #[test]
+    fn a_move_through_handles_lands_in_the_opened_folder_and_replaces_only_when_asked() {
+        let sb = Sandbox::new();
+        let from = sb.dir("from");
+        let to = sb.dir("to");
+        let elsewhere = sb.dir("elsewhere");
+        for (name, content) in [("a.txt", "a"), ("b.txt", "b"), ("c.txt", "c")] {
+            std::fs::write(from.join(name), content).expect("write");
+        }
+        let (out_of, into) = (shared(&from), shared(&to));
+        // The destination is moved away, and its path now leads elsewhere.
+        let moved = sb.root.join("to-moved");
+        std::fs::rename(&to, &moved).expect("rename the folder that is open");
+        junction(&to, &elsewhere);
+        let open = |name: &str| {
+            open_at(&out_of, name, EVERYTHING, SHARE_ALL, Disposition::Open, 0).expect("open")
+        };
+        let read = |path: &Path| std::fs::read_to_string(path).expect("read");
+
+        let a = open("a.txt");
+        rename_into(&a, &into, "moved.txt", false).expect("the name is free");
+        drop(a);
+        assert_eq!(read(&moved.join("moved.txt")), "a");
+        assert!(!from.join("a.txt").exists());
+
+        // A taken name fails the move; both files are untouched.
+        let b = open("b.txt");
+        let taken = rename_into(&b, &into, "moved.txt", false).expect_err("the name is taken");
+        assert_eq!(io_error_code(&taken), ErrorCode::AlreadyExists);
+        assert_eq!(read(&moved.join("moved.txt")), "a");
+        assert_eq!(read(&from.join("b.txt")), "b");
+        // On request it is replaced.
+        rename_into(&b, &into, "moved.txt", true).expect("replace");
+        drop(b);
+        assert_eq!(read(&moved.join("moved.txt")), "b");
+        assert!(!from.join("b.txt").exists());
+
+        // A name that is a path is refused: the entry goes into the opened
+        // folder or nowhere.
+        let c = open("c.txt");
+        for not_a_name in [r"..\outside.txt", r"sub\x.txt", "sub/x.txt", ""] {
+            assert!(
+                rename_into(&c, &into, not_a_name, true).is_err(),
+                "{not_a_name:?}"
+            );
+        }
+        drop(c);
+        assert_eq!(read(&from.join("c.txt")), "c");
+
+        // A folder is created in the opened folder, and a taken name — of a
+        // folder or of a file — is refused.
+        create_dir_at(&into, "sub").expect("a new folder");
+        assert!(moved.join("sub").is_dir());
+        for taken in ["sub", "moved.txt"] {
+            let refused = create_dir_at(&into, taken).expect_err("the name is taken");
+            assert_eq!(io_error_code(&refused), ErrorCode::AlreadyExists, "{taken}");
+        }
+        assert_eq!(read(&moved.join("moved.txt")), "b", "the file is untouched");
+
+        // An entry is opened for its removal in the opened folder, too.
+        let entry = open_at_for_removal(&into, "sub").expect("open the new folder");
+        assert_eq!(
+            super::super::kind_of(&entry).expect("what it is"),
+            Kind::Dir
+        );
+        drop(entry);
+
+        let mut left: Vec<String> = std::fs::read_dir(&elsewhere)
+            .expect("list")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        left.sort();
+        assert!(
+            left.is_empty(),
+            "nothing went where the path leads now: {left:?}"
+        );
+        assert!(!sb.root.join("outside.txt").exists());
+    }
+
+    /// A folder of CretLink's own is taken up by its path as it is: where it
+    /// lies is not compared, so a path through a junction is accepted for
+    /// it. The last part of the path is still never followed: a junction
+    /// there is taken up as the link it is, which the caller refuses
+    /// (ST-M010-004).
+    #[test]
+    fn a_folder_of_cretlinks_own_is_taken_up_as_it_is() {
+        let sb = Sandbox::new();
+        let real = sb.dir("real");
+        std::fs::create_dir(real.join("inside")).expect("create");
+        let via = sb.root.join("via");
+        junction(&via, &real);
+
+        let own = Folder::open_own(&real.join("inside")).expect("its own path");
+        assert_eq!(own.kind(), Kind::Dir);
+        assert_eq!(plain(own.path()), reported(&real.join("inside")));
+        // Through a junction: taken up, where the same path is refused for a
+        // folder that a request names.
+        let through = Folder::open_own(&via.join("inside")).expect("not compared");
+        assert_eq!(through.kind(), Kind::Dir);
+        assert!(matches!(
+            Folder::open(&via.join("inside"), Hold::Shared),
+            Err(Refusal::Elsewhere)
+        ));
+        // A name is looked up in it like in any opened folder.
+        create_dir_at(&through, "made").expect("create in it");
+        assert!(real.join("inside").join("made").is_dir());
+
+        let link = Folder::open_own(&via).expect("the junction itself");
+        assert_eq!(link.kind(), Kind::Link);
+        match Folder::open_own(&sb.root.join("not-there")) {
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+            Ok(_) => panic!("nothing is there to take up"),
+        }
     }
 
     /// A file that has a second name somewhere is known as such.

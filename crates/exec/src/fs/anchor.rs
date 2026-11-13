@@ -1,5 +1,5 @@
 //! A folder that is opened once, verified and then held (ST-M010-001,
-//! ADR-0012).
+//! ST-M010-004, ADR-0012).
 //!
 //! The agent that runs this is elevated, and the folders it is asked to work
 //! in may belong to an account that is not. A program of that account can
@@ -38,12 +38,15 @@
 //! A name inside the folder is opened with `NtCreateFile` and the folder's
 //! handle as its root directory. The file system looks the name up in the
 //! opened directory itself, so neither a path, nor a junction, nor a link in
-//! the object manager's namespace takes part. The rename that publishes a
-//! file goes through `NtSetInformationFile` with a bare name and no root
-//! directory: at that level this is a rename inside the directory the file
-//! lies in. (The Win32 wrapper `SetFileInformationByHandle` is not used for
-//! it: it reads a bare name as a path relative to the current directory of
-//! the process.)
+//! the object manager's namespace takes part. A new folder is created the
+//! same way. The rename that publishes a file goes through
+//! `NtSetInformationFile` with a bare name and no root directory: at that
+//! level this is a rename inside the directory the file lies in. (The Win32
+//! wrapper `SetFileInformationByHandle` is not used for it: it reads a bare
+//! name as a path relative to the current directory of the process.) A move
+//! into another folder is the same call with that folder's handle as the root
+//! directory: the system puts the entry into the directory the handle stands
+//! for, on the same volume, and no path names the destination (ST-M010-004).
 //!
 //! # Elsewhere
 //!
@@ -118,8 +121,8 @@ pub(super) const LEADS_ELSEWHERE: &str =
 pub(super) use sys::Folder;
 #[cfg(windows)]
 pub(super) use sys::{
-    Disposition, delete, kind_of, link_count, open_at, open_entry, open_for_removal, place_of,
-    rename_in_folder,
+    Disposition, create_dir_at, delete, kind_of, link_count, open_at, open_at_for_removal,
+    open_entry, open_for_removal, place_of, rename_in_folder, rename_into,
 };
 
 /// The text of a path for a result or a report. On Windows a path built from
@@ -327,11 +330,11 @@ mod sys {
 
     use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_INFORMATION_CLASS, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-        FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0, FILE_RENAME_POSIX_SEMANTICS,
-        FILE_RENAME_REPLACE_IF_EXISTS, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation,
-        FileRenameInformationEx, NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS,
-        NtCreateFile, NtSetInformationFile,
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_INFORMATION_CLASS, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0,
+        FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FILE_SYNCHRONOUS_IO_NONALERT,
+        FileRenameInformation, FileRenameInformationEx, NTCREATEFILE_CREATE_DISPOSITION,
+        NTCREATEFILE_CREATE_OPTIONS, NtCreateFile, NtSetInformationFile,
     };
     use windows::Win32::Foundation::{
         HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_FILE_IS_A_DIRECTORY,
@@ -439,7 +442,10 @@ mod sys {
                 Hold::ForRemoval => open_held(path)?,
             };
             let kind = kind_of(&handle)?;
-            let real = final_path(&handle, VOLUME_NAME_DOS)?;
+            // What was opened but cannot say where it lies — on a volume
+            // without a drive letter, for example — cannot be compared with
+            // the path that was asked.
+            let real = final_path(&handle, VOLUME_NAME_DOS).map_err(|_| Refusal::Elsewhere)?;
             let asked: Vec<u16> = path.as_os_str().encode_wide().collect();
             // A real location on a drive letter reads `\\?\X:\...`. Anything
             // else — a share (`\\?\UNC\...`), a volume without a letter — is
@@ -464,6 +470,46 @@ mod sys {
                 // `X:\` and nothing after it.
                 drive: location.len() == 3,
                 removable,
+            })
+        }
+
+        /// Takes up a folder of CretLink's own by its path, as it is: the
+        /// entry at the path is opened — never what a link in the last part
+        /// of the path points at — and where it lies is not compared with the
+        /// path (ST-M010-004).
+        ///
+        /// For the session's own staging folder only. Since ST-M006-020 no
+        /// other account can change a folder in a staging area: that of an
+        /// elevated program is a private folder of the administrators, and
+        /// that of a program without administrator rights lies in the folder
+        /// of its own account. A path there is the place it names, so there
+        /// is nothing a comparison would add, and a staging area on a drive
+        /// whose location cannot be compared keeps working.
+        ///
+        /// # Errors
+        ///
+        /// When the path cannot be opened or asked about.
+        pub(in super::super) fn open_own(path: &Path) -> io::Result<Self> {
+            let handle = open_entry(path, FILE_READ_ATTRIBUTES.0, SHARE_ALL)?;
+            let kind = kind_of(&handle)?;
+            // Where it lies is read for the paths built from it, and decides
+            // nothing. A folder whose location cannot be read keeps the path
+            // it was given.
+            let real = final_path(&handle, VOLUME_NAME_DOS).ok();
+            let drive = real
+                .as_deref()
+                .and_then(clean)
+                .is_some_and(|location| location.len() == 3);
+            let path = real.map_or_else(
+                || path.to_path_buf(),
+                |real| PathBuf::from(OsString::from_wide(&real)),
+            );
+            Ok(Self {
+                handle,
+                kind,
+                path,
+                drive,
+                removable: false,
             })
         }
 
@@ -535,7 +581,8 @@ mod sys {
     pub(in super::super) enum Disposition {
         /// Opens the entry of that name; fails when there is none.
         Open,
-        /// Creates a file of that name; fails when the name is taken, by
+        /// Creates an entry of that name — a file, or a folder when the
+        /// options of the open ask for one; fails when the name is taken, by
         /// whatever.
         Create,
     }
@@ -623,6 +670,58 @@ mod sys {
         Ok(unsafe { File::from_raw_handle(opened.0) })
     }
 
+    /// Opens the entry `name` in the opened folder for its removal, as
+    /// [`open_at`] opens: by its one name relative to the folder's handle,
+    /// and a link as the link. The right to change attributes is asked for
+    /// as well, so that a read-only entry can be made removable where the
+    /// file system needs that; an entry that does not grant it is opened with
+    /// the right to delete alone. Every use of the entry by others stays
+    /// allowed.
+    ///
+    /// # Errors
+    ///
+    /// The error of the system, as for [`open_at`].
+    pub(in super::super) fn open_at_for_removal(folder: &Folder, name: &str) -> io::Result<File> {
+        let wanted = DELETE.0 | FILE_READ_ATTRIBUTES.0;
+        let with_attributes = wanted | FILE_WRITE_ATTRIBUTES.0;
+        match open_at(
+            folder,
+            name,
+            with_attributes,
+            SHARE_ALL,
+            Disposition::Open,
+            0,
+        ) {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                open_at(folder, name, wanted, SHARE_ALL, Disposition::Open, 0)
+            }
+            opened => opened,
+        }
+    }
+
+    /// Creates the folder `name` **in the opened folder**: relative to the
+    /// folder's handle, never by a path. A name that is taken — by a file, a
+    /// folder or a link, also a link to nothing — fails the creation; nothing
+    /// is created where a link points. The new folder gets the permissions
+    /// the folder hands down.
+    ///
+    /// # Errors
+    ///
+    /// The error of the system, as for [`open_at`].
+    pub(in super::super) fn create_dir_at(folder: &Folder, name: &str) -> io::Result<()> {
+        // The rights with which Win32 itself creates a folder.
+        let access = FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0;
+        open_at(
+            folder,
+            name,
+            access,
+            SHARE_ALL,
+            Disposition::Create,
+            FILE_DIRECTORY_FILE.0,
+        )
+        .map(drop)
+    }
+
     /// Gives the opened file the name `name` **in the directory it lies
     /// in**, whatever happens to any path meanwhile. With `replace` a file
     /// of that name is replaced; without it a taken name fails the rename,
@@ -638,30 +737,61 @@ mod sys {
         name: &str,
         replace: bool,
     ) -> io::Result<()> {
+        rename(entry, None, name, replace)
+    }
+
+    /// Gives the opened entry the name `name` **in the opened folder
+    /// `folder`**: the entry moves into the directory that handle stands for,
+    /// which may be the one it lies in or another on the same volume. No
+    /// path names the destination, so nothing that happens to a path
+    /// meanwhile leads the entry elsewhere. With `replace` a file of that
+    /// name is replaced; without it a taken name fails the move, in one step
+    /// with the check.
+    ///
+    /// The handle of the entry must carry the right to delete.
+    ///
+    /// # Errors
+    ///
+    /// The error of the system, as for [`open_at`]. A folder on another
+    /// volume is "not the same device".
+    pub(in super::super) fn rename_into(
+        entry: &File,
+        folder: &Folder,
+        name: &str,
+        replace: bool,
+    ) -> io::Result<()> {
+        rename(entry, Some(folder), name, replace)
+    }
+
+    /// Renames an opened entry to the bare name `name`: inside the directory
+    /// it lies in, or into the opened folder `into`.
+    fn rename(entry: &File, into: Option<&Folder>, name: &str, replace: bool) -> io::Result<()> {
         let name = single_name(name).ok_or_else(not_a_name)?;
         if !replace {
             // The plain form, which every Windows and every file system has:
             // a taken name fails the rename.
-            return rename_with(entry, &name, FileRenameInformation, PLAIN_KEEP);
+            return rename_with(entry, into, &name, FileRenameInformation, PLAIN_KEEP);
         }
         // To replace, the form of Windows 10 1607 and later: the name changes
         // at once, also when the file that is replaced is still open
         // elsewhere in a way that allows its removal. It is what the standard
         // library's own rename asks for.
         let flags = FILE_RENAME_POSIX_SEMANTICS | FILE_RENAME_REPLACE_IF_EXISTS;
-        match rename_with(entry, &name, FileRenameInformationEx, flags) {
+        match rename_with(entry, into, &name, FileRenameInformationEx, flags) {
             // An older Windows, or a file system without the extended form:
             // the plain one.
             Err(error) if not_offered(&error) => {
-                rename_with(entry, &name, FileRenameInformation, PLAIN_REPLACE)
+                rename_with(entry, into, &name, FileRenameInformation, PLAIN_REPLACE)
             }
             renamed => renamed,
         }
     }
 
-    /// One native rename of an opened file to the bare name `name`.
+    /// One native rename of an opened entry to the bare name `name`, inside
+    /// the directory it lies in or, with `into`, in that opened folder.
     fn rename_with(
         entry: &File,
+        into: Option<&Folder>,
         name: &[u16],
         class: FILE_INFORMATION_CLASS,
         flags: u32,
@@ -671,6 +801,12 @@ mod sys {
         let (Ok(name_len), Ok(length)) = (u32::try_from(name_bytes), u32::try_from(size)) else {
             return Err(not_a_name());
         };
+        // Without a root directory a bare name renames the entry inside the
+        // directory it lies in. With one, the bare name is looked up in the
+        // directory that handle stands for, and the entry moves there.
+        let root = into.map_or_else(HANDLE::default, |folder| {
+            HANDLE(folder.handle.as_raw_handle())
+        });
         // The structure ends in the name, so it is built in a buffer of its
         // own size plus the name's, zeroed and aligned for it.
         let mut buffer = vec![0u64; size.div_ceil(size_of::<u64>())];
@@ -679,12 +815,12 @@ mod sys {
         // structure (asserted above), so the three header fields lie inside
         // it, and so do the `name.len()` units written from `FileName` on:
         // the field starts before the end of the structure. The writes go
-        // through raw pointers; no reference to the structure is made. No
-        // root directory is given: with a bare name the file is renamed
-        // inside the directory it lies in.
+        // through raw pointers; no reference to the structure is made. The
+        // root directory is no handle at all or the handle of `into`, which
+        // is open for as long as `into` is borrowed.
         unsafe {
             (&raw mut (*info).Anonymous).write(FILE_RENAME_INFORMATION_0 { Flags: flags });
-            (&raw mut (*info).RootDirectory).write(HANDLE::default());
+            (&raw mut (*info).RootDirectory).write(root);
             (&raw mut (*info).FileNameLength).write(name_len);
             std::ptr::copy_nonoverlapping(
                 name.as_ptr(),
@@ -693,8 +829,9 @@ mod sys {
             );
         }
         let mut status_block = IO_STATUS_BLOCK::default();
-        // SAFETY: the handle is open for as long as `entry` is borrowed;
-        // `info` points to `length` initialized bytes in `buffer`, which
+        // SAFETY: the handle is open for as long as `entry` is borrowed, and
+        // so is the root directory the structure names for as long as `into`
+        // is; `info` points to `length` initialized bytes in `buffer`, which
         // lives through the call and is only read; the status block is a
         // writable local value.
         let status = unsafe {
