@@ -2251,3 +2251,54 @@ async fn nothing_is_moved_into_a_private_staging_area_from_elsewhere() {
     .expect("a move into a staging area of the account");
     assert!(own.staging_root().join("tool.bin").exists());
 }
+
+/// What leaves a private staging area does not keep the permissions it had
+/// there, which admit only administrators: it takes the ones of the folder it
+/// arrives in, like a file that was made there.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_file_moved_out_of_a_private_staging_area_takes_the_permissions_of_its_new_folder() {
+    if !crate::own::tests_can_name_the_administrators() {
+        return;
+    }
+    let sb = Sandbox::new();
+    let data = sb.root.join("CretLink Data");
+    let base = OwnFolder::administrators_only(&data, data.join("staging"));
+    let store = FileStore::with_base(SessionId::new(), base);
+    let target = sb.root.join("target");
+    std::fs::create_dir_all(&target).expect("target");
+    std::fs::write(target.join("made-here.bin"), b"made here").expect("write");
+    transfer(
+        &store,
+        staging("tool.bin"),
+        b"tool",
+        2,
+        false,
+        Some("tool.bin"),
+        CleanupPolicy::Keep,
+    )
+    .await
+    .expect("the upload");
+    let made_here = crate::own::tests_permission_entries(&target.join("made-here.bin"));
+    let staged = crate::own::tests_permission_entries(&store.staging_root().join("tool.bin"));
+    assert!(!made_here.is_empty() && !staged.is_empty());
+    assert_ne!(
+        staged, made_here,
+        "the staging area admits fewer than the folder"
+    );
+
+    store
+        .perform(Operation::FsMove {
+            from: staging("tool.bin"),
+            to: abs(&target, "tool.bin"),
+            overwrite: false,
+        })
+        .await
+        .expect("the move");
+
+    assert_eq!(
+        crate::own::tests_permission_entries(&target.join("tool.bin")),
+        made_here,
+        "the moved file has the permissions of a file made in that folder"
+    );
+}

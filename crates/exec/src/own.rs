@@ -621,17 +621,19 @@ mod sys {
     use windows::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
         ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-        SE_FILE_OBJECT,
+        SE_FILE_OBJECT, SetSecurityInfo,
     };
     use windows::Win32::Security::{
-        CheckTokenMembership, CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetTokenInformation,
-        IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+        ACL, ACL_REVISION, CheckTokenMembership, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
+        GetTokenInformation, InitializeAcl, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION,
+        TOKEN_QUERY, TokenElevation, UNPROTECTED_DACL_SECURITY_INFORMATION,
         WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+        WRITE_DAC,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
@@ -896,6 +898,36 @@ mod sys {
         }
     }
 
+    /// Replaces the permissions of the entry at `path` by the ones that the
+    /// folder it lies in hands down, as if the entry had been made there. A
+    /// link at `path` is not followed.
+    pub(super) fn inherit_permissions(path: &Path) -> io::Result<()> {
+        let entry = open(path, WRITE_DAC.0 | READ_CONTROL.0)?;
+        let mut none = ACL::default();
+        // SAFETY: `none` is a valid place for a list of exactly its own size.
+        unsafe { InitializeAcl(&raw mut none, size_of_u32::<ACL>(), ACL_REVISION) }
+            .map_err(io::Error::from)?;
+        // SAFETY: the handle is open with the right to change permissions for
+        // as long as `entry` lives, and `none` is an initialised list that
+        // outlives the call. An empty list that is not protected leaves the
+        // entry with what its folder hands down.
+        let status = unsafe {
+            SetSecurityInfo(
+                HANDLE(entry.as_raw_handle()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&raw const none),
+                None,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status.0.cast_signed()));
+        }
+        Ok(())
+    }
+
     /// The owner and the permissions of the entry at `path`, for the tests.
     #[cfg(test)]
     pub(super) fn permissions_of(path: &Path) -> io::Result<String> {
@@ -1097,6 +1129,33 @@ pub(crate) fn tests_can_name_the_administrators() -> bool {
     }
     eprintln!("skipped: this process is not an administrator");
     false
+}
+
+/// Gives the entry at `path`, which was moved out of a private folder, the
+/// permissions that the folder it lies in now hands down, as if it had been
+/// made there. A move keeps the permissions of an entry, and those of a
+/// private folder admit only the administrators. A link at `path` is not
+/// followed.
+///
+/// # Errors
+///
+/// When the entry cannot be opened or its permissions cannot be replaced.
+#[cfg(windows)]
+pub(crate) fn inherit_permissions(path: &Path) -> io::Result<()> {
+    sys::inherit_permissions(path)
+}
+
+/// The entries of the permissions of `path`, each in the text form of a
+/// security descriptor, for tests outside this module.
+#[cfg(all(test, windows))]
+pub(crate) fn tests_permission_entries(path: &Path) -> Vec<String> {
+    let text = sys::permissions_of(path).unwrap_or_default();
+    let list = text.split_once("D:").map_or("", |(_, list)| list);
+    list.split('(')
+        .skip(1)
+        .filter_map(|entry| entry.split_once(')'))
+        .map(|(entry, _)| entry.to_string())
+        .collect()
 }
 
 /// Whether the folder at `path` has the private permissions, for tests

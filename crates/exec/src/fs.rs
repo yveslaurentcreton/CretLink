@@ -800,6 +800,25 @@ impl FileStore {
         tokio::fs::rename(&from_path, &to_path)
             .await
             .map_err(|e| FsError::from_io("failed to move the path", &e))?;
+        // What leaves a private staging area must not keep the permissions it
+        // had there, which admit only administrators: it takes the ones of
+        // the folder it arrives in, as if it had been made there.
+        #[cfg(windows)]
+        if self.base.is_private()
+            && matches!(from, RemotePath::Staging { .. })
+            && matches!(to, RemotePath::Absolute { .. })
+        {
+            let moved = to_path.clone();
+            let inherited =
+                tokio::task::spawn_blocking(move || crate::own::inherit_permissions(&moved)).await;
+            if !matches!(inherited, Ok(Ok(()))) {
+                return Err(FsError::new(
+                    ErrorCode::AccessDenied,
+                    "the entry was moved, but it kept the permissions of the staging area: only \
+                     an administrator can open it",
+                ));
+            }
+        }
         Ok(OpResult::Ack {})
     }
 
