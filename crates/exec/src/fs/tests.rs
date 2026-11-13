@@ -5258,6 +5258,15 @@ async fn a_held_file_is_in_use_and_read_only_entries_are_removed() {
             .expect_err("held by another program");
         assert_eq!(refused.code, ErrorCode::FileInUse, "{op:?}");
     }
+    // It is still a file to the removal of an empty folder, which says so
+    // and not that the file is in use.
+    let refused = store
+        .perform(Operation::RemoveDir {
+            path: abs(&target, "held.txt"),
+        })
+        .await
+        .expect_err("a file is not a folder");
+    assert_eq!(refused.code, ErrorCode::WrongPathKind);
     assert_eq!(names_in(&target), vec!["held.txt"]);
     release_block(block, &held);
 

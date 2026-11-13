@@ -116,11 +116,19 @@ pub(super) fn delete(path: &Path) -> Result<(), FsError> {
 
 /// Deletes the file or the link `name` in the opened folder.
 pub(super) fn delete_in(folder: &Folder, name: &str) -> Result<(), FsError> {
-    let entry = open_to_remove(folder, name, "failed to delete the file")?;
+    const FAILED: &str = "failed to delete the file";
+    let a_folder = || FsError::wrong_kind("the path is a directory");
+    let entry = match anchor::open_at_for_removal(folder, name) {
+        Ok(entry) => entry,
+        // A folder is refused as a folder, as it always was: also one that
+        // cannot be opened for a removal, because it is in use or protected.
+        Err(_) if kind_at(folder, name) == Some(Kind::Dir) => return Err(a_folder()),
+        Err(error) => return Err(not_found_or(&error, FAILED)),
+    };
     if kind_of(&entry)? == Kind::Dir {
-        return Err(FsError::wrong_kind("the path is a directory"));
+        return Err(a_folder());
     }
-    anchor::delete(&entry).map_err(|e| FsError::from_io("failed to delete the file", &e))
+    anchor::delete(&entry).map_err(|e| FsError::from_io(FAILED, &e))
 }
 
 /// Removes the empty folder at `path`
@@ -138,11 +146,22 @@ pub(super) fn remove_dir(path: &Path) -> Result<(), FsError> {
 
 /// Removes the empty folder `name` in the opened folder.
 pub(super) fn remove_dir_in(folder: &Folder, name: &str) -> Result<(), FsError> {
-    let entry = open_to_remove(folder, name, "failed to remove the directory")?;
+    const FAILED: &str = "failed to remove the directory";
+    let not_a_folder = || FsError::wrong_kind("the path is not a directory");
+    let entry = match anchor::open_at_for_removal(folder, name) {
+        Ok(entry) => entry,
+        // What is not a folder is refused as that, as it always was: also a
+        // file that cannot be opened for a removal, because it is in use or
+        // protected.
+        Err(_) if kind_at(folder, name).is_some_and(|kind| kind != Kind::Dir) => {
+            return Err(not_a_folder());
+        }
+        Err(error) => return Err(not_found_or(&error, FAILED)),
+    };
     if kind_of(&entry)? != Kind::Dir {
-        return Err(FsError::wrong_kind("the path is not a directory"));
+        return Err(not_a_folder());
     }
-    anchor::delete(&entry).map_err(|e| FsError::from_io("failed to remove the directory", &e))
+    anchor::delete(&entry).map_err(|e| FsError::from_io(FAILED, &e))
 }
 
 /// Creates the folder at `path`
@@ -261,9 +280,12 @@ pub(super) fn open_folder(path: &Path) -> Result<Folder, FsError> {
     }
 }
 
-/// Opens the entry `name` of the opened folder for its removal.
-fn open_to_remove(folder: &Folder, name: &str, context: &'static str) -> Result<File, FsError> {
-    anchor::open_at_for_removal(folder, name).map_err(|error| not_found_or(&error, context))
+/// What the entry `name` of the opened folder is, read without any right
+/// that another program's use of the entry could refuse. `None` when it is
+/// not there or cannot be looked at.
+fn kind_at(folder: &Folder, name: &str) -> Option<Kind> {
+    let entry = anchor::open_at(folder, name, TO_LOOK, SHARED, Disposition::Open, 0).ok()?;
+    anchor::kind_of(&entry).ok()
 }
 
 /// What an opened entry is.
