@@ -372,6 +372,26 @@ fn remove_own(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Renames a folder that was just written or is about to be replaced.
+///
+/// On Windows a folder cannot be renamed while a file in it is open, and a
+/// virus scanner opens a program that was just written for a moment. A
+/// refusal for lack of access is therefore tried again a few times, a tenth
+/// of a second apart, before it counts. Elsewhere the first answer stands.
+fn rename_folder(from: &Path, to: &Path) -> io::Result<()> {
+    const TRIES: u32 = if cfg!(windows) { 10 } else { 1 };
+    let mut tried = 1;
+    loop {
+        match fs::rename(from, to) {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied && tried < TRIES => {
+                tried += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            done => return done,
+        }
+    }
+}
+
 /// Writes a new file. `private` keeps it for this user where the system has
 /// file modes: it holds a key.
 fn write_new(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
@@ -438,12 +458,12 @@ impl Staged {
         let moved = (|| {
             if there {
                 remove_own(&old)?;
-                fs::rename(&self.target, &old)?;
+                rename_folder(&self.target, &old)?;
             }
-            fs::rename(&self.stage, &self.target).inspect_err(|_| {
+            rename_folder(&self.stage, &self.target).inspect_err(|_| {
                 // The folder of before goes back to where it was.
                 if there {
-                    let _ = fs::rename(&old, &self.target);
+                    let _ = rename_folder(&old, &self.target);
                 }
             })
         })();
