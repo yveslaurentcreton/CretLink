@@ -3809,3 +3809,219 @@ async fn a_part_whose_folder_is_no_longer_in_its_place_is_named_and_tried_again(
     );
     assert!(names_in(&folder).is_empty());
 }
+
+// --- a folder page always fits the channel (ST-M010-005) ---------------------
+
+/// How many characters the names of the long-name tests have. Windows takes a
+/// name of 255 UTF-16 units, so 250 characters of three bytes each; the other
+/// systems the agent is built for take 255 bytes, which is 85 of them.
+const LONG_NAME_CHARS: usize = if cfg!(windows) { 250 } else { 85 };
+
+/// A name of [`LONG_NAME_CHARS`] characters of three bytes each, told apart by
+/// `n`, which is written in digits of three bytes too.
+fn long_name(n: usize) -> String {
+    let digits: String = format!("{n:03}")
+        .chars()
+        .map(|digit| {
+            let value = digit.to_digit(10).expect("a decimal digit");
+            // The fullwidth digits U+FF10 to U+FF19.
+            char::from_u32(0xFF10 + value).expect("a fullwidth digit")
+        })
+        .collect();
+    let name = format!("{digits}{}", "\u{8A9E}".repeat(LONG_NAME_CHARS - 3));
+    assert_eq!(name.len(), 3 * LONG_NAME_CHARS);
+    name
+}
+
+/// Lists `path` page by page, the way a caller does: each request continues
+/// after the last name of the page before. Every page must be an answer that
+/// fits one record of the secure channel, with any request identifier, and a
+/// page that says more follows must hold an entry. Returns the names of every
+/// page.
+async fn list_in_pages(store: &FileStore, path: &RemotePath) -> Vec<Vec<String>> {
+    use cretlink_protocol::{Message, RequestId, limits};
+
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    let mut continue_after = None;
+    loop {
+        let result = store
+            .perform(Operation::FsList {
+                path: path.clone(),
+                continue_after: continue_after.clone(),
+            })
+            .await
+            .expect("a page");
+        let sent = Message::Response {
+            id: RequestId(u64::MAX),
+            session: SessionId::new(),
+            result: result.clone(),
+        }
+        .encode()
+        .expect("the page is within the bounds of the wire");
+        assert!(
+            sent.len() <= limits::MAX_RECORD_BYTES,
+            "a page of {} bytes does not fit one record",
+            sent.len()
+        );
+        let OpResult::DirEntries { entries, end } = result else {
+            panic!("expected DirEntries");
+        };
+        let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
+        if end {
+            pages.push(names);
+            return pages;
+        }
+        continue_after = Some(
+            names
+                .last()
+                .expect("a page that says more follows holds an entry")
+                .clone(),
+        );
+        pages.push(names);
+        assert!(pages.len() < 1000, "the listing must end");
+    }
+}
+
+/// A folder of 600 files with names as long as the system takes, in
+/// characters of three bytes: a page of 256 of them is far larger than one
+/// record of the secure channel. Every page fits a record, the pages end
+/// before they hold 256 entries, and together they name every file exactly
+/// once, in order.
+#[tokio::test]
+async fn a_folder_of_long_names_is_listed_in_pages_that_fit_one_record() {
+    use cretlink_protocol::limits;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    store
+        .perform(Operation::CreateDir {
+            path: staging("long-names"),
+        })
+        .await
+        .expect("create the staged folder");
+    let folder = store.staging_root().join("long-names");
+    let mut expected: Vec<String> = (0..600).map(long_name).collect();
+    for name in &expected {
+        std::fs::write(folder.join(name), b"x").expect("write a file with a long name");
+    }
+    expected.sort();
+
+    let pages = list_in_pages(&store, &staging("long-names")).await;
+
+    assert!(
+        pages.len() > 600 / limits::MAX_DIR_PAGE + 1,
+        "{}",
+        pages.len()
+    );
+    for page in &pages {
+        assert!(
+            page.len() < limits::MAX_DIR_PAGE,
+            "a page of {} long names",
+            page.len()
+        );
+    }
+    let listed: Vec<String> = pages.into_iter().flatten().collect();
+    assert_eq!(listed.len(), expected.len());
+    assert!(listed == expected, "every name exactly once, in order");
+}
+
+/// Short names are listed as before: a page ends at its number of entries,
+/// the pages together name every file exactly once, and the last page says
+/// that it is the last.
+#[tokio::test]
+async fn a_folder_of_short_names_is_listed_in_pages_of_the_full_number_of_entries() {
+    use cretlink_protocol::limits;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    store
+        .perform(Operation::CreateDir {
+            path: staging("short-names"),
+        })
+        .await
+        .expect("create the staged folder");
+    let folder = store.staging_root().join("short-names");
+    let count = 2 * limits::MAX_DIR_PAGE + 10;
+    let expected: Vec<String> = (0..count).map(|n| format!("file-{n:04}.txt")).collect();
+    for name in &expected {
+        std::fs::write(folder.join(name), b"x").expect("write");
+    }
+
+    let pages = list_in_pages(&store, &staging("short-names")).await;
+
+    let sizes: Vec<usize> = pages.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [limits::MAX_DIR_PAGE, limits::MAX_DIR_PAGE, 10]);
+    let listed: Vec<String> = pages.into_iter().flatten().collect();
+    assert_eq!(listed, expected);
+}
+
+/// Names that the encoding writes longer than they are — a quotation mark and
+/// a backslash as two bytes, a control character as six — are counted as they
+/// are written: the pages still fit a record and name every file once. Such
+/// names exist off Windows only.
+#[cfg(unix)]
+#[tokio::test]
+async fn names_that_the_encoding_writes_longer_are_counted_as_they_are_written() {
+    use cretlink_protocol::limits;
+
+    let sb = Sandbox::new();
+    let store = sb.store();
+    store
+        .perform(Operation::CreateDir {
+            path: staging("escaped"),
+        })
+        .await
+        .expect("create the staged folder");
+    let folder = store.staging_root().join("escaped");
+    // 250 control characters are 250 bytes on the disk and 1500 in the answer.
+    let mut expected: Vec<String> = (0..120)
+        .map(|n| format!("{n:03}{}", "\u{1}".repeat(250)))
+        .chain((0..120).map(|n| format!("q{n:03}{}", "\"\\".repeat(120))))
+        .collect();
+    for name in &expected {
+        std::fs::write(folder.join(name), b"x").expect("write");
+    }
+    expected.sort();
+
+    let pages = list_in_pages(&store, &staging("escaped")).await;
+
+    assert!(pages.len() > 2, "{}", pages.len());
+    assert!(pages.iter().all(|page| page.len() < limits::MAX_DIR_PAGE));
+    let listed: Vec<String> = pages.into_iter().flatten().collect();
+    assert!(listed == expected, "every name exactly once, in order");
+}
+
+/// An entry that not even an empty page takes fails the listing with the
+/// reason: a page that says more follows is never empty. No file system the
+/// agent runs on has such a name, so the entry is made up here.
+#[test]
+fn an_entry_that_fits_no_page_fails_the_listing_instead_of_ending_a_page_empty() {
+    use cretlink_protocol::{DirPage, FileEntry, limits};
+
+    let entry = |name: String| FileEntry {
+        name,
+        kind: FileKind::File,
+        len: 1,
+        modified_ms: None,
+        readonly: false,
+    };
+    let mut page = DirPage::new();
+    let refused = super::add_to_page(&mut page, entry("n".repeat(2 * limits::MAX_RECORD_BYTES)))
+        .expect_err("larger than any answer");
+    assert_eq!(refused.code, ErrorCode::LimitExceeded);
+    assert!(page.is_empty());
+
+    // An entry that fits is added, and a page that is full ends before the
+    // next one without failing.
+    assert_eq!(
+        super::add_to_page(&mut page, entry("a".to_owned())),
+        Ok(true)
+    );
+    let mut n = 0;
+    while super::add_to_page(&mut page, entry(format!("{n:03}{}", "b".repeat(700))))
+        .expect("a page that holds an entry ends, it does not fail")
+    {
+        n += 1;
+    }
+    assert!(n > 1 && page.len() == n + 1);
+}

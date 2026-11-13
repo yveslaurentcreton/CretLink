@@ -7,6 +7,16 @@
 /// Maximum encoded size of one wire frame (JSON payload), in bytes.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Maximum encoded size of one message that crosses a session, in bytes.
+///
+/// The secure channel sends a message in one Noise record: 65535 bytes, of
+/// which 16 are the authentication tag. Nothing splits a longer message, so a
+/// message whose encoding is longer cannot be sent at all. For everything that
+/// crosses a session this is the bound that holds, far below
+/// [`MAX_FRAME_BYTES`]. `cretlink-transport` asserts that it is the capacity
+/// of its record, so the two cannot drift apart.
+pub const MAX_RECORD_BYTES: usize = 65_519;
+
 /// Maximum byte length of an `Exec` command string.
 pub const MAX_COMMAND_BYTES: usize = 32 * 1024;
 
@@ -107,7 +117,9 @@ pub const MAX_NAME_BYTES: usize = 768;
 /// force an unbounded component walk.
 pub const MAX_PATH_DEPTH: usize = 64;
 
-/// Maximum number of directory entries returned in one `FsList` page.
+/// Maximum number of directory entries returned in one `FsList` page. A page
+/// of long names ends earlier: before the entry that would make its answer
+/// larger than [`MAX_RECORD_BYTES`] ([`crate::DirPage`], ST-M010-005).
 pub const MAX_DIR_PAGE: usize = 256;
 
 /// Maximum number of file-transfer operations the console keeps in flight at
