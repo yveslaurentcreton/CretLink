@@ -232,6 +232,9 @@ struct Places {
     /// The folder of a program with administrator rights, when this process
     /// has none and so cannot read it.
     out_of_reach: Option<PathBuf>,
+    /// Whether the place of an earlier release could not be told on a system
+    /// where there can be one: then nothing is known about it.
+    earlier_release_unknown: bool,
 }
 
 impl Places {
@@ -241,6 +244,7 @@ impl Places {
             staging,
             earlier_release: None,
             out_of_reach: None,
+            earlier_release_unknown: false,
         }
     }
 
@@ -252,13 +256,20 @@ impl Places {
         } else {
             cretlink_exec::administrators_folder()
         };
+        let earlier_release = cretlink_exec::earlier_release_folder();
         Self {
             staging,
-            earlier_release: cretlink_exec::earlier_release_folder(),
+            // Off Windows no earlier release kept anything elsewhere.
+            earlier_release_unknown: cfg!(windows) && earlier_release.is_none(),
+            earlier_release,
             out_of_reach,
         }
     }
 }
+
+/// How the reason starts for what a program with administrator rights kept
+/// and this one, without them, cannot see.
+const OUT_OF_REACH: &str = "what CretLink kept with administrator rights";
 
 /// Whether something stands at `path`. What cannot be looked at counts as
 /// being there: only "not found" says that nothing is.
@@ -316,8 +327,8 @@ async fn scan_in(places: &Places, tickets: &TicketStore) -> Inventory {
         inventory.unreadable.push(UnreadableKind {
             kind: ResourceKind::StagedFiles,
             reason: format!(
-                "what CretLink kept with administrator rights, in {}, can only be read and \
-                 removed by this command run as an administrator",
+                "{OUT_OF_REACH}, in {}, can only be read and removed by this command run as an \
+                 administrator",
                 folder.display()
             ),
         });
@@ -344,6 +355,12 @@ async fn scan_in(places: &Places, tickets: &TicketStore) -> Inventory {
             kind: ResourceKind::EarlierRelease,
             description: folder.to_string_lossy().into_owned(),
             session: None,
+        }),
+        // Where that folder is could not be told: nothing is known about it.
+        None if places.earlier_release_unknown => inventory.unreadable.push(UnreadableKind {
+            kind: ResourceKind::EarlierRelease,
+            reason: "the folder in which an earlier release kept its files could not be told"
+                .to_string(),
         }),
         _ => inventory.asserted_empty.push(ResourceKind::EarlierRelease),
     }
@@ -445,7 +462,13 @@ async fn recover_in(places: &Places, tickets: &TicketStore) -> RecoveryReport {
             .found
             .iter()
             .any(|resource| resource.kind == ResourceKind::EarlierRelease)
-        && let Some(reason) = remove_earlier_release(folder).await
+        && let Some(reason) = crate::recovery::remove_earlier_release(
+            folder.clone(),
+            crate::recovery::Remover::Recovery,
+            staging_base.is_private(),
+            crate::recovery::EARLIER_RELEASE_RECOVERY_WAIT,
+        )
+        .await
     {
         report.failed.push(RecoveryFailure {
             kind: ResourceKind::EarlierRelease,
@@ -535,15 +558,17 @@ async fn recover_in(places: &Places, tickets: &TicketStore) -> RecoveryReport {
         }
     }
     // What still cannot be read is unknown, unless a failure of that kind
-    // already says what was kept.
+    // already says what was kept. What lies out of this run's reach is said
+    // in any case: no failure of this run is about it.
     report.unreadable = after
         .unreadable
         .into_iter()
         .filter(|unknown| {
-            !report
-                .failed
-                .iter()
-                .any(|failure| failure.kind == unknown.kind)
+            unknown.reason.starts_with(OUT_OF_REACH)
+                || !report
+                    .failed
+                    .iter()
+                    .any(|failure| failure.kind == unknown.kind)
         })
         .collect();
 
@@ -556,25 +581,14 @@ async fn recover_in(places: &Places, tickets: &TicketStore) -> RecoveryReport {
     report
 }
 
-/// Removes the folder of an earlier release whole. Returns why it is still
-/// there, when it is.
-async fn remove_earlier_release(folder: &Path) -> Option<String> {
-    let target = folder.to_path_buf();
-    let removed = tokio::task::spawn_blocking(move || cretlink_exec::remove_whole(&target)).await;
-    match removed {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            Some("removing it needs administrator rights".to_string())
-        }
-        Ok(Err(error)) => Some(format!("could not be removed ({})", error.kind())),
-        Err(_) => Some("could not be removed".to_string()),
-    }
-}
-
 /// Removes the lock of the staging area, unless a CretLink program holds it,
 /// and then the staging area, the folder of the ticket store and the folder
 /// above them, as far as they are empty.
+///
+/// A program that has opened the lock and has not yet taken its share at this
+/// moment is not seen: it then holds a lock that no later program finds. The
+/// recovery is therefore run when no CretLink window is open or starting (see
+/// the residual risks in `docs/threat-model.md`).
 async fn remove_empty_folders(staging: &OwnFolder, tickets: &TicketStore) {
     let staging = staging.clone();
     let tickets = tickets.folder().cloned();

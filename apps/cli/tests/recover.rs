@@ -203,3 +203,56 @@ fn an_unknown_option_is_a_usage_error() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option '--force'"));
 }
+
+/// In continuous verification the program runs on Windows as an elevated
+/// administrator, in the real places of the machine, which no sandbox
+/// replaces. There the recovery is run for real: the folder of an earlier
+/// release, with a manifest that names a file elsewhere, is listed and
+/// removed whole, and the file it names stays (ST-M006-020).
+#[test]
+fn in_verification_an_elevated_recovery_removes_the_folder_of_an_earlier_release() {
+    if !cfg!(windows) || std::env::var_os("CI").is_none() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let first = stdout(&recover(&sandbox, &[]));
+    let elevated = first.lines().any(|line| {
+        line.trim_start().starts_with("elevated:") && line.trim_end().ends_with("true")
+    });
+    if !elevated {
+        return;
+    }
+    // The file that a planted manifest names, and the folder of an earlier
+    // release on the drive of Windows with that manifest in it.
+    let named = sandbox.0.join("important.txt");
+    std::fs::write(&named, b"important").expect("write the named file");
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let earlier = PathBuf::from(format!("{drive}\\ProgramData\\CretLink"));
+    let session = earlier
+        .join("staging")
+        .join("11111111-2222-4333-8444-555555555555");
+    std::fs::create_dir_all(&session).expect("plant the session folder");
+    let manifest = format!(
+        r#"{{"version":1,"staged":[{{"canonical_path":{:?},"source":"x","len":0,"algo":"sha256","digest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","cleanup":"on_session_end","created_ms":0}}]}}"#,
+        named.to_string_lossy()
+    );
+    std::fs::write(session.join("manifest.json"), manifest).expect("plant the manifest");
+
+    let inspect = stdout(&recover(&sandbox, &[]));
+    assert!(
+        inspect.contains("folder of an earlier release"),
+        "{inspect}"
+    );
+    assert!(named.exists(), "an inspection removes nothing");
+
+    let remove = stdout(&recover(&sandbox, &["--remove"]));
+
+    assert!(
+        !earlier.exists(),
+        "the folder of the earlier release is gone: {remove}"
+    );
+    assert_eq!(
+        std::fs::read(&named).expect("the named file is still there"),
+        b"important"
+    );
+}

@@ -1523,16 +1523,19 @@ that is already open. Mitigations:
   elevated program keeps the staging area and the store of reboot tickets in
   `CretLink Data` in `Program Files` on the drive of the Windows folder. Only
   administrators can create or move anything into `Program Files`, so
-  nothing can be waiting there and nobody can hold it open from before. The
-  program creates each of its folders with its owner and its permissions in
-  one step: owned by the administrators, with permissions of its own that
-  give full control to the administrators and the system and nothing to
-  anyone else, for the folder and for everything made in it later. A folder
-  that is already there is opened without following a link, and through that
-  one handle its kind and its owner are read, the private permissions are set
-  if it has others, and the result is read back. Something else under one of
-  those names (a link, a file, a folder of another owner) is an error: the
-  program then keeps nothing, stages nothing, and says so. All of this
+  nothing can be waiting there. The program creates each of its folders with
+  its owner and its permissions in one step: owned by the administrators,
+  with permissions of its own that give full control to the administrators
+  and the system and nothing to anyone else, for the folder and for
+  everything made in it later. So nobody can hold such a folder open from
+  before, and nothing in it was put there by anyone else. A folder that is
+  already there is opened without following a link, and through that one
+  handle its kind, its owner and its permissions are read: it must be such a
+  private folder of the administrators already. Nothing is made private
+  afterwards: whoever opened a folder while it was open keeps what that
+  handle allows. Anything else under one of those names (a link, a file, a
+  folder of another owner, a folder with other permissions) is an error: the
+  program then keeps nothing, stages nothing, and says why. All of this
   happens before any staging operation, before a sweep reads, and before a
   ticket is written.
 - *The place is not the starter's choice.* The drive is asked from the
@@ -1544,9 +1547,15 @@ that is already open. Mitigations:
   anything in it and without following a link. `recover` names it and
   `recover --remove` removes it. That includes files which a session of an
   earlier release kept there on purpose (cleanup policy *keep*): a file in
-  that folder can no longer be told from a planted one. A program of an
-  earlier release that still runs holds the lock of its staging area; the
+  that folder can no longer be told from a planted one. An elevated start
+  removes the folder unasked only when the administrators own it, as they do
+  when an elevated program made it. A folder there that an account owns is
+  named and left to `recover --remove`, or to a start from that account:
+  every account can make that folder again and fill it. A program of release
+  0.23.0 or 0.24.0 that still runs holds the lock of its staging area; the
   folder is then left until that program has ended, and the start says so.
+  Older releases have no such lock: a session of such a release that runs at
+  that moment loses what it staged.
 - *What a manifest holds is still not trusted.* Whatever a manifest names, a
   cleanup removes a file only when the entry ends in the session's own folder
   and a file name, and addresses it through the staging folder as the program
@@ -1580,12 +1589,26 @@ that is already open. Mitigations:
   of the running program first. For a downloaded CretLink that is a folder
   its account can write, so a program of that name planted there would have
   been started with the rights of the session.
+- *A job starts in the system folder.* A job or a terminal whose request
+  names no working directory starts in the system folder, where only
+  administrators can put anything, and the report of the job names that
+  folder. It does not start in the working directory of the CretLink
+  program, which whoever started the program chose: Command Prompt looks
+  there first for a program that a command names without its folder. An
+  elevated customer program also leaves the working directory it was started
+  in before it sweeps and connects, so that Windows does not look there for a
+  library and nothing it starts later begins there.
+- *Nothing is moved in.* A move keeps a file as it is, with its permissions
+  and with every handle a program opened on it before. An elevated program
+  therefore refuses to move a file from elsewhere into its staging area. A
+  file gets there by an upload, which makes it new.
 - *Said, not passed over.* A session whose cleanup failed, a staging area
-  that could not be made private, a folder of an earlier release that is
-  still there, and a lock that another program holds for good are named by
-  the start. The inventory calls what it could not read unknown, never
-  empty, and the recovery counts as removed only what a second look no longer
-  finds (REQ-N-008).
+  that could not be made private (with the reason), a folder of an earlier
+  release that is still there, and a lock that another program holds for
+  good are named by the start. The inventory calls what it could not read
+  unknown, never empty, also the place of an earlier release when the system
+  does not name it; the recovery counts as removed only what a second look
+  no longer finds (REQ-N-008).
 
 Evidence: `a_planted_manifest_removes_nothing_outside_the_staging_area`,
 `a_cleanup_removes_only_what_lies_directly_in_its_staging_folder`,
@@ -1598,28 +1621,39 @@ Evidence: `a_planted_manifest_removes_nothing_outside_the_staging_area`,
 `a_private_base_behind_a_link_is_not_used`,
 `the_temporary_file_of_a_manifest_is_never_written_through_a_link`,
 `a_manifest_larger_than_a_manifest_can_be_is_not_read`,
-`a_session_with_a_damaged_manifest_is_named_and_never_called_clean` and
-`a_sweep_and_a_census_make_nothing_where_nothing_was_kept`
+`a_session_with_a_damaged_manifest_is_named_and_never_called_clean`,
+`a_sweep_and_a_census_make_nothing_where_nothing_was_kept` and
+`nothing_is_moved_into_a_private_staging_area_from_elsewhere`
 (`crates/exec/src/fs/tests.rs`); the rule about private permissions, the
 chain of folders, and what happens when something else stands in the place
 of a folder (`crates/exec/src/own/tests.rs`);
-`a_shell_is_a_program_in_the_system_folder` (`crates/exec/src/system.rs`);
+`a_shell_is_a_program_in_the_system_folder` and
+`a_job_starts_in_the_folder_it_names_and_otherwise_in_the_system_folder`
+(`crates/exec/src/system.rs`);
+`default_working_dir_is_the_system_folder_on_windows`
+(`crates/exec/src/broker/tests.rs`);
 `the_folder_of_an_earlier_release_is_named_and_the_recovery_removes_it_whole`,
 `links_in_the_folder_of_an_earlier_release_are_never_followed`,
 `what_a_program_with_administrator_rights_kept_is_said_to_be_out_of_reach`,
 `a_recovery_that_left_nothing_leaves_no_empty_folder_behind`,
+`an_earlier_release_whose_place_cannot_be_told_is_unknown_not_absent`,
+`what_is_out_of_reach_is_said_also_when_something_else_was_kept`,
 `a_manifest_entry_outside_the_staging_area_is_reported_and_never_removed`,
 `a_ticket_store_behind_a_link_is_not_read_and_nothing_behind_it_is_removed`
 and `a_ticket_file_that_is_a_link_is_not_read_and_not_written_through`
 (`apps/support-agent/src/inventory/tests.rs`);
 `a_start_that_sweeps_removes_the_folder_of_an_earlier_release`,
+`a_start_removes_unasked_only_what_no_program_uses_and_what_administrators_own`,
+`work_on_a_thread_of_its_own_is_waited_for_only_so_long`,
 `what_a_start_kept_is_removed_by_a_run_of_its_own_kind` and
 `a_lock_held_for_good_does_not_keep_the_program_from_starting`
 (`apps/support-agent/src/recovery.rs`). The owner, the permissions and
 junctions exist on Windows only, and their tests run on the Windows CI
 runner, which is an elevated administrator:
+`a_folder_is_private_from_the_moment_it_is_made`,
 `a_new_private_folder_belongs_to_the_administrators_and_is_closed_to_everyone_else`,
-`a_folder_of_the_administrators_with_other_permissions_is_made_private`,
+`a_folder_of_the_administrators_with_other_permissions_is_an_error_and_is_left_as_it_is`,
+`whose_a_folder_is_is_read_from_its_owner_and_never_through_a_link`,
 `a_folder_of_another_owner_is_an_error_and_is_left_as_it_is`,
 `a_junction_in_the_place_of_a_private_folder_is_an_error_and_never_followed`,
 `removing_whole_takes_a_junction_and_never_what_it_points_at`,
@@ -1634,10 +1668,15 @@ runner, which is an elevated administrator:
 (`crates/exec/src/fs/tests.rs`),
 `the_shells_are_found_where_the_system_keeps_them`
 (`crates/exec/src/system.rs`),
+`a_job_is_a_shell_from_the_system_folder_and_starts_there`
+(`crates/exec/src/platform.rs`),
 `a_folder_that_an_earlier_release_still_uses_is_left_and_named`
-(`apps/support-agent/src/recovery.rs`) and
-`an_elevated_windows_program_does_not_follow_its_environment`
-(`apps/cli/tests/recover.rs`). The run on real hardware is scenario MT-4b in
+(`apps/support-agent/src/recovery.rs`),
+`an_elevated_windows_program_does_not_follow_its_environment` and
+`in_verification_an_elevated_recovery_removes_the_folder_of_an_earlier_release`
+(`apps/cli/tests/recover.rs`). No test acts as an account without
+administrator rights: that, and the environment of an elevated start, is
+the run on real hardware, scenario MT-4b in
 [`manual-tests.md`](manual-tests.md), not yet recorded.
 
 **Residual risks.**
@@ -1647,15 +1686,25 @@ runner, which is an elevated administrator:
   and takes its location from its environment. Use the current release.
 - An account with administrator rights can change any folder. CretLink does
   not defend a computer against its administrators: what stands in
-  `CretLink Data` was put there by one of them.
+  `CretLink Data` was put there by one of them. The protection assumes
+  `Program Files` as Windows ships it, where only administrators can create
+  or move anything.
+- A folder `CretLink Data`, or a folder in it, that CretLink did not create
+  (made by hand, or with its permissions changed) is not used and not
+  repaired. The elevated program then stages nothing and says why, until an
+  administrator removes that folder.
 - Removing the old folder removes all it holds, and an account without
-  administrator rights decides what that is. Such an account can make that
-  folder again at any time, and it can move into it a folder that it may
-  move but not empty: one that lies where the account is in control and
-  holds files that are protected against it. The next elevated start then
-  removes those files. Nothing is removed that the account could not have
-  moved there, and no link is followed. This lasts for as long as a release
-  looks for the old folder.
+  administrator rights decides what that is. Such an account can move into
+  the old folder a folder that it may move but not empty: one that lies
+  where the account is in control and holds files that are protected against
+  it. Where an elevated program of an earlier release made the old folder,
+  the first elevated start of this release removes it with those files.
+  After that the account can make the folder again, but then the account
+  owns it: an elevated start names such a folder and leaves it, and only
+  `recover --remove`, run as an administrator, removes it with all it holds.
+  Nothing is removed that the account could not have moved there, and no
+  link is followed. This lasts for as long as a release looks for the old
+  folder.
 - The downloaded program runs from a folder that its account can write. A
   program of that account can change the file before it is started, or put a
   library beside it that Windows loads with it, and an administrator who
@@ -1666,14 +1715,27 @@ runner, which is an elevated administrator:
   customer program that is installed where only administrators can write is
   ST-M009-017.
 - Command Prompt looks for a program that is named without its folder in the
-  working directory first. A job or a terminal that works in a folder which
-  another account can write can so start a program planted there, with the
-  rights of the session. PowerShell does not look in the working directory.
+  working directory first. A job that names no working directory starts in
+  the system folder. A job or a terminal that the technician lets work in a
+  folder which another account can write, or that changes to one, can start
+  a program planted there with the rights of the session. PowerShell does
+  not look in the working directory.
+- A job runs with the environment of the CretLink program and what the
+  technician adds to it; CretLink does not build that environment itself.
+  Windows gives a program that is started through the elevation prompt the
+  environment of the account that approved, not that of the program that
+  asked, so an account without rights does not choose the search path of an
+  elevated session. CretLink relies on that, and MT-4b checks it on real
+  hardware. The same holds for the profile of the elevated window's web
+  view, which lies in the local application data of the account that
+  approved.
 - A program without rights can still get in the way. It can hold a file in
   the old folder open so that the folder cannot be removed, or fill the
-  folder so that removing it takes long: the elevated program waits a bounded
-  time, says that the folder is still there, and goes on. That delays a
-  cleanup; it gives nothing away.
+  folder so that removing it takes long: a start and `recover --remove` wait
+  a bounded time, say that the folder is still there, and go on. It can also
+  make the old folder again, so that every elevated start names it until an
+  administrator removes it. That delays a cleanup and costs a notice; it
+  gives nothing away.
 - A process that is elevated without being an administrator, and a computer
   whose `Program Files` is not a folder of the system, get no staging area
   from an elevated CretLink.
@@ -1682,7 +1744,13 @@ runner, which is an elevated administrator:
   next start without them, not by an elevated one, and the other way round.
 - The folder `CretLink Data` stays in `Program Files` after a session, with
   an empty staging area and its lock. `recover --remove`, run as an
-  administrator, removes it when nothing is kept in it.
+  administrator, removes it when nothing is kept in it. Run it when no
+  CretLink window is open or starting: a window that opens the lock at the
+  moment the recovery removes it holds a lock that no later window finds, and
+  the sweep of a later window could then remove what the first one staged.
+- What an elevated session keeps on purpose (cleanup policy *keep*) lies in
+  `CretLink Data`, which only administrators can read. The customer needs
+  administrator rights to reach it, and a path into it holds a space.
 - An authorised technician is trusted with file content. Once the customer
   grants full control, CretLink cannot distinguish a legitimate log download
   from exfiltration of a personal document. The defence is disclosure,

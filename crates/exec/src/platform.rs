@@ -310,6 +310,21 @@ mod win {
         Ok(process)
     }
 
+    /// The shell that runs `spec`, with the folder it starts in and its
+    /// environment. A job that names no folder starts in the system folder,
+    /// never in the working directory of this program, which whoever started
+    /// the program chose (ST-M006-020; see `crate::system`).
+    pub(super) fn job_command(spec: &JobSpec) -> Result<Command, ExecError> {
+        let mut command = shell_command(spec.shell, &spec.command)?;
+        if let Some(dir) = crate::system::working_dir_of(spec) {
+            command.current_dir(dir);
+        }
+        for (key, value) in &spec.env {
+            command.env(key, value);
+        }
+        Ok(command)
+    }
+
     /// Spawns `spec` as a piped-stdio child contained in a kill-on-close Job
     /// Object, returning the tokio [`Child`] (for stdio and `wait`) and the [`Job`].
     ///
@@ -318,19 +333,13 @@ mod win {
     /// escapes the job (REQ-S-014), matching the ConPTY path. Once contained, its
     /// initial thread is resumed.
     pub(crate) fn spawn(spec: &JobSpec) -> Result<(Child, Job), ExecError> {
-        let mut command = shell_command(spec.shell, &spec.command)?;
+        let mut command = job_command(spec)?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .creation_flags(CREATE_SUSPENDED.0);
-        if let Some(dir) = &spec.working_dir {
-            command.current_dir(dir);
-        }
-        for (key, value) in &spec.env {
-            command.env(key, value);
-        }
 
         let child = command.spawn().map_err(ExecError::Spawn)?;
 
@@ -509,6 +518,43 @@ impl Spawned {
 #[cfg(test)]
 mod tests {
     use super::cmd_raw_tail;
+
+    /// A job runs a shell from the system folder and, when its request names
+    /// no folder, starts in the system folder: the folder this program was
+    /// started in decides neither (ST-M006-020).
+    #[cfg(windows)]
+    #[test]
+    fn a_job_is_a_shell_from_the_system_folder_and_starts_there() {
+        use std::path::{Path, PathBuf};
+
+        use crate::{JobSpec, Shell};
+
+        /// The program `spec` runs and the folder it starts in.
+        fn starts(spec: &JobSpec) -> (PathBuf, Option<PathBuf>) {
+            super::win::job_command(spec)
+                .map(|command| {
+                    let command = command.as_std();
+                    (
+                        PathBuf::from(command.get_program()),
+                        command.get_current_dir().map(Path::to_path_buf),
+                    )
+                })
+                .unwrap_or_default()
+        }
+
+        let system = crate::system::job_folder().unwrap_or_default();
+        assert!(system.is_absolute(), "{}", system.display());
+        for shell in [Shell::Cmd, Shell::PowerShell] {
+            let (program, folder) = starts(&JobSpec::new(shell, "echo x"));
+            assert!(program.starts_with(&system), "{}", program.display());
+            assert!(program.is_file(), "{}", program.display());
+            assert_eq!(folder.as_deref(), Some(system.as_path()));
+        }
+        let mut spec = JobSpec::new(Shell::Cmd, "echo x");
+        spec.working_dir = Some(PathBuf::from(r"C:\somewhere"));
+        let (_, folder) = starts(&spec);
+        assert_eq!(folder.as_deref(), Some(Path::new(r"C:\somewhere")));
+    }
 
     /// A Command Prompt command is wrapped in one pair of quotes behind
     /// `/S /C` and is otherwise passed exactly as written, so `cmd.exe`, which

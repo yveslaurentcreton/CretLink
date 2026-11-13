@@ -88,10 +88,10 @@ pub use fs::{
     FileStore, FsError, OUTSIDE_STAGING_REASON, SessionStaging, StagingCensus, StartupSweepReport,
 };
 pub use own::{
-    OwnFolder, Standing, administrators_folder, earlier_release_folder, earlier_release_in_use,
-    remove_whole,
+    OwnFolder, Standing, administrators_folder, administrators_own, earlier_release_folder,
+    earlier_release_in_use, remove_whole,
 };
-pub use system::windows_folder;
+pub use system::{job_folder, leave_the_starters_folder, windows_folder};
 
 // Reuse the wire vocabulary so the session layer forwards broker output without
 // lossy conversions.

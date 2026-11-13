@@ -2203,3 +2203,51 @@ mod junctions {
         assert_a_base_behind_a_link_is_not_used(base, &data, session, &artifact).await;
     }
 }
+
+/// A move keeps a file's permissions and the handles opened on it, so a
+/// private staging area takes nothing by a move from elsewhere. In a staging
+/// area of the account, where no boundary is crossed, the move works as
+/// before.
+#[tokio::test]
+async fn nothing_is_moved_into_a_private_staging_area_from_elsewhere() {
+    #[cfg(windows)]
+    if !crate::own::tests_can_name_the_administrators() {
+        return;
+    }
+    let sb = Sandbox::new();
+    let data = sb.root.join("CretLink Data");
+    let base = OwnFolder::administrators_only(&data, data.join("staging"));
+    let store = FileStore::with_base(SessionId::new(), base);
+    let target = sb.root.join("target");
+    std::fs::create_dir_all(&target).expect("target");
+    std::fs::write(target.join("theirs.bin"), b"theirs").expect("write");
+
+    let refused = store
+        .perform(Operation::FsMove {
+            from: abs(&target, "theirs.bin"),
+            to: staging("tool.bin"),
+            overwrite: false,
+        })
+        .await
+        .expect_err("a move into a private staging area");
+
+    assert_eq!(refused.code, ErrorCode::Unsupported);
+    assert!(
+        target.join("theirs.bin").exists(),
+        "the file stays where it was"
+    );
+    assert!(!store.staging_root().join("tool.bin").exists());
+
+    let own = FileStore::with_base(
+        SessionId::new(),
+        OwnFolder::same_account(sb.root.join("own")),
+    );
+    own.perform(Operation::FsMove {
+        from: abs(&target, "theirs.bin"),
+        to: staging("tool.bin"),
+        overwrite: false,
+    })
+    .await
+    .expect("a move into a staging area of the account");
+    assert!(own.staging_root().join("tool.bin").exists());
+}

@@ -656,14 +656,15 @@ async fn wait_job_interactive(
 }
 
 /// The effective working directory a job receives: the requested directory
-/// verbatim, or this process's current directory at spawn time. A current
-/// directory that cannot be read yields an empty path — reported honestly
-/// rather than invented (REQ-N-008).
+/// verbatim; otherwise the system folder on Windows, and this process's
+/// current directory at spawn time elsewhere. On Windows a job never starts in
+/// the working directory of this program, which whoever started the program
+/// chose (ST-M006-020; see `crate::system`). A current directory that cannot
+/// be read yields an empty path — reported honestly rather than invented
+/// (REQ-N-008).
 fn effective_working_dir(spec: &JobSpec) -> PathBuf {
-    match &spec.working_dir {
-        Some(dir) => dir.clone(),
-        None => std::env::current_dir().unwrap_or_default(),
-    }
+    crate::system::working_dir_of(spec)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
 /// Sleeps for `d`, or never resolves when there is no deadline.

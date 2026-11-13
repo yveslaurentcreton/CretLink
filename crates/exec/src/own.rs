@@ -30,10 +30,12 @@
 //!   permissions of its own (not inherited) that give full control to the
 //!   administrators and the system and nothing to anyone else. Everything
 //!   made below inherits that. A folder that is already there is opened
-//!   without following a link, and through that one handle its kind and its
-//!   owner are read, its permissions are set if they are others, and the
-//!   result is read back. Something else under one of those names is an
-//!   error: the program then keeps nothing, and says so.
+//!   without following a link, and through that one handle its kind, its
+//!   owner and its permissions are read: it must be such a private folder of
+//!   the administrators already. Nothing is made private afterwards, for the
+//!   reason above. A folder with other permissions, a folder of another
+//!   owner or something else under one of those names is an error: the
+//!   program then keeps nothing, and says so.
 //!
 //! A process that is elevated without being an administrator cannot make
 //! anything private and keeps nothing.
@@ -55,7 +57,10 @@
 //! names the folder so that a start can remove it whole, without following a
 //! link ([`remove_whole`]), and a recovery can report it. An elevated program
 //! asks the system where that folder is; a program without rights takes it
-//! from its environment, as those releases did.
+//! from its environment, as those releases did. An elevated start removes the
+//! folder unasked only when the administrators own it
+//! ([`administrators_own`]): every account can make that folder again and
+//! move into it what it may move but not remove.
 //!
 //! Off Windows the agent is a development and test tool that is never elevated
 //! on a customer computer: every place is the account's own.
@@ -257,17 +262,18 @@ impl OwnFolder {
         chain
     }
 
-    /// Makes the folder exist and, when it must be private, makes it and the
-    /// folders above it private (see the module documentation).
+    /// Makes the folder exist. When it must be private, it and the folders
+    /// above it are created private, or found to be private folders of the
+    /// administrators already (see the module documentation).
     ///
     /// Blocking: it works on the file system.
     ///
     /// # Errors
     ///
     /// When this process is not an administrator; when something that is not
-    /// a folder of the administrators stands under one of the names; or when
-    /// a folder cannot be created, opened or made private, or does not show
-    /// the permissions it was given. Nothing in the folder may be used then.
+    /// a private folder of the administrators stands under one of the names;
+    /// or when a folder cannot be created or opened. Nothing in the folder
+    /// may be used then.
     pub fn prepare(&self) -> io::Result<()> {
         if !self.is_private() {
             return std::fs::create_dir_all(&self.path);
@@ -386,7 +392,10 @@ pub fn earlier_release_folder() -> Option<PathBuf> {
 /// with a link in the place of the data folder, of its staging area or of the
 /// lock, nobody is taken to hold it. The lock is then opened for reading as
 /// what stands under its name, tried and given back; nothing is read from it
-/// and it is never waited for.
+/// and it is never waited for. Between that look and the opening, an account
+/// that may write there can put something else under one of the names:
+/// nothing is read through what is opened, so the worst that follows is a
+/// wrong answer about the lock.
 #[must_use]
 pub fn earlier_release_in_use(folder: &Path) -> bool {
     let staging = folder.join(STAGING_FOLDER);
@@ -395,6 +404,25 @@ pub fn earlier_release_in_use(folder: &Path) -> bool {
         && Standing::of_dir(&staging) == Standing::Ours
         && Standing::of_file(&lock) == Standing::Ours
         && sys::locked_by_another(&lock)
+}
+
+/// Whether the entry at `folder` is a folder, and no link, that the
+/// administrators or the system own. Off Windows, where no folder is owned
+/// like that, whether it is a folder and no link.
+///
+/// For the folder of an earlier release ([`earlier_release_folder`]): every
+/// account can make that folder, and an account can move into a folder of its
+/// own what it may move but not remove. A start with administrator rights
+/// therefore removes it unasked only when administrators made it.
+#[must_use]
+pub fn administrators_own(folder: &Path) -> bool {
+    sys::administrators_own(folder)
+}
+
+/// Whether this process is elevated: as its token says on Windows, where a
+/// token that cannot be read counts as elevated, and never elsewhere.
+pub(crate) fn this_process_is_elevated() -> bool {
+    sys::elevated()
 }
 
 /// Removes what stands at `path` whole, without reading it and without
@@ -529,6 +557,17 @@ mod sys {
         false
     }
 
+    /// Off Windows no folder is owned by administrators: a folder that is no
+    /// link is enough.
+    pub(super) fn administrators_own(folder: &Path) -> bool {
+        Standing::of_dir(folder) == Standing::Ours
+    }
+
+    /// Off Windows no program is elevated.
+    pub(super) fn elevated() -> bool {
+        false
+    }
+
     /// Off Windows there is no administrator to be: see the module
     /// documentation.
     #[allow(
@@ -565,7 +604,7 @@ mod sys {
                   itself (ST-M006-020): whether this process is elevated \
                   and an administrator, and \
                   the owner and the permissions of a folder, set when it is \
-                  created and read and set through its handle. ADR-0001 \
+                  created and read through its handle. ADR-0001 \
                   permits reviewed, localized unsafe in one platform adapter."
     )]
 
@@ -577,8 +616,7 @@ mod sys {
     use std::path::{Path, PathBuf};
 
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INVALID_OWNER, ERROR_SUCCESS, HANDLE, HLOCAL,
-        LocalFree,
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree,
     };
     use windows::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
@@ -588,13 +626,12 @@ mod sys {
     use windows::Win32::Security::{
         CheckTokenMembership, CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetTokenInformation,
         IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, SetKernelObjectSecurity, TOKEN_ELEVATION,
-        TOKEN_QUERY, TokenElevation, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
-        WRITE_DAC,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
@@ -606,10 +643,7 @@ mod sys {
     /// that is protected from what the folder above would hand down (`P`);
     /// full control for the system and for the administrators, for the folder
     /// and everything made in it later (`OICI`).
-    const PRIVATE_WITH_OWNER: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-
-    /// The same permissions without an owner, for a folder that has one.
-    const PRIVATE: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+    const PRIVATE: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
     /// The service that owns the files of Windows itself, as the system
     /// writes its identifier. It owns `Program Files`.
@@ -685,11 +719,32 @@ mod sys {
     fn system_folder(name: &str) -> Option<PathBuf> {
         let windows = crate::system::windows_folder()?;
         let drive = windows.ancestors().last()?;
-        let folder = drive.join(name);
-        let opened = open(&folder, READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0).ok()?;
-        let owner = Owner::of(&opened).ok()?;
+        trusted_folder(drive.join(name))
+    }
+
+    /// `folder`, when it is one of the system's own: a folder, and no link,
+    /// that Windows, the system or the administrators own.
+    pub(super) fn trusted_folder(folder: PathBuf) -> Option<PathBuf> {
+        let owner = owner_of_folder(&folder)?;
         let trusted = owner.is_trusted() || owner.text().as_deref() == Some(TRUSTED_INSTALLER);
-        (is_plain_folder(&opened).ok()? && trusted).then_some(folder)
+        trusted.then_some(folder)
+    }
+
+    /// Whether the entry at `folder` is a folder, and no link, that the
+    /// administrators or the system own.
+    pub(super) fn administrators_own(folder: &Path) -> bool {
+        owner_of_folder(folder).is_some_and(|owner| owner.is_trusted())
+    }
+
+    /// The owner of the folder at `path`, read through one handle that
+    /// follows no link. `None` when what stands there is not a folder, is a
+    /// link, or cannot be opened.
+    fn owner_of_folder(path: &Path) -> Option<Owner> {
+        let opened = open(path, READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0).ok()?;
+        if !is_plain_folder(&opened).ok()? {
+            return None;
+        }
+        Owner::of(&opened).ok()
     }
 
     /// Whether another program holds a lock on the file at `lock`. The file
@@ -781,19 +836,22 @@ mod sys {
         }
     }
 
-    /// Makes `dir` a private folder: creates it with its owner and the
-    /// private permissions in one step when nothing stands there; otherwise
-    /// opens what stands there without following a link and, through that one
-    /// handle, reads its kind and its owner, sets the private permissions if
-    /// it has others, and reads them back.
+    /// Makes `dir` a private folder, or finds it to be one: creates it with
+    /// its owner and the private permissions in one step when nothing stands
+    /// there; otherwise opens what stands there without following a link and,
+    /// through that one handle, reads its kind, its owner and its
+    /// permissions.
     ///
-    /// The folder above `dir` is one only administrators can write, so
-    /// whatever stands at `dir` was put there by one of them. Something that
-    /// is not a folder of theirs is an error all the same, and nothing below
-    /// it is used.
+    /// Nothing is made private afterwards. Windows checks rights when an
+    /// entry is opened: whoever opened a folder while it was open to them
+    /// keeps what that handle allows, and what was put into it stays as it
+    /// was. So a folder that is not a private folder of the administrators
+    /// already is an error, like a link or a file in its place, and nothing
+    /// below it is used: CretLink did not make it, and an administrator has
+    /// to remove it.
     pub(super) fn make_private(dir: &Path) -> io::Result<()> {
         create(dir)?;
-        let folder = open(dir, READ_CONTROL.0 | WRITE_DAC.0 | FILE_READ_ATTRIBUTES.0)?;
+        let folder = open(dir, READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0)?;
         if !is_plain_folder(&folder)? {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -807,53 +865,35 @@ mod sys {
             ));
         }
         if is_private_text(&permissions_text(&folder)?) {
-            return Ok(());
-        }
-        let private = Descriptor::from_text(PRIVATE)?;
-        // SAFETY: the handle is open with the right to change permissions for
-        // as long as `folder` lives, and `private` owns a valid descriptor.
-        unsafe {
-            SetKernelObjectSecurity(
-                HANDLE(folder.as_raw_handle()),
-                DACL_SECURITY_INFORMATION,
-                private.0,
-            )
-        }
-        .map_err(|error| os_error(&error))?;
-        if is_private_text(&permissions_text(&folder)?) {
             Ok(())
         } else {
-            Err(io::Error::other(
-                "the folder does not show the permissions it was given",
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the folder was not made by CretLink: it has other permissions than CretLink \
+                 gives a folder when it creates it",
             ))
         }
     }
 
-    /// Creates `dir` with its owner and the private permissions. A name that
-    /// is taken is not an error: what stands there is looked at by the
-    /// caller.
-    fn create(dir: &Path) -> io::Result<()> {
+    /// Creates `dir` with its owner and the private permissions, in one step:
+    /// the folder never exists without them. A name that is taken is not an
+    /// error: what stands there is looked at by the caller, and is left as it
+    /// is.
+    pub(super) fn create(dir: &Path) -> io::Result<()> {
         let path = HSTRING::from(dir.as_os_str());
-        for text in [PRIVATE_WITH_OWNER, PRIVATE] {
-            let descriptor = Descriptor::from_text(text)?;
-            let attributes = SECURITY_ATTRIBUTES {
-                nLength: size_of_u32::<SECURITY_ATTRIBUTES>(),
-                lpSecurityDescriptor: descriptor.0.0,
-                bInheritHandle: false.into(),
-            };
-            // SAFETY: `path` is a NUL-terminated wide string and `attributes`
-            // points to a valid descriptor, both for the duration of the call.
-            match unsafe { CreateDirectoryW(PCWSTR(path.as_ptr()), Some(&attributes)) } {
-                Ok(()) => return Ok(()),
-                Err(error) if error.code() == ERROR_ALREADY_EXISTS.to_hresult() => return Ok(()),
-                // This account may not name the administrators as the owner:
-                // the folder is made without naming one, and the owner it
-                // then has is judged like that of any folder found.
-                Err(error) if error.code() == ERROR_INVALID_OWNER.to_hresult() => {}
-                Err(error) => return Err(os_error(&error)),
-            }
+        let descriptor = Descriptor::from_text(PRIVATE)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of_u32::<SECURITY_ATTRIBUTES>(),
+            lpSecurityDescriptor: descriptor.0.0,
+            bInheritHandle: false.into(),
+        };
+        // SAFETY: `path` is a NUL-terminated wide string and `attributes`
+        // points to a valid descriptor, both for the duration of the call.
+        match unsafe { CreateDirectoryW(PCWSTR(path.as_ptr()), Some(&attributes)) } {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == ERROR_ALREADY_EXISTS.to_hresult() => Ok(()),
+            Err(error) => Err(os_error(&error)),
         }
-        Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
 
     /// The owner and the permissions of the entry at `path`, for the tests.

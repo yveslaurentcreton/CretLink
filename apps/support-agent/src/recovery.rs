@@ -293,6 +293,13 @@ const REASON_NOT_PRIVATE: &str = "the staging area could not be made private";
 /// was filled by something else, and must not keep this program from starting.
 const EARLIER_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How long `recover --remove` waits for the same removal. Longer than a
+/// start: whoever runs the command asked for it. Not without end: a program
+/// can hold an entry of the folder in a way that keeps a removal waiting for
+/// as long as that program likes, and must not keep the command from ending.
+pub(crate) const EARLIER_RELEASE_RECOVERY_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
 /// How every reason starts for a folder of a release up to 0.24.0 that a start
 /// did not remove.
 pub(crate) const REASON_EARLIER_RELEASE: &str = "left by an earlier release";
@@ -356,7 +363,12 @@ fn open_in_use(base: &OwnFolder) -> std::io::Result<std::fs::File> {
 /// read and the report says so. The start that sweeps also removes, whole and
 /// without reading it, the folder in which releases up to 0.24.0 kept these
 /// files, where every account could write.
+///
+/// Before anything else an elevated program leaves the working directory it
+/// was started in, which whoever started it chose
+/// ([`cretlink_exec::leave_the_starters_folder`]).
 pub async fn sweep_stale_staging() -> (StartupSweepReport, Option<StagingInUse>) {
+    cretlink_exec::leave_the_starters_folder();
     sweep_and_share(
         OwnFolder::staging_for_this_process(),
         cretlink_exec::earlier_release_folder(),
@@ -388,10 +400,11 @@ async fn sweep_and_share(
         // not swept: the customer is told which.
         let mut report = StartupSweepReport::default();
         if base.is_private() {
-            let failure = if base.prepare().is_err() {
+            let failure = if let Err(error) = base.prepare() {
+                // With the cause, so that an administrator can put it right.
                 CleanupFailure {
                     canonical_path: base.path().to_string_lossy().into_owned(),
-                    reason: REASON_NOT_PRIVATE.to_string(),
+                    reason: format!("{REASON_NOT_PRIVATE}: {error}"),
                 }
             } else {
                 CleanupFailure {
@@ -403,20 +416,33 @@ async fn sweep_and_share(
         }
         return (report, None);
     };
-    let report = match file.try_lock() {
+    let private = base.is_private();
+    let (mut report, swept) = match file.try_lock() {
         Ok(()) => {
-            let mut report = FileStore::sweep_all_sessions(base, CleanupTrigger::Shutdown).await;
-            if let Some(folder) = earlier
-                && let Some(kept) = remove_earlier_release(folder, EARLIER_RELEASE_WAIT).await
-            {
-                report.failed.push(kept);
-            }
+            let report = FileStore::sweep_all_sessions(base, CleanupTrigger::Shutdown).await;
             let _ = file.unlock();
-            report
+            (report, true)
         }
         // Another process runs (or sweeps): its trees may be live.
-        Err(_) => StartupSweepReport::default(),
+        Err(_) => (StartupSweepReport::default(), false),
     };
+    // The start that swept also removes the folder of an earlier release:
+    // after the lock is given back, so that no other window waits for it.
+    if swept
+        && let Some(folder) = earlier
+        && let Some(why) = remove_earlier_release(
+            folder.clone(),
+            Remover::Start,
+            private,
+            EARLIER_RELEASE_WAIT,
+        )
+        .await
+    {
+        report.failed.push(CleanupFailure {
+            canonical_path: folder.to_string_lossy().into_owned(),
+            reason: format!("{REASON_EARLIER_RELEASE}; {why}"),
+        });
+    }
     // Waits only while another process is sweeping, never for a session, and
     // not without end.
     let held = tokio::task::spawn_blocking(move || {
@@ -436,7 +462,6 @@ async fn sweep_and_share(
         Ok(Some(file)) => (report, Some(StagingInUse { _file: file })),
         _ => {
             // Nothing was swept and nothing is held: said, not passed over.
-            let mut report = report;
             report.failed.push(CleanupFailure {
                 canonical_path: lock.to_string_lossy().into_owned(),
                 reason: REASON_LOCK_HELD.to_string(),
@@ -446,48 +471,105 @@ async fn sweep_and_share(
     }
 }
 
+/// Who removes the folder of an earlier release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Remover {
+    /// A start that swept, unasked.
+    Start,
+    /// `recover --remove`, which whoever runs it asked for.
+    Recovery,
+}
+
+/// Why a start leaves the folder of an earlier release where it is, when it
+/// does. `private` says that this program runs with administrator rights.
+///
+/// A program of such a release that still runs loses nothing to a start. And
+/// a start with administrator rights removes unasked only a folder that the
+/// administrators own: every account can make that folder again and move into
+/// it what it may move but not remove, and those rights would then remove it
+/// for that account. Such a folder is named and left to `recover --remove`,
+/// or to a start from the account it belongs to.
+fn start_leaves(private: bool, in_use: bool, administrators_own: bool) -> Option<&'static str> {
+    if in_use {
+        Some("a program of that release still uses it")
+    } else if private && !administrators_own {
+        Some("it belongs to an account, not to the administrators, and is removed only on request")
+    } else {
+        None
+    }
+}
+
 /// Removes the folder in which releases up to 0.24.0 kept the staging area and
 /// the reboot tickets (ST-M006-020). Every account could write there, so
 /// nothing in it is read: it is removed whole, without following a link.
 ///
-/// A program of such a release that still runs holds the lock of its staging
-/// area; the folder is then left for a later start. The removal is waited for
-/// only as long as `wait`; it goes on after that, and a later start finishes
-/// what this one could not.
+/// A start leaves the folder where [`start_leaves`] says so; a recovery
+/// removes it whoever owns it. `private` says that this program runs with
+/// administrator rights. The work is waited for only as long as `wait`
+/// ([`within`]); a later start finishes what this one could not.
 ///
-/// Returns what to tell the customer when the folder is still there; `None`
-/// when it is gone or was never there.
+/// Returns why the folder is still there; `None` when it is gone or was never
+/// there.
 pub(crate) async fn remove_earlier_release(
     folder: PathBuf,
+    by: Remover,
+    private: bool,
     wait: std::time::Duration,
-) -> Option<CleanupFailure> {
-    let kept = |why: String| CleanupFailure {
-        canonical_path: folder.to_string_lossy().into_owned(),
-        reason: format!("{REASON_EARLIER_RELEASE}; {why}"),
-    };
-    let target = folder.clone();
-    let removal = tokio::task::spawn_blocking(move || {
-        if std::fs::symlink_metadata(&target).is_err() {
-            return Ok(());
+) -> Option<String> {
+    let work = move || {
+        match std::fs::symlink_metadata(&folder) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // What cannot be looked at is not known to be gone.
+            Err(error) => return Err(format!("it could not be looked at ({})", error.kind())),
         }
-        if cretlink_exec::earlier_release_in_use(&target) {
-            return Err("a program of that release still uses it".to_string());
+        if by == Remover::Start
+            && let Some(why) = start_leaves(
+                private,
+                cretlink_exec::earlier_release_in_use(&folder),
+                cretlink_exec::administrators_own(&folder),
+            )
+        {
+            return Err(why.to_string());
         }
-        match cretlink_exec::remove_whole(&target) {
+        match cretlink_exec::remove_whole(&folder) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                Err("removing it needs administrator rights".to_string())
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Err(if private {
+                "it could not be removed, also not with administrator rights".to_string()
+            } else {
+                "removing it needs administrator rights".to_string()
+            }),
             Err(error) => Err(format!("could not be removed ({})", error.kind())),
         }
-    });
-    match tokio::time::timeout(wait, removal).await {
-        Ok(Ok(Ok(()))) => None,
-        Ok(Ok(Err(why))) => Some(kept(why)),
-        Ok(Err(_)) => Some(kept("could not be removed".to_string())),
-        Err(_) => Some(kept("its removal was not finished in time".to_string())),
+    };
+    match within(wait, work).await {
+        Some(Ok(())) => None,
+        Some(Err(why)) => Some(why),
+        None => Some("its removal was not finished in time".to_string()),
     }
+}
+
+/// Runs `work` on a thread of its own and waits for it at most `wait`; `None`
+/// when it was not done by then.
+///
+/// The work is on the file system, where another program can hold an entry in
+/// a way that keeps a call waiting for as long as that program likes. So it
+/// runs where it keeps nothing else waiting: not the caller after `wait`, and
+/// not the end of this program, which a thread of its own does not hold up.
+/// The work goes on after the wait for as long as this program runs.
+async fn within<T: Send + 'static>(
+    wait: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (done, result) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("cretlink-earlier-release".to_string())
+        .spawn(move || {
+            let _ = done.send(work());
+        })
+        .ok()?;
+    tokio::time::timeout(wait, result).await.ok()?.ok()
 }
 
 /// The startup sweep in words for a command line, or `None` for a clean run
@@ -816,9 +898,13 @@ mod tests {
             report.failed[0].canonical_path,
             base.path().to_string_lossy()
         );
-        assert_eq!(
-            report.failed[0].reason,
-            "the staging area could not be made private"
+        // The reason says why, so that an administrator can put it right.
+        assert!(
+            report.failed[0]
+                .reason
+                .starts_with("the staging area could not be made private: "),
+            "{}",
+            report.failed[0].reason
         );
         let text = sweep_text(&report).unwrap_or_default();
         assert!(text.contains("could not be made private"), "{text}");
@@ -987,16 +1073,18 @@ mod tests {
     async fn the_removal_of_an_earlier_release_is_not_waited_for_without_end() {
         let (root, _, earlier) = with_an_earlier_release("earlier-slow");
 
-        let kept = remove_earlier_release(earlier.clone(), std::time::Duration::ZERO).await;
+        let kept = remove_earlier_release(
+            earlier.clone(),
+            Remover::Start,
+            false,
+            std::time::Duration::ZERO,
+        )
+        .await;
 
         // Whether the removal was already done when the wait ended depends on
         // the machine; what is said when it was not does not.
-        if let Some(kept) = kept {
-            assert_eq!(kept.canonical_path, earlier.to_string_lossy());
-            assert_eq!(
-                kept.reason,
-                "left by an earlier release; its removal was not finished in time"
-            );
+        if let Some(why) = kept {
+            assert_eq!(why, "its removal was not finished in time");
         }
         let deadline = std::time::Instant::now() + A_MOMENT;
         while earlier.exists() && std::time::Instant::now() < deadline {
@@ -1004,7 +1092,81 @@ mod tests {
         }
         assert!(!earlier.exists(), "the removal went on");
         // Nothing is there any more: nothing to say.
-        assert_eq!(remove_earlier_release(earlier, A_MOMENT).await, None);
+        assert_eq!(
+            remove_earlier_release(earlier, Remover::Start, false, A_MOMENT).await,
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a start leaves of an earlier release, and why.
+    #[test]
+    fn a_start_removes_unasked_only_what_no_program_uses_and_what_administrators_own() {
+        // Without administrator rights no boundary is crossed: whose the
+        // folder is does not matter.
+        assert_eq!(start_leaves(false, false, false), None);
+        assert_eq!(start_leaves(false, false, true), None);
+        // With them, only a folder that the administrators own is removed
+        // unasked: every account can make that folder and fill it.
+        assert_eq!(start_leaves(true, false, true), None);
+        assert!(
+            start_leaves(true, false, false)
+                .is_some_and(|why| why.starts_with("it belongs to an account"))
+        );
+        // A program of that release that still runs keeps its folder.
+        for private in [false, true] {
+            for administrators_own in [false, true] {
+                assert_eq!(
+                    start_leaves(private, true, administrators_own),
+                    Some("a program of that release still uses it")
+                );
+            }
+        }
+    }
+
+    /// Work that does not end is waited for only so long, and work that ends
+    /// is waited for.
+    #[tokio::test]
+    async fn work_on_a_thread_of_its_own_is_waited_for_only_so_long() {
+        let (let_go, held) = std::sync::mpsc::channel::<()>();
+        let hung = within(std::time::Duration::from_millis(50), move || {
+            // Ends only when the test lets go.
+            let _ = held.recv();
+        })
+        .await;
+        assert_eq!(hung, None);
+        drop(let_go);
+
+        assert_eq!(within(A_MOMENT, || 7).await, Some(7));
+    }
+
+    /// A removal that is refused to a program with administrator rights is
+    /// not blamed on missing rights, and a recovery removes the folder
+    /// whoever owns it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_removal_is_said_as_it_is_and_a_recovery_removes_what_it_can() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, _, earlier) = with_an_earlier_release("earlier-refused");
+        let closed = earlier.join("staging");
+        let _ = std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o555));
+
+        let kept = remove_earlier_release(earlier.clone(), Remover::Recovery, true, A_MOMENT).await;
+
+        let _ = std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755));
+        // An account that the permissions do not hold for (root) removed it.
+        if earlier.exists() {
+            assert_eq!(
+                kept.as_deref(),
+                Some("it could not be removed, also not with administrator rights")
+            );
+        }
+        assert_eq!(
+            remove_earlier_release(earlier.clone(), Remover::Recovery, true, A_MOMENT).await,
+            None
+        );
+        assert!(!earlier.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

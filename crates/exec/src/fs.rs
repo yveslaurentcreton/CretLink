@@ -41,7 +41,9 @@
 //! only what lies directly in the session's own staging folder, whatever a
 //! manifest names. An entry that is not what CretLink makes there — a link, a
 //! file where a folder belongs — is reported, never read, and removed whole
-//! only by the purge that an administrator asks for.
+//! only by the purge that an administrator asks for. And nothing is moved
+//! into such a staging area from elsewhere: a move keeps a file as it is, with
+//! its permissions and with every handle a program opened on it before.
 //!
 //! # Honest failures (REQ-N-008, REQ-N-015)
 //!
@@ -754,6 +756,20 @@ impl FileStore {
         to: &RemotePath,
         overwrite: bool,
     ) -> Result<OpResult, FsError> {
+        // A move keeps a file as it is: its permissions, and every handle a
+        // program opened on it before. In a private staging area nothing may
+        // stand that was ever open to others (ST-M006-020), so nothing is
+        // moved in from elsewhere: it is uploaded, which makes it new.
+        if self.base.is_private()
+            && matches!(to, RemotePath::Staging { .. })
+            && !matches!(from, RemotePath::Staging { .. })
+        {
+            return Err(FsError::new(
+                ErrorCode::Unsupported,
+                "a move into the staging area of a program with administrator rights is not \
+                 supported: upload the file",
+            ));
+        }
         let from_path = self.resolve(from)?;
         let to_path = self.resolve(to)?;
         if matches!(to, RemotePath::Staging { .. }) {

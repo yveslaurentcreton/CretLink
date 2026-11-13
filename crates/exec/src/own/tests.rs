@@ -461,7 +461,7 @@ mod windows {
     use std::path::Path;
     use std::process::Command;
 
-    use super::super::sys;
+    use super::super::{administrators_own, sys};
     use super::{
         OwnFolder, Sandbox, administrators_folder, can_make_private, earlier_release_folder,
         earlier_release_in_use, is_private_text, names_in, remove_whole,
@@ -570,8 +570,33 @@ mod windows {
         assert_handed_down(&session.join("manifest.json"));
     }
 
+    /// The folder is made with its owner and its permissions in one step:
+    /// nothing else touches it between its creation and this look, in a
+    /// folder that is open to everyone.
     #[test]
-    fn a_folder_of_the_administrators_with_other_permissions_is_made_private() {
+    fn a_folder_is_private_from_the_moment_it_is_made() {
+        if !can_make_private() {
+            return;
+        }
+        let sb = Sandbox::new();
+        open_to_everyone(&sb.root);
+
+        sys::create(&sb.data()).expect("create");
+
+        assert_private(&sb.data());
+        // A name that is taken is no error, and what stands there is left as
+        // it is: the caller looks at it.
+        let taken = sb.root.join("taken");
+        std::fs::create_dir(&taken).expect("taken");
+        let before = permissions(&taken);
+        sys::create(&taken).expect("a taken name");
+        assert_eq!(permissions(&taken), before);
+    }
+
+    /// A folder is never made private afterwards: whoever opened it, or put
+    /// something into it, while it was open keeps that.
+    #[test]
+    fn a_folder_of_the_administrators_with_other_permissions_is_an_error_and_is_left_as_it_is() {
         if !can_make_private() {
             return;
         }
@@ -581,18 +606,52 @@ mod windows {
         std::fs::create_dir(sb.data()).expect("data");
         set_owner(&sb.data(), ADMINISTRATORS);
         open_to_everyone(&sb.data());
-        assert!(!is_private_text(&permissions(&sb.data())));
-        std::fs::write(sb.data().join("kept"), b"x").expect("write");
-
-        sb.staging().prepare().expect("prepare");
-
-        assert_private(&sb.data());
-        assert_private(sb.staging().path());
-        assert_eq!(names_in(&sb.data()), ["kept", "staging"]);
-        // A second preparation finds them private and changes nothing.
         let before = permissions(&sb.data());
-        sb.staging().prepare().expect("again");
-        assert_eq!(permissions(&sb.data()), before);
+        assert!(!is_private_text(&before));
+
+        let error = sb
+            .staging()
+            .prepare()
+            .expect_err("not private from its first moment");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(permissions(&sb.data()), before, "nothing was changed");
+        assert!(names_in(&sb.data()).is_empty(), "nothing was made in it");
+    }
+
+    /// Whose a folder is, is read from its owner through a handle that
+    /// follows no link: for `Program Files`, which must be the system's, and
+    /// for the folder of an earlier release, which a start with administrator
+    /// rights removes unasked only when the administrators own it.
+    #[test]
+    fn whose_a_folder_is_is_read_from_its_owner_and_never_through_a_link() {
+        if !can_make_private() {
+            return;
+        }
+        let sb = Sandbox::new();
+        let folder = sb.root.join("folder");
+        assert!(!administrators_own(&folder), "nothing is there");
+        assert_eq!(sys::trusted_folder(folder.clone()), None);
+
+        std::fs::create_dir(&folder).expect("folder");
+        set_owner(&folder, &this_account());
+        assert!(!administrators_own(&folder), "an account owns it");
+        assert_eq!(sys::trusted_folder(folder.clone()), None);
+
+        set_owner(&folder, ADMINISTRATORS);
+        assert!(administrators_own(&folder));
+        assert_eq!(sys::trusted_folder(folder.clone()), Some(folder.clone()));
+
+        // A junction to a folder of the administrators is not one of theirs.
+        let link = sb.root.join("link");
+        junction(&link, &folder);
+        assert!(!administrators_own(&link));
+        assert_eq!(sys::trusted_folder(link.clone()), None);
+        // A file of the administrators is not a folder.
+        let file = sb.root.join("file");
+        std::fs::write(&file, b"x").expect("file");
+        set_owner(&file, ADMINISTRATORS);
+        assert!(!administrators_own(&file));
     }
 
     #[test]
@@ -633,11 +692,12 @@ mod windows {
         assert_eq!(permissions(&elsewhere), before, "nothing was changed there");
         std::fs::remove_dir(sb.data()).expect("remove the junction");
 
-        // A junction where the staging area belongs.
-        std::fs::create_dir(sb.data()).expect("data");
-        set_owner(&sb.data(), ADMINISTRATORS);
+        // A junction where the staging area belongs, in a data folder that
+        // is private.
+        sys::create(&sb.data()).expect("data");
         junction(&sb.data().join("staging"), &elsewhere);
-        assert!(sb.staging().prepare().is_err());
+        let error = sb.staging().prepare().expect_err("a junction is no folder");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(names_in(&elsewhere).is_empty());
         assert_eq!(permissions(&elsewhere), before);
     }

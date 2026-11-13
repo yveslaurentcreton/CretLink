@@ -469,10 +469,10 @@ fn spawn_child(spec: &JobSpec, hpc: HPCON, job: HANDLE) -> Result<PROCESS_INFORM
             .as_os_str(),
     );
     let mut command = command_line_utf16(spec);
-    let cwd = spec
-        .working_dir
-        .as_ref()
-        .map(|dir| to_utf16(dir.as_os_str()));
+    // A terminal that names no folder starts in the system folder, never in
+    // the working directory of this program, which whoever started the
+    // program chose (ST-M006-020; see `crate::system`).
+    let cwd = crate::system::working_dir_of(spec).map(|dir| to_utf16(dir.as_os_str()));
     let env = env_block(spec);
 
     let mut info = PROCESS_INFORMATION::default();

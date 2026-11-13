@@ -607,6 +607,7 @@ fn places_with_an_earlier_release(sb: &Sandbox) -> (Places, PathBuf) {
         staging: OwnFolder::same_account(sb.staging_base()),
         earlier_release: Some(earlier.clone()),
         out_of_reach: None,
+        earlier_release_unknown: false,
     };
     (places, earlier)
 }
@@ -788,6 +789,7 @@ async fn what_a_program_with_administrator_rights_kept_is_said_to_be_out_of_reac
         staging: OwnFolder::same_account(sb.staging_base()),
         earlier_release: None,
         out_of_reach: Some(theirs.clone()),
+        earlier_release_unknown: false,
     };
     let store = sb.ticket_store();
 
@@ -904,4 +906,74 @@ async fn a_recovery_that_kept_something_keeps_its_folders() {
 
     assert!(!report.ok());
     assert!(root.join("ours.bin").exists());
+}
+
+/// Where the place of an earlier release cannot be told, nothing is known
+/// about it: neither the scan nor the recovery calls the machine clean.
+#[tokio::test]
+async fn an_earlier_release_whose_place_cannot_be_told_is_unknown_not_absent() {
+    let sb = Sandbox::new();
+    let places = Places {
+        earlier_release_unknown: true,
+        ..Places::only(OwnFolder::same_account(sb.staging_base()))
+    };
+    let store = sb.ticket_store();
+
+    let inventory = scan_in(&places, &store).await;
+
+    assert!(!inventory.is_clean(), "unknown is not clean");
+    assert!(
+        !inventory
+            .asserted_empty
+            .contains(&ResourceKind::EarlierRelease)
+    );
+    assert!(
+        inventory
+            .unreadable
+            .iter()
+            .any(|unknown| unknown.kind == ResourceKind::EarlierRelease),
+        "{:?}",
+        inventory.unreadable
+    );
+    let report = recover_in(&places, &store).await;
+    assert!(!report.ok(), "a recovery that could not look says so");
+}
+
+/// What lies out of reach is said also when the recovery kept something of
+/// its own: the one says nothing about the other.
+#[tokio::test]
+async fn what_is_out_of_reach_is_said_also_when_something_else_was_kept() {
+    let sb = Sandbox::new();
+    let theirs = sb.root.join("CretLink Data");
+    std::fs::create_dir_all(theirs.join("staging")).expect("create");
+    let base = sb.staging_base();
+    let session = SessionId::new();
+    stage_artifact(&base, session, "ours.bin", CleanupPolicy::OnSessionEnd).await;
+    let manifest = base.join(session.to_string()).join("manifest.json");
+    std::fs::write(&manifest, b"this is not a manifest").expect("damage");
+    let places = Places {
+        out_of_reach: Some(theirs.clone()),
+        ..Places::only(OwnFolder::same_account(base))
+    };
+    let store = sb.ticket_store();
+
+    let report = recover_in(&places, &store).await;
+
+    assert!(
+        report
+            .failed
+            .iter()
+            .any(|failure| failure.kind == ResourceKind::StagedFiles),
+        "the recovery kept staged files of its own: {:?}",
+        report.failed
+    );
+    assert!(
+        report
+            .unreadable
+            .iter()
+            .any(|unknown| unknown.reason.contains("as an administrator")),
+        "failed: {:?}; unknown: {:?}",
+        report.failed,
+        report.unreadable
+    );
 }
