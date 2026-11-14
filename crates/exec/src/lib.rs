@@ -70,6 +70,8 @@ mod conpty;
 mod desktop;
 mod error;
 mod fs;
+// The program file of this process, held and verified (ST-M009-017).
+mod image;
 mod own;
 mod platform;
 mod system;
@@ -87,9 +89,11 @@ pub use error::ExecError;
 pub use fs::{
     FileStore, FsError, OUTSIDE_STAGING_REASON, SessionStaging, StagingCensus, StartupSweepReport,
 };
+pub use image::hold_running_program;
 pub use own::{
     OwnFolder, Standing, administrators_folder, administrators_own, earlier_release_folder,
-    earlier_release_in_use, remove_whole,
+    earlier_release_in_use, kept_program_folder, prepare_program_folder, remove_whole,
+    require_administrator,
 };
 pub use system::{job_folder, leave_the_starters_folder, windows_folder};
 
