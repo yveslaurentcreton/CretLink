@@ -402,6 +402,11 @@ pub struct CommandError {
     pub stage: String,
     /// A safe, actionable description. Never carries key material or codes.
     pub message: String,
+    /// The text of a file that the technician can write by hand, when a
+    /// file could not be written for them (ST-M007-011). Never carries key
+    /// material either.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "fileText")]
+    pub file_text: Option<String>,
 }
 
 impl CommandError {
@@ -409,6 +414,7 @@ impl CommandError {
         Self {
             stage: stage.to_string(),
             message: message.to_string(),
+            file_text: None,
         }
     }
 }

@@ -11,7 +11,12 @@
 // | `kept`         | installed, with a relay in its settings |
 // | `file`         | installed, with a profile file next to the program that wins |
 // | `file-problem` | installed, with a profile file that cannot be used |
-// | `run-once`     | runs once, and keeps no settings |
+// | `run-once`     | runs once: its relay is the file next to the program, not there yet |
+// | `run-once-file`| runs once, with a profile file next to the program |
+//
+// `?folder=read-only` makes the folder of a copy that runs once one that
+// cannot be written: Save then answers with the text for the file, without
+// the key.
 //
 // `?relay=` picks how the relay answers a test and a session: `admit` (the
 // default), `key` (it does not know the key) or `down` (it cannot be
@@ -39,7 +44,8 @@
 // depend on them: an address needs a port, a key is never sent back, a kept
 // key stays with its relay (the host of the address, the name in the
 // certificate and the certificate authority), the certificate file is named
-// by a number, and a copy that runs once refuses to keep anything. A relay is
+// by a number, and a copy that runs once keeps its relay in the file next to
+// the program, which Save writes and Remove removes. A relay is
 // named with where it is reached and what vouches for its name, as the real
 // backend names one (`../src/shared/relay`).
 
@@ -66,6 +72,7 @@ import {
   RELAY_FILE_PROBLEM,
   RELAY_NONE,
   RELAY_RUN_ONCE,
+  RELAY_RUN_ONCE_FILE,
   RELAY_STORED,
   consoleIn,
 } from "../src/technician/fixtures";
@@ -84,10 +91,13 @@ const COPIES: Record<string, RelaySettings> = {
   file: RELAY_FILE,
   "file-problem": RELAY_FILE_PROBLEM,
   "run-once": RELAY_RUN_ONCE,
+  "run-once-file": RELAY_RUN_ONCE_FILE,
 };
+/** Whether the folder of a copy that runs once cannot be written. */
+const readOnlyFolder = params.get("folder") === "read-only";
 
 let settings: RelaySettings = COPIES[copy] ?? RELAY_NONE;
-const app: AppInfo = settings.editable ? APP_INSTALLED : APP_RUN_ONCE;
+const app: AppInfo = settings.keptIn === "settings" ? APP_INSTALLED : APP_RUN_ONCE;
 /** Whether the copy keeps a key. The key itself is not kept on this page. */
 let keySet = settings.stored?.relay?.keySet ?? false;
 let nextPick = 1;
@@ -213,11 +223,20 @@ function relayOf(form: RelayForm): RelayView {
   return relay;
 }
 
-function runOnce(): never {
-  return refuse(
-    "relay_run_once",
-    "This copy runs once and keeps no settings. To give it a relay, put a file cretlink.toml next to the program.",
-  );
+/**
+ * The refusal of a save in a folder that cannot be written, with the text
+ * for the file as the backend writes it: a line in place of the key.
+ */
+function folderReadOnly(relay: RelayView): never {
+  const lines = ["[relay]", `address = "${relay.address}"`];
+  if (relay.keySet) lines.push('key = "the key of this copy"');
+  if (relay.ca) lines.push(`ca = "${relay.ca}"`);
+  if (relay.name) lines.push(`name = "${relay.name}"`);
+  throw {
+    stage: "relay_folder",
+    message: `The relay could not be saved: the folder of the program cannot be written (Permission denied). Nothing was changed. You can put a file cretlink.toml with the text below next to the program yourself: ${settings.file.path}.`,
+    fileText: `${lines.join("\n")}\n`,
+  };
 }
 
 /** What the simulated relay says to a test of `relay`. */
@@ -301,12 +320,7 @@ function useRelay(): Promise<ConsoleState> {
   if (!relay) {
     const problem = settings.source === "file" ? settings.file.problem : settings.stored?.problem;
     if (problem) refuse("relay_profile", `${problem.message} (${problem.file})`);
-    refuse(
-      "relay_none",
-      settings.editable
-        ? "This copy has no relay. Set one up in Settings, under Relay."
-        : "This copy has no relay. Put a file cretlink.toml next to the program; Settings, Relay shows where and what it holds.",
-    );
+    refuse("relay_none", "This copy has no relay. Set one up in Settings, under Relay.");
   }
   generation += 1;
   // The listener of this network goes first, as in the application.
@@ -480,9 +494,16 @@ mockIPC(
         nextPick += 1;
         return picked;
       case "save_relay": {
-        if (!settings.editable) runOnce();
         const form = payload.form as RelayForm;
         const relay = relayOf(form);
+        if (settings.keptIn === "program_folder") {
+          if (readOnlyFolder) folderReadOnly(relay);
+          keySet = relay.keySet;
+          picked = null;
+          const path = settings.file.path;
+          settings = { ...settings, source: "file", file: { path, relay }, stored: { path, relay } };
+          return settings;
+        }
         keySet = relay.keySet;
         picked = null;
         settings = {
@@ -493,9 +514,13 @@ mockIPC(
         return settings;
       }
       case "remove_relay":
-        if (!settings.editable) runOnce();
         keySet = false;
         picked = null;
+        if (settings.keptIn === "program_folder") {
+          const path = settings.file.path;
+          settings = { ...settings, source: "none", file: { path }, stored: { path } };
+          return settings;
+        }
         settings = {
           ...settings,
           source: settings.source === "file" ? "file" : "none",

@@ -23,9 +23,10 @@
 //! leaves both as they were.
 //!
 //! - **Only the installed copy** reads and writes these files. A copy that
-//!   runs once writes nothing but its audit trail, and the customer role
-//!   reads only the profile file next to its program; neither calls this
-//!   module's writers.
+//!   runs once keeps its relay, on the technician's request, in the file next
+//!   to its program instead ([`crate::relay_profile::program_file`]), and the
+//!   customer role reads only the profile file next to its program and
+//!   writes nothing; neither keeps settings here.
 //! - **For this user only.** The file holds the relay's admission key in
 //!   readable form. Where the system has file modes (macOS, Linux) it is
 //!   created with mode `0600`: read and write for the user, nothing for
@@ -213,7 +214,18 @@ pub fn write(layout: &Layout, settings: &Settings) -> io::Result<()> {
     if settings.is_empty() {
         return remove_file_if_exists(&layout.settings).map(drop);
     }
+    create_folder_of(&layout.settings)?;
     write_private(&layout.settings, settings.to_text().as_bytes())
+}
+
+/// Creates the folder of the settings, when it is not there yet. The
+/// settings live in a folder of the user's own that CretLink makes; a relay
+/// file next to the program never makes a folder ([`write_together`]).
+fn create_folder_of(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(parent) => fs::create_dir_all(parent),
+        None => Ok(()),
+    }
 }
 
 /// What a change of the relay in the settings does to the certificate
@@ -263,48 +275,98 @@ pub fn write_with_relay_ca(
     settings: &Settings,
     ca: RelayCa<'_>,
 ) -> io::Result<()> {
+    if let Some(adapter) = &settings.network_adapter
+        && !is_adapter_name(adapter)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the name of the network adapter cannot be kept",
+        ));
+    }
+    let text = (!settings.is_empty()).then(|| settings.to_text());
+    if text.is_some() || matches!(ca, RelayCa::Replace(_)) {
+        create_folder_of(&layout.settings)?;
+    }
+    write_together(
+        &layout.settings,
+        text.as_ref().map(|text| text.as_bytes()),
+        &layout.relay_ca,
+        ca,
+    )
+}
+
+/// Writes a file that holds a relay and the certificate authority file of
+/// that relay as one change: afterwards both are as asked, or both are as
+/// they were. `text` `None` removes the file `main`. Both files stand in one
+/// folder, which must be there: no folder is made.
+///
+/// This is the change [`write_with_relay_ca`] describes, for the settings of
+/// the installed copy and for the relay file next to the program
+/// ([`crate::relay_profile::program_file`]).
+///
+/// # Errors
+///
+/// As [`write_with_relay_ca`]. A new file that could not be made in the
+/// folder is said by [`is_not_created`].
+pub(crate) fn write_together(
+    main: &Path,
+    text: Option<&[u8]>,
+    ca_path: &Path,
+    ca: RelayCa<'_>,
+) -> io::Result<()> {
     let invalid = |text: &str| io::Error::new(io::ErrorKind::InvalidInput, text.to_owned());
     // The certificate file of after, under another name: the one in use is
-    // not touched until the settings are written.
+    // not touched until the main file is written.
     if let RelayCa::Replace(pem) = ca {
         let certificates = relay_profile::certificates_only(pem)
             .map_err(|_| invalid("the certificate file holds no certificate"))?;
         if certificates.len() as u64 > MAX_CA_BYTES {
             return Err(invalid("the certificate file is too large"));
         }
-        stage_private(&layout.relay_ca, &certificates)?;
+        stage_private(ca_path, &certificates)?;
     }
     let discard = || {
         if matches!(ca, RelayCa::Replace(_)) {
-            let _ = fs::remove_file(temporary_name(&layout.relay_ca));
+            let _ = fs::remove_file(temporary_name(ca_path));
         }
     };
-    // What the settings hold now, to put it back. A file that cannot be read
-    // cannot be put back either: then nothing is begun.
-    let before = match fs::read(&layout.settings) {
+    // What the main file holds now, to put it back. A file that cannot be
+    // read cannot be put back either: then nothing is begun.
+    let before = match fs::read(main) {
         Ok(bytes) => Some(Zeroizing::new(bytes)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            None
+        }
         Err(error) => {
             discard();
             return Err(error);
         }
     };
-    if let Err(error) = write(layout, settings) {
+    let written = match text {
+        Some(text) => write_private(main, text),
+        None => remove_file_if_exists(main).map(drop),
+    };
+    if let Err(error) = written {
         discard();
         return Err(error);
     }
     let moved = match ca {
         RelayCa::Keep => Ok(()),
-        RelayCa::Remove => remove_file_if_exists(&layout.relay_ca).map(drop),
-        RelayCa::Replace(_) => fs::rename(temporary_name(&layout.relay_ca), &layout.relay_ca),
+        RelayCa::Remove => remove_file_if_exists(ca_path).map(drop),
+        RelayCa::Replace(_) => fs::rename(temporary_name(ca_path), ca_path),
     };
     let Err(error) = moved else {
         return Ok(());
     };
     discard();
     let restored = match &before {
-        Some(bytes) => write_private(&layout.settings, bytes),
-        None => remove_file_if_exists(&layout.settings).map(drop),
+        Some(bytes) => write_private(main, bytes),
+        None => remove_file_if_exists(main).map(drop),
     };
     Err(match restored {
         Ok(()) => error,
@@ -332,9 +394,9 @@ impl std::fmt::Display for NotPutBack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "the certificate file could not be changed ({}), and the settings of before could \
-             not be put back ({}); the relay in the settings is the new one and its certificate \
-             file is the old one, so save or remove the relay again",
+            "the certificate file could not be changed ({}), and the relay of before could not \
+             be put back ({}); the relay is the new one and its certificate file is the old one, \
+             so save or remove the relay again",
             self.change, self.restore
         )
     }
@@ -355,12 +417,12 @@ pub fn is_not_put_back(error: &io::Error) -> bool {
 /// Writes `bytes` under the temporary name of `path`, in the same folder and
 /// for this user only. One left behind by a run that was interrupted is
 /// replaced. `path` itself is not touched.
+///
+/// A failure here means that no new file could be made in that folder, and
+/// the error says so ([`is_not_created`]).
 fn stage_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let temporary = temporary_name(path);
-    remove_file_if_exists(&temporary)?;
+    remove_file_if_exists(&temporary).map_err(not_created)?;
     let written = (|| {
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -377,7 +439,35 @@ fn stage_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if written.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    written
+    written.map_err(not_created)
+}
+
+/// A new file that could not be made, or written, in the folder of the file
+/// it was to replace: the folder cannot be written, or is not there. The
+/// file of before is untouched. It is the payload of the error then, so that
+/// a caller can say that the folder is the trouble ([`is_not_created`]).
+#[derive(Debug)]
+pub struct NotCreated(pub io::Error);
+
+impl std::fmt::Display for NotCreated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for NotCreated {}
+
+fn not_created(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), NotCreated(error))
+}
+
+/// Whether `error` of a write of this module says that no new file could be
+/// made in the folder ([`NotCreated`]). Nothing was changed then.
+#[must_use]
+pub fn is_not_created(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<NotCreated>())
 }
 
 /// Writes `bytes` to `path` through a temporary file in the same folder that

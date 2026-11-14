@@ -31,7 +31,8 @@ pub enum InstallKind {
     /// It is the installed copy.
     Installed,
     /// It runs from wherever it was unpacked and writes nothing but the audit
-    /// trail.
+    /// trail, and the relay file next to the program when the technician
+    /// saves a relay (ST-M007-011).
     RunOnce,
 }
 

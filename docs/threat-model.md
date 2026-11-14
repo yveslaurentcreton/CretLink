@@ -3187,7 +3187,9 @@ metadata rather than content.
   in the certificate (ST-M007-011). It is read from `cretlink.toml` next to
   the program, by both roles, or from the settings of the installed technician
   copy; the customer role reads the file next to its program and nothing
-  else, and writes nothing. Nothing in a profile grants control (ADR-0016 §2,
+  else, and writes nothing. A technician copy that runs once writes that file
+  itself when the technician saves a relay in Settings (below). Nothing in a
+  profile grants control (ADR-0016 §2,
   §4). Somebody who can write next to the program or into the settings can
   point a copy at a relay of their own, which is then the hostile relay this
   section already models: it sees metadata and can deny service, and the
@@ -3240,6 +3242,29 @@ metadata rather than content.
   relay whose certificate that authority did not sign. The kept file holds
   the certificates only, written anew, so that a private key which stood in
   the chosen file is never copied next to the settings.
+- *A copy that runs once writes its relay next to the program, and only
+  there.* Such a copy keeps no settings; **Settings → Relay** fills its form
+  from `cretlink.toml` next to the program, and **Save** writes that file and
+  `relay-ca.pem` beside it, with the same rules as the settings of the
+  installed copy: the key never comes back to the window, a kept key stays
+  with its relay, both files change together, and the certificate file holds
+  certificates only (ST-M007-011). The place is the folder of the running
+  program and nothing else: no path comes from the window, and the screen
+  names both files, and says that the key stands in the file in readable
+  form, before Save. Nothing is written until the technician presses Save,
+  not even to find out whether the folder can be written; when it cannot,
+  the screen shows the text for the file with a line in place of the key.
+  Save and Remove refuse when either file is there and is not a plain file
+  (a symbolic link, a junction or another reparse point, a folder), so that
+  nothing is written or removed through a link that somebody else put
+  there; new files are made in the same folder and then moved into place.
+  Save replaces only the relay settings of a file that it can read, and
+  leaves the comments in it; a file that it cannot read as a profile it does
+  not overwrite. Remove deletes the profile file and `relay-ca.pem`, and
+  leaves a certificate file of another name that a profile written by hand
+  names. A copy made for a customer, and the customer role, have none of
+  this: the customer role has no such command, and the commands refuse a
+  `CretLink-Support*` program.
 - *A customer copy carries a key of its own, and nothing of the
   technician's.* **Make a customer copy** writes one folder for one customer:
   the support program, a `cretlink.toml` with the relay of the technician's
@@ -3362,6 +3387,15 @@ metadata rather than content.
   handed over, and whoever has it has its key. A key admits to the forwarder
   and nothing else, and one key per customer bounds what a leaked one is
   worth until its line is deleted.
+- A copy that runs once leaves its key at rest next to the program. When the
+  technician saves a relay there, `cretlink.toml` holds the key in readable
+  form in whatever folder the program was unpacked to: a download folder, a
+  shared folder or a USB stick. On macOS and Linux the file is made with mode
+  `0600`; on Windows it takes the access rules of that folder, which
+  CretLink does not change, so whoever can read the folder can read the key,
+  and a copy of the folder carries it. The file stays after the program has
+  closed, until Remove deletes it. The screen says this before Save, and the
+  key admits to the forwarder only; its operator can withdraw it.
 - The environment can replace the system's authorities. A copy whose
   profile names no certificate file checks the relay's certificate against
   the authorities of the operating system, which it reads with
@@ -3544,7 +3578,9 @@ and an uninstall entry under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\CretLink`
 (Windows) or a desktop entry (Linux), registers the selected AI clients with
 the installed path, and records all of it in `install.json`. A *run-once* copy
-writes nothing of its own but the audit trail.
+writes nothing of its own but the audit trail, and, only when the technician
+saves a relay in Settings, the relay file `cretlink.toml` and its certificate
+file next to the program (ST-M007-011, under the relay above).
 
 **Threats and mitigations.**
 

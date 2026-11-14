@@ -152,6 +152,9 @@ export interface TerminalFrame {
 export interface CommandError {
   stage: string;
   message: string;
+  // The text of a file to write by hand, when CretLink could not write it
+  // (`relay_folder`, ST-M007-011). It never holds a key.
+  fileText?: string;
 }
 
 // A selected entry of the open folder, for a copy to this computer: its
@@ -288,9 +291,11 @@ export const api = {
     invoke<void>("open_audit", session === undefined ? {} : { session }),
   uninstallPlan: () => invoke<UninstallPlan>("uninstall_plan"),
   uninstallApp: () => invoke<void>("uninstall_app"),
-  // Settings → Relay (ST-M007-011). Only the installed copy keeps a relay;
-  // `save_relay` and `remove_relay` refuse in a copy that runs once. The
-  // certificate authority file is chosen in the system's dialog, opened by
+  // Settings → Relay (ST-M007-011). The installed copy keeps a relay in its
+  // settings; a copy that runs once in the file `cretlink.toml` next to its
+  // program, which `save_relay` writes and `remove_relay` removes. When that
+  // folder cannot be written, `save_relay` refuses with the stage
+  // `relay_folder` and the text for the file. The certificate authority file is chosen in the system's dialog, opened by
   // the backend. `test_relay` reaches the relay of the form as it stands,
   // or without a form the one this copy uses, and saves nothing.
   relaySettings: () => invoke<RelaySettings>("get_relay_settings"),

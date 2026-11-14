@@ -1333,6 +1333,40 @@ its certificate file; expect Windows to show the same publisher for
     Escape. With Narrator on, open the waiting screen on the relay again.
     - Expected: Escape cancels the wait. Narrator reads the relay code
       character by character and announces when the relay holds the code.
+15. **A technician copy that runs once (ST-M007-011).** Unpack the release
+    archive into a new folder of your own on the technician computer, with
+    no `cretlink.toml` in it, start `cretlink` and choose **Run once without
+    installing**. Open **Settings → Relay**.
+    - Expected: the same form as in the installed copy, empty. Above it the
+      screen names the file `cretlink.toml` in that folder, says that the
+      certificate file goes beside it as `relay-ca.pem` and that the key
+      stands in that file in readable form. The folder holds no new file.
+16. **Fill and Save.** Enter the relay's address and the technician's key
+    (and, for a relay with an authority of its own, choose its certificate
+    file), press **Test**, then **Save**.
+    - Expected: the test admits this copy and the folder is still unchanged;
+      after Save the folder holds `cretlink.toml` (and `relay-ca.pem`), the
+      screen says that the relay was saved next to the program, and the key
+      field is empty with "A key is set". The file holds the key in readable
+      form; on macOS and Linux `ls -l` shows `-rw-------`.
+17. **Close and open.** Close the program and start the same copy again with
+    **Run once without installing**; open **Settings → Relay**, and start a
+    session.
+    - Expected: the form is filled from the file, the key only as set. The
+      waiting screen offers **Use relay…** with the relay's host name; steps
+      3 to 6 work as with the installed copy.
+18. **Remove.** In **Settings → Relay** press **Remove…** and confirm.
+    - Expected: the question names both files before they go. Afterwards
+      `cretlink.toml` and `relay-ca.pem` are gone from the folder and the
+      form is empty; nothing else of CretLink is in the folder.
+19. **A folder that cannot be written.** Put the program in a folder that
+    the account cannot write (on Windows, for example, a folder under
+    `C:\Program Files` without administrator rights; on macOS and Linux a
+    folder with `chmod a-w`), run it once, fill the form and press **Save**.
+    - Expected: the screen says that the folder of the program cannot be
+      written and that nothing was changed, and shows the text for
+      `cretlink.toml` with a line in place of the key. The key appears
+      nowhere on the screen. No file appears in the folder.
 
 What the relay's log and metrics show for all of this is the labels of the
 two keys, the sizes and the times (ST-M007-014), never a command, a file name
@@ -1545,5 +1579,5 @@ hardware.
 | _pending_ | | | The webview profile folder on Windows (ST-M009-014): MT-10 step 2 (the folder in `%TEMP%` while Get help is open, gone after each way of closing, the folder of a killed copy listed by `recover` and removed by the next start, no `dev.cretlink.app`), MT-11 step 2 (a copy that runs once) and step 6 (the installed copy's profile, removed once its window has closed) | not yet recorded on hardware; on Linux the same was checked under a virtual display |
 | _pending_ | | | MT-13 (a technician's computer on several networks, ST-M009-016) | not yet recorded on hardware |
 | _pending_ | | | MT-16 (a customer keeps the support program: not offered without administrator rights or by a command, keep, what was added and nothing else, a session from the Start menu, the program that runs is what is kept, update and an older copy, the three ways to remove, keyboard and Narrator; with a standard and an administrator account, ST-M009-017) | not yet recorded on hardware |
-| _pending_ | | | MT-15 (a session through the relay between two networks: the offer, the wait and its code, pairing through a typed code, a session with a stop from each side, a code that nobody waits on, a withdrawn key, a relay that is off, a certificate that is not trusted, a relay that stops in the middle, the network first, a copy without a relay, ST-M007-013) | not yet recorded on hardware |
+| _pending_ | | | MT-15 (a session through the relay between two networks: the offer, the wait and its code, pairing through a typed code, a session with a stop from each side, a code that nobody waits on, a withdrawn key, a relay that is off, a certificate that is not trusted, a relay that stops in the middle, the network first, a copy without a relay, ST-M007-013; Settings → Relay in a copy that runs once, steps 15 to 19, ST-M007-011) | not yet recorded on hardware |
 | _pending_ | | | MT-14 (the file operations of the explorer: the drives, a folder with links / through a junction / a held file / cancel and stop / swapped while it is removed, a file sent to a folder on two drives and refused for a junction, ST-M010-001; browsing in the Files tab: nothing before the tab is opened, from folder to folder with one item for the customer, a typed path under its real name, links, a refused folder, a folder of thousands of entries, views, selection, keys and the context menu, a stop while a folder arrives, and the Narrator pass of the grid, ST-M010-002; a delete, a folder removal, a new folder and a move refused through a junction, after a swap and on a substituted drive, ST-M010-004) | not yet recorded on hardware |

@@ -37,7 +37,7 @@ import {
   withView,
   withViewport,
 } from "./explorer";
-import { type TechnicianSnapshot, initialSnapshot } from "./model";
+import { type TechnicianSnapshot, initialRelayDraft, initialSnapshot } from "./model";
 
 /** 2026-11-03 14:30:00 UTC: the fixtures' "now". */
 export const NOW = Date.UTC(2026, 10, 3, 14, 30, 0);
@@ -204,6 +204,7 @@ const PORTABLE_PROFILE_PATH = "C:\\Users\\sam\\Downloads\\cretlink.toml";
 /** The installed copy without a relay. */
 export const RELAY_NONE: RelaySettings = {
   editable: true,
+  keptIn: "settings",
   source: "none",
   file: { path: PROFILE_PATH },
   stored: { path: SETTINGS_PATH },
@@ -219,6 +220,7 @@ export const RELAY_STORED: RelaySettings = {
 /** A file next to the program, which wins over the relay of the settings. */
 export const RELAY_FILE: RelaySettings = {
   editable: true,
+  keptIn: "settings",
   source: "file",
   file: { path: PROFILE_PATH, relay: RELAY_PRIVATE },
   stored: { path: SETTINGS_PATH, relay: RELAY },
@@ -227,6 +229,7 @@ export const RELAY_FILE: RelaySettings = {
 /** A file next to the program that cannot be used. */
 export const RELAY_FILE_PROBLEM: RelaySettings = {
   editable: true,
+  keptIn: "settings",
   source: "file",
   file: {
     path: PROFILE_PATH,
@@ -240,18 +243,27 @@ export const RELAY_FILE_PROBLEM: RelaySettings = {
   stored: { path: SETTINGS_PATH },
 };
 
-/** A copy that runs once: no settings, and no file next to it. */
+const PORTABLE_CA_PATH = "C:\\Users\\sam\\Downloads\\relay-ca.pem";
+
+/**
+ * A copy that runs once without a file next to it: Save writes that file
+ * (ST-M007-011).
+ */
 export const RELAY_RUN_ONCE: RelaySettings = {
-  editable: false,
+  editable: true,
+  keptIn: "program_folder",
   source: "none",
   file: { path: PORTABLE_PROFILE_PATH },
+  stored: { path: PORTABLE_PROFILE_PATH },
+  caPath: PORTABLE_CA_PATH,
 };
 
-/** A copy that runs once with a profile file next to it. */
+/** A copy that runs once with a profile file next to it, which fills the form. */
 export const RELAY_RUN_ONCE_FILE: RelaySettings = {
-  editable: false,
+  ...RELAY_RUN_ONCE,
   source: "file",
   file: { path: PORTABLE_PROFILE_PATH, relay: RELAY },
+  stored: { path: PORTABLE_PROFILE_PATH, relay: RELAY },
 };
 
 export const CLIENTS: AiClientStatus[] = [
@@ -1468,6 +1480,25 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
     app: APP_RUN_ONCE,
     relay: RELAY_RUN_ONCE_FILE,
   },
+  "settings-relay-run-once-removing": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE_FILE,
+    relayDraft: { ...initialRelayDraft(), removing: true },
+  },
+  // A save that could not write next to the program: the text for the file,
+  // with a line in place of the key.
+  "settings-relay-run-once-by-hand": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE,
+    relayDraft: {
+      ...initialRelayDraft(),
+      byHand: '[relay]\naddress = "relay.example.org:443"\nkey = "the key of this copy"\n',
+    },
+  },
   // Make a customer copy (ST-M007-016): the step while the relay is looked
   // at, as a form on Windows and elsewhere, with what was chosen, with a
   // generated key, with the question about a folder that is there, and with
@@ -1586,6 +1617,7 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
     nav: "settings",
     relay: {
       editable: true,
+      keptIn: "settings",
       source: "file",
       file: {
         path: `C:\\${XSS_NAME}\\cretlink.toml`,

@@ -382,11 +382,14 @@ describe("not on the same network (ST-M007-013)", () => {
     expect(text(offer(show("wait-relay-unknown")))).toContain("set up your relay in Settings");
   });
 
-  it("says where the relay of a copy that runs once goes", () => {
+  it("sends a copy that runs once to Settings for its relay, like the installed copy", () => {
     const card = offer(show("wait-relay-run-once"));
-    expect(text(card)).toContain("put a file cretlink.toml for your relay next to the program");
-    expect(text(card)).toContain("Settings, under Relay, shows how");
+    expect(text(card)).toContain(
+      "This copy has no relay. To help someone on another network, set up your relay in Settings, under Relay.",
+    );
+    expect(text(card)).not.toContain("cretlink.toml");
     expect(card?.querySelector('[data-action="use-relay"]')).toBeNull();
+    expect(card?.querySelector<HTMLButtonElement>("button")?.dataset.arg).toBe("settings");
   });
 
   it("says that a relay profile cannot be used, with what is wrong and its file", () => {
@@ -1356,27 +1359,60 @@ describe("settings: the relay (ST-M007-011)", () => {
     expect(buttonNamed(card, "Test the relay")).toBeUndefined();
   });
 
-  it("tells a copy that runs once where its relay goes, and keeps nothing", () => {
+  it("gives a copy that runs once the form, and says where Save writes before it does", () => {
     const card = relayCard(show("settings-run-once"));
-    expect(text(card)).toContain(
-      "This copy runs once and keeps no settings. To use a relay with it, put a file named cretlink.toml next to the program:",
+    // Where the file and the certificate file go, and that the key stands
+    // there in readable form.
+    expect(text(card.querySelector("#relay-place"))).toContain(
+      "This copy runs once and keeps no settings. Save writes the relay to the file cretlink.toml next to the program, and the certificate file you choose beside it as relay-ca.pem:",
     );
     expect(text(card.querySelector(".relay-where"))).toBe("C:\\Users\\sam\\Downloads\\cretlink.toml");
-    expect(card.querySelector(".relay-example")?.textContent).toBe(
-      '[relay]\naddress = "relay.example.org:443"\nkey = "the key of this copy"',
+    expect(text(card)).toContain(
+      "The admission key stands in that file in readable form: whoever can read the folder of the program can read the key.",
     );
-    expect(card.querySelector("input")).toBeNull();
-    expect(buttonNamed(card, "Save")).toBeUndefined();
+    expect(text(card)).toContain("Save writes a copy of its certificates next to the program as relay-ca.pem");
+    expect(card.querySelector<HTMLInputElement>("#relay-address")?.value).toBe("");
+    expect(buttonNamed(card, "Save")).toBeDefined();
+    expect(buttonNamed(card, "Test the relay")).toBeDefined();
+    // Nothing to remove yet.
+    expect(buttonNamed(card, "Remove…")).toBeUndefined();
+    // No example text until a save could not write the file.
+    expect(card.querySelector(".relay-example")).toBeNull();
 
+    // A file next to the program fills the form; the key only as set.
     const withFile = relayCard(show("settings-relay-run-once-file"));
-    expect(text(withFile)).toContain("Relay relay.example.org");
-    expect(text(withFile)).toContain("Admission key Set (never shown)");
-    expect(text(withFile)).toContain(
-      "Certificate checked against The certificate authorities of this computer",
+    expect(withFile.querySelector<HTMLInputElement>("#relay-address")?.value).toBe(
+      "relay.example.org:443",
     );
+    expect(withFile.querySelector<HTMLInputElement>("#relay-key")?.value).toBe("");
+    expect(text(withFile)).toContain("A key is set. It is never shown.");
     // No settings to win over.
     expect(text(withFile)).not.toContain("wins over");
-    expect(buttonNamed(withFile, "Test the relay")).toBeDefined();
+    expect(buttonNamed(withFile, "Remove…")).toBeDefined();
+  });
+
+  it("names both files before a copy that runs once removes them", () => {
+    const card = relayCard(show("settings-relay-run-once-removing"));
+    const question = card.querySelector("#relay-remove-step");
+    expect(text(question)).toContain(
+      "Remove the relay relay.example.org from the folder of the program?",
+    );
+    expect(text(question)).toContain(
+      "The file C:\\Users\\sam\\Downloads\\cretlink.toml and the certificate file C:\\Users\\sam\\Downloads\\relay-ca.pem are deleted, with the admission key. A certificate file of another name stays.",
+    );
+  });
+
+  it("shows the text for the file when the folder of the program cannot be written", () => {
+    const card = relayCard(show("settings-relay-run-once-by-hand"));
+    const part = card.querySelector("#relay-by-hand");
+    expect(text(part)).toContain(
+      "The folder of the program cannot be written. Nothing was saved. To use this relay, put a file named cretlink.toml with this text next to the program yourself:",
+    );
+    expect(part?.querySelector(".relay-example")?.textContent).toBe(
+      '[relay]\naddress = "relay.example.org:443"\nkey = "the key of this copy"\n',
+    );
+    expect(text(part)).toContain("Put your key in place of the words of the key line.");
+    expect(text(part)).not.toContain("certificate file you chose");
   });
 
   it("says when the relay of this copy is not known yet", () => {

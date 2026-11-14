@@ -312,8 +312,9 @@ pub(crate) struct ThisCopy {
     /// The running program.
     pub(crate) exe: PathBuf,
     /// The layout of the install, only when this copy is the installed one:
-    /// the one copy that keeps settings. A copy that runs once has none and
-    /// writes nothing but its audit trail.
+    /// the one copy that keeps settings. A copy that runs once has none: it
+    /// writes nothing but its audit trail, and its relay file next to the
+    /// program when the technician saves a relay there.
     pub(crate) installed: Option<Layout>,
 }
 
