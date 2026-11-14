@@ -92,8 +92,8 @@ pub use fs::{
 pub use image::hold_running_program;
 pub use own::{
     OwnFolder, Standing, administrators_folder, administrators_own, earlier_release_folder,
-    earlier_release_in_use, kept_program_folder, prepare_program_folder, remove_whole,
-    require_administrator,
+    earlier_release_in_use, kept_program_folder, open_webview_profile, prepare_program_folder,
+    remove_whole, require_administrator,
 };
 pub use system::{job_folder, leave_the_starters_folder, system_folder, windows_folder};
 
