@@ -577,6 +577,33 @@ fn a_kept_program_that_runs_is_neither_replaced_nor_removed() {
     assert!(machine.system.entries.borrow().contains_key(UNINSTALL_KEY));
 }
 
+/// A program file that cannot be held as it is keeps nothing: the file that
+/// would be kept could be another one. Nothing was made for it.
+#[test]
+fn a_program_that_cannot_be_held_is_not_kept_and_nothing_is_made() {
+    let machine = Machine::new("not-held");
+    let plan = machine.plan("1.0.0").unwrap();
+    // The file under the path of the copy is gone when it is to be held.
+    fs::remove_file(machine.copy()).unwrap();
+    let before = machine.everything();
+
+    let error = keep(&machine.layout, &machine.system, &plan, true).unwrap_err();
+
+    assert!(matches!(error, KeptError::Program(_)), "{error}");
+    assert_eq!(error.stage(), "keep_program");
+    assert!(
+        error
+            .to_string()
+            .starts_with("the file of the program that runs could not be held as it is ("),
+        "{error}"
+    );
+    assert!(error.to_string().contains("nothing was kept"), "{error}");
+    assert_eq!(machine.everything(), before);
+    assert!(machine.system.folders.borrow().is_empty());
+    assert!(machine.system.shortcuts.borrow().is_empty());
+    assert!(machine.system.entries.borrow().is_empty());
+}
+
 #[test]
 fn nothing_is_written_through_what_is_no_file_or_no_folder() {
     // A folder stands where the program belongs.

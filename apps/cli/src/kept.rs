@@ -752,6 +752,10 @@ pub enum KeptError {
     Running(PathBuf),
     /// No program is kept, and nothing of one is there.
     NotKept(PathBuf),
+    /// The file of the program that runs could not be held unchanged, or is
+    /// not the image this process runs from: nothing is kept from a file
+    /// that could be another one.
+    Program(io::Error),
     /// A file or system step failed.
     Io {
         /// What was being done, as "could not \<stage\>".
@@ -781,6 +785,7 @@ impl KeptError {
             Self::NotNewer { .. } => "keep_older",
             Self::Running(_) => "keep_running",
             Self::NotKept(_) => "keep_absent",
+            Self::Program(_) => "keep_program",
             Self::Io { .. } => "keep_failed",
         }
     }
@@ -821,6 +826,12 @@ impl std::fmt::Display for KeptError {
                 f,
                 "CretLink Support is not kept on this computer (nothing of it in {})",
                 folder.display()
+            ),
+            Self::Program(source) => write!(
+                f,
+                "the file of the program that runs could not be held as it is ({source}); \
+                 nothing was kept, because what would be kept could be another file. Close \
+                 other programs that use this copy, then try again"
             ),
             Self::Io {
                 stage,
@@ -943,6 +954,10 @@ pub fn keep(
     if running {
         return Err(KeptError::Running(layout.exe.clone()));
     }
+    // The program that runs is held before anything is made: verified to be
+    // the image of this process, and closed to every change until it is
+    // written. When it cannot be held, nothing was added.
+    let source = system.hold_running_program().map_err(KeptError::Program)?;
     system
         .prepare_folder(&layout.folder)
         .map_err(|err| KeptError::io("make the folder of the kept program", &layout.folder, err))?;
@@ -973,10 +988,7 @@ pub fn keep(
     };
     write_record(layout, &record)?;
 
-    // The program that runs: held, verified, and read through that handle.
-    let source = system
-        .hold_running_program()
-        .map_err(|err| KeptError::io("hold the program that runs", &layout.exe, err))?;
+    // Read through the held file, never by a path.
     write_program(&source, &layout.exe)
         .map_err(|err| KeptError::io("write the program", &layout.exe, err))?;
     drop(source);
