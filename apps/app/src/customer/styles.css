@@ -56,6 +56,13 @@ body {
 .note.dev { align-items: center; flex-wrap: wrap; }
 .note.dev > span { flex: 1 1 240px; }
 .note.info { border-color: var(--cust-line); background: var(--cust-soft); color: var(--cust-deep); }
+/* A session through the relay (ST-M007-013). */
+.cbody .relay-host { overflow-wrap: anywhere; }
+.cbody .relay-explained { max-width: 420px; margin: 0; }
+.cbody p.relay-trust { max-width: 420px; margin: 0; font-size: 12.5px; }
+.cbody .via-relay { margin: 0; }
+.cbody.center .via-relay { margin-top: 6px; }
+.note.relay-lost > span { flex: 1; }
 .spinner.lg { width: 28px; height: 28px; border-width: 3px; }
 .provenance { margin: -4px 0 0; font-size: 12px; }
 

@@ -103,6 +103,14 @@ export interface SessionSummary {
   integrity: "verified" | "unsealed" | "broken";
   hostname?: string;
   os?: string;
+  // The host name of the relay the session ran through; absent for a session
+  // on one network (ST-M007-013).
+  relay?: string;
+  // Where the technician's copy connected to reach that relay, and what the
+  // relay's certificate was checked against, as the audit recorded them.
+  // Absent in a log from before they were recorded.
+  relayAddress?: string;
+  relayTrust?: RelayTrust;
   startedAt?: string;
   endedAt?: string;
   durationMs?: number;
@@ -191,6 +199,15 @@ export interface AiClientStatus {
   // anything changes (REQ-F-025).
   installPlan: string[];
   uninstallPlan: string[];
+}
+
+// `uninstall_plan`: what uninstalling this copy would remove and what it
+// would leave in place, one line each, before anything changes. What stays
+// includes a relay profile next to the installed program, with whether it
+// holds an admission key (ST-M007-011). The audit trail stays too.
+export interface UninstallPlan {
+  removes: string[];
+  stays: string[];
 }
 
 // --- The local MCP bridge, for the technician's rail (ST-M009-008) ---
@@ -408,6 +425,160 @@ export interface ListenNetwork {
   adapter: string;
   // A point-to-point link, as many VPN tunnels are.
   pointToPoint: boolean;
+}
+
+// --- The relay of this copy (ST-M007-011) ---
+
+// What the certificate of a relay is checked against: the certificate
+// authorities of the computer, or the certificate file that the relay
+// profile names and nothing else. A screen that names a relay says so when
+// it is the file (`shared/relay.ts`).
+export type RelayTrust = "system_authorities" | "profile_file";
+
+// A relay as a screen shows it. A relay profile is addressing only: it says
+// where two copies meet and grants nothing. The view never holds the
+// admission key, only whether there is one.
+export interface RelayView {
+  // The relay's host name: the name its certificate must carry.
+  host: string;
+  // Where it is reached: `host:port`.
+  address: string;
+  trust: RelayTrust;
+  keySet: boolean;
+  // The certificate authority file the profile names, next to it.
+  ca?: string;
+  // The name in the certificate, when the profile gives one.
+  name?: string;
+}
+
+export type RelayField = "address" | "key" | "ca" | "name";
+
+// A relay profile that cannot be used: the file, the setting and what is
+// wrong as a sentence. It never holds text from the file.
+export interface RelayProblem {
+  file: string;
+  field?: RelayField;
+  message: string;
+}
+
+// What one place says about a relay: the profile file next to the program,
+// or the settings of the installed copy.
+export interface RelayPlace {
+  path: string;
+  relay?: RelayView;
+  problem?: RelayProblem;
+}
+
+// `get_relay_settings`, and the answer of `save_relay` and `remove_relay`.
+export interface RelaySettings {
+  // Whether this copy keeps settings: only the installed copy does. A copy
+  // that runs once takes its relay from the file next to the program.
+  editable: boolean;
+  // Which profile this copy uses. A file next to the program wins over the
+  // settings, also when that file cannot be used.
+  source: "file" | "settings" | "none";
+  file: RelayPlace;
+  // What the settings hold; absent in a copy that keeps none.
+  stored?: RelayPlace;
+}
+
+// The relay as the form of Settings → Relay gives it (`save_relay`,
+// `test_relay`). A key travels to the backend only; none ever comes back:
+// `keep` leaves the kept key alone. The certificate authority file is chosen
+// in the system's dialog, opened by the backend, and named here by its
+// number: the window never holds a path of this computer.
+export interface RelayForm {
+  address: string;
+  keyMode: "keep" | "none" | "set";
+  key?: string;
+  caMode: "keep" | "none" | "chosen";
+  caPick?: number;
+  name?: string;
+}
+
+// `choose_relay_ca`: the number a form names the chosen file by, and its
+// file name for the words. `null` when the dialog was closed.
+export interface ChosenCa {
+  pick: number;
+  name: string;
+}
+
+// `test_relay`: what reaching the relay once came to, in words. `kind` is
+// `admitted`, or the name of the failure.
+export interface RelayTest {
+  ok: boolean;
+  kind: string;
+  message: string;
+  // What to do next; empty when the relay admits this copy.
+  next: string;
+}
+
+// --- Make a customer copy (ST-M007-016) ---
+
+// `customer_copy_options`: what a customer copy would hold, before anything
+// is typed. `relay` is the relay of this technician copy without any key:
+// the technician's own key is never part of a customer copy.
+export interface CustomerCopyOptions {
+  relay: RelayView;
+  // Where the program comes from: on Windows the copy is this program
+  // itself; elsewhere the technician points at `cretlink.exe` of a release.
+  program: "this_program" | "choose";
+  // The longest label: letters, digits and hyphens.
+  labelMax: number;
+  // The folder is named `folderPrefix` and the label; `programName` is the
+  // name of the program in it.
+  folderPrefix: string;
+  programName: string;
+}
+
+// `choose_customer_program` and `choose_customer_place`: what the technician
+// chose in the system's dialog, opened by the backend. The window names it
+// by its number and never sends a path of this computer; `name` is the
+// file's name or the folder's path, for the words. `null` when the dialog
+// was closed.
+export interface ChosenForCopy {
+  pick: number;
+  name: string;
+}
+
+// `generate_customer_key`: a new random admission key, drawn by the backend
+// from the system's random source. The window shows it once, with the label,
+// as the line `label:key` of the relay's key file; nothing keeps it but the
+// copy that is made with it.
+export interface GeneratedKey {
+  key: string;
+}
+
+// `make_customer_copy`. The key is the one the technician typed or had
+// generated for this customer; there is no way to ask for the technician's
+// own key. `replace` is the technician's answer to "a folder of that name is
+// there already".
+export interface CustomerCopyForm {
+  label: string;
+  keyMode: "set" | "none";
+  key?: string;
+  programPick?: number;
+  placePick?: number;
+  replace?: boolean;
+}
+
+// The answer of `make_customer_copy`: the folder that was written and the
+// names of its files. `copy` is the number `show_customer_copy` takes.
+// `setAside` is the folder that was replaced, when it could not be removed
+// and still lies beside the copy under another name.
+export interface CustomerCopyMade {
+  copy: number;
+  folder: string;
+  files: string[];
+  setAside?: string;
+}
+
+// The `console-notice` event: something the technician should know that is
+// not the failure of a command, with a next step.
+export interface ConsoleNotice {
+  title: string;
+  message: string;
+  next: string;
 }
 
 // --- This copy of the application (ST-M009-006, ST-M009-008) ---

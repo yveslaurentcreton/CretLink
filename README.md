@@ -81,9 +81,10 @@ unpacked. Its start screen offers, under **Give help**:
 
 `cretlink uninstall` (or **Uninstall** in Settings, or the Windows *Installed
 apps* entry) shows what it will remove and asks first, then removes the
-installed files, the shortcut or desktop entry, the uninstall entry and the AI
-client registrations the install made, but only while they still point at the
-installed copy. The audit trail stays. On macOS and Linux an installed copy
+installed files, the settings of the installed copy (its relay with its key,
+and the network it waits on), the shortcut or desktop entry, the uninstall
+entry and the AI client registrations the install made, but only while they
+still point at the installed copy. The audit trail stays. On macOS and Linux an installed copy
 opens Give help directly; a copy that is not installed shows the start screen
 so it can still be installed. A `CretLink-Support*` copy, for customers, never
 installs or uninstalls; the one command it accepts is `recover [--remove]`.
@@ -127,12 +128,27 @@ CretLink is under active development. Versions are `0.x` pre-releases;
   [release sign-off](docs/release-signoff.md) on the official files.
 - **Experimental:** the screenshot, input and clipboard tools, and the
   technician's interactive terminal.
-- **In progress:** sessions over the internet. The relay server, which forwards
-  only end-to-end encrypted traffic, is released and
-  [documented](docs/relay-server.md), but the application cannot use a relay
-  yet. Attended reboot-resume has its building blocks (a customer-armed,
-  single-use, expiring ticket that never restores control without fresh
-  consent) but is not wired into an actual reboot.
+- **In progress:** sessions over the internet, through a relay that you host
+  yourself and that forwards only end-to-end encrypted traffic. The relay
+  server is released and [documented](docs/relay-server.md). A copy of
+  CretLink is told which relay to use in a file `cretlink.toml` next to the
+  program or in **Settings → Relay** of the installed copy, and can test it
+  ([how](docs/relay-server.md#3-tell-a-copy-of-cretlink-which-relay-to-use)).
+  For a customer, **Settings → Relay → Make a customer copy…** writes one
+  folder to hand over: the support program and a `cretlink.toml` with your
+  relay and a key of that customer's own
+  ([how](docs/relay-server.md#make-a-customer-copy)).
+  With that, the technician chooses **Use relay** on the waiting screen and
+  reads out a relay code, the customer types it, and from there the session
+  is the one of one network: the same approval code on both screens, the
+  customer's permission, and a stop on either side
+  ([how](docs/relay-server.md#a-session-through-the-relay)). This is covered
+  by automated tests against a relay inside the test; it has not been run
+  between real computers on two networks yet
+  ([MT-15](docs/manual-tests.md)). Attended reboot-resume has
+  its building blocks (a customer-armed, single-use, expiring ticket that
+  never restores control without fresh consent) but is not wired into an
+  actual reboot.
 
 Official releases are built by the release workflow and ship with SHA-256
 checksums, a dependency inventory, and CycloneDX SBOMs.

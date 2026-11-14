@@ -8,11 +8,16 @@
 
 import { type Child, append, h } from "../../shared/dom";
 import { type IconName, icon } from "../../shared/icons";
+import { relayWords } from "../../shared/relay";
 import {
   type NavPage,
+  RELAY_LOST_STAGE,
   type Screen,
   type TechnicianSnapshot,
+  isRelayFailure,
   phaseAnnouncement,
+  relayFailureTitle,
+  relayLostWords,
   screenFor,
 } from "../model";
 import { aiView } from "./ai";
@@ -148,10 +153,30 @@ function phaseError(
 ): { title: string; message: string; next: string } | null {
   const phase = s.console.phase;
   if (phase.phase !== "failed") return null;
+  const everyone =
+    "Nobody has access to the customer computer. Start a new session when you are ready.";
+  // A session through a relay whose connection was lost before full
+  // control: the relay may have stopped (ST-M007-013).
+  if (phase.stage === RELAY_LOST_STAGE) {
+    const relay = s.console.relay;
+    return {
+      title: "The connection through the relay was lost",
+      ...(relay ? relayLostWords(relayWords(relay)) : { message: phase.message, next: everyone }),
+    };
+  }
+  // A relay that could not be used: its own words and its own next step. No
+  // customer was connected yet.
+  if (isRelayFailure(phase.stage)) {
+    return {
+      title: relayFailureTitle(phase.stage),
+      message: phase.message,
+      next: phase.next ?? everyone,
+    };
+  }
   return {
     title: "The session failed",
     message: `${phase.message} (${phase.stage})`,
-    next: "Nobody has access to the customer computer. Start a new session when you are ready.",
+    next: phase.next ?? everyone,
   };
 }
 

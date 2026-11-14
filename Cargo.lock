@@ -366,14 +366,17 @@ dependencies = [
  "cretlink-console",
  "cretlink-mcp",
  "cretlink-protocol",
+ "cretlink-relay",
  "cretlink-session",
  "cretlink-shared",
  "cretlink-support-agent",
+ "cretlink-wss",
  "jsonschema",
  "serde",
  "serde_json",
  "tokio",
  "windows",
+ "zeroize",
 ]
 
 [[package]]
@@ -567,6 +570,7 @@ dependencies = [
 name = "cretlink-wss"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "const-oid",
  "cretlink-wss",
  "futures-util",

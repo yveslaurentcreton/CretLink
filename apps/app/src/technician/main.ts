@@ -11,7 +11,13 @@
 
 import "./styles.css";
 import { listen } from "@tauri-apps/api/event";
-import type { ActivityEntry, AiClientStatus, ClientId } from "../shared/contract";
+import type {
+  ActivityEntry,
+  AiClientStatus,
+  ClientId,
+  RelayForm,
+  RelaySettings,
+} from "../shared/contract";
 import { type ActionEvent, bindActions } from "../shared/dom";
 import { morph } from "../shared/morph";
 import {
@@ -19,6 +25,7 @@ import {
   CONSOLE_BRIDGE_EVENT,
   CONSOLE_EXPLORER_DROP_EVENT,
   CONSOLE_EXPLORER_EVENT,
+  CONSOLE_NOTICE_EVENT,
   CONSOLE_REMOVAL_EVENT,
   CONSOLE_STATE_EVENT,
   CONSOLE_TRANSFERS_EVENT,
@@ -35,13 +42,27 @@ import {
   type UiError,
   applyConsole,
   canStop,
+  customerCopyForm,
+  initialRelayDraft,
   initialSnapshot,
   isActivityEvent,
   isAuditEntry,
   isBridgeStatus,
+  isChosenCa,
+  isChosenForCopy,
+  isConsoleNotice,
+  isCopyLabel,
+  isCustomerCopyMade,
+  isCustomerCopyOptions,
+  isGeneratedKey,
   isListenNetwork,
+  isRelaySettings,
+  isRelayTest,
+  isUninstallPlan,
+  keyFileLine,
   listenHost,
   placeholderConsole,
+  relayForm,
   screenFor,
   sessionCounts,
   summaryFor,
@@ -223,13 +244,17 @@ function adoptConsole(next: ConsoleState): void {
   }
   // Waiting on an address the list does not name yet: ask which networks this
   // computer has, so the screen can name the adapter and offer the others
-  // (ST-M009-016).
-  if (next.phase.phase === "listening") {
+  // (ST-M009-016). A wait on a relay listens on no network of this computer.
+  if (next.phase.phase === "listening" && !next.relay) {
     const host = listenHost(next.phase.address);
     const previous = snap.console.phase;
     if (previous.phase !== "listening" || listenHost(previous.address) !== host) {
       void loadNetworks();
     }
+    // The waiting screen offers the relay of this copy: read which one that
+    // is now, a profile file may have been put next to the program meanwhile
+    // (ST-M007-013).
+    if (previous.phase !== "listening") void loadRelay();
   }
   const wasFull = before === "full_control";
   // Transfers that the end of full control cuts short are said in the
@@ -301,6 +326,371 @@ async function loadAppInfo(): Promise<void> {
     set({ app: await api.getAppInfo() });
   } catch {
     set({ app: null });
+  }
+}
+
+// --- Settings → Relay (ST-M007-011) ---
+
+// The newest answer about the relay wins: a save, a removal and a look at
+// the settings may be on their way at once.
+let relayGeneration = 0;
+
+/** Which relay this copy uses, as the backend reads it now. */
+async function loadRelay(): Promise<void> {
+  relayGeneration += 1;
+  const generation = relayGeneration;
+  try {
+    const relay = await api.relaySettings();
+    if (generation === relayGeneration) set({ relay: isRelaySettings(relay) ? relay : null });
+  } catch {
+    // Not offered: the card says that it is not available yet.
+    if (generation === relayGeneration) set({ relay: null });
+  }
+}
+
+// The field of the form that a refusal of the backend is about.
+const RELAY_FIELDS: Record<string, string> = {
+  relay_address: "#relay-address",
+  relay_key: "#relay-key",
+  relay_ca: "#relay-ca-choose",
+  relay_name: "#relay-name",
+};
+
+/** A refusal about the relay: its words, and the field they are about. */
+function relayRefused(error: unknown, title: string, otherwise: string): void {
+  const field = isCommandError(error) ? RELAY_FIELDS[error.stage] : undefined;
+  if (field) focusNext = field;
+  set({
+    busy: undefined,
+    error: {
+      title,
+      // The backend's sentence stands alone: it names the setting already.
+      message: isCommandError(error) ? error.message : describe(error),
+      next: field ? "Correct it, then try again." : otherwise,
+    },
+  });
+}
+
+/** The form of Settings → Relay as it stands; none when no form is shown. */
+function readRelayForm(): RelayForm | undefined {
+  const input = (id: string): HTMLInputElement | null | undefined =>
+    live?.querySelector<HTMLInputElement>(`#${id}`);
+  const address = input("relay-address");
+  if (!address) return undefined;
+  return relayForm(
+    {
+      address: address.value,
+      key: input("relay-key")?.value ?? "",
+      removeKey: input("relay-key-remove")?.checked ?? false,
+      name: input("relay-name")?.value ?? "",
+    },
+    snap.relayDraft,
+    snap.relay?.stored?.relay,
+  );
+}
+
+/**
+ * Adopts what the backend says the settings hold now, with an empty form.
+ * The form is drawn anew, which would leave the keyboard nowhere: `focus`
+ * names where it goes instead.
+ */
+function relayChanged(relay: RelaySettings, notice: string, focus: string): void {
+  relayGeneration += 1;
+  focusNext = focus;
+  set({
+    busy: undefined,
+    relay,
+    // A new form: no typed key stays in a field.
+    relayDraft: initialRelayDraft(snap.relayDraft.round + 1),
+    // A customer copy names the relay as it was: the step closes with it.
+    customerCopy: undefined,
+    notice,
+  });
+}
+
+async function saveRelay(): Promise<void> {
+  const form = readRelayForm();
+  if (!form || snap.busy !== undefined) return;
+  set({ busy: "relay-save", error: undefined });
+  try {
+    const relay = await api.saveRelay(form);
+    if (!isRelaySettings(relay)) throw new Error("The settings could not be read back.");
+    const host = relay.stored?.relay?.host;
+    relayChanged(
+      relay,
+      host ? `The relay ${host} was saved.` : "The relay was saved.",
+      // Where the technician was: on Save.
+      '[data-action="relay-save"]',
+    );
+  } catch (error) {
+    // The backend's sentence says whether anything was changed.
+    relayRefused(error, "The relay was not saved", "Try again.");
+  }
+}
+
+async function removeRelay(): Promise<void> {
+  if (snap.busy !== undefined) return;
+  set({ busy: "relay-remove", error: undefined });
+  try {
+    const relay = await api.removeRelay();
+    if (!isRelaySettings(relay)) throw new Error("The settings could not be read back.");
+    relayChanged(
+      relay,
+      "The relay was removed from the settings.",
+      // The question is gone: on to the empty form, or to the relay of the
+      // file that is in use.
+      '#relay-address, [data-action="relay-test"]',
+    );
+  } catch (error) {
+    relayRefused(error, "The relay was not removed", "Try again.");
+  }
+}
+
+/** Closes "Remove the relay?" and gives the focus back to what opened it. */
+function closeRelayQuestion(): void {
+  focusNext = '[data-action="relay-remove"]';
+  set({ relayDraft: { ...snap.relayDraft, removing: false } });
+}
+
+/** Reaches the relay of the form as it stands, or the one this copy uses. */
+async function testRelay(): Promise<void> {
+  if (snap.busy !== undefined || snap.relayDraft.test?.state === "running") return;
+  const form = readRelayForm();
+  const round = snap.relayDraft.round;
+  set({ relayDraft: { ...snap.relayDraft, test: { state: "running" } }, error: undefined });
+  try {
+    const result = await api.testRelay(form);
+    // The form was saved or removed meanwhile: the result is of another relay.
+    if (snap.relayDraft.round !== round) return;
+    if (!isRelayTest(result)) throw new Error("The test gave no result.");
+    set({ relayDraft: { ...snap.relayDraft, test: { state: "done", result } } });
+  } catch (error) {
+    if (snap.relayDraft.round !== round) return;
+    set({ relayDraft: { ...snap.relayDraft, test: undefined } });
+    relayRefused(error, "The relay could not be tested", "Check the relay settings.");
+  }
+}
+
+/** The system's dialog for the certificate authority file of the relay. */
+async function chooseRelayCa(): Promise<void> {
+  if (snap.busy !== undefined) return;
+  set({ busy: "relay-ca", error: undefined });
+  try {
+    const chosen = await api.chooseRelayCa();
+    if (chosen === null) {
+      set({ busy: undefined });
+      return;
+    }
+    if (!isChosenCa(chosen)) throw new Error("The file could not be read.");
+    set({
+      busy: undefined,
+      relayDraft: {
+        ...snap.relayDraft,
+        ca: { mode: "chosen", pick: chosen.pick, name: chosen.name },
+        test: undefined,
+      },
+      notice: `${chosen.name} is chosen. It is kept when you save.`,
+    });
+  } catch (error) {
+    relayRefused(
+      error,
+      "That certificate file cannot be used",
+      "Choose the PEM file of the authority that signed the relay's certificate.",
+    );
+  }
+}
+
+// --- Make a customer copy (ST-M007-016) ---
+
+// The field of the step that a refusal of the backend is about.
+const COPY_FIELDS: Record<string, string> = {
+  copy_label: "#copy-label",
+  copy_key: "#copy-key, #copy-generate",
+  copy_program: "#copy-program-choose",
+  copy_place: "#copy-place-choose",
+};
+
+/** A refusal about a customer copy: its words, and the field they are about. */
+function copyRefused(error: unknown, title: string, otherwise: string): void {
+  const field = isCommandError(error) ? COPY_FIELDS[error.stage] : undefined;
+  if (field) focusNext = field;
+  set({
+    busy: undefined,
+    error: {
+      title,
+      // The backend's sentence stands alone: it says what is asked.
+      message: isCommandError(error) ? error.message : describe(error),
+      next: field ? "Correct it, then try again." : otherwise,
+    },
+  });
+}
+
+/** Opens the step and asks the backend what a copy of this relay would hold. */
+async function openCustomerCopy(): Promise<void> {
+  if (snap.busy !== undefined || snap.customerCopy) return;
+  focusNext = "#copy-step";
+  set({ customerCopy: { options: null }, error: undefined });
+  try {
+    const options = await api.customerCopyOptions();
+    // The step was closed meanwhile.
+    if (!snap.customerCopy) return;
+    if (!isCustomerCopyOptions(options)) throw new Error("The relay of this copy could not be read.");
+    focusNext = "#copy-label";
+    set({ customerCopy: { options } });
+  } catch (error) {
+    focusNext = "#copy-open";
+    set({
+      customerCopy: undefined,
+      error: {
+        title: "A customer copy cannot be made",
+        message: isCommandError(error) ? error.message : describe(error),
+        next: "A customer copy names the relay of this copy. Check the relay above, then try again.",
+      },
+    });
+    void loadRelay();
+  }
+}
+
+/** Closes the step. What was typed or generated is forgotten with it. */
+function closeCustomerCopy(): void {
+  focusNext = "#copy-open";
+  set({ customerCopy: undefined });
+}
+
+/** The system's dialog for the program of a copy, or for where to make it. */
+async function chooseForCopy(what: "program" | "place"): Promise<void> {
+  if (snap.busy !== undefined || !snap.customerCopy) return;
+  set({ busy: `copy-${what}`, error: undefined });
+  try {
+    const chosen =
+      what === "program" ? await api.chooseCustomerProgram() : await api.chooseCustomerPlace();
+    if (!snap.customerCopy || chosen === null) {
+      set({ busy: undefined });
+      return;
+    }
+    if (!isChosenForCopy(chosen)) throw new Error("The choice could not be read.");
+    set({ busy: undefined, customerCopy: { ...snap.customerCopy, [what]: chosen } });
+  } catch (error) {
+    copyRefused(
+      error,
+      what === "program" ? "That file cannot be the program of a copy" : "That folder cannot be used",
+      "Choose again.",
+    );
+  }
+}
+
+/** What stands in the fields of the step. */
+function copyFields(): { label: string; key: string; noKey: boolean } {
+  const input = (id: string): HTMLInputElement | null | undefined =>
+    live?.querySelector<HTMLInputElement>(`#${id}`);
+  return {
+    label: input("copy-label")?.value ?? "",
+    key: input("copy-key")?.value ?? "",
+    noKey: input("copy-no-key")?.checked ?? false,
+  };
+}
+
+/**
+ * **Generate**: a new key from the backend's random source, shown with the
+ * label as the line of the relay's key file. The label must stand first: it
+ * is half of that line.
+ */
+async function generateCustomerKey(): Promise<void> {
+  const draft = snap.customerCopy;
+  if (snap.busy !== undefined || !draft?.options) return;
+  const label = copyFields().label.trim();
+  if (!isCopyLabel(label, draft.options.labelMax)) {
+    focusNext = "#copy-label";
+    set({
+      error: {
+        title: "Give the copy a label first",
+        message: `The label holds letters, digits and hyphens only, at least one and at most ${draft.options.labelMax}. It is the name the key is listed under in the relay's key file.`,
+        next: "Type the label, then generate the key.",
+      },
+    });
+    return;
+  }
+  set({ busy: "copy-generate", error: undefined });
+  try {
+    const generated = await api.generateCustomerKey();
+    if (!snap.customerCopy) {
+      set({ busy: undefined });
+      return;
+    }
+    if (!isGeneratedKey(generated)) throw new Error("No key was generated.");
+    // The keyboard was on Generate, which is gone: on to Copy.
+    focusNext = '[data-action="copy-key-line"]';
+    set({
+      busy: undefined,
+      customerCopy: { ...snap.customerCopy, generated: { label, key: generated.key } },
+      notice: "A new key was generated. It is shown once, with its line for the key file.",
+    });
+  } catch (error) {
+    copyRefused(error, "No key was generated", "Try again, or type a key.");
+  }
+}
+
+/** Copies the line `label:key` of the generated key. */
+async function copyKeyLine(): Promise<void> {
+  const generated = snap.customerCopy?.generated;
+  if (!generated) return;
+  try {
+    if (!navigator.clipboard) throw new Error("no clipboard");
+    await navigator.clipboard.writeText(keyFileLine(generated.label, generated.key));
+    set({ notice: "The line for the key file was copied." });
+  } catch {
+    set({ notice: "The line could not be copied. Select it and copy it by hand." });
+  }
+}
+
+/**
+ * **Make the copy**. `replace` is the technician's answer to "a folder of
+ * that name is there already"; without it such a folder is never touched.
+ */
+async function makeCustomerCopy(replace: boolean): Promise<void> {
+  const draft = snap.customerCopy;
+  if (snap.busy !== undefined || !draft?.options || draft.made) return;
+  const form = customerCopyForm(copyFields(), draft, replace);
+  set({ busy: "copy-make", error: undefined });
+  try {
+    const made = await api.makeCustomerCopy(form);
+    if (!isCustomerCopyMade(made)) throw new Error("The result could not be read.");
+    focusNext = "#copy-step";
+    const { replacing: _asked, ...rest } = snap.customerCopy ?? draft;
+    set({
+      busy: undefined,
+      customerCopy: { ...rest, made },
+      notice: `The customer copy was written to ${made.folder}.`,
+    });
+  } catch (error) {
+    if (isCommandError(error) && error.stage === "copy_exists" && snap.customerCopy) {
+      // Nothing was changed. The technician is asked.
+      focusNext = "#copy-replace-step [data-autofocus]";
+      set({ busy: undefined, customerCopy: { ...snap.customerCopy, replacing: error.message } });
+      return;
+    }
+    if (snap.customerCopy?.replacing !== undefined) {
+      const { replacing: _asked, ...rest } = snap.customerCopy;
+      snap = { ...snap, customerCopy: rest };
+    }
+    copyRefused(error, "The customer copy was not made", "Try again.");
+  }
+}
+
+/** **Show in folder**: the folder that was written, in the file manager. */
+async function showCustomerCopy(): Promise<void> {
+  const made = snap.customerCopy?.made;
+  if (!made || snap.busy !== undefined) return;
+  try {
+    await api.showCustomerCopy(made.copy);
+  } catch (error) {
+    set({
+      error: {
+        title: "The folder could not be shown",
+        message: isCommandError(error) ? error.message : describe(error),
+        next: `Open ${made.folder} in your file manager.`,
+      },
+    });
   }
 }
 
@@ -377,6 +767,63 @@ async function switchNetwork(address: string): Promise<void> {
     }
   }
   void loadNetworks();
+}
+
+/**
+ * **Use relay** on the waiting screen (ST-M007-013): stop waiting on the
+ * network and wait for the customer on the relay of this copy.
+ */
+async function useRelay(): Promise<void> {
+  const phase = snap.console.phase;
+  if (phase.phase !== "listening" || snap.console.relay || snap.busy !== undefined) return;
+  set({ busy: "relay", error: undefined, networksOpen: false });
+  try {
+    const next = await api.useRelay();
+    // The answer is the waiting state on the relay. States were pushed
+    // meanwhile; the answer is adopted unless the relay has already answered
+    // or failed, which is newer.
+    snap = { ...snap, busy: undefined };
+    const now = snap.console.phase.phase;
+    const newer = snap.console.relay !== undefined && now !== "stopped";
+    if (!newer && (now === "stopped" || now === "listening" || now === "idle")) {
+      adoptConsole(next);
+    }
+    // The keyboard was on **Use relay**, which is gone: on to Cancel.
+    focusNext = "#stop";
+    set({});
+    // The backend read the profile again for this wait: so does the screen,
+    // which says where the relay comes from (ST-M007-011).
+    void loadRelay();
+  } catch (error) {
+    // Nothing changed, or the listener is gone already: show what the backend
+    // says now, and why the relay was not used.
+    set({
+      busy: undefined,
+      error: {
+        title: "The relay was not used",
+        message: isCommandError(error) ? error.message : describe(error),
+        next: relayRefusalNext(error),
+      },
+    });
+    try {
+      adoptConsole(await api.getState());
+    } catch {
+      // The state stays as it was pushed.
+    }
+    void loadRelay();
+  }
+}
+
+/** What to do when **Use relay** was refused, by why it was. */
+function relayRefusalNext(error: unknown): string {
+  const stage = isCommandError(error) ? error.stage : "";
+  switch (stage) {
+    case "relay_none":
+    case "relay_profile":
+      return "Open Settings, under Relay, to set up or correct the relay of this copy. The session on this network is unchanged.";
+    default:
+      return "Try again. If the session is no longer waiting, start a new one.";
+  }
 }
 
 // Bumped when a new session starts, so an older `get_session_audit` answer
@@ -489,7 +936,13 @@ function onAction(event: ActionEvent): void {
           endDismissed: true,
           confirm: undefined,
           uninstall: undefined,
+          relayDraft: { ...snap.relayDraft, removing: false },
+          // A generated key is shown once: the step does not wait behind
+          // another page with the key still in it.
+          customerCopy: undefined,
         });
+        // A profile file may have been put next to the program meanwhile.
+        if (arg === "settings") void loadRelay();
       }
       break;
     case "tab":
@@ -522,6 +975,9 @@ function onAction(event: ActionEvent): void {
       break;
     case "network":
       if (arg) void switchNetwork(arg);
+      break;
+    case "use-relay":
+      void useRelay();
       break;
     case "open-audit":
       void openAudit(arg);
@@ -558,6 +1014,73 @@ function onAction(event: ActionEvent): void {
     case "uninstall-confirm":
       void uninstall();
       break;
+    case "relay-save":
+      void saveRelay();
+      break;
+    case "relay-test":
+      void testRelay();
+      break;
+    case "relay-ca-choose":
+      void chooseRelayCa();
+      break;
+    case "relay-ca-none":
+      // This button goes away with the file: the focus moves to its neighbour.
+      focusNext = "#relay-ca-choose";
+      set({ relayDraft: { ...snap.relayDraft, ca: { mode: "none" }, test: undefined } });
+      break;
+    case "relay-remove":
+      focusNext = "#relay-remove-step [data-autofocus]";
+      set({ relayDraft: { ...snap.relayDraft, removing: true } });
+      break;
+    case "relay-remove-cancel":
+      closeRelayQuestion();
+      break;
+    case "relay-remove-confirm":
+      void removeRelay();
+      break;
+    case "copy-open":
+      void openCustomerCopy();
+      break;
+    case "copy-cancel":
+    case "copy-done":
+      closeCustomerCopy();
+      break;
+    case "copy-program":
+      void chooseForCopy("program");
+      break;
+    case "copy-place":
+      void chooseForCopy("place");
+      break;
+    case "copy-generate":
+      void generateCustomerKey();
+      break;
+    case "copy-discard-key":
+      if (snap.customerCopy) {
+        // The key is forgotten here; the label can be changed again.
+        focusNext = "#copy-key";
+        const { generated: _discarded, ...rest } = snap.customerCopy;
+        set({ customerCopy: rest });
+      }
+      break;
+    case "copy-key-line":
+      void copyKeyLine();
+      break;
+    case "copy-make":
+      void makeCustomerCopy(false);
+      break;
+    case "copy-replace":
+      void makeCustomerCopy(true);
+      break;
+    case "copy-replace-cancel":
+      if (snap.customerCopy) {
+        focusNext = "#copy-make";
+        const { replacing: _asked, ...rest } = snap.customerCopy;
+        set({ customerCopy: rest });
+      }
+      break;
+    case "copy-show":
+      void showCustomerCopy();
+      break;
     default:
       // The controls of the file explorer.
       if (action.startsWith("xp-")) explorer.onAction(event);
@@ -567,10 +1090,12 @@ function onAction(event: ActionEvent): void {
 
 // A pure clipboard convenience; no backend authority is involved.
 async function copy(text: string): Promise<void> {
+  // Said by its name: a relay code is not the connection code.
+  const what = snap.console.relay ? "Relay code" : "Connection code";
   try {
     if (!navigator.clipboard) throw new Error("no clipboard");
     await navigator.clipboard.writeText(text);
-    set({ notice: "Connection code copied." });
+    set({ notice: `${what} copied.` });
   } catch {
     set({ notice: "The code could not be copied. Read it out instead." });
   }
@@ -633,8 +1158,9 @@ async function loadUninstallPlan(): Promise<void> {
   set({ uninstall: { plan: null }, busy: "uninstall-plan", error: undefined });
   try {
     const plan = await api.uninstallPlan();
+    if (!isUninstallPlan(plan)) throw new Error("The plan could not be read.");
     focusNext = "#uninstall-step";
-    set({ uninstall: { plan: Array.isArray(plan) ? plan : [] }, busy: undefined });
+    set({ uninstall: { plan: plan.removes, stays: plan.stays }, busy: undefined });
   } catch (error) {
     set({
       uninstall: undefined,
@@ -695,6 +1221,8 @@ function onKeydown(event: KeyboardEvent): void {
       set({ confirm: undefined });
     } else if (snap.uninstall) {
       set({ uninstall: undefined });
+    } else if (snap.relayDraft.removing) {
+      closeRelayQuestion();
     }
     return;
   }
@@ -763,6 +1291,11 @@ export async function start(options: StartOptions = {}): Promise<void> {
       set({ bridge: event.payload });
     }
   });
+  // What the backend has to say that is not the failure of a command, such
+  // as a network choice that could not be saved (ST-M007-011).
+  await listen<unknown>(CONSOLE_NOTICE_EVENT, (event) => {
+    if (isConsoleNotice(event.payload)) set({ error: event.payload });
+  });
   // The pages of a folder the explorer opened (ST-M010-002).
   await listen<unknown>(CONSOLE_EXPLORER_EVENT, (event) => explorer.onEvent(event.payload));
   // What was dropped on the window, the transfer queue and a delete that runs.
@@ -789,6 +1322,7 @@ export async function start(options: StartOptions = {}): Promise<void> {
     loadActivity(),
     loadAudit(),
     loadBridge(),
+    loadRelay(),
     refreshSessions(),
     refreshClients(),
   ]);

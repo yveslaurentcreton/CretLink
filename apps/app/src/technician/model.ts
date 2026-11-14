@@ -19,9 +19,22 @@ import type {
   AuditOutcome,
   BridgeStatus,
   CleanupResult,
+  ChosenCa,
   ClientId,
+  ConsoleNotice,
   EndedBy,
   ListenNetwork,
+  RelayForm,
+  RelayPlace,
+  RelaySettings,
+  RelayTest,
+  ChosenForCopy,
+  CustomerCopyForm,
+  CustomerCopyMade,
+  CustomerCopyOptions,
+  GeneratedKey,
+  RelayView,
+  UninstallPlan,
   SessionSummary,
 } from "../shared/contract";
 import {
@@ -37,7 +50,14 @@ import {
   trimFeed,
   upsertActivity,
 } from "../shared/feed";
-import { type ConsoleState, type StopReason, type TargetIdentity, selectedTarget } from "./api";
+import { relayWords } from "../shared/relay";
+import {
+  type ConsoleState,
+  type RelayRoute,
+  type StopReason,
+  type TargetIdentity,
+  selectedTarget,
+} from "./api";
 import { type ExplorerState, initialExplorer } from "./explorer";
 
 // The role-neutral feed helpers live in `../shared/feed` (ST-M009-009).
@@ -85,6 +105,82 @@ export interface AiConfirm {
   replace: boolean;
 }
 
+/**
+ * What the form of Settings → Relay holds beside its typed fields: which
+ * certificate authority file the relay is checked against, the result of the
+ * last test, and the question before a relay is removed (ST-M007-011).
+ */
+export interface RelayDraft {
+  // `keep` the file the settings hold, use `none`, or the file just `chosen`.
+  ca: { mode: "keep" } | { mode: "none" } | { mode: "chosen"; pick: number; name: string };
+  test?: { state: "running" } | { state: "done"; result: RelayTest };
+  // "Remove the relay?" is being asked.
+  removing?: boolean;
+  // Counts what was saved or removed: a new number draws the form anew, so
+  // that no typed key stays in a field.
+  round: number;
+}
+
+export function initialRelayDraft(round = 0): RelayDraft {
+  return { ca: { mode: "keep" }, round };
+}
+
+/**
+ * The step **Make a customer copy…** of Settings → Relay (ST-M007-016): what
+ * it holds beside the typed label and key.
+ */
+export interface CustomerCopyDraft {
+  // What a copy would hold, as the backend said; `null` while it is asked.
+  options: CustomerCopyOptions | null;
+  // `cretlink.exe` of a release, where the technician chooses the program.
+  program?: ChosenForCopy;
+  // The folder the copy is made in.
+  place?: ChosenForCopy;
+  // A key that was generated for this customer, with the label it was
+  // generated for: together they are the line of the relay's key file. The
+  // label cannot be changed while the key is there.
+  generated?: { label: string; key: string };
+  // "A folder of that name is there already": the backend's sentence, while
+  // the technician is asked whether to replace it.
+  replacing?: string;
+  // The copy that was written.
+  made?: CustomerCopyMade;
+}
+
+/** Whether `label` can name a customer copy: letters, digits and hyphens. */
+export function isCopyLabel(label: string, max: number): boolean {
+  return label.length >= 1 && label.length <= max && /^[A-Za-z0-9-]+$/.test(label);
+}
+
+/** The line of the relay's key file for a customer copy: `label:key`. */
+export function keyFileLine(label: string, key: string): string {
+  return `${label}:${key}`;
+}
+
+/**
+ * Reads the step as the backend takes it. The key is the generated one, or
+ * the one that was typed; the technician's own key is not among the
+ * choices. With `noKey` ticked, for a relay that asks for none, the copy
+ * holds no key, whatever stands in the field. A generated key is a key that
+ * was asked for: it is used.
+ */
+export function customerCopyForm(
+  fields: { label: string; key: string; noKey: boolean },
+  draft: CustomerCopyDraft,
+  replace = false,
+): CustomerCopyForm {
+  const noKey = fields.noKey && draft.generated === undefined;
+  const form: CustomerCopyForm = {
+    label: draft.generated?.label ?? fields.label.trim(),
+    keyMode: noKey ? "none" : "set",
+  };
+  if (!noKey) form.key = draft.generated?.key ?? fields.key;
+  if (draft.program) form.programPick = draft.program.pick;
+  if (draft.place) form.placePick = draft.place.pick;
+  if (replace) form.replace = true;
+  return form;
+}
+
 export interface TechnicianSnapshot {
   console: ConsoleState;
   // The feed of the current or last session, oldest first.
@@ -117,9 +213,17 @@ export interface TechnicianSnapshot {
   // The end report is still being read from the sealed audit file.
   reportPending: boolean;
   confirm?: AiConfirm;
-  // The uninstall plan, shown before anything is removed; `null` while loading.
-  uninstall?: { plan: string[] | null };
+  // The uninstall plan, shown before anything is removed; `null` while
+  // loading. `stays` is what uninstall leaves in place, beside the audit
+  // trail: a relay profile next to the program, for one (ST-M007-011).
+  uninstall?: { plan: string[] | null; stays?: string[] };
   uninstalled?: boolean;
+  // Which relay this copy uses and where that comes from (ST-M007-011);
+  // `null` until the backend has said.
+  relay: RelaySettings | null;
+  relayDraft: RelayDraft;
+  // The step **Make a customer copy…**, while it is open (ST-M007-016).
+  customerCopy?: CustomerCopyDraft;
   // The file explorer of the Files tab (ST-M010-002): where it stands in the
   // customer computer's files, and what is listed there. It belongs to one
   // session: it starts empty with full control and is dropped when that ends.
@@ -163,6 +267,8 @@ export function initialSnapshot(console: ConsoleState, now: number): TechnicianS
     tab: "overview",
     endDismissed: false,
     reportPending: false,
+    relay: null,
+    relayDraft: initialRelayDraft(),
     explorer: initialExplorer(),
     now,
   };
@@ -218,8 +324,9 @@ function isEndPhase(phase: PhaseName): boolean {
 export function screenFor(s: TechnicianSnapshot): Screen {
   const phase = s.console.phase.phase;
   // A change of network stops waiting on one address and starts on another:
-  // the screen stays the waiting screen in between (ST-M009-016).
-  if (s.busy === "network") return "wait";
+  // the screen stays the waiting screen in between (ST-M009-016). So does the
+  // change from the network to the relay (ST-M007-013).
+  if (s.busy === "network" || s.busy === "relay") return "wait";
   if (phase === "full_control") return "live";
   if (phase === "stopping") return "stopping";
   if (SESSION_PHASES.includes(phase) && s.nav === "home") {
@@ -614,8 +721,13 @@ export function formatWhen(at: string | undefined, now: number): string {
 export function phaseAnnouncement(s: TechnicianSnapshot): string {
   const phase = s.console.phase;
   switch (phase.phase) {
-    case "listening":
-      return "Waiting for the customer. No access.";
+    case "listening": {
+      const relay = s.console.relay;
+      if (!relay) return "Waiting for the customer. No access.";
+      return relay.admitted
+        ? `Waiting for the customer on the relay ${relayWords(relay)}. Read them the relay code. No access.`
+        : `Connecting to the relay ${relayWords(relay)}. No access.`;
+    }
     case "connecting":
       return "The customer is connecting. No access yet.";
     case "awaiting_approval_code":
@@ -645,6 +757,265 @@ export function isListenNetwork(value: unknown): value is ListenNetwork {
     typeof network.adapter === "string" &&
     typeof network.pointToPoint === "boolean"
   );
+}
+
+// --- A session through the relay (ST-M007-013) ---
+
+/** The relay the console waits on, while it waits for the customer there. */
+export function waitingRelay(console: ConsoleState): RelayRoute | undefined {
+  return console.phase.phase === "listening" ? console.relay : undefined;
+}
+
+/** A relay code as the groups it is read in: `53ST-A71D-JKKV-0VGH` is four. */
+export function relayCodeGroups(code: string): string[] {
+  return code.split("-").filter((group) => group !== "");
+}
+
+/** A relay code as a screen reader says it: every character on its own. */
+export function spokenCode(code: string): string {
+  return relayCodeGroups(code)
+    .map((group) => Array.from(group).join(" "))
+    .join(", ");
+}
+
+/** What the waiting screen can say about a relay for this copy. */
+export type RelayOffer =
+  // A relay that can be used: its name, where this copy connects and what
+  // vouches for the name. `fromFile` is the profile file next to the program
+  // when the installed copy takes its relay from there and not from
+  // Settings.
+  | { state: "ready"; relay: RelayView; fromFile?: string }
+  // No relay. `runOnce`: this copy keeps no settings, so a relay goes into
+  // the file next to the program.
+  | { state: "none"; runOnce: boolean }
+  // A profile that cannot be used: what is wrong, and the file.
+  | { state: "problem"; message: string; file: string };
+
+/**
+ * The profile file next to the program, when the installed copy takes its
+ * relay from it (ST-M007-011). Settings is where the technician of an
+ * installed copy sets the relay up; a file next to the program wins over it,
+ * and whoever can write there chose the relay. The waiting screen says so. A
+ * copy that runs once has no other place for a relay: there is nothing to
+ * say.
+ */
+export function relayFromFile(settings: RelaySettings | null): string | undefined {
+  return settings?.editable && settings.source === "file" && settings.file.relay
+    ? settings.file.path
+    : undefined;
+}
+
+export function relayOffer(settings: RelaySettings | null): RelayOffer {
+  const relay = activeRelay(settings);
+  if (relay) {
+    const fromFile = relayFromFile(settings);
+    return fromFile === undefined
+      ? { state: "ready", relay }
+      : { state: "ready", relay, fromFile };
+  }
+  const place = settings?.source === "file" ? settings.file : settings?.stored;
+  if (place?.problem) {
+    return { state: "problem", message: place.problem.message, file: place.problem.file };
+  }
+  return { state: "none", runOnce: settings !== null && !settings.editable };
+}
+
+/** The stage of a relay that could not be used: `relay_unreachable`, … */
+export function isRelayFailure(stage: string): boolean {
+  return stage.startsWith("relay_");
+}
+
+/**
+ * The stage of a session through a relay that lost its connection before it
+ * was under control. The backend takes it from the session's own verdict.
+ */
+export const RELAY_LOST_STAGE = "relay_lost";
+
+const RELAY_FAILURE_TITLES: Record<string, string> = {
+  relay_unreachable: "The relay cannot be reached",
+  relay_name_not_found: "The relay was not found",
+  relay_untrusted: "The relay's certificate is not trusted",
+  relay_no_answer: "The relay did not answer",
+  relay_key_required: "The relay asks for an admission key",
+  relay_key_refused: "The relay refused the admission key",
+  relay_rate_limited: "The relay asks you to wait",
+  relay_busy: "The relay is full",
+  relay_unavailable: "The relay admits nobody right now",
+  relay_version: "The relay and this copy do not fit together",
+  relay_settings: "The relay settings cannot be used",
+};
+
+/** What a relay failure is called, in a few words. */
+export function relayFailureTitle(stage: string): string {
+  return RELAY_FAILURE_TITLES[stage] ?? "The relay could not be used";
+}
+
+/**
+ * Why a session through a relay ended, when its connection was lost: said
+ * with the relay (`relayWords`: its name, and where it is reached when that
+ * differs), so that it does not read as a lost session of unknown
+ * cause (REQ-N-015). The relay may have stopped; either computer may have
+ * gone offline. Nothing connects again by itself.
+ */
+export function relayLostWords(relay: string): { message: string; next: string } {
+  return {
+    message: `The connection through the relay ${relay} was lost. The relay may have stopped, or one of the two computers went offline.`,
+    next: "Nobody has access to the customer computer any more. Start a new session when you are ready; it gets a new relay code.",
+  };
+}
+
+// --- The relay of this copy (ST-M007-011) ---
+
+/** The relay this copy uses, when its profile can be used. */
+export function activeRelay(relay: RelaySettings | null): RelayView | undefined {
+  if (!relay) return undefined;
+  if (relay.source === "file") return relay.file.relay;
+  if (relay.source === "settings") return relay.stored?.relay;
+  return undefined;
+}
+
+/**
+ * Reads the form of Settings → Relay as the backend takes it. An empty key
+ * field keeps the key that is kept, unless the technician asked to remove
+ * it; without a kept key it means that the relay asks for none.
+ */
+export function relayForm(
+  fields: { address: string; key: string; removeKey: boolean; name: string },
+  draft: RelayDraft,
+  stored: RelayView | undefined,
+): RelayForm {
+  const form: RelayForm = {
+    address: fields.address.trim(),
+    keyMode: "none",
+    caMode: draft.ca.mode,
+  };
+  if (fields.key !== "") {
+    form.keyMode = "set";
+    form.key = fields.key;
+  } else if (stored?.keySet && !fields.removeKey) {
+    form.keyMode = "keep";
+  }
+  if (draft.ca.mode === "chosen") form.caPick = draft.ca.pick;
+  // Nothing is kept that could be kept: the system's authorities.
+  if (draft.ca.mode === "keep" && !stored?.ca) form.caMode = "none";
+  const name = fields.name.trim();
+  if (name !== "") form.name = name;
+  return form;
+}
+
+function isText(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function isRelayView(value: unknown): value is RelayView {
+  if (typeof value !== "object" || value === null) return false;
+  const view = value as Record<string, unknown>;
+  return (
+    isText(view.host) &&
+    isText(view.address) &&
+    (view.trust === "system_authorities" || view.trust === "profile_file") &&
+    typeof view.keySet === "boolean" &&
+    (view.ca === undefined || isText(view.ca)) &&
+    (view.name === undefined || isText(view.name))
+  );
+}
+
+function isRelayPlace(value: unknown): value is RelayPlace {
+  if (typeof value !== "object" || value === null) return false;
+  const place = value as Record<string, unknown>;
+  const problem = place.problem as Record<string, unknown> | undefined;
+  return (
+    isText(place.path) &&
+    (place.relay === undefined || isRelayView(place.relay)) &&
+    (problem === undefined ||
+      (typeof problem === "object" &&
+        problem !== null &&
+        isText(problem.file) &&
+        isText(problem.message)))
+  );
+}
+
+/** Whether a value is a `RelaySettings` of the contract (ST-M007-011). */
+export function isRelaySettings(value: unknown): value is RelaySettings {
+  if (typeof value !== "object" || value === null) return false;
+  const settings = value as Record<string, unknown>;
+  return (
+    typeof settings.editable === "boolean" &&
+    (settings.source === "file" || settings.source === "settings" || settings.source === "none") &&
+    isRelayPlace(settings.file) &&
+    (settings.stored === undefined || isRelayPlace(settings.stored))
+  );
+}
+
+/** Whether a value is a `CustomerCopyOptions` of the contract (ST-M007-016). */
+export function isCustomerCopyOptions(value: unknown): value is CustomerCopyOptions {
+  if (typeof value !== "object" || value === null) return false;
+  const options = value as Record<string, unknown>;
+  return (
+    isRelayView(options.relay) &&
+    (options.program === "this_program" || options.program === "choose") &&
+    typeof options.labelMax === "number" &&
+    isText(options.folderPrefix) &&
+    isText(options.programName)
+  );
+}
+
+/** Whether a value is a `ChosenForCopy` of the contract (ST-M007-016). */
+export function isChosenForCopy(value: unknown): value is ChosenForCopy {
+  if (typeof value !== "object" || value === null) return false;
+  const chosen = value as Record<string, unknown>;
+  return typeof chosen.pick === "number" && isText(chosen.name);
+}
+
+/** Whether a value is a `GeneratedKey` of the contract (ST-M007-016). */
+export function isGeneratedKey(value: unknown): value is GeneratedKey {
+  if (typeof value !== "object" || value === null) return false;
+  const key = (value as Record<string, unknown>).key;
+  return isText(key) && key !== "";
+}
+
+/** Whether a value is a `CustomerCopyMade` of the contract (ST-M007-016). */
+export function isCustomerCopyMade(value: unknown): value is CustomerCopyMade {
+  if (typeof value !== "object" || value === null) return false;
+  const made = value as Record<string, unknown>;
+  return (
+    typeof made.copy === "number" &&
+    isText(made.folder) &&
+    Array.isArray(made.files) &&
+    made.files.every(isText) &&
+    (made.setAside === undefined || isText(made.setAside))
+  );
+}
+
+/** Whether a value is an `UninstallPlan` of the contract. */
+export function isUninstallPlan(value: unknown): value is UninstallPlan {
+  if (typeof value !== "object" || value === null) return false;
+  const plan = value as Record<string, unknown>;
+  const lines = (list: unknown): boolean => Array.isArray(list) && list.every(isText);
+  return lines(plan.removes) && lines(plan.stays);
+}
+
+/** Whether a value is a `RelayTest` of the contract (ST-M007-011). */
+export function isRelayTest(value: unknown): value is RelayTest {
+  if (typeof value !== "object" || value === null) return false;
+  const test = value as Record<string, unknown>;
+  return (
+    typeof test.ok === "boolean" && isText(test.kind) && isText(test.message) && isText(test.next)
+  );
+}
+
+/** Whether a value is a `ChosenCa` of the contract (ST-M007-011). */
+export function isChosenCa(value: unknown): value is ChosenCa {
+  if (typeof value !== "object" || value === null) return false;
+  const chosen = value as Record<string, unknown>;
+  return typeof chosen.pick === "number" && isText(chosen.name);
+}
+
+/** Whether a value is a `ConsoleNotice` of the contract (ST-M007-011). */
+export function isConsoleNotice(value: unknown): value is ConsoleNotice {
+  if (typeof value !== "object" || value === null) return false;
+  const notice = value as Record<string, unknown>;
+  return isText(notice.title) && isText(notice.message) && isText(notice.next);
 }
 
 /** Whether a value is a `BridgeStatus` of the contract (ST-M009-008). */

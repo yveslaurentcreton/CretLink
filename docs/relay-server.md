@@ -297,15 +297,291 @@ On Windows, run the verified `.exe` under a dedicated low-privilege service
 account (for example via a Scheduled Task or a service wrapper); the binary
 itself needs no elevation.
 
-## 3. Point the endpoints at the relay
+## 3. Tell a copy of CretLink which relay to use
 
-Both the console and the support agent dial the relay outbound and must present
-the **same** single-use rendezvous ticket. Give each side a relay address, that
-ticket, and — if the relay requires one — the shared admission token, through
-their CLI flags or environment. Today these options exist only in the headless
-development tools `cretlink-console` and `cretlink-support-agent`, built from
-the source tree (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)); the released
-application `cretlink` does not use a relay yet (M007, ST-M009-010):
+A copy of the application learns its relay from a **relay profile**
+(ST-M007-011). A profile has four settings:
+
+| Setting | Meaning |
+| --- | --- |
+| `address` | The relay's host name and port, such as `relay.example.org:443`. An IPv6 address stands in square brackets: `[2001:db8::1]:443`. |
+| `key` | The admission key of this copy, when the relay asks for one ([§2](#one-key-per-customer)). Leave it out for a relay without keys. |
+| `ca` | The name of a PEM file next to the profile: the certificate of the authority that signed the relay's certificate. Only for a certificate from an authority of your own. |
+| `name` | The name in the relay's certificate, when it differs from the host of `address`. |
+
+A profile is **addressing and nothing else**. It says where two copies meet,
+and its key only admits a copy to the forwarder. It gives nobody control:
+pairing, the approval code that two people compare and the customer's consent
+decide about a session, exactly as on one network (ADR-0016 §2, §4). Without
+a profile no relay is offered and nothing changes for a session on one
+network.
+
+With a profile in both copies, a session runs through the relay when the
+technician chooses it: see
+[A session through the relay](#a-session-through-the-relay) below.
+
+### A file next to the program
+
+Both roles read a file named `cretlink.toml` next to the program. This is how
+a copy that runs once, and every copy you hand to a customer
+(`CretLink-Support.exe`), learn your relay:
+
+```toml
+# cretlink.toml, in the same folder as the program
+[relay]
+address = "relay.example.org:443"
+key = "9a41c7b3…"
+```
+
+With a certificate from an authority of your own, put that authority's
+certificate next to it and name it:
+
+```toml
+[relay]
+address = "192.0.2.1:9970"
+name = "relay.example.org"
+ca = "relay-ca.pem"
+```
+
+- The file is a small form of TOML: one section `[relay]`, one setting on a
+  line, each text in double quotes (or in single quotes, taken as written).
+  Lines that start with `#` are comments.
+- **An unknown section or setting is an error**, and so is an address without
+  a port, an empty key, or a `ca` that names a folder. A file that cannot be
+  used is explained in plain words with its line and its setting, before
+  anything is connected to, and never passed over for another relay. The
+  explanation never repeats what the file holds, so a key that was typed in
+  the wrong place does not appear on a screen.
+- The file is read up to 16 KiB and the certificate file up to 256 KiB.
+- The customer role reads this file and nothing else, and writes nothing.
+- **The key stands in the file in readable form.** Give every customer copy a
+  key of its own, so that you can withdraw one by deleting its line from the
+  relay's key file. A key that leaks lets a stranger use the forwarder until
+  then; it shows no session and controls none.
+- You do not have to write this file by hand for a customer: the application
+  makes the whole folder, see [Make a customer copy](#make-a-customer-copy).
+
+### Settings, in the installed copy
+
+The installed technician copy has **Settings → Relay** with the same four
+settings:
+
+- **Save** keeps the relay for your user account, next to the install record:
+  `settings.toml`, and `relay-ca.pem` when you chose a certificate file. On
+  macOS and Linux the file can be read and written by your account only (mode
+  `0600`); on Windows it lies in your own `%LOCALAPPDATA%` folder and has the
+  access rules of that folder. `cretlink uninstall` removes both files and
+  says so before it does. A `cretlink.toml` next to the installed program is
+  not one of them: uninstall leaves it, and says that it stays, where it lies
+  and whether it holds a key.
+- `relay-ca.pem` holds **the certificates of the file you chose and nothing
+  else**, written anew. Some tools keep the private key of an authority in
+  the same file as its certificate; that key is not copied.
+- **A save lands whole or not at all.** The relay and its certificate file
+  change together: when a save fails, both are as they were, and the screen
+  says that nothing was changed.
+- The **key is never shown** again once it is saved: the screen says only
+  that a key is set. Leave the field empty to keep it. A kept key stays with
+  its relay as it was saved: when you change the host of the address, the
+  name in the certificate or the certificate authority, the application asks
+  for the key again instead of presenting the kept one. Another port of the
+  same host keeps it.
+- **Test** reaches the relay once, with what stands in the form, and says in
+  words what came of it: the relay admits this copy, or it could not be
+  reached, its certificate is not trusted, it asks for a key, it does not
+  know the key, or it comes from another release. It meets nobody and saves
+  nothing.
+- **Remove** removes the relay, its key and its certificate file, after
+  asking.
+
+**A file next to the program wins over Settings**, and the screen says so: it
+then shows the relay of the file, and what Settings holds as the relay that is
+not used. A copy that runs once keeps no settings; its relay goes in the file.
+
+The installed copy keeps one more thing in the same file: the network it
+waits on when your computer is on several (ST-M009-016).
+
+### Make a customer copy
+
+A customer needs two things from you: the support program, and a
+`cretlink.toml` with your relay and a key of their own. The application
+writes both into one folder that you hand over (ST-M007-016). In **Settings →
+Relay**, a copy that has a relay offers **Make a customer copy…**:
+
+```text
+CretLink-Support-acme/
+  CretLink-Support.exe   the support program
+  cretlink.toml          your relay's address, this customer's key, and the
+                         name and certificate file when your relay has them
+  relay-ca.pem           the certificates of your own authority, when your
+                         profile names a certificate file
+  README.txt             a few lines for the customer
+```
+
+- **The label** names who the copy is for and becomes part of the folder's
+  name: letters, digits and hyphens, at most 40. It is also the label of the
+  customer's line in the relay's key file.
+- **The program.** On Windows the copy is the program you are running,
+  written under the name `CretLink-Support.exe`. On macOS and Linux you
+  point at `cretlink.exe` from the Windows archive of a
+  [release](verifying-artifacts.md); a file that is no Windows program is
+  refused. Either way the file is copied byte for byte, so a signed program
+  stays signed.
+- **The key** is this customer's own: type or paste the key that the relay's
+  key file lists for them, or press **Generate**. Generate draws a new key
+  from the system's random source and shows the line `label:key` once, with
+  **Copy**: add that line to the relay's key file
+  ([§2](#one-key-per-customer)), and the relay takes it up without a restart.
+  For a relay without keys, tick that the relay asks for none. **Your own
+  key is never written into a customer copy**, and there is no way to ask
+  for it: a copy holds the key you gave for that customer, or none.
+- **The place** is a folder you choose. A folder of the copy's name that is
+  there already is never replaced without asking; when you say so, it is
+  replaced as a whole.
+- **Nothing half.** The folder is written under another name beside its
+  place, read back the way the customer's copy will read it, and only then
+  given its name. When that fails, what was written is removed, and the
+  screen says so; if it could not be removed, it says where it lies.
+- **Nothing leaves your computer.** The application writes the folder and
+  shows it (**Show in folder**). Getting it to the customer is up to you.
+
+The key stands in `cretlink.toml` in readable form, and whoever has the
+folder has the key. It admits that copy to your relay and nothing else: it
+shows no session and controls none (ADR-0016 §4). To withdraw it, delete its
+line from the relay's key file.
+
+### Always TLS
+
+The application speaks `wss` to the relay and nothing else. A profile has no
+setting that turns TLS off, and an address with `ws://`, `wss://` or a path is
+refused. The relay's certificate is checked against the certificate
+authorities of the computer, or against the `ca` file when the profile names
+one, and it must carry the relay's name: the `name` of the profile, or else
+the host of its `address`. When that check fails nothing is sent to the relay,
+not even the rendezvous preamble, and the application never falls back to a
+connection without TLS.
+
+A `ca` file **replaces** the certificate authorities of the computer, it does
+not add to them: with it, no public authority can vouch for a server under
+the relay's name. Without it, one thing can change what "the certificate
+authorities of the computer" are: when the environment variable
+`SSL_CERT_FILE` or `SSL_CERT_DIR` is set for the program, the certificates
+named there are used instead of the operating system's store. Leave both
+unset for CretLink, or give the profile a `ca` file, which is then the only
+authority and is not affected by the environment.
+
+That name is the relay's host name for everything else too: it is what both
+people are shown, and what the relay code is tied to
+([§7](#the-relay-code-and-the-ticket)). Give every copy of one relay the same
+`name`, or leave it out in all of them.
+
+### The name, the address and what vouches for the name
+
+With `name` and `ca` a profile says three things that need not agree: the name
+the relay is called, the host a copy connects to, and the authority that
+vouches for the name. That is what a relay behind an address of its own with a
+certificate from your own authority needs. It is also what somebody who can
+write the profile could use to give a server of their own the name of your
+relay. They would stand where a hostile relay stands, which sees encrypted
+traffic and its size and can deny service; they would not get into a session,
+and the approval codes differ when they put themselves in between. But a
+screen that showed the name alone would name the wrong relay.
+
+So wherever the application names a relay to a person, it shows what the copy
+really does:
+
+- **The address beside the name, when its host is another one**:
+  `relay.example.org (reached at 192.0.2.1:9970)`. When the name is the host
+  of the address, the name says it all, and another port is not another host.
+- **What vouches for the name, when it is a file of the profile**: "The
+  relay's certificate is checked against a certificate file of this copy's
+  relay settings, not against the certificate authorities of this computer."
+  Nothing is added when the computer's own authorities vouch for it.
+- **Where the relay comes from, in the installed copy**: when a file next to
+  the program wins over Settings, the waiting screen says that the relay
+  comes from that file and not from Settings.
+
+This holds on both sides and on every screen: the offer on the waiting screen,
+the wait on the relay, the customer's code field and connecting screen, the
+comparison of the approval code, the decision, the live session, the end
+report and the words of every failure. The technician's audit trail records
+the same three facts (`session_route`: the name, the address and the kind of
+trust), and the session history shows them.
+
+### A session through the relay
+
+A session between two networks starts like one on one network and differs in
+one step (ST-M007-013). Both copies need a profile for the **same** relay.
+
+1. **The technician** presses **Start a session**. The waiting screen shows
+   the connection code of this network as before and, under it, **Not on the
+   same network?** with the relay's host name and **Use relay…**. Without a
+   profile the card names **Settings → Relay** instead, and a profile that
+   cannot be used is said there with its file.
+2. **Use relay…** stops waiting on the network and waits on the relay. The
+   screen shows the relay's host name, a **relay code** in four groups
+   (`53ST-A71D-JKKV-0VGH`) with **Copy**, and in words whether the relay holds
+   the code yet. The technician reads the code to the customer.
+3. **The customer** opens their copy and chooses **Get help**. Under the code
+   field, a copy with a profile names the relay it would connect through. The
+   customer types the code into that field, which also takes a connection
+   code. The screen says **Connecting through the relay** with the relay's
+   host name, and that the relay only passes encrypted traffic on.
+4. From here everything is as on one network: both read the same six-digit
+   approval code, the technician confirms it, the customer allows full
+   control, and either side stops the session. Every screen says through
+   which relay the session runs, and the technician's audit log records it
+   first, before pairing and consent (a record `session_route` with the
+   relay's host name, the address the copy connected to and what its
+   certificate was checked against).
+
+What to know:
+
+- **The relay code is not the approval code.** It only leads the two copies
+  to each other on the relay: it holds no key and no address, and it grants
+  nothing. It is drawn differently, in four outlined groups, so that nobody
+  takes it for the six digits that both people compare aloud. Those digits
+  are what tie the session to the two people; a relay that puts itself in
+  between makes them differ.
+- **A new code for every session.** A code leads to one session and works for
+  as long as the technician's waiting screen is open: the relay holds a
+  waiting connection for half a minute, and the technician's copy takes the
+  code back to it every time. **Cancel** (`Escape`) ends the wait, and the
+  code then leads nowhere.
+- **Both copies must name the same relay.** The code is tied to the relay's
+  host name ([§7](#the-relay-code-and-the-ticket)): two copies whose profiles
+  give the relay different names never meet.
+- **The network first.** Discovery and the connection code keep working with
+  a profile present. The relay is used only when the technician chooses it
+  and the customer types a relay code.
+- **Nothing connects again by itself.** A relay that stops, or a connection
+  that is lost, ends the session on both sides. Both screens then say that
+  the connection through the relay was lost and that the relay may have
+  stopped. A new session needs a new code and the customer's permission
+  again.
+
+When it does not work, each side says why and what to do:
+
+| The screen says | What happened | What to do |
+| --- | --- | --- |
+| *Nobody is waiting on that code* (customer, after ten seconds) | The code is mistyped or was used already, the technician cancelled, or the two copies name different relays. | Read the code on the technician's screen again; start a new wait for a new code. |
+| *The relay cannot be reached* / *CretLink could not reach the relay* | No connection to the relay's address: it is off, the address or port is wrong, or the network blocks it. | Check that the relay runs and that its port is open; **Settings → Relay → Test** says more. |
+| *The relay's certificate is not trusted* / *This computer does not trust the relay* | The certificate does not chain to an authority the computer knows, is out of date or carries another name. Nothing was sent to the relay. | For a certificate of your own authority, put its `ca` file into the profile; check `name`. |
+| *The relay asks for an admission key* / *The relay refused the admission key* / *The relay did not let this copy in* | The relay asks for a key and the copy has none, or it does not know the copy's key. | Give the copy its key, or add its line to the relay's key file ([§2](#one-key-per-customer)). |
+| *The relay did not answer* | The server at that address is no CretLink relay, or one of an older release. | Check the address and port; update the relay server. |
+| *The connection through the relay was lost* | The relay stopped, or one of the two computers went offline. | Start a new session. Nobody has access any more. |
+
+A code with a typing error is caught before anything is dialled: the last
+characters of a code are a check on the others.
+
+### The development tools
+
+The headless development tools `cretlink-console` and
+`cretlink-support-agent`, built from the source tree (see
+[`CONTRIBUTING.md`](../CONTRIBUTING.md)), take the relay on their command line
+instead. Both must present the **same** single-use rendezvous ticket. Give
+each side a relay address, that ticket, and — if the relay requires one — the
+shared admission token, through their CLI flags or environment:
 
 | Variable | Flag | Used by | Meaning |
 | --- | --- | --- | --- |
@@ -513,10 +789,12 @@ ticket      HKDF-SHA256(salt = "CretLink relay rendezvous ticket v1",
 ```
 
 The code carries no address: each program takes the relay from its own
-settings. The host name is part of the derivation, so two programs that name
-different relays never meet. The canonical form is the host name in lower case
-without a trailing dot, or an IP address in its standard text form; the port
-is not part of it. An address in another spelling, such as one with leading
+relay profile ([§3](#3-tell-a-copy-of-cretlink-which-relay-to-use)). The host
+name is part of the derivation, so two programs that name different relays
+never meet. It is the name the relay's certificate must carry: the `name` of
+the profile, or else the host of its `address`. The canonical form is the host
+name in lower case without a trailing dot, or an IP address in its standard
+text form; the port is not part of it. An address in another spelling, such as one with leading
 zeros, is refused instead of taken for a name. The alphabet has no `I`, `L`, `O` or `U`; input in any case
 is accepted, `I` and `L` read as `1`, `O` as `0`, and hyphens and spaces are
 ignored. The checksum rejects every mistyped character and every swap of two
@@ -539,7 +817,7 @@ any such tampering, permanently poisoning the channel (REQ-S-008, REQ-S-009).
 posture), REQ-N-016 through REQ-N-019 (provenance, honest failure, versioned
 artifacts), REQ-N-023 (the container image). Stories: ST-M007-005
 (deployment), ST-M007-007 (server binary), ST-M007-009 (built-in wss/TLS
-transport), ST-M007-012 (the relay's answer and the relay code), ST-M007-014
-(one key per customer), ST-M007-015 (the container image and the relay behind
-a proxy). Architecture: ADR-0016 §2 (rendezvous is addressing), §3
+transport), ST-M007-011 (the relay profile), ST-M007-012 (the relay's answer
+and the relay code), ST-M007-014 (one key per customer), ST-M007-015 (the
+container image and the relay behind a proxy). Architecture: ADR-0016 §2 (rendezvous is addressing), §3
 (shipped wss transport), §5 (opaque rendezvous forwarder).*

@@ -8,11 +8,18 @@ import { type Child, append, h } from "../../shared/dom";
 import { icon } from "../../shared/icons";
 import {
   type CustomerSnapshot,
+  RELAY_LOST_STAGE,
+  RENDEZVOUS_STAGE,
   type Screen,
   type UiError,
   announcement,
   bandFor,
   capName,
+  isRelayFailure,
+  nobodyWaitsWords,
+  relayFailureTitle,
+  relayLostWords,
+  relayNamed,
   screenFor,
   technicianName,
 } from "../model";
@@ -27,6 +34,26 @@ import { liveView, since } from "./live";
 function phaseError(s: CustomerSnapshot): UiError | null {
   const phase = s.view?.status.phase;
   if (phase?.phase !== "failed") return null;
+  const nobody = "Nobody has access to this computer.";
+  // A relay code that nobody waits on (ST-M007-012, ST-M007-013).
+  if (phase.stage === RENDEZVOUS_STAGE) return nobodyWaitsWords(relayNamed(s));
+  // A session through a relay whose connection was lost before control.
+  if (phase.stage === RELAY_LOST_STAGE) {
+    const relay = relayNamed(s);
+    return {
+      title: "The connection through the relay was lost",
+      ...(relay ? relayLostWords(relay) : { message: phase.message, next: nobody }),
+    };
+  }
+  // A relay that could not be used: the backend's words for a customer, and
+  // its next step.
+  if (isRelayFailure(phase.stage)) {
+    return {
+      title: relayFailureTitle(phase.stage),
+      message: phase.message,
+      next: s.view?.failure_next ?? `${nobody} Tell your technician what this says.`,
+    };
+  }
   const connect = phase.stage === "connect";
   return {
     title: connect ? "CretLink could not reach your technician" : "The session failed",

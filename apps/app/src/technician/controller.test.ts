@@ -5,7 +5,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActivityEvent } from "../shared/contract";
 import { type TimerTracker, trackTimers } from "../shared/test-timers";
 import type { ConsoleState } from "./api";
-import { AUDIT, CLIENTS, FEED, NETWORKS, SESSIONS, SESSION_ID, consoleIn } from "./fixtures";
+import {
+  APP_INSTALLED,
+  AUDIT,
+  CLIENTS,
+  COPY_KEY,
+  COPY_MADE,
+  COPY_OPTIONS,
+  COPY_OPTIONS_CHOOSE,
+  FEED,
+  NETWORKS,
+  RELAY,
+  RELAY_CODE,
+  RELAY_FILE,
+  RELAY_NONE,
+  RELAY_PRIVATE,
+  RELAY_RUN_ONCE,
+  RELAY_STORED,
+  SESSIONS,
+  SESSION_ID,
+  VIA_RELAY,
+  consoleIn,
+} from "./fixtures";
 
 type Handler = (args?: Record<string, unknown>) => unknown;
 
@@ -500,5 +521,1005 @@ describe("the network to wait on (ST-M009-016)", () => {
     await flush();
     expect(asked("stop_session")).toBe(1);
     expect(app().querySelector(".conn-code")).toBeNull();
+  });
+});
+
+describe("a session through the relay (ST-M007-013)", () => {
+  const listening = (): ConsoleState =>
+    consoleIn(
+      { phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" },
+      { displayName: "Sam" },
+    );
+  const onRelay = (admitted: boolean, code = RELAY_CODE): ConsoleState =>
+    consoleIn(
+      { phase: "listening", code, address: "relay.example.org:443" },
+      { displayName: "Sam", relay: { ...VIA_RELAY, admitted } },
+    );
+  const asked = (cmd: string): number => backend.calls.filter(([name]) => name === cmd).length;
+  const escape = (): void => {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+  };
+  const alert = (): string => app().querySelector('[role="alert"]')?.textContent ?? "";
+
+  it("reads which relay this copy uses when the waiting screen opens, and offers it", async () => {
+    let relay = RELAY_NONE;
+    await boot({ get_relay_settings: () => relay, get_listen_networks: () => NETWORKS });
+    expect(asked("get_relay_settings")).toBe(1);
+    // A profile was set up after CretLink started.
+    relay = RELAY_STORED;
+    push(listening());
+    await flush();
+    expect(asked("get_relay_settings")).toBe(2);
+    const use = app().querySelector<HTMLButtonElement>("#use-relay");
+    expect(use?.textContent).toBe("Use relay…");
+    expect(app().querySelector("#relay-offer")?.textContent).toContain("relay.example.org");
+    // The same waiting state again is no reason to ask again.
+    push(listening());
+    await flush();
+    expect(asked("get_relay_settings")).toBe(2);
+  });
+
+  it("changes the wait to the relay: no code in between, then the relay code and the relay's state", async () => {
+    let finish: (next: ConsoleState) => void = () => undefined;
+    await boot({
+      get_relay_settings: () => RELAY_STORED,
+      get_listen_networks: () => NETWORKS,
+      use_relay: () =>
+        new Promise<ConsoleState>((resolve) => {
+          finish = resolve;
+        }),
+    });
+    push(listening());
+    await flush();
+    app().querySelector<HTMLElement>("#use-relay")?.focus();
+    click("#use-relay");
+    await flush();
+    expect(asked("use_relay")).toBe(1);
+    expect(backend.calls.find(([cmd]) => cmd === "use_relay")?.[1]).toBeUndefined();
+    // The backend stops the listener of this network first.
+    push(consoleIn({ phase: "stopped", reason: "technician_requested" }));
+    await flush();
+    expect(app().querySelector(".screen.wait")).not.toBeNull();
+    expect(app().querySelector(".conn-switching")?.textContent).toBe("Changing to your relay…");
+    expect(app().querySelector(".conn-code")).toBeNull();
+    expect(app().querySelector(".relay-code")).toBeNull();
+    // A second press while it changes does nothing.
+    expect(app().querySelector("#use-relay")).toBeNull();
+
+    // The answer: waiting on the relay, which is still being reached.
+    finish(onRelay(false));
+    await flush();
+    expect(app().querySelector("#relay-code")?.textContent).toBe("53STA71DJKKV0VGH");
+    expect(app().querySelector("#relay-host")?.textContent).toBe("relay.example.org");
+    expect(app().querySelector("#relay-state")?.textContent).toBe(
+      "Connecting to the relay relay.example.org…",
+    );
+    // The button that was pressed is gone: the keyboard is on Cancel.
+    expect(document.activeElement?.id).toBe("stop");
+    expect(alert()).toBe("");
+
+    // The relay holds the code.
+    push(onRelay(true));
+    await flush();
+    expect(app().querySelector("#relay-state")?.textContent).toContain("The relay holds this code.");
+    expect(app().querySelector("#announce")?.textContent).toBe(
+      "Waiting for the customer on the relay relay.example.org. Read them the relay code. No access.",
+    );
+    // Nothing about networks was asked for a wait on the relay.
+    expect(asked("get_listen_networks")).toBe(1);
+  });
+
+  it("does not step back when the relay answers before the command does", async () => {
+    let finish: (next: ConsoleState) => void = () => undefined;
+    await boot({
+      get_relay_settings: () => RELAY_STORED,
+      use_relay: () =>
+        new Promise<ConsoleState>((resolve) => {
+          finish = resolve;
+        }),
+    });
+    push(listening());
+    await flush();
+    click("#use-relay");
+    await flush();
+    push(consoleIn({ phase: "stopped", reason: "technician_requested" }));
+    push(onRelay(false));
+    push(onRelay(true));
+    // The command's answer is the older state.
+    finish(onRelay(false));
+    await flush();
+    expect(app().querySelector("#relay-state")?.textContent).toContain("The relay holds this code.");
+  });
+
+  it("shows a relay that cannot be reached with its own words, although the command answered first", async () => {
+    const failed = consoleIn(
+      {
+        phase: "failed",
+        stage: "relay_unreachable",
+        message: "CretLink could not connect to the relay at relay.example.org:443.",
+        next: "Check that the relay is running.",
+      },
+      { relay: { ...VIA_RELAY, admitted: false } },
+    );
+    await boot({
+      get_relay_settings: () => RELAY_STORED,
+      use_relay: () => {
+        state = onRelay(false);
+        return state;
+      },
+    });
+    push(listening());
+    await flush();
+    click("#use-relay");
+    await flush();
+    expect(app().querySelector("#relay-code")).not.toBeNull();
+    push(failed);
+    await flush();
+    // No session existed: back where a session starts, with the reason.
+    expect(app().querySelector("#start-session")).not.toBeNull();
+    expect(alert()).toContain("The relay cannot be reached");
+    expect(alert()).toContain("could not connect to the relay at relay.example.org:443");
+    expect(alert()).toContain("Check that the relay is running.");
+    expect(alert()).not.toContain("The session failed");
+    expect(app().querySelector(".relay-code")).toBeNull();
+    // Nothing is tried again by itself.
+    expect(asked("use_relay")).toBe(1);
+    expect(asked("start_live_session")).toBe(0);
+  });
+
+  it("says why the relay was not used when the backend refuses, and keeps waiting on this network", async () => {
+    await boot({
+      get_relay_settings: () => RELAY_STORED,
+      use_relay: () => {
+        throw {
+          stage: "relay_profile",
+          message: "Line 3: `address` needs a port, such as relay.example.org:443.",
+        };
+      },
+    });
+    state = listening();
+    push(state);
+    await flush();
+    click("#use-relay");
+    await flush();
+    expect(alert()).toContain("The relay was not used");
+    expect(alert()).toContain("Line 3: `address` needs a port");
+    expect(alert()).toContain("Open Settings, under Relay");
+    // The session on this network is what the backend still says it is.
+    expect(app().querySelector(".conn-code")?.textContent).toBe("6RRR-2H8F");
+    // The relay of this copy was read again: it may have changed.
+    expect(asked("get_relay_settings")).toBeGreaterThanOrEqual(3);
+  });
+
+  it("cancels the wait on the relay with Escape and with Cancel", async () => {
+    await boot({ get_relay_settings: () => RELAY_STORED });
+    push(onRelay(true));
+    await flush();
+    expect(app().querySelector("#relay-code")).not.toBeNull();
+    escape();
+    await flush();
+    expect(asked("stop_session")).toBe(1);
+    expect(app().querySelector(".relay-code")).toBeNull();
+    expect(app().querySelector("#start-session")).not.toBeNull();
+
+    push(onRelay(true, "6TTT-A71D-JKKV-0VGH"));
+    await flush();
+    click("#stop");
+    await flush();
+    expect(asked("stop_session")).toBe(2);
+    expect(app().querySelector(".relay-code")).toBeNull();
+  });
+
+  it("copies the relay code and says so by its name", async () => {
+    const written: string[] = [];
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: async (text: string) => void written.push(text) },
+    });
+    await boot({ get_relay_settings: () => RELAY_STORED });
+    push(onRelay(true));
+    await flush();
+    click('[data-action="copy"]');
+    await flush();
+    expect(written).toEqual([RELAY_CODE]);
+    expect(app().querySelector("#announce")?.textContent).toBe("Relay code copied.");
+    // On one network it is the connection code that was copied.
+    push(listening());
+    await flush();
+    click('[data-action="copy"]');
+    await flush();
+    expect(written).toEqual([RELAY_CODE, "6RRR-2H8F"]);
+    expect(app().querySelector("#announce")?.textContent).toBe("Connection code copied.");
+    Reflect.deleteProperty(navigator, "clipboard");
+  });
+
+  it("goes from the relay code to the approval code, consent and control as on one network", async () => {
+    await boot({
+      get_relay_settings: () => RELAY_STORED,
+      confirm_code: () => state,
+    });
+    push(onRelay(true));
+    await flush();
+    state = consoleIn(
+      { phase: "awaiting_approval_code", code: "482913" },
+      { session: true, target: true, relay: VIA_RELAY },
+    );
+    push(state);
+    await flush();
+    expect(app().querySelector(".sac")?.getAttribute("aria-label")).toBe("Approval code 482 913");
+    expect(app().querySelector(".relay-code")).toBeNull();
+    expect(app().querySelector(".via-relay")?.textContent).toContain("relay.example.org");
+    click('[data-action="compare"]');
+    await flush();
+    expect(asked("confirm_code")).toBe(1);
+    push(
+      consoleIn({ phase: "awaiting_consent" }, { session: true, target: true, relay: VIA_RELAY }),
+    );
+    await flush();
+    expect(app().textContent).toContain("Only the customer can grant control.");
+    push(consoleIn({ phase: "full_control" }, { session: true, target: true, relay: VIA_RELAY }));
+    await flush();
+    expect(app().querySelector("#control-band")?.textContent).toContain("FULL CONTROL");
+    expect(app().querySelector("#session-relay")?.textContent).toContain("relay.example.org");
+    // Escape stops, as in every session.
+    escape();
+    await flush();
+    expect(asked("stop_session")).toBe(1);
+  });
+
+  it("offers Open Settings when this copy has no relay, and comes back to the waiting screen", async () => {
+    await boot({ get_relay_settings: () => RELAY_NONE });
+    push(listening());
+    await flush();
+    expect(app().querySelector("#use-relay")).toBeNull();
+    click('#relay-offer [data-action="nav"]');
+    await flush();
+    expect(app().querySelector("#relay-head")?.textContent).toBe("Relay");
+    // The session keeps waiting meanwhile, and Home shows it again.
+    expect(asked("stop_session")).toBe(0);
+    click('nav.side [data-arg="home"]');
+    await flush();
+    expect(app().querySelector(".conn-code")?.textContent).toBe("6RRR-2H8F");
+  });
+});
+
+describe("Settings → Relay (ST-M007-011)", () => {
+  const asked = (cmd: string): number => backend.calls.filter(([name]) => name === cmd).length;
+  const sent = (cmd: string): Record<string, unknown> | undefined =>
+    backend.calls.filter(([name]) => name === cmd).at(-1)?.[1];
+  const escape = (): void => {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+  };
+  const input = (id: string): HTMLInputElement => {
+    const found = app().querySelector<HTMLInputElement>(`#${id}`);
+    if (!found) throw new Error(`no #${id}`);
+    return found;
+  };
+  const type = (id: string, value: string): void => {
+    input(id).value = value;
+  };
+  const alert = (): string => app().querySelector('[role="alert"]')?.textContent ?? "";
+  const announced = (): string => app().querySelector("#announce")?.textContent ?? "";
+  // A sample value that no scanner takes for a real key.
+  const KEY = "ab".repeat(32);
+
+  /** Starts with `relay` as what the backend holds, and opens Settings. */
+  async function settings(
+    relay: unknown = RELAY_STORED,
+    handlers: Record<string, Handler> = {},
+  ): Promise<void> {
+    await boot({ get_relay_settings: () => relay, ...handlers });
+    click('nav.side [data-arg="settings"]');
+    await flush();
+  }
+
+  it("asks which relay this copy uses on start, and again when Settings opens", async () => {
+    await settings();
+    expect(asked("get_relay_settings")).toBe(2);
+    expect(input("relay-address").value).toBe("relay.example.org:443");
+  });
+
+  it("says that the relay is not available when the backend does not offer it", async () => {
+    await boot();
+    click('nav.side [data-arg="settings"]');
+    await flush();
+    expect(app().textContent).toContain("The relay of this copy is not available yet.");
+    expect(app().querySelector("#relay-address")).toBeNull();
+  });
+
+  it("saves the form and keeps the kept key when its field is left empty", async () => {
+    const saved = {
+      ...RELAY_STORED,
+      stored: { ...RELAY_STORED.stored, relay: { ...RELAY, address: "host-01.example.org:9970" } },
+    };
+    await settings(RELAY_STORED, { save_relay: () => saved });
+    type("relay-address", "  host-01.example.org:9970 ");
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")).toEqual({
+      form: { address: "host-01.example.org:9970", keyMode: "keep", caMode: "none" },
+    });
+    expect(announced()).toBe("The relay relay.example.org was saved.");
+    expect(input("relay-address").value).toBe("host-01.example.org:9970");
+    expect(alert()).toBe("");
+    // The form was drawn anew; the keyboard is where it was, on Save.
+    expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe("relay-save");
+  });
+
+  it("sends a typed key to the backend and keeps none of it in the window", async () => {
+    await settings(RELAY_NONE, { save_relay: () => RELAY_STORED });
+    type("relay-address", "relay.example.org:443");
+    type("relay-key", KEY);
+    type("relay-name", " relay.example.org ");
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")).toEqual({
+      form: {
+        address: "relay.example.org:443",
+        keyMode: "set",
+        key: KEY,
+        caMode: "none",
+        name: "relay.example.org",
+      },
+    });
+    // The form is drawn anew: the key field is empty, and the key is nowhere.
+    expect(input("relay-key").value).toBe("");
+    expect(app().innerHTML).not.toContain(KEY);
+    expect(app().textContent).toContain("A key is set. It is never shown.");
+  });
+
+  it("uses no key when the field is empty and nothing is kept, or when asked to remove it", async () => {
+    await settings(RELAY_NONE, { save_relay: () => RELAY_NONE });
+    type("relay-address", "relay.example.org:443");
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")).toEqual({
+      form: { address: "relay.example.org:443", keyMode: "none", caMode: "none" },
+    });
+
+    document.body.innerHTML = '<div id="app" aria-busy="true"></div>';
+    vi.resetModules();
+    backend.calls = [];
+    await settings(RELAY_STORED, { save_relay: () => RELAY_STORED });
+    input("relay-key-remove").click();
+    click('[data-action="relay-save"]');
+    await flush();
+    expect((sent("save_relay")?.form as { keyMode: string }).keyMode).toBe("none");
+  });
+
+  it("names the setting a refusal is about, moves the focus there and keeps what was typed", async () => {
+    await settings(RELAY_STORED, {
+      save_relay: () => {
+        throw {
+          stage: "relay_address",
+          message:
+            "`address` needs a port; write the relay's host name and port, like relay.example.org:443.",
+        };
+      },
+    });
+    type("relay-address", "relay.example.org");
+    type("relay-key", KEY);
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(alert()).toContain("The relay was not saved");
+    expect(alert()).toContain("`address` needs a port;");
+    expect(alert()).toContain("Correct it, then try again.");
+    // The sentence stands alone, without the name of a stage.
+    expect(alert()).not.toContain("relay_address");
+    expect(document.activeElement?.id).toBe("relay-address");
+    expect(input("relay-address").value).toBe("relay.example.org");
+    expect(input("relay-key").value).toBe(KEY);
+  });
+
+  it("asks for the key of another relay instead of taking the kept one there", async () => {
+    await settings(RELAY_STORED, {
+      save_relay: () => {
+        throw {
+          stage: "relay_key",
+          message:
+            "The key that is kept is the key of the relay relay.example.org; enter the key of this relay, or remove the key.",
+        };
+      },
+    });
+    type("relay-address", "host-01.example.org:443");
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")?.form).toMatchObject({ keyMode: "keep" });
+    expect(alert()).toContain("The relay was not saved");
+    expect(alert()).toContain("is the key of the relay relay.example.org");
+    // The focus is where the key of the other relay goes.
+    expect(document.activeElement?.id).toBe("relay-key");
+  });
+
+  it("tests the form as it stands and shows the result in words, without saving", async () => {
+    let answer: (value: unknown) => void = () => undefined;
+    await settings(RELAY_STORED, {
+      test_relay: () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    });
+    type("relay-address", "host-01.example.org:9970");
+    click('[data-action="relay-test"]');
+    await flush();
+    expect(sent("test_relay")).toEqual({
+      form: { address: "host-01.example.org:9970", keyMode: "keep", caMode: "none" },
+    });
+    expect(app().querySelector("#relay-test")?.textContent).toBe("Reaching the relay…");
+    // The button waits for the answer: a second press starts no second test.
+    // It keeps the focus meanwhile, so it is marked and not disabled.
+    const test = app().querySelector<HTMLButtonElement>('[data-action="relay-test"]');
+    expect(test?.getAttribute("aria-disabled")).toBe("true");
+    expect(test?.disabled).toBe(false);
+    test?.focus();
+    click('[data-action="relay-test"]');
+    await flush();
+    expect(asked("test_relay")).toBe(1);
+
+    answer({
+      ok: false,
+      kind: "unreachable",
+      message: "CretLink could not connect to the relay at host-01.example.org:9970.",
+      next: "Check that the relay is running.",
+    });
+    await flush();
+    const region = app().querySelector("#relay-test")?.textContent ?? "";
+    expect(region).toContain("The relay cannot be used");
+    expect(region).toContain("CretLink could not connect to the relay at host-01.example.org:9970.");
+    expect(region).toContain("Check that the relay is running.");
+    // A relay that cannot be reached is the result of the test, not a failed command.
+    expect(alert()).toBe("");
+    expect(asked("test_relay")).toBe(1);
+    expect(asked("save_relay")).toBe(0);
+    // What was typed is still there to be corrected.
+    expect(input("relay-address").value).toBe("host-01.example.org:9970");
+    // The button is available again, and the keyboard never left it.
+    expect(test?.isConnected).toBe(true);
+    expect(test?.hasAttribute("aria-disabled")).toBe(false);
+    expect(document.activeElement).toBe(test);
+  });
+
+  it("drops the result of a test when the relay was removed meanwhile", async () => {
+    let answer: (value: unknown) => void = () => undefined;
+    await settings(RELAY_STORED, {
+      test_relay: () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+      remove_relay: () => RELAY_NONE,
+    });
+    click('[data-action="relay-test"]');
+    await flush();
+    click('[data-action="relay-remove"]');
+    await flush();
+    click('[data-action="relay-remove-confirm"]');
+    await flush();
+    expect(announced()).toBe("The relay was removed from the settings.");
+    // The answer comes late: it is about a relay that is no longer there.
+    answer({ ok: true, kind: "admitted", message: "Admitted.", next: "" });
+    await flush();
+    expect(app().querySelector("#relay-test")?.textContent).toBe("");
+  });
+
+  it("chooses the certificate file through the backend and names it by its number", async () => {
+    let picked: unknown = null;
+    await settings(RELAY_STORED, {
+      choose_relay_ca: () => picked,
+      save_relay: () => ({
+        ...RELAY_STORED,
+        stored: { ...RELAY_STORED.stored, relay: RELAY_PRIVATE },
+      }),
+    });
+    // The dialog was closed: nothing changes.
+    click('[data-action="relay-ca-choose"]');
+    await flush();
+    expect(app().querySelector("#relay-ca")?.textContent).toBe(
+      "The certificate authorities of this computer",
+    );
+
+    picked = { pick: 7, name: "authority.pem" };
+    click('[data-action="relay-ca-choose"]');
+    await flush();
+    expect(app().querySelector("#relay-ca")?.textContent).toBe(
+      "authority.pem · chosen, not saved yet",
+    );
+    expect(announced()).toBe("authority.pem is chosen. It is kept when you save.");
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")?.form).toMatchObject({ caMode: "chosen", caPick: 7 });
+    // Saved: the kept file is named, and the next save leaves it alone.
+    expect(app().querySelector("#relay-ca")?.textContent).toBe(
+      "relay-ca.pem · kept with your settings",
+    );
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")?.form).toMatchObject({ caMode: "keep" });
+    expect((sent("save_relay")?.form as Record<string, unknown>).caPick).toBeUndefined();
+
+    // Back to the authorities of this computer. The button that was pressed
+    // goes away with the file; the focus moves to its neighbour.
+    click('[data-action="relay-ca-none"]');
+    await flush();
+    expect(document.activeElement?.id).toBe("relay-ca-choose");
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")?.form).toMatchObject({ caMode: "none" });
+  });
+
+  it("says why a chosen file cannot be used", async () => {
+    await settings(RELAY_STORED, {
+      choose_relay_ca: () => {
+        throw { stage: "relay_ca", message: "The certificate file holds no certificate." };
+      },
+    });
+    click('[data-action="relay-ca-choose"]');
+    await flush();
+    expect(alert()).toContain("That certificate file cannot be used");
+    expect(alert()).toContain("The certificate file holds no certificate.");
+    expect(document.activeElement?.id).toBe("relay-ca-choose");
+  });
+
+  it("asks before it removes the relay; Cancel and Escape leave it", async () => {
+    await settings(RELAY_STORED, { remove_relay: () => RELAY_NONE });
+    click('[data-action="relay-remove"]');
+    await flush();
+    expect(app().querySelector("#relay-remove-step")).not.toBeNull();
+    // The safe answer has the focus.
+    expect(document.activeElement?.textContent).toBe("Cancel");
+    escape();
+    await flush();
+    expect(app().querySelector("#relay-remove-step")).toBeNull();
+    expect(asked("remove_relay")).toBe(0);
+    // The focus is back on what opened the question.
+    expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe("relay-remove");
+
+    click('[data-action="relay-remove"]');
+    await flush();
+    click('[data-action="relay-remove-cancel"]');
+    await flush();
+    expect(asked("remove_relay")).toBe(0);
+    expect(input("relay-address").value).toBe("relay.example.org:443");
+    expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe("relay-remove");
+
+    click('[data-action="relay-remove"]');
+    await flush();
+    click('[data-action="relay-remove-confirm"]');
+    await flush();
+    expect(asked("remove_relay")).toBe(1);
+    expect(announced()).toBe("The relay was removed from the settings.");
+    expect(input("relay-address").value).toBe("");
+    expect(app().querySelector('[data-action="relay-remove"]')).toBeNull();
+    // The question is gone; the keyboard goes on to the empty form.
+    expect(document.activeElement?.id).toBe("relay-address");
+  });
+
+  it("tests the relay of the file next to the program, which has no form", async () => {
+    await settings(RELAY_FILE, {
+      test_relay: () => ({ ok: true, kind: "admitted", message: "Admitted.", next: "" }),
+      remove_relay: () => ({ ...RELAY_FILE, stored: { path: RELAY_FILE.stored?.path ?? "" } }),
+    });
+    expect(app().textContent).toContain("That file wins over what Settings holds.");
+    click('[data-action="relay-test"]');
+    await flush();
+    // Without a form: the backend tests the relay this copy uses.
+    expect(sent("test_relay")).toEqual({});
+    expect(app().querySelector("#relay-test")?.textContent).toContain("Admitted.");
+    expect(asked("save_relay")).toBe(0);
+
+    // The relay of the settings can still be removed.
+    click('[data-action="relay-remove"]');
+    await flush();
+    click('[data-action="relay-remove-confirm"]');
+    await flush();
+    expect(asked("remove_relay")).toBe(1);
+    expect(app().querySelector(".relay-unused")).toBeNull();
+    // No form to go to: the focus is on the test of the relay in use.
+    expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe("relay-test");
+  });
+
+  it("keeps nothing in a copy that runs once", async () => {
+    await settings(RELAY_RUN_ONCE);
+    expect(app().textContent).toContain("This copy runs once and keeps no settings.");
+    expect(app().querySelector('[data-action="relay-save"]')).toBeNull();
+    expect(asked("save_relay")).toBe(0);
+  });
+
+  it("shows what the backend has to say in the alert, with its next step", async () => {
+    await boot({ get_relay_settings: () => RELAY_NONE });
+    backend.listeners["console-notice"]?.({
+      payload: {
+        title: "The network choice could not be saved",
+        message: "The settings could not be written: disk full.",
+        next: "It holds until CretLink closes.",
+      },
+    });
+    await flush();
+    expect(alert()).toContain("The network choice could not be saved");
+    expect(alert()).toContain("The settings could not be written: disk full.");
+    expect(alert()).toContain("It holds until CretLink closes.");
+    // Anything else on that channel is not shown.
+    click('[data-action="dismiss-error"]');
+    await flush();
+    backend.listeners["console-notice"]?.({ payload: { title: 1 } });
+    await flush();
+    expect(alert()).toBe("");
+  });
+});
+
+describe("Settings: what uninstall leaves in place (ST-M007-011)", () => {
+  const asked = (cmd: string): number => backend.calls.filter(([name]) => name === cmd).length;
+  const alert = (): string => app().querySelector('[role="alert"]')?.textContent ?? "";
+  const lines = (selector: string): string[] =>
+    Array.from(app().querySelectorAll(selector)).map((line) => line.textContent ?? "");
+
+  async function openUninstall(plan: unknown): Promise<void> {
+    await boot({
+      get_app_info: () => APP_INSTALLED,
+      get_relay_settings: () => RELAY_FILE,
+      uninstall_plan: () => plan,
+    });
+    click('nav.side [data-arg="settings"]');
+    await flush();
+    click('[data-action="uninstall-plan"]');
+    await flush();
+  }
+
+  it("shows what goes and what stays before anything is removed", async () => {
+    const stays =
+      "The relay profile C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.toml, which CretLink did not write and does not remove. It holds the admission key of a relay in readable form: remove the file yourself when nobody else should be able to read that key";
+    await openUninstall({ removes: ["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink"], stays: [stays] });
+    expect(asked("uninstall_plan")).toBe(1);
+    expect(lines(".plan:not(.stays) li")).toEqual(["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink"]);
+    expect(lines(".plan.stays li")).toEqual([stays]);
+    // Nothing was removed by looking, and the question is where the focus is.
+    expect(asked("uninstall_app")).toBe(0);
+    expect((document.activeElement as HTMLElement | null)?.id).toBe("uninstall-step");
+  });
+
+  it("says nothing about what stays when nothing does but the audit trail", async () => {
+    await openUninstall({ removes: ["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink"], stays: [] });
+    expect(app().querySelector(".plan.stays")).toBeNull();
+    expect(app().textContent).toContain("The audit trail stays");
+  });
+
+  it("does not show a plan that it cannot read", async () => {
+    // What an earlier backend answered: the lines to remove alone.
+    await openUninstall(["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink"]);
+    expect(app().querySelector("#uninstall-step")).toBeNull();
+    expect(alert()).toContain("CretLink could not check what to uninstall");
+    expect(alert()).toContain("Nothing was changed.");
+    expect(asked("uninstall_app")).toBe(0);
+  });
+});
+
+describe("Settings: make a customer copy (ST-M007-016)", () => {
+  const asked = (cmd: string): number => backend.calls.filter(([name]) => name === cmd).length;
+  const sent = (cmd: string): Record<string, unknown> | undefined =>
+    backend.calls.filter(([name]) => name === cmd).at(-1)?.[1];
+  const alert = (): string => app().querySelector('[role="alert"]')?.textContent ?? "";
+  const announced = (): string => app().querySelector("#announce")?.textContent ?? "";
+  const focused = (): string => (document.activeElement as HTMLElement | null)?.id ?? "";
+  const input = (id: string): HTMLInputElement => {
+    const found = app().querySelector<HTMLInputElement>(`#${id}`);
+    if (!found) throw new Error(`no #${id}`);
+    return found;
+  };
+  const type = (id: string, value: string): void => {
+    input(id).value = value;
+  };
+  // A sample value that no scanner takes for a real key.
+  const TYPED = "cd".repeat(16);
+  const PROGRAM = { pick: 3, name: "cretlink.exe" };
+  const PLACE = { pick: 4, name: "C:\\Users\\sam\\Documents\\Customers" };
+
+  /** Settings with the step open, on a system where the program is chosen. */
+  async function open(handlers: Record<string, Handler> = {}, options = COPY_OPTIONS_CHOOSE): Promise<void> {
+    await boot({
+      get_app_info: () => APP_INSTALLED,
+      get_relay_settings: () => RELAY_STORED,
+      customer_copy_options: () => options,
+      choose_customer_program: () => PROGRAM,
+      choose_customer_place: () => PLACE,
+      generate_customer_key: () => ({ key: COPY_KEY }),
+      make_customer_copy: () => COPY_MADE,
+      show_customer_copy: () => null,
+      ...handlers,
+    });
+    click('nav.side [data-arg="settings"]');
+    await flush();
+    click("#copy-open");
+    await flush();
+  }
+
+  it("opens on the label, with the relay the backend says a copy would name", async () => {
+    await open();
+    expect(asked("customer_copy_options")).toBe(1);
+    expect(app().querySelector("#copy-step")?.textContent).toContain("host-01.example.org");
+    expect(focused()).toBe("copy-label");
+    // The offer gave way to the step, and nothing was written by looking.
+    expect(app().querySelector("#copy-open")).toBeNull();
+    expect(asked("make_customer_copy")).toBe(0);
+  });
+
+  it("says why no copy can be made when this copy has no relay to name, and closes the step", async () => {
+    await open({
+      customer_copy_options: () => {
+        throw { stage: "relay_profile", message: "Line 2: `address` needs a port. (C:\\cretlink.toml)" };
+      },
+    });
+    expect(app().querySelector("#copy-step")).toBeNull();
+    expect(alert()).toContain("A customer copy cannot be made");
+    expect(alert()).toContain("Line 2: `address` needs a port.");
+    expect(focused()).toBe("copy-open");
+  });
+
+  it("makes the copy with the typed key and the numbers of what was chosen, and shows the result", async () => {
+    await open();
+    type("copy-label", "acme-front-desk");
+    type("copy-key", TYPED);
+    click("#copy-program-choose");
+    await flush();
+    click("#copy-place-choose");
+    await flush();
+    expect(app().querySelector("#copy-program")?.textContent).toBe("cretlink.exe · chosen");
+    expect(app().querySelector("#copy-place")?.textContent).toContain(PLACE.name);
+    // What was typed stays in the fields while choices come in.
+    expect(input("copy-label").value).toBe("acme-front-desk");
+    expect(input("copy-key").value).toBe(TYPED);
+
+    click("#copy-make");
+    await flush();
+    expect(sent("make_customer_copy")).toEqual({
+      form: {
+        label: "acme-front-desk",
+        keyMode: "set",
+        key: TYPED,
+        programPick: 3,
+        placePick: 4,
+      },
+    });
+    // The result, where the keyboard and a screen reader land.
+    expect(app().querySelector("#copy-folder")?.textContent).toBe(COPY_MADE.folder);
+    expect(focused()).toBe("copy-step");
+    expect(announced()).toBe(`The customer copy was written to ${COPY_MADE.folder}.`);
+    // The typed key is in no field any more, and no key line is shown: none
+    // was generated.
+    expect(app().querySelector("#copy-key")).toBeNull();
+    expect(app().querySelector("#copy-key-line")).toBeNull();
+    expect(app().textContent).not.toContain(TYPED);
+
+    // Show in folder names the copy by its number.
+    click("#copy-show");
+    await flush();
+    expect(sent("show_customer_copy")).toEqual({ copy: 7 });
+    // Done closes the step and offers the next copy.
+    click('[data-action="copy-done"]');
+    await flush();
+    expect(app().querySelector("#copy-step")).toBeNull();
+    expect(focused()).toBe("copy-open");
+  });
+
+  it("generates a key only for a label, shows its line once, and sends that key", async () => {
+    const written: string[] = [];
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: async (text: string) => void written.push(text) },
+    });
+    try {
+      await open({}, COPY_OPTIONS);
+      // Without a label there is no line to show: nothing is asked.
+      click("#copy-generate");
+      await flush();
+      expect(asked("generate_customer_key")).toBe(0);
+      expect(alert()).toContain("Give the copy a label first");
+      expect(focused()).toBe("copy-label");
+
+      type("copy-label", "acme-front-desk");
+      click("#copy-generate");
+      await flush();
+      expect(asked("generate_customer_key")).toBe(1);
+      expect(alert()).toBe("");
+      expect(app().querySelector("#copy-key-line")?.textContent).toBe(
+        `acme-front-desk:${COPY_KEY}`,
+      );
+      // The keyboard is on Copy; the label is fixed and still says what was typed.
+      expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe("copy-key-line");
+      expect(input("copy-label").hasAttribute("readonly")).toBe(true);
+      expect(input("copy-label").value).toBe("acme-front-desk");
+      click('[data-action="copy-key-line"]');
+      await flush();
+      expect(written).toEqual([`acme-front-desk:${COPY_KEY}`]);
+      expect(announced()).toBe("The line for the key file was copied.");
+
+      click("#copy-place-choose");
+      await flush();
+      click("#copy-make");
+      await flush();
+      expect(sent("make_customer_copy")).toEqual({
+        form: { label: "acme-front-desk", keyMode: "set", key: COPY_KEY, placePick: 4 },
+      });
+      // The line once more with the result, and gone with Done.
+      expect(app().querySelector("#copy-key-line")?.textContent).toBe(
+        `acme-front-desk:${COPY_KEY}`,
+      );
+      click('[data-action="copy-done"]');
+      await flush();
+      expect(app().textContent).not.toContain(COPY_KEY);
+    } finally {
+      Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
+
+  it("forgets a generated key when it is discarded or the page is left", async () => {
+    await open({}, COPY_OPTIONS);
+    type("copy-label", "acme");
+    click("#copy-generate");
+    await flush();
+    expect(app().textContent).toContain(COPY_KEY);
+    click("#copy-discard-key");
+    await flush();
+    expect(app().textContent).not.toContain(COPY_KEY);
+    // The label can be changed again, and a key typed instead.
+    expect(input("copy-label").hasAttribute("readonly")).toBe(false);
+    expect(input("copy-label").value).toBe("acme");
+    expect(focused()).toBe("copy-key");
+
+    click("#copy-generate");
+    await flush();
+    expect(app().textContent).toContain(COPY_KEY);
+    // Another page: the step does not wait there with the key in it.
+    click('nav.side [data-arg="home"]');
+    await flush();
+    click('nav.side [data-arg="settings"]');
+    await flush();
+    expect(app().textContent).not.toContain(COPY_KEY);
+    expect(app().querySelector("#copy-step")).toBeNull();
+    expect(app().querySelector("#copy-open")).not.toBeNull();
+  });
+
+  it("makes a copy without a key when the relay asks for none", async () => {
+    await open({}, COPY_OPTIONS);
+    type("copy-label", "acme");
+    type("copy-key", "left-in-the-field");
+    input("copy-no-key").checked = true;
+    click("#copy-place-choose");
+    await flush();
+    click("#copy-make");
+    await flush();
+    expect(sent("make_customer_copy")).toEqual({
+      form: { label: "acme", keyMode: "none", placePick: 4 },
+    });
+  });
+
+  it("asks before a folder that is there is replaced, and replaces only on that answer", async () => {
+    let calls = 0;
+    await open(
+      {
+        make_customer_copy: (args) => {
+          calls += 1;
+          const form = (args as { form: { replace?: boolean } }).form;
+          if (!form.replace) {
+            throw {
+              stage: "copy_exists",
+              message: `A folder ${COPY_MADE.folder} is there already. Nothing was changed.`,
+            };
+          }
+          return COPY_MADE;
+        },
+      },
+      COPY_OPTIONS,
+    );
+    type("copy-label", "acme-front-desk");
+    type("copy-key", TYPED);
+    click("#copy-place-choose");
+    await flush();
+    click("#copy-make");
+    await flush();
+    // The question, not an error; the keyboard is on the answer that keeps.
+    expect(alert()).toBe("");
+    expect(app().querySelector("#copy-replace-step")?.textContent).toContain("is there already");
+    expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe(
+      "copy-replace-cancel",
+    );
+    // Keep it: nothing more is asked of the backend, and the form is back.
+    click('[data-action="copy-replace-cancel"]');
+    await flush();
+    expect(calls).toBe(1);
+    expect(app().querySelector("#copy-replace-step")).toBeNull();
+    expect(focused()).toBe("copy-make");
+    expect(input("copy-key").value).toBe(TYPED);
+
+    // Asked again and answered with Replace: the same form, with the answer.
+    click("#copy-make");
+    await flush();
+    click('[data-action="copy-replace"]');
+    await flush();
+    expect(calls).toBe(3);
+    expect(sent("make_customer_copy")).toEqual({
+      form: {
+        label: "acme-front-desk",
+        keyMode: "set",
+        key: TYPED,
+        placePick: 4,
+        replace: true,
+      },
+    });
+    expect(app().querySelector("#copy-folder")?.textContent).toBe(COPY_MADE.folder);
+  });
+
+  it.each([
+    ["copy_label", "copy-label"],
+    ["copy_key", "copy-key"],
+    ["copy_program", "copy-program-choose"],
+    ["copy_place", "copy-place-choose"],
+  ])("puts the keyboard on the field a refusal is about (%s)", async (stage, field) => {
+    await open({
+      make_customer_copy: () => {
+        throw { stage, message: "What the backend says about this field." };
+      },
+    });
+    type("copy-label", "acme");
+    click("#copy-make");
+    await flush();
+    expect(alert()).toContain("The customer copy was not made");
+    expect(alert()).toContain("What the backend says about this field.");
+    expect(alert()).toContain("Correct it, then try again.");
+    expect(focused()).toBe(field);
+    // The step is still open with what was typed.
+    expect(input("copy-label").value).toBe("acme");
+  });
+
+  it("says when a copy could not be written, and that nothing was left behind", async () => {
+    await open({
+      make_customer_copy: () => {
+        throw {
+          stage: "copy_write",
+          message:
+            "The customer copy could not be written: the disk is full. Nothing of it was left behind.",
+        };
+      },
+    });
+    type("copy-label", "acme");
+    click("#copy-make");
+    await flush();
+    expect(alert()).toContain("Nothing of it was left behind.");
+    expect(alert()).toContain("Try again.");
+    expect(app().querySelector("#copy-result")).toBeNull();
+    expect(app().querySelector("#copy-make")).not.toBeNull();
+  });
+
+  it("keeps the step as it is when a dialog is closed without a choice, or a file is refused", async () => {
+    await open({
+      choose_customer_place: () => null,
+      choose_customer_program: () => {
+        throw {
+          stage: "copy_program",
+          message:
+            "That file is not a Windows program. A customer copy holds cretlink.exe from the Windows archive of a CretLink release.",
+        };
+      },
+    });
+    click("#copy-place-choose");
+    await flush();
+    expect(app().querySelector("#copy-place")?.textContent).toBe("None chosen yet");
+    expect(alert()).toBe("");
+    click("#copy-program-choose");
+    await flush();
+    expect(alert()).toContain("That file cannot be the program of a copy");
+    expect(alert()).toContain("That file is not a Windows program.");
+    expect(app().querySelector("#copy-program")?.textContent).toBe("None chosen yet");
+    expect(focused()).toBe("copy-program-choose");
+  });
+
+  it("closes the step when the relay it would name is saved anew or removed", async () => {
+    await open({ remove_relay: () => RELAY_NONE }, COPY_OPTIONS);
+    expect(app().querySelector("#copy-step")).not.toBeNull();
+    click('[data-action="relay-remove"]');
+    await flush();
+    click('[data-action="relay-remove-confirm"]');
+    await flush();
+    expect(app().querySelector("#copy-step")).toBeNull();
+    // Without a relay there is no copy to offer.
+    expect(app().querySelector("#copy-open")).toBeNull();
   });
 });

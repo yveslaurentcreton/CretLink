@@ -80,6 +80,7 @@ use cretlink_shared::{
 };
 
 use crate::ipc_server::{AuditEntry, AuditReceiver, ChannelAudit};
+use crate::state::RelayRoute;
 
 /// Bound of the audit entry channel (REQ-N-006). Generous on purpose: sends
 /// are non-blocking (`try_send`, REQ-S-004), so the bound is only ever reached
@@ -135,6 +136,7 @@ const NEVER_ELIDED_ACTIONS: &[&str] = &[
     SESSION_ENDED_ACTION,
     CLEANUP_REPORT_ACTION,
     TARGET_IDENTITY_ACTION,
+    SESSION_ROUTE_ACTION,
 ];
 
 /// The audit action of the record of who ended a session (ST-M009-012).
@@ -147,6 +149,10 @@ pub const CLEANUP_REPORT_ACTION: &str = "cleanup_report";
 /// The audit action of the record of the consent-bound target identity
 /// (ST-M009-012).
 pub const TARGET_IDENTITY_ACTION: &str = "target_identity";
+
+/// The audit action of the record that a session runs through a relay
+/// (ST-M007-013). A session on one network has no such record.
+pub const SESSION_ROUTE_ACTION: &str = "session_route";
 
 /// The `source` of a [`CLEANUP_REPORT_ACTION`] record: the agent sent its
 /// report, none was needed because control was never granted, or none
@@ -306,6 +312,33 @@ impl SessionAudit for ChannelAudit {
             self.record_entry(entry);
         }
     }
+}
+
+/// The record that this session runs through `relay` (ST-M007-013): the
+/// transport, the relay's host name, where this copy connected to reach it,
+/// and what its certificate was checked against.
+///
+/// The name alone would not say where the session travelled: a relay profile
+/// can give the relay a name that differs from the host it connects to, with
+/// a certificate file of its own to vouch for that name. The address and the
+/// kind of trust are what a reader of the trail needs to tell the relay that
+/// was meant from a server that was given its name.
+///
+/// It holds nothing else of the relay profile, and never the admission key
+/// or the relay code. The relay is where the session travels; the records of
+/// pairing, consent and every action stay what they are on one network.
+#[must_use]
+pub fn relay_route_entry(relay: &RelayRoute) -> AuditEntry {
+    let mut entry = AuditEntry::event(Actor::Console, None, SESSION_ROUTE_ACTION, Outcome::Ok);
+    entry.args = AuditArgs::new()
+        .with("transport", AuditValue::String("relay".to_owned()))
+        .with("relay_host", truncate_field(&relay.host))
+        .with("relay_address", truncate_field(&relay.address))
+        .with(
+            "relay_trust",
+            AuditValue::String(relay.trust.as_str().to_owned()),
+        );
+    entry
 }
 
 /// The record of the honest identity the customer's consent bound

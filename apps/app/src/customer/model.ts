@@ -11,7 +11,14 @@
 
 import type { ActivityEntry, ActivityItem, ActivityKind, CustomerReport } from "../shared/contract";
 import { formatElapsed, isFailure } from "../shared/feed";
-import type { ConsentView, DiscoveredConsoleView, LaunchView, PhaseName } from "./api";
+import { relayWords } from "../shared/relay";
+import type {
+  ConsentView,
+  DiscoveredConsoleView,
+  LaunchView,
+  PhaseName,
+  RelayUseView,
+} from "./api";
 
 export type WindowKind = "main" | "mini";
 
@@ -220,10 +227,86 @@ function endedBeforeControl(view: ConsentView, name: string): string {
     case "technician_requested":
       return `${capName(name)} ended the connection before getting access. Nothing was shared.`;
     case "disconnected":
-      return "The connection was lost before anyone got access. Nothing was shared.";
+      return view.relay
+        ? `The connection through the relay ${relayWords(view.relay)} was lost before anyone got access. Nothing was shared.`
+        : "The connection was lost before anyone got access. Nothing was shared.";
     default:
       return "The connection ended before anyone got access. Nothing was shared.";
   }
+}
+
+// --- A session through the relay (ST-M007-013) ---
+
+/** The relay this session runs through, if it runs through one. */
+export function sessionRelay(s: CustomerSnapshot): RelayUseView | undefined {
+  return s.view?.relay ?? undefined;
+}
+
+/**
+ * That relay as a sentence names it: its name, and where this copy connects
+ * when that is another host than the name says (`shared/relay.ts`).
+ */
+export function relayNamed(s: CustomerSnapshot): string | undefined {
+  const relay = sessionRelay(s);
+  return relay ? relayWords(relay) : undefined;
+}
+
+/** The stage of a code that nobody waits on: mistyped, used, or given up. */
+export const RENDEZVOUS_STAGE = "rendezvous";
+
+/**
+ * The stage of a session through a relay that lost its connection before
+ * anyone had control. The backend takes it from the session's own verdict.
+ */
+export const RELAY_LOST_STAGE = "relay_lost";
+
+/** The stage of a relay that could not be used: `relay_unreachable`, … */
+export function isRelayFailure(stage: string): boolean {
+  return stage.startsWith("relay_");
+}
+
+const RELAY_FAILURE_TITLES: Record<string, string> = {
+  relay_unreachable: "CretLink could not reach the relay",
+  relay_name_not_found: "The relay was not found",
+  relay_untrusted: "This computer does not trust the relay",
+  relay_no_answer: "The relay did not answer",
+  relay_key_required: "The relay did not let this copy in",
+  relay_key_refused: "The relay did not let this copy in",
+  relay_rate_limited: "The relay asks you to wait",
+  relay_busy: "The relay is full right now",
+  relay_unavailable: "The relay lets nobody in right now",
+  relay_version: "The relay and this copy do not fit together",
+  relay_settings: "The relay settings of this copy cannot be used",
+};
+
+/** What a relay failure is called, in a few words for the customer. */
+export function relayFailureTitle(stage: string): string {
+  return RELAY_FAILURE_TITLES[stage] ?? "CretLink could not use the relay";
+}
+
+/**
+ * A code that nobody waits on (ST-M007-012): the relay took the connection
+ * in, and no technician was there. Nobody had any access.
+ */
+export function nobodyWaitsWords(relay: string | undefined): UiError {
+  return {
+    title: "Nobody is waiting on that code",
+    message: relay
+      ? `The relay ${relay} found nobody waiting on the code you typed. It may be mistyped or already used, or your technician stopped waiting.`
+      : "Nobody was waiting on the code you typed. It may be mistyped or already used, or your technician stopped waiting.",
+    next: "Nobody has access to this computer. Ask your technician for the code on their screen and type it again. A code works once.",
+  };
+}
+
+/**
+ * A session through a relay whose connection was lost, said with the relay,
+ * so that it does not read as a lost session of unknown cause (REQ-N-015).
+ */
+export function relayLostWords(relay: string): { message: string; next: string } {
+  return {
+    message: `The connection through the relay ${relay} was lost. The relay may have stopped, or one of the two computers went offline.`,
+    next: "Nobody has access to this computer any more. Nothing connects again by itself: ask your technician for a new code when you want to start again.",
+  };
 }
 
 // --- Names ---
@@ -448,8 +531,10 @@ export function announcement(s: CustomerSnapshot): string {
       return "No access. Windows did not get permission.";
     case "find":
       return s.ended ? `No access. ${s.ended}` : "No access. Choose your technician.";
-    case "connecting":
-      return "Connecting. No access.";
+    case "connecting": {
+      const relay = relayNamed(s);
+      return relay ? `Connecting through the relay ${relay}. No access.` : "Connecting. No access.";
+    }
     case "compare":
       return `Connected to ${name}, but no access. Compare the code.`;
     case "consent":

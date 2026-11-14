@@ -4,7 +4,18 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import { DISCLOSURE_TEXT } from "./disclosure";
-import { FIXTURES, XSS } from "./fixtures";
+import {
+  COPY_KEY,
+  FIXTURES,
+  RELAY_CODE,
+  RELAY_FILE_PROBLEM,
+  RELAY_NONE,
+  RELAY_RUN_ONCE,
+  RELAY_RUN_ONCE_FILE,
+  VIA_RELAY_ELSEWHERE,
+  XSS,
+  consoleIn,
+} from "./fixtures";
 import type { TechnicianSnapshot } from "./model";
 import { renderTechnician } from "./views/shell";
 
@@ -227,10 +238,9 @@ describe("waiting (#t-wait)", () => {
     expect(copy?.dataset.arg).toBe("6RRR-2H8F");
   });
 
-  it("falls back to the hostname without a display name, and offers no relay (M007)", () => {
+  it("falls back to the hostname without a display name", () => {
     const root = show("wait-no-name");
     expect(text(root)).toContain("select TECH-LAPTOP.");
-    expect(text(root).toLowerCase()).not.toContain("relay");
   });
 
   it("keeps Cancel while connecting", () => {
@@ -304,6 +314,389 @@ describe("waiting (#t-wait)", () => {
     expect(root.querySelector("img")).toBeNull();
     expect(root.querySelector("script")).toBeNull();
     expect(text(root.querySelector(".conn-addr"))).toContain(XSS);
+  });
+});
+
+describe("not on the same network (ST-M007-013)", () => {
+  const offer = (root: HTMLElement): HTMLElement | null => root.querySelector("#relay-offer");
+
+  it("offers Use relay with the relay's host name when this copy has a relay", () => {
+    const root = show("wait-relay-ready");
+    const card = offer(root);
+    expect(card?.getAttribute("role")).toBe("group");
+    expect(text(card?.querySelector("#relay-offer-h"))).toBe("Not on the same network?");
+    expect(card?.getAttribute("aria-labelledby")).toBe("relay-offer-h");
+    expect(text(card)).toContain("relay.example.org");
+    expect(text(card)).toContain("only passes encrypted traffic on and cannot look into the session");
+    const use = buttonNamed(root, "Use the relay relay.example.org");
+    expect(text(use)).toBe("Use relay…");
+    expect(use?.dataset.action).toBe("use-relay");
+    expect(use?.disabled).toBe(false);
+    // The connection code of this network is still there: LAN first.
+    expect(text(root.querySelector(".conn-code"))).toBe("6RRR-2H8F");
+    expect(root.querySelector(".relay-code")).toBeNull();
+  });
+
+  it("shows where the copy connects, what vouches for the name and that the relay comes from the file", () => {
+    // The installed copy has a relay in Settings, and a file next to the
+    // program that wins: its relay is reached at another host than its name
+    // says, and checked against a certificate file of its own.
+    const root = show("wait-relay-file");
+    const card = offer(root);
+    expect(text(card?.querySelector(".relay-name"))).toBe("host-01.example.org");
+    expect(text(card?.querySelector(".relay-address"))).toBe("192.0.2.1:9970");
+    expect(text(card)).toContain("Use your relay host-01.example.org (reached at 192.0.2.1:9970).");
+    expect(text(card?.querySelector(".relay-trust"))).toBe(
+      "The relay's certificate is checked against a certificate file of this copy's relay settings, not against the certificate authorities of this computer.",
+    );
+    expect(text(card?.querySelector(".relay-source"))).toBe(
+      "This relay comes from the file C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.toml next to the program, not from Settings.",
+    );
+    // The button says the same to a screen reader.
+    const use = buttonNamed(root, "Use the relay host-01.example.org (reached at 192.0.2.1:9970)");
+    expect(use?.dataset.action).toBe("use-relay");
+
+    // A relay from Settings whose name is the host of its address, checked
+    // against the system's authorities: none of the three is said.
+    const plain = offer(show("wait-relay-ready"));
+    expect(plain?.querySelector(".relay-address")).toBeNull();
+    expect(plain?.querySelector(".relay-trust")).toBeNull();
+    expect(plain?.querySelector(".relay-source")).toBeNull();
+    // A copy that runs once has no Settings that its file could differ from.
+    const runOnce = offer(show("wait-relay-ready", { relay: RELAY_RUN_ONCE_FILE }));
+    expect(runOnce?.querySelector(".relay-source")).toBeNull();
+  });
+
+  it("names Settings when this copy has no relay, and offers nothing to press but that", () => {
+    const root = show("wait");
+    const card = offer(root);
+    expect(text(card)).toContain("Not on the same network?");
+    expect(text(card)).toContain("This copy has no relay.");
+    expect(text(card)).toContain("set up your relay in Settings, under Relay");
+    expect(card?.querySelector('[data-action="use-relay"]')).toBeNull();
+    const settings = card?.querySelector<HTMLButtonElement>("button");
+    expect(text(settings)).toBe("Open Settings");
+    expect(settings?.dataset.action).toBe("nav");
+    expect(settings?.dataset.arg).toBe("settings");
+    // Until the backend has said which relay this copy uses, the same.
+    expect(text(offer(show("wait-relay-unknown")))).toContain("set up your relay in Settings");
+  });
+
+  it("says where the relay of a copy that runs once goes", () => {
+    const card = offer(show("wait-relay-run-once"));
+    expect(text(card)).toContain("put a file cretlink.toml for your relay next to the program");
+    expect(text(card)).toContain("Settings, under Relay, shows how");
+    expect(card?.querySelector('[data-action="use-relay"]')).toBeNull();
+  });
+
+  it("says that a relay profile cannot be used, with what is wrong and its file", () => {
+    const card = offer(show("wait-relay-problem"));
+    expect(text(card)).toContain("The relay settings of this copy cannot be used.");
+    expect(text(card)).toContain("cretlink.toml");
+    expect(card?.querySelector('[data-action="use-relay"]')).toBeNull();
+    expect(card?.querySelector<HTMLButtonElement>("button")?.dataset.arg).toBe("settings");
+  });
+
+  it("shows no code and no offer while the wait changes to the relay", () => {
+    const root = show("wait-relay-changing");
+    expect(root.dataset.screen).toBe("wait");
+    expect(text(root.querySelector('[role="status"].conn-switching'))).toBe(
+      "Changing to your relay…",
+    );
+    expect(root.querySelector(".conn-code")).toBeNull();
+    expect(root.querySelector(".relay-code")).toBeNull();
+    expect(offer(root)).toBeNull();
+    expect(buttonNamed(root, /Cancel/)?.dataset.action).toBe("stop");
+  });
+
+  it("keeps the offer away while the network changes and while another action runs", () => {
+    expect(offer(show("wait-switching"))).toBeNull();
+    const busy = show("wait-relay-ready", { busy: "stop" });
+    expect(buttonNamed(busy, "Use the relay relay.example.org")?.disabled).toBe(true);
+  });
+});
+
+describe("waiting on the relay (ST-M007-013)", () => {
+  it("shows the relay's host name, the relay code with Copy, the state in words and Cancel (Esc)", () => {
+    const root = show("relay-wait");
+    expect(root.dataset.screen).toBe("wait");
+    expect(text(root.querySelector(".pill"))).toContain("No access");
+    expect(text(root.querySelector("h2"))).toBe("Waiting for the customer on your relay");
+    expect(text(root.querySelector("#relay-host"))).toBe("relay.example.org");
+    const cancel = buttonNamed(root, /Cancel/);
+    expect(cancel?.id).toBe("stop");
+    expect(cancel?.dataset.action).toBe("stop");
+    expect(cancel?.getAttribute("aria-keyshortcuts")).toBe("Escape");
+    const copy = buttonNamed(root, "Copy the relay code");
+    expect(copy?.dataset.action).toBe("copy");
+    expect(copy?.dataset.arg).toBe("53ST-A71D-JKKV-0VGH");
+    const state = root.querySelector("#relay-state");
+    expect(state?.getAttribute("role")).toBe("status");
+    expect(text(state)).toBe(
+      "The relay holds this code. It works once, for as long as this screen is open.",
+    );
+    expect(text(root)).toContain("type this code into the code field");
+    // What follows is said: the relay code is not the permission.
+    expect(text(root)).toContain(
+      "You compare the approval code and the customer gives permission next, as on one network.",
+    );
+    expect(text(root.querySelector("#announce"))).toBe(
+      "Waiting for the customer on the relay relay.example.org. Read them the relay code. No access.",
+    );
+  });
+
+  it("shows where the copy connects, what vouches for the name and where the relay comes from", () => {
+    const root = show("relay-wait-elsewhere");
+    expect(text(root.querySelector("#relay-host"))).toBe(
+      "relay.example.org (reached at 192.0.2.1:9970)",
+    );
+    const facts = root.querySelector("#relay-facts");
+    expect(text(facts?.querySelector(".relay-trust"))).toBe(
+      "The relay's certificate is checked against a certificate file of this copy's relay settings, not against the certificate authorities of this computer.",
+    );
+    expect(text(facts?.querySelector(".relay-source"))).toContain(
+      "next to the program, not from Settings.",
+    );
+    expect(text(root.querySelector("#announce"))).toBe(
+      "Waiting for the customer on the relay relay.example.org (reached at 192.0.2.1:9970). Read them the relay code. No access.",
+    );
+    // While the relay is still being reached, the words name it the same way.
+    const reaching = show("relay-wait-elsewhere", {
+      console: consoleIn(
+        { phase: "listening", code: RELAY_CODE, address: "192.0.2.1:9970" },
+        { displayName: "Sam", relay: { ...VIA_RELAY_ELSEWHERE, admitted: false } },
+      ),
+    });
+    expect(text(reaching.querySelector("#relay-state"))).toBe(
+      "Connecting to the relay relay.example.org (reached at 192.0.2.1:9970)…",
+    );
+    // A relay from Settings whose name says where it is: nothing to add.
+    expect(show("relay-wait").querySelector("#relay-facts")).toBeNull();
+  });
+
+  it("names and draws the relay code differently from the approval code and the connection code", () => {
+    const root = show("relay-wait");
+    const code = root.querySelector("#relay-code");
+    expect(code?.classList.contains("relay-code")).toBe(true);
+    // Four groups of four, each a box of its own.
+    expect(Array.from(code?.querySelectorAll("span") ?? []).map(text)).toEqual([
+      "53ST",
+      "A71D",
+      "JKKV",
+      "0VGH",
+    ]);
+    expect(text(root.querySelector("#relay-code-label"))).toBe(
+      "Relay code · read it to the customer",
+    );
+    expect(code?.getAttribute("role")).toBe("img");
+    expect(code?.getAttribute("aria-label")).toBe(
+      "Relay code 5 3 S T, A 7 1 D, J K K V, 0 V G H",
+    );
+    // Neither of the two other codes is on this screen, nor their drawing.
+    expect(root.querySelector(".sac")).toBeNull();
+    expect(root.querySelector(".conn-code")).toBeNull();
+    expect(text(root)).not.toContain("Connection code");
+    expect(text(root)).not.toContain("Approval code");
+    // And the approval code is not drawn as a relay code.
+    const compare = show("relay-compare");
+    expect(compare.querySelector(".relay-code")).toBeNull();
+    expect(compare.querySelector(".sac")?.getAttribute("aria-label")).toBe("Approval code 482 913");
+  });
+
+  it("says that the relay is still being reached until it holds the code", () => {
+    const root = show("relay-wait-connecting");
+    expect(text(root.querySelector("#relay-state"))).toBe(
+      "Connecting to the relay relay.example.org…",
+    );
+    // The code is drawn on this side and can be read out already.
+    expect(root.querySelector("#relay-code")).not.toBeNull();
+    expect(text(root.querySelector("#announce"))).toBe(
+      "Connecting to the relay relay.example.org. No access.",
+    );
+  });
+
+  it("offers neither another network nor another relay while it waits", () => {
+    const root = show("relay-wait", { networksOpen: true });
+    expect(root.querySelector("#net-toggle")).toBeNull();
+    expect(root.querySelector("#net-list")).toBeNull();
+    expect(root.querySelector("#relay-offer")).toBeNull();
+    expect(root.querySelector('[data-action="use-relay"]')).toBeNull();
+  });
+});
+
+describe("a relay that cannot be used (ST-M007-013)", () => {
+  const alert = (root: HTMLElement): HTMLElement | null => root.querySelector("#alert");
+
+  it.each([
+    ["relay-failed-unreachable", "The relay cannot be reached", "could not connect to the relay", "Check that the relay is running"],
+    ["relay-failed-untrusted", "The relay's certificate is not trusted", "showed no certificate that this computer trusts", "give its certificate file"],
+    ["relay-failed-key", "The relay refused the admission key", "does not know the admission key", "Enter the key again"],
+  ])("%s: says what happened in its own words, with its own next step", (name, title, message, next) => {
+    const root = show(name);
+    // No session ever existed: the technician is back where a session starts.
+    expect(root.dataset.screen).toBe("home");
+    const region = alert(root);
+    expect(region?.getAttribute("role")).toBe("alert");
+    expect(text(region?.querySelector("b"))).toBe(title);
+    expect(text(region)).toContain(message);
+    expect(text(region?.querySelector(".next"))).toContain(next);
+    expect(text(region?.querySelector(".next"))).toContain("Settings, under Relay");
+    // It does not read as a session that failed for no known reason, and the
+    // stage is not shown as a code.
+    expect(text(region)).not.toContain("The session failed");
+    expect(text(region)).not.toMatch(/\(relay_/);
+    expect(text(root.querySelector("#announce"))).toBe("The session failed. No access.");
+  });
+
+  it("keeps the generic words for a failure that names no next step", () => {
+    const root = show("failed-no-session");
+    expect(text(alert(root)?.querySelector("b"))).toBe("The session failed");
+    expect(text(alert(root))).toContain("The port 7000 is already in use. (listen)");
+    expect(text(alert(root)?.querySelector(".next"))).toBe(
+      "Nobody has access to the customer computer. Start a new session when you are ready.",
+    );
+  });
+
+  it("says that the relay may have stopped when the connection is lost before control", () => {
+    const root = show("relay-lost-early");
+    const region = alert(root);
+    expect(text(region?.querySelector("b"))).toBe("The connection through the relay was lost");
+    expect(text(region)).toContain(
+      "The connection through the relay relay.example.org was lost. The relay may have stopped, or one of the two computers went offline.",
+    );
+    expect(text(region?.querySelector(".next"))).toBe(
+      "Nobody has access to the customer computer any more. Start a new session when you are ready; it gets a new relay code.",
+    );
+    expect(text(region)).not.toContain("The session failed");
+  });
+});
+
+describe("a session through the relay (ST-M007-013)", () => {
+  it.each(["relay-connecting", "relay-compare", "relay-consent"])(
+    "%s: says that the session runs through the relay, by its host name",
+    (name) => {
+      const line = show(name).querySelector(".via-relay");
+      expect(text(line)).toBe(
+        "Through the relay relay.example.org · it only passes encrypted traffic on",
+      );
+    },
+  );
+
+  it("shows the address beside the name and what vouches for it on every screen of the session", () => {
+    const trust =
+      "The relay's certificate is checked against a certificate file of this copy's relay settings, not against the certificate authorities of this computer.";
+    const compare = show("relay-compare-elsewhere").querySelector(".via-relay");
+    expect(text(compare)).toBe(
+      `Through the relay relay.example.org (reached at 192.0.2.1:9970) · it only passes encrypted traffic on ${trust}`,
+    );
+    const live = show("relay-live-elsewhere");
+    expect(text(live.querySelector("#session-relay"))).toBe(
+      "Through the relay relay.example.org (reached at 192.0.2.1:9970) · it only passes encrypted traffic on",
+    );
+    const overview = text(live.querySelector("#panel-overview"));
+    expect(overview).toContain(
+      "Connection Through the relay relay.example.org (reached at 192.0.2.1:9970)",
+    );
+    expect(overview).toContain(
+      "Relay certificate Checked against a certificate file of this copy's relay settings, not against the certificate authorities of this computer",
+    );
+    // The end report, from the audit trail: the same three facts.
+    const end = show("relay-end-elsewhere");
+    expect(text(end)).toContain(
+      "Connection Through the relay relay.example.org (reached at 192.0.2.1:9970)",
+    );
+    expect(text(end)).toContain("Relay certificate Checked against a certificate file");
+    expect(text(end.querySelector(".relay-lost"))).toContain(
+      "The connection through the relay relay.example.org (reached at 192.0.2.1:9970) was lost.",
+    );
+    // And the same report opened from the history.
+    const report = show("relay-end-elsewhere", {
+      nav: "sessions",
+      openReport: "7f3a9c51d2e84b6a",
+      endDismissed: true,
+    });
+    expect(text(report)).toContain(
+      "Connection Through the relay relay.example.org (reached at 192.0.2.1:9970)",
+    );
+    expect(text(report)).toContain("Relay certificate Checked against a certificate file");
+    // While the report is still being prepared, the state says it.
+    const preparing = show("relay-end-elsewhere", { sessions: [], reportPending: true });
+    expect(text(preparing)).toContain(
+      "Connection Through the relay relay.example.org (reached at 192.0.2.1:9970)",
+    );
+    expect(text(preparing)).toContain("Relay certificate Checked against a certificate file");
+    // A relay whose name says where it is, checked against the system's
+    // authorities: the report says neither.
+    const plain = text(show("relay-end"));
+    expect(plain).not.toContain("reached at");
+    expect(plain).not.toContain("Relay certificate");
+  });
+
+  it("leaves the compare and consent screens of a relayed session what they are on one network", () => {
+    const compare = show("relay-compare");
+    expect(text(compare.querySelector(".pill"))).toBe("◐ Connected · no access");
+    expect(buttonNamed(compare, "Codes match")?.dataset.action).toBe("compare");
+    expect(buttonNamed(compare, "Codes don't match")?.dataset.action).toBe("mismatch");
+    const consent = show("relay-consent");
+    expect(text(consent)).toContain("Only the customer can grant control.");
+    expect(text(consent.querySelector(".disclose"))).toBe(DISCLOSURE_TEXT);
+    expect(buttonNamed(consent, /Stop/)?.dataset.action).toBe("stop");
+  });
+
+  it("names the relay under the identity of the live session and in the overview", () => {
+    const root = show("relay-live");
+    expect(text(root.querySelector("#session-relay"))).toBe(
+      "Through the relay relay.example.org · it only passes encrypted traffic on",
+    );
+    expect(text(root.querySelector("#panel-overview"))).toContain(
+      "Connection Through the relay relay.example.org",
+    );
+    // The band, the identity and Stop are those of any session.
+    expect(text(root.querySelector("#control-band"))).toContain("FULL CONTROL");
+    expect(buttonNamed(root, "Stop the session with ACME-PC-07")?.dataset.action).toBe("stop");
+  });
+
+  it("says nothing about a relay in a session on one network", () => {
+    for (const name of ["connecting", "compare", "consent", "live", "end-by-technician"]) {
+      const root = show(name);
+      expect(root.querySelector(".via-relay")).toBeNull();
+      expect(root.querySelector("#session-relay")).toBeNull();
+      expect(root.querySelector(".relay-lost")).toBeNull();
+    }
+    expect(text(show("live").querySelector("#panel-overview"))).toContain(
+      "Connection On this network",
+    );
+    expect(text(show("end-by-technician"))).toContain("Connection On one network");
+  });
+
+  it("names the relay in the end report", () => {
+    const root = show("relay-end");
+    expect(root.dataset.screen).toBe("end");
+    expect(text(root)).toContain("Connection Through the relay relay.example.org");
+    expect(root.querySelector(".relay-lost")).toBeNull();
+  });
+
+  it("says that the relay may have stopped when the connection of a relayed session is lost", () => {
+    for (const name of ["relay-end-lost", "relay-end-lost-preparing"]) {
+      const root = show(name);
+      expect(root.dataset.screen).toBe("end");
+      const note = root.querySelector(".relay-lost");
+      expect(note?.getAttribute("role")).toBe("note");
+      expect(text(note)).toBe(
+        "The connection through the relay relay.example.org was lost. The relay may have stopped, or one of the two computers went offline. Nobody has access to the customer computer any more. Start a new session when you are ready; it gets a new relay code.",
+      );
+      expect(text(root)).toContain("Connection Through the relay relay.example.org");
+    }
+    // The cleanup of a lost connection is still not shown as a success.
+    expect(text(show("relay-end-lost"))).toContain("Cleanup unknown");
+    // On one network the same end says nothing about a relay.
+    expect(show("end-disconnected").querySelector(".relay-lost")).toBeNull();
+  });
+
+  it("names the relay in a report from the history", () => {
+    const root = show("relay-end", { nav: "sessions", openReport: "7f3a9c51d2e84b6a", endDismissed: true });
+    expect(root.dataset.screen).toBe("report");
+    expect(text(root)).toContain("Connection Through the relay relay.example.org");
   });
 });
 
@@ -755,6 +1148,27 @@ describe("settings", () => {
     expect(buttonNamed(root, "Cancel")?.dataset.action).toBe("uninstall-cancel");
   });
 
+  it("says what uninstall leaves in place: a relay profile next to the program, and that it holds a key", () => {
+    const root = show("settings-uninstall-profile");
+    const stays = root.querySelector(".plan.stays");
+    expect(text(root.querySelector("#uninstall-stays-h"))).toBe("This stays:");
+    expect(stays?.getAttribute("aria-labelledby")).toBe("uninstall-stays-h");
+    const lines = Array.from(stays?.querySelectorAll("li") ?? []).map(text);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("cretlink.toml, which CretLink did not write and does not remove.");
+    expect(lines[0]).toContain("It holds the admission key of a relay in readable form");
+    // It is not among what is removed, and the audit trail is still said.
+    expect(
+      Array.from(root.querySelectorAll(".plan:not(.stays) li")).map(text),
+    ).toEqual(["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.exe"]);
+    expect(text(root)).toContain("The audit trail stays");
+    // Without anything of the kind, the step says nothing about it.
+    const plain = show("settings-uninstall");
+    expect(plain.querySelector(".plan.stays")).toBeNull();
+    expect(plain.querySelector("#uninstall-stays-h")).toBeNull();
+    expect(Array.from(plain.querySelectorAll(".plan li")).map(text)).toHaveLength(4);
+  });
+
   it("offers no uninstall for a run-once copy and names the folder it runs from", () => {
     const root = show("settings-run-once");
     expect(text(root)).toContain("Runs from C:\\Users\\sam\\Downloads");
@@ -765,6 +1179,220 @@ describe("settings", () => {
     const root = show("settings-unavailable");
     expect(text(root)).toContain("Version CretLink 0.22.0");
     expect(text(root)).toContain("Not available yet");
+  });
+});
+
+describe("settings: the relay (ST-M007-011)", () => {
+  const relayCard = (root: HTMLElement): HTMLElement => {
+    const head = root.querySelector("#relay-head");
+    const found = head?.closest<HTMLElement>(".card");
+    if (!found) throw new Error("no relay card");
+    return found;
+  };
+  const input = (root: HTMLElement, id: string): HTMLInputElement => {
+    const found = root.querySelector<HTMLInputElement>(`#${id}`);
+    if (!found) throw new Error(`no #${id}`);
+    return found;
+  };
+
+  it("says what a relay is and that it grants nothing", () => {
+    const card = relayCard(show("settings"));
+    expect(text(card)).toContain("You host it yourself.");
+    expect(text(card)).toContain(
+      "It only passes encrypted traffic on: it cannot look into a session and it grants nothing.",
+    );
+    expect(text(card)).toContain("The approval code and the customer's consent decide");
+  });
+
+  it("gives the installed copy a form with the four settings, Save and Test", () => {
+    const root = show("settings");
+    const card = relayCard(root);
+    // Every field has a visible label and a hint that says what it is.
+    for (const [id, label] of [
+      ["relay-address", "Address"],
+      ["relay-key", "Admission key"],
+      ["relay-name", "Name in the certificate"],
+    ] as const) {
+      const field = input(root, id);
+      expect(text(root.querySelector(`label[for="${id}"]`))).toBe(label);
+      const hint = field.getAttribute("aria-describedby");
+      expect(text(root.querySelector(`#${hint}`))).not.toBe("");
+    }
+    expect(text(card.querySelector("#relay-ca-label"))).toBe("Certificate authority");
+    expect(text(card.querySelector("#relay-ca"))).toBe(
+      "The certificate authorities of this computer",
+    );
+    expect(text(card)).toContain("CretLink always uses TLS.");
+    expect(input(root, "relay-address").getAttribute("value")).toBe("");
+    expect(buttonNamed(card, "Save")?.dataset.action).toBe("relay-save");
+    expect(buttonNamed(card, "Test the relay")?.dataset.action).toBe("relay-test");
+    expect(buttonNamed(card, "Choose a file…")?.dataset.action).toBe("relay-ca-choose");
+    // Nothing is kept yet, so there is nothing to remove.
+    expect(buttonNamed(card, /Remove/)).toBeUndefined();
+    expect(card.querySelector("#relay-key-remove")).toBeNull();
+  });
+
+  it("shows the kept relay without ever showing its key", () => {
+    const root = show("settings-relay");
+    const card = relayCard(root);
+    expect(input(root, "relay-address").getAttribute("value")).toBe("relay.example.org:443");
+    const key = input(root, "relay-key");
+    expect(key.type).toBe("password");
+    expect(key.hasAttribute("value")).toBe(false);
+    expect(key.value).toBe("");
+    expect(text(card.querySelector("#relay-key-hint"))).toBe(
+      "A key is set. It is never shown. Leave this empty to keep it. A kept key stays with this relay as it was saved: when you change the host, the name in the certificate or the certificate authority, enter the key again.",
+    );
+    expect(text(card)).toContain(
+      "A key only admits this copy to the relay. It gives nobody control over a session.",
+    );
+    expect(text(root.querySelector('label[for="relay-key-remove"]'))).toBe(
+      "Remove the key that is set",
+    );
+    expect(buttonNamed(card, "Remove…")?.dataset.action).toBe("relay-remove");
+  });
+
+  it("names the certificate file that is kept, and the one that was just chosen", () => {
+    const kept = relayCard(show("settings-relay-private"));
+    expect(text(kept.querySelector("#relay-ca"))).toBe("relay-ca.pem · kept with your settings");
+    expect(buttonNamed(kept, "Choose another file…")?.dataset.action).toBe("relay-ca-choose");
+    expect(buttonNamed(kept, "Use this computer's authorities")?.dataset.action).toBe(
+      "relay-ca-none",
+    );
+    expect(kept.querySelector<HTMLInputElement>("#relay-name")?.getAttribute("value")).toBe(
+      "host-01.example.org",
+    );
+
+    const chosen = relayCard(show("settings-relay-chosen"));
+    expect(text(chosen.querySelector("#relay-ca"))).toBe("authority.pem · chosen, not saved yet");
+  });
+
+  it("reports a test in words, in a region that is announced politely", () => {
+    const running = show("settings-relay-testing");
+    const region = running.querySelector("#relay-test");
+    expect(region?.getAttribute("role")).toBe("status");
+    expect(text(region)).toBe("Reaching the relay…");
+    // Unavailable while it runs, and still where the keyboard is.
+    const test = buttonNamed(running, "Test the relay");
+    expect(test?.getAttribute("aria-disabled")).toBe("true");
+    expect(test?.disabled).toBe(false);
+    expect(buttonNamed(show("settings-relay"), "Test the relay")?.hasAttribute("aria-disabled")).toBe(
+      false,
+    );
+
+    const admitted = show("settings-relay-admitted").querySelector("#relay-test");
+    expect(text(admitted)).toContain("The relay admits this copy");
+    expect(text(admitted)).toContain("The relay relay.example.org answered and admits this copy.");
+
+    const refused = show("settings-relay-refused").querySelector("#relay-test");
+    // The state is in words, not in a colour alone, and has a next step.
+    expect(text(refused?.querySelector(".pill"))).toBe("The relay cannot be used");
+    expect(text(refused)).toContain("does not know the admission key of this copy");
+    expect(text(refused?.querySelector(".next"))).toBe(
+      "Enter the key again, or ask the relay's operator for a new one.",
+    );
+    // Without a test the region is there, and empty.
+    expect(text(show("settings-relay").querySelector("#relay-test"))).toBe("");
+  });
+
+  it("asks before the relay and its key are removed", () => {
+    const root = show("settings-relay-removing");
+    const step = root.querySelector<HTMLElement>("#relay-remove-step");
+    expect(text(step)).toContain("Remove the relay relay.example.org from the settings?");
+    expect(text(step)).toContain(
+      "Its admission key and its certificate file are removed with it and cannot be shown again. The network to wait on stays.",
+    );
+    const cancel = buttonNamed(step as HTMLElement, "Cancel");
+    expect(cancel?.dataset.action).toBe("relay-remove-cancel");
+    expect(cancel?.hasAttribute("data-autofocus")).toBe(true);
+    expect(buttonNamed(step as HTMLElement, "Remove")?.dataset.action).toBe(
+      "relay-remove-confirm",
+    );
+    // The form waits for the answer.
+    expect(buttonNamed(root, "Save")?.disabled).toBe(true);
+  });
+
+  it("explains settings that cannot be read with the setting and the file", () => {
+    const root = show("settings-relay-unreadable");
+    const note = relayCard(root).querySelector(".relay-problem");
+    expect(text(note)).toBe(
+      "These relay settings cannot be used. Line 3: the value of `key` must be text in double quotes. The file is C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\settings.toml. Saving a relay below replaces them; Remove clears them.",
+    );
+    // The form and Remove are still there to put it right.
+    expect(root.querySelector("#relay-address")).not.toBeNull();
+    expect(buttonNamed(root, "Remove…")?.dataset.action).toBe("relay-remove");
+  });
+
+  it("says that a file next to the program wins over Settings", () => {
+    const root = show("settings-relay-file");
+    const card = relayCard(root);
+    expect(text(card.querySelector(".relay-file"))).toBe(
+      "This copy takes its relay from the file C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.toml next to the program. That file wins over what Settings holds.",
+    );
+    expect(text(card)).toContain("Relay host-01.example.org");
+    expect(text(card)).toContain("Address 192.0.2.1:9970");
+    expect(text(card)).toContain("Admission key None");
+    expect(text(card)).toContain("Certificate checked against The certificate file relay-ca.pem");
+    expect(text(card)).toContain("Name in the certificate host-01.example.org");
+    // The relay of the settings is named as the one that is not used.
+    expect(text(card.querySelector(".relay-unused"))).toContain(
+      "Settings also holds the relay relay.example.org. It is not used while the file is there.",
+    );
+    expect(buttonNamed(card, "Remove from Settings…")?.dataset.action).toBe("relay-remove");
+    expect(buttonNamed(card, "Test the relay")?.dataset.action).toBe("relay-test");
+    // The file is not edited here: no form.
+    expect(card.querySelector("input")).toBeNull();
+    expect(buttonNamed(card, "Save")).toBeUndefined();
+  });
+
+  it("explains a file that cannot be used, and offers no test of it", () => {
+    const card = relayCard(show("settings-relay-file-problem"));
+    expect(text(card.querySelector(".relay-problem"))).toContain(
+      "These relay settings cannot be used. Line 2: `address` needs a port;",
+    );
+    expect(text(card.querySelector(".relay-problem"))).toContain(
+      "Correct the file, or remove it.",
+    );
+    expect(buttonNamed(card, "Test the relay")).toBeUndefined();
+  });
+
+  it("tells a copy that runs once where its relay goes, and keeps nothing", () => {
+    const card = relayCard(show("settings-run-once"));
+    expect(text(card)).toContain(
+      "This copy runs once and keeps no settings. To use a relay with it, put a file named cretlink.toml next to the program:",
+    );
+    expect(text(card.querySelector(".relay-where"))).toBe("C:\\Users\\sam\\Downloads\\cretlink.toml");
+    expect(card.querySelector(".relay-example")?.textContent).toBe(
+      '[relay]\naddress = "relay.example.org:443"\nkey = "the key of this copy"',
+    );
+    expect(card.querySelector("input")).toBeNull();
+    expect(buttonNamed(card, "Save")).toBeUndefined();
+
+    const withFile = relayCard(show("settings-relay-run-once-file"));
+    expect(text(withFile)).toContain("Relay relay.example.org");
+    expect(text(withFile)).toContain("Admission key Set (never shown)");
+    expect(text(withFile)).toContain(
+      "Certificate checked against The certificate authorities of this computer",
+    );
+    // No settings to win over.
+    expect(text(withFile)).not.toContain("wins over");
+    expect(buttonNamed(withFile, "Test the relay")).toBeDefined();
+  });
+
+  it("says when the relay of this copy is not known yet", () => {
+    expect(text(relayCard(show("settings-unavailable")))).toContain(
+      "The relay of this copy is not available yet.",
+    );
+  });
+
+  it("writes the texts of a profile as text, never as markup", () => {
+    const root = show("settings-relay-xss");
+    expect(root.querySelector("img, script, b.bold")).toBeNull();
+    expect(text(relayCard(root))).toContain(XSS);
+  });
+
+  it("says in the uninstall text that the settings go too", () => {
+    expect(text(show("settings"))).toContain("its settings with the relay and its key");
   });
 });
 
@@ -798,5 +1426,265 @@ describe("errors and announcements", () => {
         show("live", { notice: "Connection code copied." }).querySelector('[aria-live="polite"]'),
       ),
     ).toBe("Connection code copied.");
+  });
+});
+
+describe("make a customer copy (ST-M007-016)", () => {
+  const step = (root: HTMLElement): HTMLElement | null => root.querySelector("#copy-step");
+  const field = (root: HTMLElement, id: string): HTMLInputElement | null =>
+    root.querySelector<HTMLInputElement>(`#${id}`);
+
+  it("is offered in Settings, Relay when this copy has a relay, and only then", () => {
+    // The installed copy with a relay in Settings, with a file next to the
+    // program, and a copy that runs once with a file: each has a relay.
+    for (const name of ["settings-relay", "settings-relay-file", "settings-relay-run-once-file"]) {
+      const root = show(name);
+      const open = buttonNamed(root, "Make a customer copy…");
+      expect(open?.dataset.action, name).toBe("copy-open");
+      expect(open?.id).toBe("copy-open");
+      expect(step(root)).toBeNull();
+    }
+    // Without a relay, or with a profile that cannot be used, there is
+    // nothing a copy could name.
+    for (const patch of [RELAY_NONE, RELAY_FILE_PROBLEM, RELAY_RUN_ONCE, null]) {
+      const root = show("settings-relay", { relay: patch });
+      expect(buttonNamed(root, "Make a customer copy…")).toBeUndefined();
+    }
+  });
+
+  it("says that it looks at the relay while the step opens", () => {
+    const root = show("settings-copy-loading");
+    expect(text(step(root))).toContain("Looking at the relay of this copy…");
+    expect(step(root)?.querySelector('[aria-busy="true"]')).not.toBeNull();
+    // The offer gave way to the step.
+    expect(buttonNamed(root, "Make a customer copy…")).toBeUndefined();
+    expect(buttonNamed(root, "Make the copy")).toBeUndefined();
+  });
+
+  it("says what a copy is, names the relay it will hold, and asks for a label, a key and a place", () => {
+    const root = show("settings-copy-windows");
+    const form = step(root);
+    expect(form?.getAttribute("role")).toBe("group");
+    expect(form?.getAttribute("aria-labelledby")).toBe("copy-head");
+    expect(text(root.querySelector("#copy-head"))).toBe("Make a customer copy");
+    expect(text(form)).toContain(
+      "A folder for one customer: the support program, and the file that tells it which relay to use. You hand over the folder; the customer needs nothing else. CretLink writes it on this computer and sends nothing anywhere.",
+    );
+    // The relay the copy will name.
+    expect(text(form)).toContain("Relay relay.example.org");
+    expect(text(form)).toContain("Address relay.example.org:443");
+    // The label, bounded, with what it becomes.
+    const label = field(root, "copy-label");
+    expect(label?.getAttribute("maxlength")).toBe("40");
+    expect(label?.hasAttribute("readonly")).toBe(false);
+    expect(text(root.querySelector("#copy-label-hint"))).toBe(
+      "Who the copy is for: letters, digits and hyphens, at most 40. The folder is named CretLink-Support- and the label.",
+    );
+    expect(text(root.querySelector('label[for="copy-label"]'))).toBe("Label");
+    // The key of this customer: typed or pasted, or generated.
+    const key = field(root, "copy-key");
+    expect(key?.type).toBe("password");
+    expect(key?.hasAttribute("value")).toBe(false);
+    expect(buttonNamed(root, "Generate a new key for this customer")?.dataset.action).toBe(
+      "copy-generate",
+    );
+    expect(text(root.querySelector('label[for="copy-no-key"]'))).toBe(
+      "The relay asks for no key: make the copy without one",
+    );
+    expect(field(root, "copy-no-key")?.type).toBe("checkbox");
+    // The place, chosen in a dialog of the system.
+    expect(text(root.querySelector("#copy-place"))).toBe("None chosen yet");
+    expect(buttonNamed(root, "Choose a folder…")?.dataset.action).toBe("copy-place");
+    expect(buttonNamed(root, "Make the copy")?.dataset.action).toBe("copy-make");
+    expect(buttonNamed(form as HTMLElement, "Cancel")?.dataset.action).toBe("copy-cancel");
+    // The relay's own form is still there above the step.
+    expect(field(root, "relay-address")).not.toBeNull();
+  });
+
+  it("is honest about the key: readable, admits only, no control, can be withdrawn, never the technician's own", () => {
+    const honest = text(show("settings-copy-windows").querySelector("#copy-key-honest"));
+    expect(honest).toBe(
+      "The key stands in the file cretlink.toml of the copy in readable form. It only admits that copy to the relay and gives nobody control over a session. As the relay's operator you withdraw it by deleting its line from the relay's key file. Your own key is never written into a customer copy.",
+    );
+    // The same on every state of the form.
+    for (const name of ["settings-copy-choose", "settings-copy-generated", "settings-copy-replacing"]) {
+      expect(text(show(name).querySelector("#copy-key-honest")), name).toBe(honest);
+    }
+  });
+
+  it("copies this program itself on Windows, and says so", () => {
+    const root = show("settings-copy-windows");
+    expect(text(root.querySelector("#copy-program"))).toBe(
+      "This program itself, written under the name CretLink-Support.exe. It is copied unchanged.",
+    );
+    expect(buttonNamed(root, /Choose cretlink\.exe/)).toBeUndefined();
+  });
+
+  it("asks for cretlink.exe of a release elsewhere, and says that it is copied unchanged", () => {
+    const root = show("settings-copy-choose");
+    expect(text(root.querySelector("#copy-program"))).toBe("None chosen yet");
+    const choose = buttonNamed(root, "Choose cretlink.exe…");
+    expect(choose?.dataset.action).toBe("copy-program");
+    expect(choose?.id).toBe("copy-program-choose");
+    expect(text(step(root))).toContain(
+      "The support program runs on Windows. Point at cretlink.exe from the Windows archive of a CretLink release. It is copied unchanged as CretLink-Support.exe, so a signed program stays signed.",
+    );
+    // A relay with an authority of its own: the copy names where it is
+    // reached, its certificate file and what vouches for it.
+    const facts = text(step(root));
+    expect(facts).toContain("Relay host-01.example.org (reached at 192.0.2.1:9970)");
+    expect(facts).toContain("Certificate file relay-ca.pem");
+    expect(facts).toContain(
+      "Certificate The relay's certificate is checked against a certificate file of this copy's relay settings",
+    );
+  });
+
+  it("shows what was chosen: the program by its name, and where the folder is made", () => {
+    const root = show("settings-copy-chosen");
+    expect(text(root.querySelector("#copy-program"))).toBe("cretlink.exe · chosen");
+    expect(buttonNamed(root, "Choose another file…")?.dataset.action).toBe("copy-program");
+    expect(text(root.querySelector("#copy-place"))).toBe(
+      "The folder CretLink-Support-<label> is made in /home/sam/Customers",
+    );
+    expect(buttonNamed(root, "Choose another folder…")?.dataset.action).toBe("copy-place");
+  });
+
+  it("shows a generated key once, as the line for the relay's key file, with Copy", () => {
+    const root = show("settings-copy-generated");
+    const line = root.querySelector("#copy-key-line");
+    expect(text(line)).toBe(`acme-front-desk:${COPY_KEY}`);
+    expect(line?.getAttribute("aria-labelledby")).toBe("copy-key-line-h");
+    expect(text(root.querySelector("#copy-key-line-h"))).toBe(
+      "A new key for this customer. The line for your relay's key file:",
+    );
+    const copy = buttonNamed(root, "Copy the line for the key file");
+    expect(copy?.dataset.action).toBe("copy-key-line");
+    // The key is in no attribute of the page: it is text, in one place.
+    expect(copy?.dataset.arg).toBeUndefined();
+    expect(text(root.querySelector("#copy-key-generated"))).toContain(
+      "Add it to the relay's key file; the relay takes it up without a restart. The key is shown here only: CretLink keeps it nowhere but in the copy you make.",
+    );
+    // The label belongs to the key now, and there is no other key to type.
+    const label = field(root, "copy-label");
+    expect(label?.hasAttribute("readonly")).toBe(true);
+    expect(label?.getAttribute("value")).toBe("acme-front-desk");
+    expect(text(root.querySelector("#copy-label-hint"))).toContain(
+      "The generated key belongs to this label; discard the key to change it.",
+    );
+    expect(field(root, "copy-key")).toBeNull();
+    expect(field(root, "copy-no-key")).toBeNull();
+    expect(buttonNamed(root, "Generate a new key for this customer")).toBeUndefined();
+    expect(buttonNamed(root, "Discard this key")?.dataset.action).toBe("copy-discard-key");
+  });
+
+  it("asks before a folder that is there is replaced, and offers nothing else meanwhile", () => {
+    const root = show("settings-copy-replacing");
+    const question = root.querySelector("#copy-replace-step");
+    expect(text(question?.querySelector(".confirm-head"))).toBe("Replace the folder that is there?");
+    expect(text(question)).toContain(
+      "A folder C:\\Users\\sam\\Documents\\Customers\\CretLink-Support-acme-front-desk is there already. Nothing was changed. Replacing it removes that folder with everything in it and puts the new copy in its place.",
+    );
+    expect(buttonNamed(root, "Replace")?.dataset.action).toBe("copy-replace");
+    const keep = buttonNamed(root, "Keep it");
+    expect(keep?.dataset.action).toBe("copy-replace-cancel");
+    // Keeping is where the keyboard starts: nothing is replaced by accident.
+    expect(keep?.hasAttribute("data-autofocus")).toBe(true);
+    expect(buttonNamed(root, "Replace")?.hasAttribute("data-autofocus")).toBe(false);
+    expect(buttonNamed(root, "Make the copy")).toBeUndefined();
+    // The choices wait for the answer.
+    expect(buttonNamed(root, "Choose another folder…")?.disabled).toBe(true);
+    expect(buttonNamed(root, "Generate a new key for this customer")?.disabled).toBe(true);
+  });
+
+  it("shows the copy that was written, with Show in folder, and the key line once more", () => {
+    const root = show("settings-copy-made");
+    const result = root.querySelector("#copy-result");
+    expect(result?.getAttribute("role")).toBe("status");
+    expect(text(result?.querySelector(".pill"))).toBe("The customer copy was written");
+    expect(text(root.querySelector("#copy-folder"))).toBe(
+      "C:\\Users\\sam\\Documents\\Customers\\CretLink-Support-acme-front-desk",
+    );
+    expect(Array.from(root.querySelectorAll("#copy-files li")).map(text)).toEqual([
+      "CretLink-Support.exe",
+      "cretlink.toml",
+      "relay-ca.pem",
+      "README.txt",
+    ]);
+    expect(text(result)).toContain(
+      "Hand the whole folder to the customer and keep its files together. Nothing was sent anywhere.",
+    );
+    const show_ = buttonNamed(root, "Show in folder");
+    expect(show_?.dataset.action).toBe("copy-show");
+    expect(buttonNamed(root, "Done")?.dataset.action).toBe("copy-done");
+    // The generated key, a last time.
+    expect(text(root.querySelector("#copy-key-line"))).toBe(`acme-front-desk:${COPY_KEY}`);
+    expect(text(root.querySelector("#copy-key-generated"))).toContain(
+      "Add it to the key file before the customer connects. It is not shown again: CretLink keeps the key nowhere but in the copy.",
+    );
+    // The form is gone: nothing is typed or chosen any more.
+    expect(field(root, "copy-label")).toBeNull();
+    expect(buttonNamed(root, "Make the copy")).toBeUndefined();
+    expect(root.querySelector("#copy-set-aside")).toBeNull();
+  });
+
+  it("says when the folder that was replaced could not be removed, and where it lies", () => {
+    const root = show("settings-copy-made-set-aside");
+    expect(text(root.querySelector("#copy-set-aside"))).toBe(
+      "The folder that was there before could not be removed. It lies in C:\\Users\\sam\\Documents\\Customers\\CretLink-Support-acme-front-desk.cretlink-old; remove it yourself.",
+    );
+    expect(Array.from(root.querySelectorAll("#copy-files li")).map(text)).toEqual([
+      "CretLink-Support.exe",
+      "cretlink.toml",
+      "README.txt",
+    ]);
+    // No key was generated for this copy: no line is shown.
+    expect(root.querySelector("#copy-key-line")).toBeNull();
+  });
+
+  it("says what the backend refused in the alert, with the step still open", () => {
+    const root = show("settings-copy-windows", {
+      error: {
+        title: "The customer copy was not made",
+        message:
+          "The label holds letters, digits and hyphens only, at least one and at most 40. It becomes part of the folder's name.",
+        next: "Correct it, then try again.",
+      },
+    });
+    const alert = root.querySelector('[role="alert"]');
+    expect(text(alert)).toContain("The customer copy was not made");
+    expect(text(alert)).toContain("letters, digits and hyphens only");
+    expect(text(alert)).toContain("Correct it, then try again.");
+    expect(step(root)).not.toBeNull();
+    expect(buttonNamed(root, "Make the copy")?.disabled).toBe(false);
+    // A copy that could not be written says that nothing was left behind.
+    const failed = show("settings-copy-windows", {
+      error: {
+        title: "The customer copy was not made",
+        message:
+          "The customer copy could not be written: the disk is full. Nothing of it was left behind.",
+        next: "Try again.",
+      },
+    });
+    expect(text(failed.querySelector('[role="alert"]'))).toContain(
+      "Nothing of it was left behind.",
+    );
+  });
+
+  it("waits while a choice or the copy is on its way", () => {
+    const root = show("settings-copy-chosen", { busy: "copy-make" });
+    for (const name of ["Make the copy", "Choose another file…", "Choose another folder…"]) {
+      expect(buttonNamed(root, name)?.disabled, name).toBe(true);
+    }
+    expect(buttonNamed(root, "Generate a new key for this customer")?.disabled).toBe(true);
+  });
+
+  it("writes a relay, a path, a label and a key as text, never as markup", () => {
+    for (const name of ["settings-copy-xss", "settings-copy-made-xss"]) {
+      const root = show(name);
+      expect(root.querySelector("img"), name).toBeNull();
+      expect(root.querySelector("script"), name).toBeNull();
+      expect(step(root)?.querySelector("b:not(.relay-name)"), name).toBeNull();
+      expect(text(step(root)), name).toContain(XSS);
+    }
   });
 });

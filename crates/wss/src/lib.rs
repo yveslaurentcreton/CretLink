@@ -21,6 +21,10 @@
 //!   runtime operate over it exactly as over a bare `TcpStream`.
 //! - [`accept_plain`] is the same without TLS, for a relay behind a reverse
 //!   proxy that ends TLS (ST-M007-015).
+//! - [`is_server_name`] says whether a certificate can be checked for a name,
+//!   and [`certs_to_pem`] writes certificates back as the text of a PEM file,
+//!   so that a copy of a certificate authority file holds its certificates
+//!   and nothing else (ST-M007-011).
 //!
 //! # Cryptographic backend
 //!
@@ -39,8 +43,10 @@ mod adapter;
 #[cfg(feature = "test-cert")]
 pub mod testcert;
 
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
 use rustls::pki_types::pem::{self, PemObject};
@@ -174,6 +180,19 @@ pub fn pinned_roots(cas: Vec<CertificateDer<'static>>) -> Result<RootCertStore, 
 /// malformed anchors in the OS store are skipped so one bad entry cannot deny
 /// the whole set.
 ///
+/// # The environment can replace the store
+///
+/// The anchors are read by `rustls-native-certs`. When the environment
+/// variable `SSL_CERT_FILE` or `SSL_CERT_DIR` is set for the process, that
+/// library reads the certificates named there **instead of** the operating
+/// system's store, on every platform, and it offers no way to read the
+/// system's store without them (its platform loaders are private). Whoever
+/// sets the environment of the program therefore chooses the authorities that
+/// vouch for a relay without a pinned certificate. It is recorded as a
+/// residual risk of the relay in the threat model; a caller that pins a
+/// certificate ([`pinned_roots`]) is not affected, because the environment is
+/// then not read at all.
+///
 /// # Errors
 ///
 /// Returns [`WssError::NoSystemRoots`] if the OS exposes no usable anchors.
@@ -208,6 +227,35 @@ pub fn certs_from_pem(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, WssErr
     Ok(certs)
 }
 
+/// Writes certificates as the text of a PEM file: one `CERTIFICATE` block
+/// each, the base64 of its DER in lines of 64 characters (RFC 7468).
+///
+/// Together with [`certs_from_pem`] this copies the certificates of a file
+/// and nothing else of it: a private key, a comment or any other block that
+/// stood beside them is not in the result. A caller that keeps a copy of a
+/// certificate authority file keeps this text, never the file as it was
+/// (ST-M007-011).
+#[must_use]
+pub fn certs_to_pem(certs: &[CertificateDer<'_>]) -> String {
+    /// The length of a line of base64 in a PEM block.
+    const LINE: usize = 64;
+    let mut out = String::new();
+    for cert in certs {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+        out.push_str("-----BEGIN CERTIFICATE-----\n");
+        let mut rest = encoded.as_str();
+        while !rest.is_empty() {
+            // Base64 is ASCII, so any byte offset is a character boundary.
+            let (line, tail) = rest.split_at(rest.len().min(LINE));
+            out.push_str(line);
+            out.push('\n');
+            rest = tail;
+        }
+        out.push_str("-----END CERTIFICATE-----\n");
+    }
+    out
+}
+
 /// Parses the first private key from PEM bytes (PKCS#8, PKCS#1, or SEC1).
 ///
 /// # Errors
@@ -220,6 +268,21 @@ pub fn private_key_from_pem(pem: &[u8]) -> Result<PrivateKeyDer<'static>, WssErr
         Err(pem::Error::NoItemsFound) => Err(WssError::NoPrivateKey),
         Err(e) => Err(WssError::Pem(e.to_string())),
     }
+}
+
+/// Whether `name` is a name that the certificate of a server can be checked
+/// against: a DNS name as TLS takes it, or an IP address in its standard text
+/// form.
+///
+/// A DNS name is refused when one of its labels is empty, longer than 63
+/// characters or begins or ends with a hyphen, when it is longer than 253
+/// characters, or when it holds anything but ASCII letters, digits, hyphens,
+/// underscores and dots. [`connect`] refuses the same names, but only once a
+/// connection exists; this lets a caller refuse them when the name is
+/// configured (ST-M007-011).
+#[must_use]
+pub fn is_server_name(name: &str) -> bool {
+    ServerName::try_from(name).is_ok()
 }
 
 /// Wraps a server TLS config into a reusable [`TlsAcceptor`].
@@ -281,6 +344,18 @@ where
     Ok(WsByteStream::new(ws))
 }
 
+/// The host of a request as the authority of its URI: an IPv6 address stands
+/// in square brackets (RFC 3986, section 3.2.2), and anything else as it is.
+/// Without the brackets the colons of the address read as the start of a port
+/// and no request can be built, so a relay named by an IPv6 address could
+/// never be reached.
+fn authority(host: &str) -> String {
+    match host.parse::<Ipv6Addr>() {
+        Ok(_) => format!("[{host}]"),
+        Err(_) => host.to_owned(),
+    }
+}
+
 /// Completes the client side of a WebSocket **without TLS** over a connected
 /// transport `tcp`: what a reverse proxy does towards a relay behind it
 /// ([`accept_plain`]). The endpoints of a session never use this; they speak
@@ -293,7 +368,7 @@ pub async fn connect_plain<S>(host: &str, tcp: S) -> Result<WsByteStream<S>, Wss
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let request = format!("ws://{host}/");
+    let request = format!("ws://{}/", authority(host));
     let (ws, _response) = tokio_tungstenite::client_async(request, tcp)
         .await
         .map_err(|e| WssError::Handshake(Box::new(e)))?;
@@ -309,9 +384,10 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`WssError::InvalidServerName`] if `server_name` is not a valid DNS
-/// name, [`WssError::Io`] if the TLS handshake fails (including an untrusted
-/// certificate), or [`WssError::Handshake`] if the WebSocket upgrade fails.
+/// Returns [`WssError::InvalidServerName`] if `server_name` is neither a valid
+/// DNS name nor an IP address, [`WssError::Io`] if the TLS handshake fails
+/// (including an untrusted certificate), or [`WssError::Handshake`] if the
+/// WebSocket upgrade fails.
 pub async fn connect<S>(
     connector: &TlsConnector,
     server_name: &str,
@@ -323,7 +399,7 @@ where
     let name = ServerName::try_from(server_name.to_owned())
         .map_err(|_| WssError::InvalidServerName(server_name.to_owned()))?;
     let tls = connector.connect(name, tcp).await.map_err(WssError::Io)?;
-    let request = format!("wss://{server_name}/");
+    let request = format!("wss://{}/", authority(server_name));
     let (ws, _response) = tokio_tungstenite::client_async(request, tls)
         .await
         .map_err(|e| WssError::Handshake(Box::new(e)))?;

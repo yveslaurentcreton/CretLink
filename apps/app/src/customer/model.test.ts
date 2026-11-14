@@ -2,20 +2,37 @@
 
 import { describe, expect, it } from "vitest";
 import type { ActivityItem } from "../shared/contract";
-import { CONSOLES, FEED, FEED_DONE, LAUNCH_READY, NOW, REPORT, viewIn } from "./fixtures";
+import {
+  CONSOLES,
+  FEED,
+  FEED_DONE,
+  LAUNCH_READY,
+  NOW,
+  REPORT,
+  VIA_RELAY,
+  VIA_RELAY_ELSEWHERE,
+  viewIn,
+} from "./fixtures";
 import {
   type CustomerSnapshot,
   SCREEN_RECENT_MS,
+  announcement,
   applyView,
   canStop,
   consoleName,
   filtered,
   happeningNow,
   initialSnapshot,
+  isRelayFailure,
   liveCounts,
+  nobodyWaitsWords,
   outcomeWords,
+  relayFailureTitle,
+  relayLostWords,
+  relayNamed,
   screenFor,
   screenUse,
+  sessionRelay,
   sourceWords,
   technicianName,
 } from "./model";
@@ -170,5 +187,123 @@ describe("screen use", () => {
     const both = { ...view, screen: { observed_at_ms: NOW - 1000, controlled_at_ms: NOW - 2000 } };
     expect(screenUse(both, NOW)).toEqual({ state: "controlled" });
     expect(screenUse(both, NOW + SCREEN_RECENT_MS)).toEqual({ state: "earlier", at: NOW - 1000 });
+  });
+});
+
+describe("a session through the relay (ST-M007-013)", () => {
+  const reaching = viewIn({ phase: "announced" }, { technician: null, relay: VIA_RELAY });
+
+  it("knows the relay of a session, and none on one network", () => {
+    expect(sessionRelay(snapshot(reaching))).toEqual(VIA_RELAY);
+    expect(relayNamed(snapshot(reaching))).toBe("relay.example.org");
+    expect(sessionRelay(snapshot(viewIn({ phase: "announced" })))).toBeUndefined();
+    expect(relayNamed(snapshot(viewIn({ phase: "announced" })))).toBeUndefined();
+    expect(relayNamed(snapshot())).toBeUndefined();
+  });
+
+  it("names a relay with where this copy connects when that is another host than its name", () => {
+    // The profile gives the relay's certificate a name of its own: the name
+    // is not where the copy connects, so a sentence says both.
+    const elsewhere = viewIn(
+      { phase: "announced" },
+      { technician: null, relay: VIA_RELAY_ELSEWHERE },
+    );
+    const s = snapshot(elsewhere);
+    expect(relayNamed(s)).toBe("relay.example.org (reached at 192.0.2.1:9970)");
+    expect(announcement(s)).toBe(
+      "Connecting through the relay relay.example.org (reached at 192.0.2.1:9970). No access.",
+    );
+    let lost = applyView(snapshot(), elsewhere, NOW);
+    lost = applyView(
+      lost,
+      viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY_ELSEWHERE }),
+      NOW,
+    );
+    expect(lost.ended).toBe(
+      "The connection through the relay relay.example.org (reached at 192.0.2.1:9970) was lost before anyone got access. Nothing was shared.",
+    );
+    expect(nobodyWaitsWords(relayNamed(s)).message).toContain(
+      "The relay relay.example.org (reached at 192.0.2.1:9970) found nobody waiting",
+    );
+  });
+
+  it("shows the connecting screen for a relay code and announces the relay", () => {
+    const s = snapshot(reaching);
+    expect(screenFor(s)).toBe("connecting");
+    expect(canStop(s)).toBe(true);
+    expect(announcement(s)).toBe("Connecting through the relay relay.example.org. No access.");
+  });
+
+  it("returns to the code field when nobody waits or the relay cannot be used", () => {
+    let s = applyView(snapshot(), reaching, NOW);
+    s = applyView(
+      s,
+      viewIn(
+        { phase: "failed", stage: "rendezvous", message: "nobody joined the rendezvous on the relay" },
+        { relay: VIA_RELAY },
+      ),
+      NOW,
+    );
+    expect(screenFor(s)).toBe("find");
+    // A failure is said in the alert, not as how a session ended.
+    expect(s.ended).toBe("");
+    expect(canStop(s)).toBe(false);
+  });
+
+  it("says with the relay that a connection was lost before anyone had access", () => {
+    let s = applyView(snapshot(), reaching, NOW);
+    s = applyView(s, viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY }), NOW);
+    expect(s.ended).toBe(
+      "The connection through the relay relay.example.org was lost before anyone got access. Nothing was shared.",
+    );
+    // On one network the sentence is the one it was.
+    let lan = applyView(snapshot(), viewIn({ phase: "announced" }), NOW);
+    lan = applyView(lan, viewIn({ phase: "stopped", reason: "disconnected" }), NOW);
+    expect(lan.ended).toBe("The connection was lost before anyone got access. Nothing was shared.");
+  });
+
+  it("starts the next dial without what the last one said about a relay", () => {
+    let s = applyView(snapshot(), reaching, NOW);
+    s = applyView(s, viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY }), NOW);
+    s = applyView(s, viewIn({ phase: "announced" }), NOW);
+    expect(s.ended).toBeUndefined();
+    expect(relayNamed(s)).toBeUndefined();
+  });
+
+  it("names every relay failure in a few words for a customer", () => {
+    const stages = [
+      "relay_unreachable",
+      "relay_name_not_found",
+      "relay_untrusted",
+      "relay_no_answer",
+      "relay_key_required",
+      "relay_key_refused",
+      "relay_rate_limited",
+      "relay_busy",
+      "relay_unavailable",
+      "relay_version",
+      "relay_settings",
+    ];
+    for (const stage of stages) {
+      expect(isRelayFailure(stage)).toBe(true);
+      expect(relayFailureTitle(stage)).not.toBe("CretLink could not use the relay");
+      // A customer is not told about keys: that is the technician's matter.
+      expect(relayFailureTitle(stage).toLowerCase()).not.toContain("key");
+    }
+    expect(relayFailureTitle("relay_something_new")).toBe("CretLink could not use the relay");
+    for (const stage of ["connect", "rendezvous", "pairing", "relay"]) {
+      expect(isRelayFailure(stage)).toBe(false);
+    }
+  });
+
+  it("words a code that nobody waits on and a lost connection with a next step", () => {
+    const nobody = nobodyWaitsWords("relay.example.org");
+    expect(nobody.title).toBe("Nobody is waiting on that code");
+    expect(nobody.message).toContain("The relay relay.example.org found nobody waiting");
+    expect(nobody.next).toContain("type it again");
+    expect(nobodyWaitsWords(undefined).message).toContain("Nobody was waiting on the code you typed.");
+    const lost = relayLostWords("relay.example.org");
+    expect(lost.message).toContain("The relay may have stopped");
+    expect(lost.next).toContain("Nothing connects again by itself");
   });
 });

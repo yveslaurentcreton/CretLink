@@ -7,13 +7,17 @@ import type {
   AiClientStatus,
   AppInfo,
   AuditEntryView,
+  CustomerCopyMade,
+  CustomerCopyOptions,
   ExplorerDrive,
   ExplorerEntry,
   ListenNetwork,
+  RelaySettings,
+  RelayView,
   SessionSummary,
   TransferEntry,
 } from "../shared/contract";
-import type { ConsoleState, SessionPhase, TargetIdentity } from "./api";
+import type { ConsoleState, RelayRoute, SessionPhase, TargetIdentity } from "./api";
 import {
   DRIVES,
   type ExplorerState,
@@ -51,9 +55,40 @@ export const TARGET: TargetIdentity = {
 
 export const SESSION_ID = "7f3a9c51d2e84b6a";
 
+/** The relay code of the fixtures, as a technician reads it out. */
+export const RELAY_CODE = "53ST-A71D-JKKV-0VGH";
+
+/** The relay of the fixtures, holding the code of a waiting session. */
+export const VIA_RELAY: RelayRoute = {
+  host: "relay.example.org",
+  address: "relay.example.org:443",
+  trust: "system_authorities",
+  admitted: true,
+};
+
+/**
+ * A relay whose certificate carries another name than the host this copy
+ * connects to, checked against a certificate file of the profile: the screens
+ * then show the address beside the name and say what vouches for the name
+ * (ST-M007-011).
+ */
+export const VIA_RELAY_ELSEWHERE: RelayRoute = {
+  host: "relay.example.org",
+  address: "192.0.2.1:9970",
+  trust: "profile_file",
+  admitted: true,
+};
+
 export function consoleIn(
   phase: SessionPhase,
-  options: { session?: boolean; target?: boolean; simulated?: boolean; displayName?: string } = {},
+  options: {
+    session?: boolean;
+    target?: boolean;
+    simulated?: boolean;
+    displayName?: string;
+    // The relay the session waits on or runs through (ST-M007-013).
+    relay?: RelayRoute;
+  } = {},
 ): ConsoleState {
   const withTarget = options.target ?? false;
   const identity: TargetIdentity = options.simulated
@@ -85,6 +120,7 @@ export function consoleIn(
       : [],
     ...(withTarget ? { selected: "t1" } : {}),
     ...(options.session ? { session: SESSION_ID } : {}),
+    ...(options.relay ? { relay: options.relay } : {}),
     phase,
   };
 }
@@ -109,6 +145,113 @@ export const APP_RUN_ONCE: AppInfo = {
   ...APP_INSTALLED,
   install: "run_once",
   location: "C:\\Users\\sam\\Downloads",
+};
+
+// --- The relay of this copy (ST-M007-011) ---
+
+/** The relay Sam hosts. Its key is never part of a view. */
+export const RELAY: RelayView = {
+  host: "relay.example.org",
+  address: "relay.example.org:443",
+  trust: "system_authorities",
+  keySet: true,
+};
+
+/** A relay with a certificate from an authority of the technician's own. */
+export const RELAY_PRIVATE: RelayView = {
+  host: "host-01.example.org",
+  address: "192.0.2.1:9970",
+  trust: "profile_file",
+  keySet: false,
+  ca: "relay-ca.pem",
+  name: "host-01.example.org",
+};
+
+// --- Make a customer copy (ST-M007-016) ---
+
+/** A customer copy on Windows: the copy is this program itself. */
+export const COPY_OPTIONS: CustomerCopyOptions = {
+  // The relay of this copy without any key: the technician's own key is no
+  // part of a customer copy.
+  relay: { ...RELAY, keySet: false },
+  program: "this_program",
+  labelMax: 40,
+  folderPrefix: "CretLink-Support-",
+  programName: "CretLink-Support.exe",
+};
+
+/** A customer copy on macOS or Linux, of a relay with its own authority. */
+export const COPY_OPTIONS_CHOOSE: CustomerCopyOptions = {
+  ...COPY_OPTIONS,
+  relay: RELAY_PRIVATE,
+  program: "choose",
+};
+
+/** A sample value that no scanner takes for a real key. */
+export const COPY_KEY = "ab".repeat(32);
+
+/** The folder a customer copy was written to. */
+export const COPY_MADE: CustomerCopyMade = {
+  copy: 7,
+  folder: "C:\\Users\\sam\\Documents\\Customers\\CretLink-Support-acme-front-desk",
+  files: ["CretLink-Support.exe", "cretlink.toml", "relay-ca.pem", "README.txt"],
+};
+
+const SETTINGS_PATH = "C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\settings.toml";
+const PROFILE_PATH = "C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.toml";
+const PORTABLE_PROFILE_PATH = "C:\\Users\\sam\\Downloads\\cretlink.toml";
+
+/** The installed copy without a relay. */
+export const RELAY_NONE: RelaySettings = {
+  editable: true,
+  source: "none",
+  file: { path: PROFILE_PATH },
+  stored: { path: SETTINGS_PATH },
+};
+
+/** The installed copy with a relay in its settings. */
+export const RELAY_STORED: RelaySettings = {
+  ...RELAY_NONE,
+  source: "settings",
+  stored: { path: SETTINGS_PATH, relay: RELAY },
+};
+
+/** A file next to the program, which wins over the relay of the settings. */
+export const RELAY_FILE: RelaySettings = {
+  editable: true,
+  source: "file",
+  file: { path: PROFILE_PATH, relay: RELAY_PRIVATE },
+  stored: { path: SETTINGS_PATH, relay: RELAY },
+};
+
+/** A file next to the program that cannot be used. */
+export const RELAY_FILE_PROBLEM: RelaySettings = {
+  editable: true,
+  source: "file",
+  file: {
+    path: PROFILE_PATH,
+    problem: {
+      file: PROFILE_PATH,
+      field: "address",
+      message:
+        "Line 2: `address` needs a port; write the relay's host name and port, like relay.example.org:443.",
+    },
+  },
+  stored: { path: SETTINGS_PATH },
+};
+
+/** A copy that runs once: no settings, and no file next to it. */
+export const RELAY_RUN_ONCE: RelaySettings = {
+  editable: false,
+  source: "none",
+  file: { path: PORTABLE_PROFILE_PATH },
+};
+
+/** A copy that runs once with a profile file next to it. */
+export const RELAY_RUN_ONCE_FILE: RelaySettings = {
+  editable: false,
+  source: "file",
+  file: { path: PORTABLE_PROFILE_PATH, relay: RELAY },
 };
 
 export const CLIENTS: AiClientStatus[] = [
@@ -732,6 +875,7 @@ function base(console: ConsoleState): TechnicianSnapshot {
     clients: CLIENTS,
     sessions: SESSIONS.slice(0, 3),
     networks: NETWORKS,
+    relay: RELAY_NONE,
   };
 }
 
@@ -807,7 +951,239 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
     ...base(consoleIn({ phase: "stopped", reason: "technician_requested" })),
     busy: "network",
   },
+  // Not on the same network? (ST-M007-013): with a relay, with a profile
+  // that cannot be used, in a copy that runs once, and while the wait changes
+  // from the network to the relay.
+  "wait-relay-ready": {
+    ...base(
+      consoleIn(
+        { phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" },
+        { displayName: "Sam" },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  // The installed copy takes its relay from the file next to the program,
+  // and that relay is reached at another host than its name says and checked
+  // against a certificate file of the profile (ST-M007-011): the offer says
+  // all three.
+  "wait-relay-file": {
+    ...base(
+      consoleIn(
+        { phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" },
+        { displayName: "Sam" },
+      ),
+    ),
+    relay: RELAY_FILE,
+  },
+  "wait-relay-problem": {
+    ...base(consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" })),
+    relay: RELAY_FILE_PROBLEM,
+  },
+  "wait-relay-run-once": {
+    ...base(consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" })),
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE,
+  },
+  "wait-relay-unknown": {
+    ...base(consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" })),
+    relay: null,
+  },
+  "wait-relay-changing": {
+    ...base(consoleIn({ phase: "stopped", reason: "technician_requested" })),
+    relay: RELAY_STORED,
+    busy: "relay",
+  },
+  // Waiting on the relay: while it is being reached, and once it holds the
+  // code.
+  "relay-wait-connecting": {
+    ...base(
+      consoleIn(
+        { phase: "listening", code: RELAY_CODE, address: "relay.example.org:443" },
+        { displayName: "Sam", relay: { ...VIA_RELAY, admitted: false } },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  "relay-wait": {
+    ...base(
+      consoleIn(
+        { phase: "listening", code: RELAY_CODE, address: "relay.example.org:443" },
+        { displayName: "Sam", relay: VIA_RELAY },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  // The same wait on a relay that the profile file next to the program
+  // names otherwise than the host it connects to.
+  "relay-wait-elsewhere": {
+    ...base(
+      consoleIn(
+        { phase: "listening", code: RELAY_CODE, address: "192.0.2.1:9970" },
+        { displayName: "Sam", relay: VIA_RELAY_ELSEWHERE },
+      ),
+    ),
+    relay: RELAY_FILE,
+  },
+  // A relay that could not be used: each failure with its own words.
+  "relay-failed-unreachable": {
+    ...base(
+      consoleIn(
+        {
+          phase: "failed",
+          stage: "relay_unreachable",
+          message:
+            "CretLink could not connect to the relay at relay.example.org:443. The relay may be off, the address may be wrong, or this network does not let this computer reach it.",
+          next: "Check that the relay is running and that its address and port are right, then try again. You can change and test the relay in Settings, under Relay.",
+        },
+        { relay: { ...VIA_RELAY, admitted: false } },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  "relay-failed-untrusted": {
+    ...base(
+      consoleIn(
+        {
+          phase: "failed",
+          stage: "relay_untrusted",
+          message:
+            "The relay at relay.example.org:443 showed no certificate that this computer trusts for the name relay.example.org, so nothing was sent to it. The certificate may come from an authority this computer does not know, be out of date or carry another name; or the server at that address is not the relay.",
+          next: "If the relay's certificate comes from an authority of your own, give its certificate file. If it carries another name than the host of the address, give that name. You can change and test the relay in Settings, under Relay.",
+        },
+        { relay: { ...VIA_RELAY, admitted: false } },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  "relay-failed-key": {
+    ...base(
+      consoleIn(
+        {
+          phase: "failed",
+          stage: "relay_key_refused",
+          message:
+            "The relay relay.example.org does not know the admission key of this copy. The key may be mistyped, or it was withdrawn.",
+          next: "Enter the key again, or ask the relay's operator for a new one. You can change and test the relay in Settings, under Relay.",
+        },
+        { relay: { ...VIA_RELAY, admitted: false } },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
+  // The relay stopped while the approval code was being compared.
+  "relay-lost-early": {
+    ...base(
+      consoleIn(
+        {
+          phase: "failed",
+          stage: "relay_lost",
+          message: "The connection through the relay relay.example.org was lost.",
+        },
+        { relay: VIA_RELAY },
+      ),
+    ),
+    relay: RELAY_STORED,
+  },
   connecting: base(consoleIn({ phase: "connecting" }, { session: true })),
+  // A session through the relay: every screen after the code says so.
+  "relay-connecting": base(
+    consoleIn({ phase: "connecting" }, { session: true, relay: VIA_RELAY }),
+  ),
+  "relay-compare": base(
+    consoleIn(
+      { phase: "awaiting_approval_code", code: "482913" },
+      { session: true, target: true, relay: VIA_RELAY },
+    ),
+  ),
+  "relay-consent": base(
+    consoleIn({ phase: "awaiting_consent" }, { session: true, target: true, relay: VIA_RELAY }),
+  ),
+  "relay-live": {
+    ...base(
+      consoleIn(
+        { phase: "full_control" },
+        { session: true, target: true, displayName: "Sam", relay: VIA_RELAY },
+      ),
+    ),
+    activity: FEED,
+    last: { id: SESSION_ID, target: TARGET, since: NOW - minutes(28) },
+  },
+  // A session through a relay that is reached at another host than its name
+  // says, and checked against a certificate file of the profile: every
+  // screen shows the address beside the name and says what vouches for it.
+  "relay-compare-elsewhere": base(
+    consoleIn(
+      { phase: "awaiting_approval_code", code: "482913" },
+      { session: true, target: true, relay: VIA_RELAY_ELSEWHERE },
+    ),
+  ),
+  "relay-live-elsewhere": {
+    ...base(
+      consoleIn(
+        { phase: "full_control" },
+        { session: true, target: true, displayName: "Sam", relay: VIA_RELAY_ELSEWHERE },
+      ),
+    ),
+    activity: FEED,
+    last: { id: SESSION_ID, target: TARGET, since: NOW - minutes(28) },
+  },
+  "relay-end-elsewhere": {
+    ...base(
+      consoleIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY_ELSEWHERE }),
+    ),
+    sessions: [
+      {
+        ...SUMMARY_UNKNOWN,
+        id: SESSION_ID,
+        hostname: "ACME-PC-07",
+        endedAt: iso(NOW),
+        relay: "relay.example.org",
+        relayAddress: "192.0.2.1:9970",
+        relayTrust: "profile_file",
+      },
+      ...SESSIONS,
+    ],
+    activity: FEED,
+    last: { ...last, reason: "disconnected" },
+  },
+  "relay-end": {
+    ...base(consoleIn({ phase: "stopped", reason: "technician_requested" }, { relay: VIA_RELAY })),
+    sessions: [
+      {
+        ...SUMMARY_CLEAN,
+        id: SESSION_ID,
+        endedBy: "technician",
+        endedAt: iso(NOW),
+        relay: "relay.example.org",
+      },
+      ...SESSIONS,
+    ],
+    activity: FEED,
+    last: { ...last, reason: "technician_requested" },
+  },
+  // The relay stopped during the session.
+  "relay-end-lost": {
+    ...base(consoleIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY })),
+    sessions: [
+      {
+        ...SUMMARY_UNKNOWN,
+        id: SESSION_ID,
+        hostname: "ACME-PC-07",
+        endedAt: iso(NOW),
+        relay: "relay.example.org",
+      },
+      ...SESSIONS,
+    ],
+    activity: FEED,
+    last: { ...last, reason: "disconnected" },
+  },
+  "relay-end-lost-preparing": {
+    ...base(consoleIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY })),
+    activity: FEED,
+    reportPending: true,
+    last: { ...last, reason: "disconnected" },
+  },
   compare: base(
     consoleIn({ phase: "awaiting_approval_code", code: "482913" }, { session: true, target: true }),
   ),
@@ -986,8 +1362,248 @@ export const FIXTURES: Record<string, TechnicianSnapshot> = {
       ],
     },
   },
-  "settings-run-once": { ...base(idle), nav: "settings", app: APP_RUN_ONCE },
-  "settings-unavailable": { ...base(idle), nav: "settings", app: null },
+  // A relay profile next to the installed program stays, and the plan says
+  // that it holds a key (ST-M007-011).
+  "settings-uninstall-profile": {
+    ...base(idle),
+    nav: "settings",
+    uninstall: {
+      plan: ["C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.exe"],
+      stays: [
+        `The relay profile ${PROFILE_PATH}, which CretLink did not write and does not remove. It holds the admission key of a relay in readable form: remove the file yourself when nobody else should be able to read that key`,
+      ],
+    },
+  },
+  "settings-run-once": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE,
+  },
+  "settings-unavailable": { ...base(idle), nav: "settings", app: null, relay: null },
+  // Settings → Relay (ST-M007-011).
+  "settings-relay": { ...base(idle), nav: "settings", relay: RELAY_STORED },
+  "settings-relay-private": {
+    ...base(idle),
+    nav: "settings",
+    relay: { ...RELAY_STORED, stored: { path: SETTINGS_PATH, relay: RELAY_PRIVATE } },
+  },
+  "settings-relay-chosen": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: { ca: { mode: "chosen", pick: 4, name: "authority.pem" }, round: 0 },
+  },
+  "settings-relay-testing": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: { ca: { mode: "keep" }, round: 0, test: { state: "running" } },
+  },
+  "settings-relay-admitted": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: {
+      ca: { mode: "keep" },
+      round: 0,
+      test: {
+        state: "done",
+        result: {
+          ok: true,
+          kind: "admitted",
+          message:
+            "The relay relay.example.org answered and admits this copy. Its certificate is valid for relay.example.org, checked against the certificate authorities of this computer.",
+          next: "",
+        },
+      },
+    },
+  },
+  "settings-relay-refused": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: {
+      ca: { mode: "keep" },
+      round: 0,
+      test: {
+        state: "done",
+        result: {
+          ok: false,
+          kind: "key_refused",
+          message:
+            "The relay relay.example.org does not know the admission key of this copy. The key may be mistyped, or it was withdrawn.",
+          next: "Enter the key again, or ask the relay's operator for a new one.",
+        },
+      },
+    },
+  },
+  "settings-relay-removing": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    relayDraft: { ca: { mode: "keep" }, round: 0, removing: true },
+  },
+  "settings-relay-unreadable": {
+    ...base(idle),
+    nav: "settings",
+    relay: {
+      ...RELAY_NONE,
+      source: "settings",
+      stored: {
+        path: SETTINGS_PATH,
+        problem: {
+          file: SETTINGS_PATH,
+          field: "key",
+          message: "Line 3: the value of `key` must be text in double quotes.",
+        },
+      },
+    },
+  },
+  "settings-relay-file": { ...base(idle), nav: "settings", relay: RELAY_FILE },
+  "settings-relay-file-problem": { ...base(idle), nav: "settings", relay: RELAY_FILE_PROBLEM },
+  "settings-relay-run-once-file": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE_FILE,
+  },
+  // Make a customer copy (ST-M007-016): the step while the relay is looked
+  // at, as a form on Windows and elsewhere, with what was chosen, with a
+  // generated key, with the question about a folder that is there, and with
+  // the copy that was written.
+  "settings-copy-loading": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: { options: null },
+  },
+  "settings-copy-windows": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: { options: COPY_OPTIONS },
+  },
+  "settings-copy-choose": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE_FILE,
+    customerCopy: { options: COPY_OPTIONS_CHOOSE },
+  },
+  "settings-copy-chosen": {
+    ...base(idle),
+    nav: "settings",
+    app: APP_RUN_ONCE,
+    relay: RELAY_RUN_ONCE_FILE,
+    customerCopy: {
+      options: COPY_OPTIONS_CHOOSE,
+      program: { pick: 3, name: "cretlink.exe" },
+      place: { pick: 4, name: "/home/sam/Customers" },
+    },
+  },
+  "settings-copy-generated": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: COPY_OPTIONS,
+      place: { pick: 4, name: "C:\\Users\\sam\\Documents\\Customers" },
+      generated: { label: "acme-front-desk", key: COPY_KEY },
+    },
+  },
+  "settings-copy-replacing": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: COPY_OPTIONS,
+      place: { pick: 4, name: "C:\\Users\\sam\\Documents\\Customers" },
+      replacing: `A folder ${COPY_MADE.folder} is there already. Nothing was changed.`,
+    },
+  },
+  "settings-copy-made": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: COPY_OPTIONS,
+      generated: { label: "acme-front-desk", key: COPY_KEY },
+      made: COPY_MADE,
+    },
+  },
+  "settings-copy-made-set-aside": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: COPY_OPTIONS,
+      made: {
+        ...COPY_MADE,
+        files: ["CretLink-Support.exe", "cretlink.toml", "README.txt"],
+        setAside: `${COPY_MADE.folder}.cretlink-old`,
+      },
+    },
+  },
+  // What a copy names comes from a profile that somebody else may have
+  // written, and a path from this computer.
+  "settings-copy-xss": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: {
+        ...COPY_OPTIONS_CHOOSE,
+        relay: {
+          host: XSS,
+          address: XSS,
+          trust: "profile_file",
+          keySet: false,
+          ca: XSS,
+          name: XSS,
+        },
+        folderPrefix: XSS,
+        programName: XSS,
+      },
+      program: { pick: 1, name: XSS },
+      place: { pick: 2, name: `C:\\${XSS_NAME}` },
+      replacing: XSS,
+    },
+  },
+  "settings-copy-made-xss": {
+    ...base(idle),
+    nav: "settings",
+    relay: RELAY_STORED,
+    customerCopy: {
+      options: COPY_OPTIONS,
+      generated: { label: XSS_NAME, key: XSS },
+      made: { copy: 1, folder: `C:\\${XSS_NAME}`, files: [XSS], setAside: XSS },
+    },
+  },
+  // A profile's texts come from a file that somebody else may have written.
+  "settings-relay-xss": {
+    ...base(idle),
+    nav: "settings",
+    relay: {
+      editable: true,
+      source: "file",
+      file: {
+        path: `C:\\${XSS_NAME}\\cretlink.toml`,
+        relay: {
+          host: XSS,
+          address: XSS,
+          trust: "profile_file",
+          keySet: true,
+          ca: XSS,
+          name: XSS,
+        },
+      },
+      stored: {
+        path: SETTINGS_PATH,
+        problem: { file: XSS, message: XSS },
+      },
+    },
+  },
   error: {
     ...base(idle),
     error: {

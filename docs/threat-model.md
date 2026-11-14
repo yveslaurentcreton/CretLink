@@ -3033,6 +3033,12 @@ are the rules the shipped code satisfies, not merely a future commitment. The
 end-to-end trust model is unchanged by the relay's presence (REQ-F-022,
 REQ-S-021).
 
+The application itself runs a session through the relay (ST-M007-013): the
+technician's copy waits on the relay of its profile when the technician
+chooses **Use relay**, and the customer's copy joins when a relay code is
+typed. Until then the relay path existed only in the headless development
+tools. The paragraphs below that name the application say what this adds.
+
 Equally important is what the endpoints expose: neither the console nor the
 support agent opens an internet-reachable listener (REQ-S-010). On the LAN path
 discovery and control traffic are limited to the intended local interfaces,
@@ -3170,6 +3176,90 @@ metadata rather than content.
   relay's log, events and metrics name the label and never the key, and a key
   file that breaks a rule is refused as a whole, so a typing error neither
   opens the relay nor locks everybody out.
+- *A relay profile is addressing, and its file is untrusted input.* A copy
+  learns its relay from a relay profile: the relay's address, an optional
+  admission key, an optional certificate authority file and an optional name
+  in the certificate (ST-M007-011). It is read from `cretlink.toml` next to
+  the program, by both roles, or from the settings of the installed technician
+  copy; the customer role reads the file next to its program and nothing
+  else, and writes nothing. Nothing in a profile grants control (ADR-0016 §2,
+  §4). Somebody who can write next to the program or into the settings can
+  point a copy at a relay of their own, which is then the hostile relay this
+  section already models: it sees metadata and can deny service, and the
+  approval codes differ when it puts itself in between. With `name` and `ca`
+  that person can also give their server the name of the technician's relay
+  and vouch for it with an authority of their own, so the name alone would
+  mislead both people. The application therefore names a relay with what the
+  copy really does: it shows the address beside the name when the copy
+  connects to another host than the name says, and says when the certificate
+  is checked against a file of the profile and not against the system's
+  authorities, on every screen of both roles, in the end report and in the
+  words of every failure. The waiting screen of the installed technician
+  copy says when the relay comes from the file next to the program and not
+  from Settings. The file may have
+  been written by somebody else, so it is read up to a fixed size in a small,
+  strict form: every unknown section and setting is refused, every setting is
+  bounded, the certificate file must be a plain name next to the profile, and
+  a file that cannot be used is explained before any connection and never
+  passed over for another relay. An explanation names the line and the
+  setting and never repeats text from the file.
+- *The application speaks only `wss` to a relay.* A profile has no setting
+  that turns TLS off and an address with a scheme is refused. The relay's
+  certificate is validated against the system's authorities, or against the
+  profile's certificate file and nothing else when it names one, for the
+  profile's name or else the host of its address. A certificate that is not
+  trusted, or that carries another name, ends the dial before the rendezvous
+  preamble is written, so neither the admission key nor the ticket leaves the
+  computer, and the application never falls back to a connection without TLS.
+- *The admission key stays where it is needed.* It is held in a type that is
+  erased when dropped and redacted in debug output. The application never
+  shows it again once it is saved, never logs it, puts it in no audit record
+  and in no error text; a form that leaves the key alone tells the backend to
+  keep it instead of sending it back. A kept key stays with the relay it was
+  saved for, and that is more than its name: the host of the address, the
+  name its certificate must carry and the authority that certificate is
+  checked against. When a form changes one of the three, the application
+  refuses to keep the key and asks for it again, so neither a test nor a
+  save presents the key to another host that claims the same name, or to
+  the same host under an authority that somebody else chose. The test of a
+  relay in Settings presents a ticket of its own, meets nobody and carries
+  nothing of a session.
+- *The settings and the certificate file change together.* The installed
+  copy keeps the relay in `settings.toml` and, for a private authority, the
+  certificates of the chosen file in `relay-ca.pem`. A save writes the new
+  certificate file under another name, then the settings, and only then lets
+  the certificate file take its place; when a step fails, both are as they
+  were. A save that reached only one of them would leave the relay of before
+  with the authority of after. A crash between the two steps leaves the new
+  relay with the old authority, which fails closed: nothing is sent to a
+  relay whose certificate that authority did not sign. The kept file holds
+  the certificates only, written anew, so that a private key which stood in
+  the chosen file is never copied next to the settings.
+- *A customer copy carries a key of its own, and nothing of the
+  technician's.* **Make a customer copy** writes one folder for one customer:
+  the support program, a `cretlink.toml` with the relay of the technician's
+  copy and that customer's admission key, the relay's certificate file when
+  the profile names one, and a note (ST-M007-016). The key is the one the
+  technician typed or had generated for this customer, or none; nothing reads
+  the key of the technician's own profile, and the form has no way to ask for
+  it, so handing out copies never spreads the technician's key. A generated
+  key comes from the system's random source and is shown once, as the line
+  for the relay's key file; the application keeps it nowhere but in the copy.
+  The key stands in the copy in readable form, and whoever has the folder
+  has it: it admits to the forwarder and nothing else, and the operator
+  withdraws it by deleting its line. The certificate file of a copy holds
+  certificates only, also when the technician's own file holds the private
+  key of the authority. The program is copied byte for byte, so its signature
+  is the one of the release. Every name that goes into a path (the label, the
+  folder, the certificate file) is checked as one plain name that Windows
+  takes before anything is written; the window names the program, the place
+  and the copy by a number and never sends a path. The folder is written
+  beside its place and takes its name only when it is whole and was read back
+  as the customer's copy will read it, so a failure leaves no folder that
+  looks like a copy; a folder that is there already is replaced only on the
+  technician's answer. Nothing is sent anywhere: how the folder reaches the
+  customer is the technician's to choose, and a folder that is intercepted on
+  the way gives away the key and the relay's address, not a session.
 - *A relay code grants nothing.* It holds a random seed of 64 bits and a
   typing check, no address and no key. Someone who overhears or guesses a code
   can at most reach the rendezvous before the customer does: the approval
@@ -3181,6 +3271,58 @@ metadata rather than content.
   the relay's host name enters the derivation, a code read
   aloud names nothing on any other relay. The code is named and drawn
   differently from the approval code, which alone establishes trust.
+- *The relay is chosen by the technician, for one session.* The application
+  reaches a relay only when the technician presses **Use relay** on the
+  waiting screen, or when the customer types a relay code into a copy that
+  has a profile (ST-M007-013). Nothing reaches out before that, and discovery
+  and the connection code of one network work as before with a profile
+  present. A wait on a relay opens no listener: the technician's copy dials
+  out, and the listener of the network it waited on is closed first. Every
+  wait has a turn of its own on the console's state: should the task of an
+  earlier wait still be there, it ends what it holds and writes nothing into
+  the state of the newer one, so a late connection to an old listener never
+  shows as a customer of the wait that is on screen. The
+  technician's copy draws a new relay code for every wait and keeps its
+  rendezvous open only while the waiting screen is open; **Cancel** closes
+  the connection, and the code then leads nowhere. Both windows name the
+  relay from the first moment to the end report, by its host name and, when
+  the copy connects to another host than that name says, by that address
+  too, so neither person is left guessing which way the session goes.
+- *A relayed session takes every step of a session on one network.* The
+  handle of a relayed session is driven by the same code as one from the
+  network listener, on both sides: the approval code is shown and compared,
+  the technician confirms, the customer decides, either side stops, and the
+  cleanup is reported (REQ-F-005, REQ-F-006, REQ-F-018, REQ-F-019). The
+  relay's part ends when the two connections have found each other. The
+  console state names the relay as a label and no transition reads it. An
+  end-to-end test runs both roles of the application against the real relay
+  server with TLS inside the test: pairing through a typed code, a command, a
+  transfer there and back, a stop from each side, and a relay that stops in
+  the middle.
+- *The relay code stays on the two screens.* It is shown on the technician's
+  screen to be read out and typed on the customer's. The relay never gets it:
+  both copies present a ticket derived from the code and from the relay's
+  host name. The technician's audit trail records that the session ran
+  through a relay, as the first thing it says of the session
+  (`session_route`): the relay's host name, the address the copy connected
+  to and whether the certificate was checked against the system's
+  authorities or against a file of the profile. A reader of the trail can
+  thus tell the relay that was meant from a server that was given its name.
+  The trail holds neither the code nor the admission key, and no log or
+  error text does.
+- *Every relay failure is said, and nothing connects again by itself.* A
+  relay that cannot be reached, a certificate that is not trusted, a key the
+  relay refuses and a code that nobody waits on each end the wait or the dial
+  with words of their own and a next step (REQ-N-008, REQ-N-015); the
+  customer is told what to pass on, the technician what to change. A relay
+  that drops the connection ends the session on both sides, fail closed, and
+  both windows say that the connection through the relay was lost and that
+  the relay may have stopped. Neither copy dials again after a failure or an
+  end: a relay cannot keep an endpoint reconnecting, and a session never
+  comes back without a new code, a new comparison and a new consent
+  (REQ-S-009). The one thing that is repeated is the technician's waiting
+  connection while nobody has joined, with the same code, for as long as the
+  waiting screen is open.
 - *The relay's answer says only what admission decided.* The reasons it can
   name (no key, an unknown key, the rate limit, the quota, not available,
   another preamble version) concern the use of the forwarder, never a session
@@ -3207,6 +3349,47 @@ metadata rather than content.
 - Availability is not defended. A hostile relay can always refuse, delay, or
   degrade service. The guarantee is fail-closed denial of control, not
   liveness.
+- The admission key stands in readable form on disk: in `cretlink.toml` next
+  to a copy, and in the settings of the installed technician copy. The
+  settings file is created for the user only where the system has file modes
+  (`0600` on macOS and Linux) and has the access rules of the user's
+  `%LOCALAPPDATA%` folder on Windows; a customer copy is a folder that is
+  handed over, and whoever has it has its key. A key admits to the forwarder
+  and nothing else, and one key per customer bounds what a leaked one is
+  worth until its line is deleted.
+- The environment can replace the system's authorities. A copy whose
+  profile names no certificate file checks the relay's certificate against
+  the authorities of the operating system, which it reads with
+  `rustls-native-certs`. When the environment variable `SSL_CERT_FILE` or
+  `SSL_CERT_DIR` is set for the program, that library reads the certificates
+  named there instead of the operating system's store, on Windows, macOS and
+  Linux alike, and it offers no way to read the system's store without them.
+  Whoever can set the environment a copy starts with can therefore choose
+  the authorities that vouch for a relay, as somebody who can write the
+  profile file can with `ca`; the screens then still speak of the
+  certificate authorities of this computer, because the copy cannot tell the
+  two apart. What they gain is the place of a hostile relay: they see
+  ciphertext, sizes and timing and can deny service, and the approval codes
+  differ when they put themselves in between. A profile with a certificate
+  file is not affected: its file replaces every other authority, and the
+  environment is not read at all. A technician who wants a relay checked
+  against one authority and nothing else gives the profile that authority's
+  certificate file.
+- The relay code is read over the same call as the approval code. Somebody
+  who listens to that call learns the relay code; to use it they also need a
+  copy that the relay admits. If they join before the customer, the
+  technician's screen shows an approval code that the customer cannot
+  confirm, and the customer's copy says that nobody waits on the code. The
+  protection is the comparison: a technician who confirms a code that the
+  customer did not read back gives the listener the consent screen, and only
+  the listener's own computer is then at stake, never the customer's.
+- A lost connection has no cause that an endpoint can see. When a relayed
+  session ends because the connection is gone, neither copy can tell a relay
+  that stopped from a computer that went offline; the windows say both.
+- The relay in the application has not been run between real computers on
+  two networks yet. Its behaviour is covered by automated tests against a
+  relay inside the test process; the manual scenario MT-15 in
+  [`manual-tests.md`](manual-tests.md) is pending.
 - Third-party relay deployments. As MIT-licensed software, relay code can be
   self-hosted by anyone; the project cannot police hostile or negligent
   deployments beyond making endpoint security independent of relay honesty.
@@ -3367,6 +3550,15 @@ writes nothing of its own but the audit trail.
   desktop entry, the uninstall entry and the recorded registrations, and
   reports anything it could not remove instead of claiming success. The audit
   trail stays on purpose, and the uninstall says so.
+- *A relay profile next to the installed program outlives the install.* The
+  installed copy keeps its relay in its settings, which uninstall removes with
+  the key in them. A file `cretlink.toml` next to the installed program is not
+  part of the install: a person put it there, and it may hold an admission
+  key in readable form. Uninstall leaves it, and both the command and the
+  Settings screen say before anything is removed that it stays, where it lies
+  and whether it holds a key, so that a key is never left behind without the
+  technician knowing. The key admits to the relay and controls no session;
+  its operator can withdraw it.
 - *A tampered `install.json` turns uninstall into a deletion primitive.*
   Uninstall deletes only the fixed paths of the layout, never a path read from
   the record, and reads at most 64 KiB of it. The record decides only which

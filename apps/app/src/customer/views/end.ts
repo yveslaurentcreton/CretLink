@@ -9,7 +9,16 @@ import type { CleanupNote, CleanupResult, CustomerReport, EndedBy } from "../../
 import { h } from "../../shared/dom";
 import { plural } from "../../shared/feed";
 import { icon } from "../../shared/icons";
-import { type CustomerSnapshot, capName, liveCounts, technicianName } from "../model";
+import { viaRelay } from "../../shared/relay";
+import {
+  type CustomerSnapshot,
+  capName,
+  liveCounts,
+  relayLostWords,
+  relayNamed,
+  sessionRelay,
+  technicianName,
+} from "../model";
 import { button } from "./common";
 
 export function endHeading(endedBy: EndedBy | undefined, name: string): string {
@@ -147,6 +156,26 @@ function record(s: CustomerSnapshot, report: CustomerReport | null): HTMLElement
   );
 }
 
+/**
+ * A session through a relay whose connection was lost says so with the
+ * relay, and that nothing connects again by itself (ST-M007-013).
+ */
+function relayLost(s: CustomerSnapshot): HTMLElement | null {
+  const relay = relayNamed(s);
+  const phase = s.view?.status.phase;
+  const lost =
+    s.report?.endedBy === "connection_lost" ||
+    (phase?.phase === "stopped" && phase.reason === "disconnected");
+  if (!relay || !lost) return null;
+  const words = relayLostWords(relay);
+  return h(
+    "p",
+    { class: "note relay-lost", role: "note", "data-key": "relay-lost" },
+    icon("alert"),
+    h("span", null, h("b", null, `${words.message} `), words.next),
+  );
+}
+
 export function endView(s: CustomerSnapshot): HTMLElement[] {
   const report = s.report;
   const name = technicianName(s);
@@ -163,7 +192,9 @@ export function endView(s: CustomerSnapshot): HTMLElement[] {
           { class: "lead" },
           `${capName(name)} can no longer reach this computer. A new session needs a new code and your permission again.`,
         ),
+        viaRelay(sessionRelay(s)),
       ),
+      relayLost(s),
       stats(s, report),
       cleanup(report),
       record(s, report),

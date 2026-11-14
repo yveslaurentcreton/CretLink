@@ -19,6 +19,7 @@ use crate::audit::{
     terminal_open_started, terminal_opened,
 };
 use crate::ipc_server::AuditEntry;
+use crate::state::RelayRoute;
 
 /// 2026-11-03T10:00:00.000Z
 const T0: i64 = 1_793_700_000_000;
@@ -214,6 +215,98 @@ fn a_full_session_is_summarized_from_its_records() {
     assert!(summary.cleanup.notes[0].text.contains("fix.msi"));
     assert_eq!(summary.cleanup.notes.len(), 2);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_session_through_a_relay_names_the_relay_and_one_on_a_network_names_none() {
+    let dir = temp_dir("relay");
+    // On one network there is no route record, and the summary names no relay.
+    let lan = SessionId::new();
+    let on_a_network = read_session(&write_session(&dir, T0, lan, full_session(lan), true));
+    assert_eq!(on_a_network.relay, None);
+    assert!(
+        serde_json::to_value(&on_a_network)
+            .unwrap()
+            .get("relay")
+            .is_none()
+    );
+
+    // Through a relay the record stands before pairing and consent.
+    let relayed = SessionId::new();
+    let route = RelayRoute::new(
+        "relay.example.org",
+        "192.0.2.1:443",
+        RelayTrust::ProfileFile,
+    );
+    let mut entries = vec![crate::audit::relay_route_entry(&route)];
+    entries.extend(full_session(relayed));
+    let through = read_session(&write_session(&dir, T0 + 60_000, relayed, entries, true));
+    assert_eq!(through.relay.as_deref(), Some("relay.example.org"));
+    // The summary also says where the copy connected and what vouched for
+    // the relay's name: the name alone would not tell the relay that was
+    // meant from a server that was given its name.
+    assert_eq!(through.relay_address.as_deref(), Some("192.0.2.1:443"));
+    assert_eq!(through.relay_trust, Some(RelayTrust::ProfileFile));
+    let shown = serde_json::to_value(&through).unwrap();
+    assert_eq!(shown["relay"], "relay.example.org");
+    assert_eq!(shown["relayAddress"], "192.0.2.1:443");
+    assert_eq!(shown["relayTrust"], "profile_file");
+    // A log from before the address and the trust were recorded names the
+    // relay alone, and nothing is made up for the rest.
+    let earlier = SessionId::new();
+    let mut entry = crate::audit::relay_route_entry(&route);
+    entry.args = AuditArgs::new()
+        .with("transport", AuditValue::String("relay".to_owned()))
+        .with(
+            "relay_host",
+            AuditValue::String("relay.example.org".to_owned()),
+        );
+    let mut entries = vec![entry];
+    entries.extend(full_session(earlier));
+    let before = read_session(&write_session(&dir, T0 + 120_000, earlier, entries, true));
+    assert_eq!(before.relay.as_deref(), Some("relay.example.org"));
+    assert_eq!((before.relay_address, before.relay_trust), (None, None));
+    // It is where the session travelled, and no action on the customer
+    // computer: everything else of the summary is what it is on one network.
+    assert_eq!(through.actions, on_a_network.actions);
+    assert_eq!(through.failures, on_a_network.failures);
+    assert_eq!(through.ended_by, on_a_network.ended_by);
+    assert_eq!(through.cleanup, on_a_network.cleanup);
+    assert_eq!(through.hostname, on_a_network.hostname);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_route_record_holds_the_transport_the_relay_and_how_it_was_trusted_and_nothing_else() {
+    let route = RelayRoute::new(
+        "relay.example.org",
+        "192.0.2.1:443",
+        RelayTrust::ProfileFile,
+    );
+    let entry = crate::audit::relay_route_entry(&route);
+    assert_eq!(entry.actor, Actor::Console);
+    assert_eq!(entry.action, crate::audit::SESSION_ROUTE_ACTION);
+    assert_eq!(entry.outcome, Outcome::Ok);
+    assert_eq!(
+        serde_json::to_value(&entry.args).unwrap(),
+        serde_json::json!({
+            "transport": { "string": "relay" },
+            "relay_host": { "string": "relay.example.org" },
+            "relay_address": { "string": "192.0.2.1:443" },
+            "relay_trust": { "string": "profile_file" },
+        })
+    );
+    assert!(entry.digests.is_empty());
+    // A relay checked against the system's authorities says so too.
+    let system = RelayRoute::new(
+        "relay.example.org",
+        "relay.example.org:443",
+        RelayTrust::SystemAuthorities,
+    );
+    assert_eq!(
+        serde_json::to_value(&crate::audit::relay_route_entry(&system).args).unwrap()["relay_trust"],
+        serde_json::json!({ "string": "system_authorities" })
+    );
 }
 
 #[test]
