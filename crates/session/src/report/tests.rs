@@ -296,6 +296,7 @@ fn sample_input() -> CustomerReportInput {
                 at: cretlink_shared::format_rfc3339_millis(START + 120_000),
             },
         ],
+        kept_program: None,
     }
 }
 
@@ -370,6 +371,58 @@ fn the_file_name_is_safe_on_windows() {
     assert_eq!(
         CustomerReport::build(input).file_name(),
         "2025-10-22 this computer.html"
+    );
+}
+
+/// A support program that the customer kept is on the computer on purpose:
+/// the report says so in words, and never counts it among what a session
+/// left behind (ST-M009-017, REQ-F-019).
+#[test]
+fn a_kept_program_is_said_to_be_there_on_purpose_and_is_no_residual() {
+    let without = CustomerReport::build(sample_input());
+    assert!(without.kept_program.is_none());
+    assert!(
+        serde_json::to_value(&without)
+            .unwrap()
+            .get("keptProgram")
+            .is_none()
+    );
+    assert!(!html::render(&without).contains("kept there on purpose"));
+
+    let kept = KeptProgram {
+        location: format!("C:\\Program Files\\CretLink Support {XSS}"),
+        version: Some("1.2.0".to_owned()),
+    };
+    let with = CustomerReport::build(CustomerReportInput {
+        kept_program: Some(kept.clone()),
+        ..sample_input()
+    });
+    // The cleanup result is what the session reported, with or without it.
+    assert_eq!(with.cleanup, without.cleanup);
+    assert_eq!(
+        serde_json::to_value(&with).unwrap()["keptProgram"],
+        serde_json::json!({ "location": kept.location, "version": "1.2.0" })
+    );
+    let page = html::render(&with);
+    assert!(
+        page.contains(
+            ", version 1.2.0) because it was kept there on purpose. It was not left behind by \
+             this session. To remove it, use Installed apps in the settings of Windows, or \
+             start it and choose Remove from this computer.</p>"
+        ),
+        "{page}"
+    );
+    // The folder is text like every other string of the report.
+    assert!(!page.contains(XSS));
+    // Without a version that the record names, none is said.
+    let unnamed = KeptProgram {
+        location: "C:\\Program Files\\CretLink Support".to_owned(),
+        version: None,
+    };
+    assert!(
+        unnamed
+            .words()
+            .starts_with("CretLink Support is installed on this computer (C:\\Program Files\\CretLink Support) because")
     );
 }
 

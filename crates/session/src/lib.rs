@@ -91,7 +91,7 @@ pub use redeem::{
 };
 pub use report::{
     CleanupNote, CleanupResult, CleanupState, CustomerCounts, CustomerReport, CustomerReportInput,
-    EndedBy,
+    EndedBy, KeptProgram,
 };
 pub use transfer::{
     CancelToken, DownloadRequest, TransferProgress, TransferReport, UploadRequest,

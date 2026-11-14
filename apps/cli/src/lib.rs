@@ -249,8 +249,11 @@ async fn recover_command(program: &str, remove: bool) -> ExitCode {
         recovery::identity_text(program, &cretlink_support_agent::current_identity())
     );
     let store = cretlink_support_agent::TicketStore::for_this_process();
-    let webview = WebviewResidue(webview_profile::Places::current());
-    let run = recovery::run_recover_with(program, remove, &store, Some(&webview)).await;
+    let more = MoreResidue {
+        webview: webview_profile::Places::current(),
+        kept: kept::Layout::current(),
+    };
+    let run = recovery::run_recover_with(program, remove, &store, Some(&more)).await;
     print!("{}", run.text);
     if run.success {
         ExitCode::SUCCESS
@@ -259,18 +262,36 @@ async fn recover_command(program: &str, remove: bool) -> ExitCode {
     }
 }
 
-/// The webview profile folders that the application's window left, as the
-/// recovery verb lists and removes them (ST-M009-014).
-struct WebviewResidue(webview_profile::Places);
+/// What the shipped command line knows beside the residue of sessions: the
+/// webview profile folders that the application's window left, which the
+/// recovery verb lists and removes (ST-M009-014), and the support program
+/// that a customer chose to keep, which is no residue and is only named
+/// (ST-M009-017).
+struct MoreResidue {
+    webview: webview_profile::Places,
+    /// The places of a kept program; `None` off Windows.
+    kept: Option<kept::Layout>,
+}
 
-impl cretlink_support_agent::OtherResidue for WebviewResidue {
+impl cretlink_support_agent::OtherResidue for MoreResidue {
     fn scan(&self, inventory: &mut cretlink_support_agent::Inventory) {
-        add_webview_inventory(inventory, &webview_profile::leftovers(&self.0));
+        add_webview_inventory(inventory, &webview_profile::leftovers(&self.webview));
     }
 
     fn recover(&self, report: &mut cretlink_support_agent::RecoveryReport) {
         let mut patience = webview_profile::Patience::a_few_seconds();
-        add_webview_recovery(report, &webview_profile::recover(&self.0, &mut patience));
+        add_webview_recovery(
+            report,
+            &webview_profile::recover(&self.webview, &mut patience),
+        );
+    }
+
+    fn on_purpose(&self) -> Vec<String> {
+        self.kept
+            .as_ref()
+            .and_then(kept::on_purpose)
+            .into_iter()
+            .collect()
     }
 }
 
@@ -559,7 +580,8 @@ Commands:
   recover [--remove]  List what CretLink left on this computer (staged files,
                       reboot-resume tickets, webview profile folders); with
                       --remove, remove it. Exits with an error when something
-                      could not be removed.
+                      could not be removed. A support program that a customer
+                      chose to keep is named, and never removed by this.
   version             Print the version.
   help                Print this help.
 

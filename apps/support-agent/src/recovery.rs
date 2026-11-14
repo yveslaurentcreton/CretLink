@@ -66,6 +66,15 @@ pub trait OtherResidue {
     /// was removed, what was kept with the reason, and what could not be
     /// read.
     fn recover(&self, report: &mut RecoveryReport);
+
+    /// What is on this computer on purpose, one sentence each: the support
+    /// program that a customer chose to keep (ST-M009-017). It is no residue
+    /// and is never listed, counted or removed as such; it is said after the
+    /// report, so that nobody takes it for something a session left behind
+    /// (REQ-F-019).
+    fn on_purpose(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Runs the recovery verb on the platform defaults. Without `remove` it
@@ -106,10 +115,23 @@ pub async fn run_recover_with(
             success: true,
         }
     };
+    let on_purpose = other.map(OtherResidue::on_purpose).unwrap_or_default();
     RecoverRun {
-        text: with_scope_note(run.text, with_administrator_rights),
+        text: with_scope_note(
+            with_what_is_there_on_purpose(run.text, &on_purpose),
+            with_administrator_rights,
+        ),
         success: run.success,
     }
+}
+
+/// A report, with what is on the computer on purpose said after it: not as
+/// residue, and without a word about removing it with this command.
+fn with_what_is_there_on_purpose(mut text: String, on_purpose: &[String]) -> String {
+    for sentence in on_purpose {
+        let _ = writeln!(text, "  Not left behind, but there on purpose: {sentence}");
+    }
+    text
 }
 
 /// What the report of a run with administrator rights does not cover. (A run
@@ -1232,6 +1254,27 @@ mod tests {
             reason: format!("{REASON_EARLIER_RELEASE}; removing it needs administrator rights"),
         });
         assert!(needs_administrator(&earlier, false));
+    }
+
+    /// A support program that a customer kept is not residue: it is said
+    /// after the report, which stays the report of a clean computer
+    /// (ST-M009-017).
+    #[test]
+    fn what_is_there_on_purpose_is_said_and_is_no_residue() {
+        let clean = inventory_text("cretlink", &Inventory::default());
+        assert_eq!(with_what_is_there_on_purpose(clean.clone(), &[]), clean);
+        let kept = "CretLink Support is installed in C:/Program Files/CretLink Support.".to_owned();
+        let text = with_what_is_there_on_purpose(clean.clone(), std::slice::from_ref(&kept));
+        assert!(text.starts_with(&clean), "{text}");
+        assert!(text.contains("This machine is clean"), "{text}");
+        assert!(
+            text.ends_with(
+                "  Not left behind, but there on purpose: CretLink Support is installed in \
+                 C:/Program Files/CretLink Support.\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("recover --remove"), "{text}");
     }
 
     #[test]

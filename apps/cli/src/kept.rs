@@ -697,6 +697,38 @@ pub fn status(layout: &Layout, this_exe: &Path, this_version: &str) -> Status {
     }
 }
 
+/// The program that is kept on this computer: its folder, and its version
+/// when its record says one. `None` when nothing is kept.
+#[must_use]
+pub fn kept(layout: &Layout) -> Option<(PathBuf, Option<String>)> {
+    if Standing::of_file(&layout.exe) != Standing::Ours {
+        return None;
+    }
+    let version = read_record(layout)
+        .ok()
+        .flatten()
+        .map(|record| record.version);
+    Some((layout.folder.clone(), version))
+}
+
+/// What a report says about a program that is kept on this computer, so that
+/// nobody takes it for something a session left behind (REQ-F-019): that it
+/// is there because it was kept, and how it goes again. `None` when nothing
+/// is kept.
+#[must_use]
+pub fn on_purpose(layout: &Layout) -> Option<String> {
+    let (folder, version) = kept(layout)?;
+    let version = version
+        .map(|version| format!(", version {version}"))
+        .unwrap_or_default();
+    Some(format!(
+        "CretLink Support is installed on this computer ({}{version}) because it was kept there \
+         on purpose. To remove it, use Installed apps in the settings of Windows, or run \
+         '{PROGRAM_FILE} uninstall'.",
+        folder.display()
+    ))
+}
+
 // --- Keeping ---
 
 /// Why the program was not kept, or not removed.

@@ -315,6 +315,30 @@ fn keeping_adds_the_program_its_entries_and_its_record_and_nothing_else() {
     );
 }
 
+/// What `recover` says about a kept program: that it is there on purpose.
+#[test]
+fn a_kept_program_is_named_as_kept_on_purpose() {
+    let machine = Machine::new("on-purpose");
+    assert_eq!(on_purpose(&machine.layout), None);
+    machine.keep("1.0.0", false).unwrap();
+    assert_eq!(
+        on_purpose(&machine.layout),
+        Some(format!(
+            "CretLink Support is installed on this computer ({}, version 1.0.0) because it was \
+             kept there on purpose. To remove it, use Installed apps in the settings of \
+             Windows, or run 'CretLink-Support.exe uninstall'.",
+            machine.layout.folder.display()
+        ))
+    );
+    // Without a record that can be read, no version is said.
+    fs::remove_file(&machine.layout.record).unwrap();
+    assert!(
+        on_purpose(&machine.layout)
+            .unwrap()
+            .contains(&format!("({}) because", machine.layout.folder.display()))
+    );
+}
+
 #[test]
 fn a_desktop_shortcut_is_added_only_on_request_and_goes_when_it_is_no_longer_wanted() {
     let machine = Machine::new("desktop");
