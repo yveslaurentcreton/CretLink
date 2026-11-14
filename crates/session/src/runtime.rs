@@ -1176,7 +1176,7 @@ fn finish_with_report<T: AsyncRead + AsyncWrite + Unpin>(
     // Explicit drop: releasing the `SecureChannel` invalidates the Noise
     // session keys and closes the stream. The session is single-use.
     drop(channel);
-    let control_granted = shared.control_active();
+    let control_granted = shared.control_granted();
     shared.set_control_active(false);
     let ended_by = ended_by(ending);
     shared.set_ended_by(ended_by);

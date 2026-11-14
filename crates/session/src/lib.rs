@@ -716,6 +716,9 @@ pub(crate) struct Shared {
     disclosure: OnceLock<DisclosureSummary>,
     session: OnceLock<SessionId>,
     control_active: AtomicBool,
+    /// Whether the session ever reached full control. It stays set when
+    /// control is taken away at the end, so the end record can say it.
+    control_granted: AtomicBool,
     heartbeats: AtomicU64,
     /// Expiry (Unix millis) of the currently-armed reboot-resume ticket, or `0`
     /// when none is armed (ADR-0014). A display-only indicator both endpoints
@@ -770,6 +773,7 @@ impl Shared {
             disclosure: OnceLock::new(),
             session: OnceLock::new(),
             control_active: AtomicBool::new(false),
+            control_granted: AtomicBool::new(false),
             heartbeats: AtomicU64::new(0),
             armed_not_after: AtomicI64::new(0),
             cleanup: OnceLock::new(),
@@ -832,8 +836,20 @@ impl Shared {
     }
 
     fn set_control_active(&self, active: bool) {
+        if active {
+            self.control_granted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         self.control_active
             .store(active, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the session ever reached full control. Unlike
+    /// [`Self::control_active`] this stays true once control is taken away,
+    /// which an ending session does before it fails the requests that wait.
+    fn control_granted(&self) -> bool {
+        self.control_granted
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn control_active(&self) -> bool {
