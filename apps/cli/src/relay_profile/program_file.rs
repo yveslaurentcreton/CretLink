@@ -13,7 +13,8 @@
 //!   Save or Remove: it is the one thing besides the audit trail that a copy
 //!   that runs once writes. The customer role never calls it.
 //! - **Whole or not at all.** The profile file and the certificate file
-//!   change together ([`settings::write_together`]): new files are made in
+//!   change together, as the settings of the installed copy do
+//!   ([`settings::write_with_relay_ca`]): new files are made in
 //!   the same folder and then moved into place; when a step fails, both are
 //!   as they were.
 //! - **Never through a link.** When the profile file or the certificate file
