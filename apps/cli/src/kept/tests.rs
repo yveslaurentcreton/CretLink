@@ -1225,6 +1225,7 @@ fn nothing_kept_is_nothing_to_remove() {
 fn the_plan_and_the_report_of_a_removal_say_what_goes_and_what_stays() {
     let plan = RemovePlan {
         folder: PathBuf::from("/c/Program Files/CretLink Support"),
+        folder_goes: true,
         files: vec![PathBuf::from(
             "/c/Program Files/CretLink Support/CretLink-Support.exe",
         )],
@@ -1488,6 +1489,13 @@ fn an_interrupted_keep_is_named_and_not_taken_for_a_kept_program() {
     // temporary name: each is a keep that did not finish.
     fs::create_dir(&layout.folder).unwrap();
     assert!(unfinished(layout));
+    // Even the folder alone is removed by `uninstall`, as the report says.
+    let plan = machine.remove_plan(&machine.copy());
+    assert!(plan.folder_goes && plan.files.is_empty(), "{plan:?}");
+    assert!(remove(layout, &machine.system, &plan).unwrap().complete());
+    assert!(!layout.folder.exists());
+    assert!(!unfinished(layout));
+    fs::create_dir(&layout.folder).unwrap();
     let record = Record {
         schema: RECORD_SCHEMA,
         version: "1.0.0".to_owned(),

@@ -1256,6 +1256,9 @@ fn add_shortcut(
 pub struct RemovePlan {
     /// The folder of the kept program.
     pub folder: PathBuf,
+    /// Whether the folder is removed, once it is empty: it is the folder
+    /// that CretLink made, and no link stands under its name.
+    pub folder_goes: bool,
     /// The files in it that are removed.
     pub files: Vec<PathBuf>,
     /// The shortcuts that are removed.
@@ -1284,7 +1287,7 @@ impl RemovePlan {
             .iter()
             .map(|file| format!("{}{after}", file.display()))
             .collect();
-        if !self.files.is_empty() {
+        if self.folder_goes {
             lines.push(format!("The folder {}{after}", self.folder.display()));
         }
         for shortcut in &self.shortcuts {
@@ -1449,11 +1452,14 @@ pub fn remove_plan(
             layout.uninstall_key
         ));
     }
-    if files.is_empty() && shortcuts.is_empty() && uninstall_entry.is_none() {
+    // A folder that CretLink made goes also when nothing is left in it: what
+    // an interrupted keep can leave.
+    if !folder_is_ours && files.is_empty() && shortcuts.is_empty() && uninstall_entry.is_none() {
         return Err(KeptError::NotKept(layout.folder.clone()));
     }
     Ok(RemovePlan {
         folder: layout.folder.clone(),
+        folder_goes: folder_is_ours,
         after_exit: layout.is_kept_exe(current_exe),
         files,
         shortcuts,

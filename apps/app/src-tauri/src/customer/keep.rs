@@ -802,6 +802,7 @@ mod tests {
     fn the_plan_of_a_removal_says_what_goes_and_what_stays() {
         let plan = kept::RemovePlan {
             folder: PathBuf::from("/c/Program Files/CretLink Support"),
+            folder_goes: true,
             files: vec![PathBuf::from(
                 "/c/Program Files/CretLink Support/CretLink-Support.exe",
             )],
