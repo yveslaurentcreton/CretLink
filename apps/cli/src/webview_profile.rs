@@ -10,7 +10,7 @@
 //! | Process | Profile folder | Removed |
 //! |---|---|---|
 //! | Not installed (the start screen, a technician that runs once, a `CretLink-Support*` copy) and every customer process | `CretLink-webview-<random>` in the temporary folder ([`TempProfile`]) | by the process, after its last window closed |
-//! | Any process with administrator rights | `CretLink-webview-<random>` in `webview` in `CretLink Data`, the private folder of an elevated program ([`Base::Private`]) | by the process, after its last window closed |
+//! | Any process with administrator rights | `CretLink-webview-<random>` in `webview` in `CretLink Data`, the private folder of an elevated program ([`Base::Private`]), opened to the account of the desktop ([`TempProfile::create_for`]) | by the process, after its last window closed |
 //! | The installed technician copy | `webview` in the application's data folder, next to the audit trail ([`installed_dir`]) | by uninstall |
 //! | Any process on macOS | none: WebKit keeps its data where a program cannot direct it | not by CretLink |
 //!
@@ -55,9 +55,24 @@
 //! (`cretlink_exec::OwnFolder::webview_for_this_process`), which is created
 //! with its owner and its permissions in one step or found to be such a
 //! folder already, and every profile folder made in it takes those
-//! permissions when it is created. No program without administrator rights
-//! can write into it while the window runs. Leftovers are looked for and
-//! removed only there. What lies in the account's own folders (the temporary
+//! permissions when it is created. Leftovers are looked for and removed only
+//! there.
+//!
+//! WebView2 does not run its browser with administrator rights: with an
+//! elevated host it starts the browser through the desktop's shell, as the
+//! account signed in at the desktop and without administrator rights (after
+//! an elevation with another administrator's password, that is the standard
+//! account at the keyboard). A folder that admits only the administrators
+//! keeps that browser out, and the window stays empty. So once its lock is in
+//! it, the process's own profile folder is opened to that account
+//! ([`TempProfile::create_for`], `cretlink_exec::open_webview_profile`): the
+//! account may make files and folders in it, but may not remove or rename
+//! the folder, change its permissions, or put anything into `webview`. Its
+//! path therefore stays one that only administrators can change, and the
+//! removal of the folder walks it through handles without following a link
+//! that the account put into it. What the account can do is write into the
+//! profile while the window runs, as the browser itself does; that is a
+//! residual risk of the threat model, and nothing secret is kept there. What lies in the account's own folders (the temporary
 //! profiles of a window without administrator rights, the folder of earlier
 //! versions) is removed by a start or a recovery without administrator
 //! rights, and a recovery with them says so. Before the webview is created,
@@ -360,6 +375,31 @@ impl TempProfile {
             }
         }
         Err(last)
+    }
+
+    /// Creates the profile of this process in `base` ([`Self::create_in`]).
+    /// In the private folder of a process with administrator rights, the new
+    /// folder, with its lock in it, is then opened to the account that is
+    /// signed in at the desktop ([`cretlink_exec::open_webview_profile`]):
+    /// WebView2 runs its browser without administrator rights, as that
+    /// account, and the browser could not use a folder that admits only the
+    /// administrators.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_in`], and when the folder cannot be opened to that
+    /// account: it is removed again then, and no window opens.
+    pub fn create_for(base: &Base) -> io::Result<Self> {
+        let profile = Self::create_in(base.dir())?;
+        if base.is_private()
+            && let Err(err) = cretlink_exec::open_webview_profile(profile.path())
+        {
+            // Nothing but the lock is in it yet. What cannot go now is a
+            // folder that was left, which the next elevated start removes.
+            let _ = profile.remove(&mut Patience::none());
+            return Err(err);
+        }
+        Ok(profile)
     }
 
     /// Creates the folder at `path`, where nothing may stand, and takes its

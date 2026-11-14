@@ -514,6 +514,79 @@ pub(crate) fn this_process_is_elevated() -> bool {
     sys::elevated()
 }
 
+/// Opens the profile folder of an elevated window's webview at `dir` to the
+/// account whose desktop the window is shown on (ST-M009-014, REQ-S-024).
+///
+/// WebView2 does not run its browser with administrator rights: when the
+/// program that hosts it is elevated, it starts its browser through the
+/// desktop's shell (Explorer), with the unelevated token of the account that
+/// is signed in at the desktop. In that token the administrators are a group
+/// that refuses and never grants, so the browser cannot enter a private
+/// folder, which admits only the administrators and the system: Microsoft
+/// Edge WebView2 then says it "can't read and write to its data directory",
+/// and the window stays empty. After a consent elevation that account is the
+/// one the program runs as; after an elevation with another administrator's
+/// password it is the standard account at the keyboard.
+///
+/// So the folder, made private in `webview` in `CretLink Data` with the lock
+/// of its process already in it, gets permissions of its own
+/// (`webview_profile_descriptor`): the administrators and the system keep
+/// full control, and the account of the desktop may read the folder and make
+/// files and folders in it, with full control over what is made there. It may
+/// not remove or rename the folder, nor change its permissions or its owner,
+/// and it can put nothing into `webview` itself: the path of the folder stays
+/// one that only administrators can change, so an elevated program that
+/// removes the folder later removes this folder and what is in it, never
+/// another place (the removal does not follow a link inside it,
+/// [`remove_whole`]).
+///
+/// The folder must already hold the lock file: a folder that is not empty
+/// cannot be made a link. Off Windows nothing is changed.
+///
+/// # Errors
+///
+/// When the account of the desktop cannot be told, when what stands at `dir`
+/// is not a folder of the administrators, or when its permissions cannot be
+/// set. The window then does not open.
+pub fn open_webview_profile(dir: &Path) -> io::Result<()> {
+    sys::open_webview_profile(dir)
+}
+
+/// The owner and the permissions of the profile folder of an elevated
+/// window's webview once it is opened to `user`, the account of the desktop
+/// as the system writes its identifier ([`open_webview_profile`]). `None`
+/// when `user` is not such an identifier.
+///
+/// - The administrators own it, and they and the system keep full control
+///   over the folder and everything in it (`OICI`), as in a private folder.
+/// - The account may read the folder, make files and folders in it and
+///   change their attributes (`0x1201bf`: reading, writing and starting,
+///   without removing it, without removing what others made in it, and
+///   without changing its permissions or its owner), for the folder itself
+///   only.
+/// - What is made in the folder gives the account full control (`OICIIO`):
+///   the profile that the browser writes is its own.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows adapter sets permissions; the rule is tested everywhere"
+    )
+)]
+fn webview_profile_descriptor(user: &str) -> Option<String> {
+    let digits = user.strip_prefix("S-1-")?;
+    let well_formed = !digits.is_empty()
+        && user.len() <= 184
+        && digits
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    well_formed.then(|| {
+        format!(
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1201bf;;;{user})(A;OICIIO;FA;;;{user})"
+        )
+    })
+}
+
 /// Removes what stands at `path` whole, without reading it and without
 /// following a link: a link is removed as a link, a folder with everything in
 /// it. For what CretLink no longer uses or did not make, where nothing in it
@@ -729,6 +802,15 @@ mod sys {
         false
     }
 
+    /// Off Windows there is no WebView2, and no elevated window.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the Windows adapter of the same name can fail"
+    )]
+    pub(super) fn open_webview_profile(_dir: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Off Windows there is no administrator to be: see the module
     /// documentation.
     #[allow(
@@ -786,21 +868,26 @@ mod sys {
     };
     use windows::Win32::Security::{
         ACL, ACL_REVISION, CheckTokenMembership, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
-        GetTokenInformation, InitializeAcl, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION,
-        TOKEN_QUERY, TokenElevation, UNPROTECTED_DACL_SECURITY_INFORMATION,
+        GetSecurityDescriptorDacl, GetTokenInformation, InitializeAcl, IsWellKnownSid,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+        TokenElevation, TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION,
         WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+        WRITE_DAC,
     };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
     use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
 
     use super::{
         DATA_FOLDER, KEPT_PROGRAM_FOLDER, PRIVATE_DATA_FOLDER, is_private_text,
-        is_program_folder_text,
+        is_program_folder_text, webview_profile_descriptor,
     };
 
     /// The private permissions of a folder with their owner, in the text form
@@ -1124,6 +1211,137 @@ mod sys {
             return Err(io::Error::from_raw_os_error(status.0.cast_signed()));
         }
         Ok(())
+    }
+
+    /// Gives the profile folder at `dir` the permissions that open it to the
+    /// account of the desktop (see `open_webview_profile` in the module
+    /// above). The folder is opened once, without following a link, and its
+    /// kind, its owner and its new permissions go through that one handle.
+    pub(super) fn open_webview_profile(dir: &Path) -> io::Result<()> {
+        let user = desktop_user().or_else(own_user).ok_or_else(|| {
+            io::Error::other("the account that is signed in at the desktop cannot be told")
+        })?;
+        let text = webview_profile_descriptor(&user).ok_or_else(|| {
+            io::Error::other("the account of the desktop has an identifier of another form")
+        })?;
+        let descriptor = Descriptor::from_text(&text)?;
+        let folder = open(dir, READ_CONTROL.0 | WRITE_DAC.0 | FILE_READ_ATTRIBUTES.0)?;
+        if !is_plain_folder(&folder)? || !Owner::of(&folder)?.is_trusted() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the profile folder is not a folder of the administrators",
+            ));
+        }
+        let mut present = BOOL::default();
+        let mut defaulted = BOOL::default();
+        let mut list: *mut ACL = std::ptr::null_mut();
+        // SAFETY: `descriptor` owns a valid descriptor for as long as it
+        // lives; the three places are valid for the results. `list` points
+        // into that descriptor.
+        unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut list, &mut defaulted) }
+            .map_err(|error| os_error(&error))?;
+        if !present.as_bool() || list.is_null() {
+            return Err(io::Error::other(
+                "the permissions of the profile were not made",
+            ));
+        }
+        // SAFETY: the handle is open with the right to change permissions for
+        // as long as `folder` lives, and `list` points into `descriptor`,
+        // which outlives the call. `PROTECTED` keeps what `webview` hands
+        // down out of the folder.
+        let status = unsafe {
+            SetSecurityInfo(
+                HANDLE(folder.as_raw_handle()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(list.cast_const()),
+                None,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status.0.cast_signed()));
+        }
+        Ok(())
+    }
+
+    /// The account that is signed in at the desktop of this session, as the
+    /// system writes its identifier: the user of the token of the shell
+    /// (Explorer), through which WebView2 starts its browser when its host is
+    /// elevated. `None` without a shell, or when its token cannot be read.
+    fn desktop_user() -> Option<String> {
+        // SAFETY: no argument; the answer is a window handle or null.
+        let shell = unsafe { GetShellWindow() };
+        if shell.is_invalid() {
+            return None;
+        }
+        let mut id = 0u32;
+        // SAFETY: `shell` is a window handle, which may have gone since; then
+        // the answer is 0. `id` is a valid place for the process identifier.
+        unsafe { GetWindowThreadProcessId(shell, Some(&raw mut id)) };
+        if id == 0 {
+            return None;
+        }
+        // SAFETY: a process identifier and a right to ask; the handle that
+        // comes back is closed below.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, id) }.ok()?;
+        let user = user_of_process(process);
+        // SAFETY: `process` was opened above and is closed once.
+        let _ = unsafe { CloseHandle(process) };
+        user
+    }
+
+    /// The account this process runs as: when no shell can be asked, the
+    /// account of the desktop is taken to be this one, as after a consent
+    /// elevation.
+    fn own_user() -> Option<String> {
+        // SAFETY: `GetCurrentProcess` returns a pseudo-handle that is always
+        // valid and is not closed.
+        user_of_process(unsafe { GetCurrentProcess() })
+    }
+
+    /// The user of the token of `process`, as the system writes its
+    /// identifier.
+    fn user_of_process(process: HANDLE) -> Option<String> {
+        let mut token = HANDLE::default();
+        // SAFETY: `process` is a valid process handle for the duration of the
+        // call; `token` is a valid place for the result.
+        unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.ok()?;
+        // Words, not bytes, so that the structure and the SID after it are
+        // aligned; large enough for the largest SID.
+        let mut buffer = [0usize; 64];
+        let mut returned = 0u32;
+        // SAFETY: `token` was just opened for querying; the buffer is
+        // writable for the size passed, and `returned` is a valid place for
+        // the length.
+        let read = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buffer.as_mut_ptr().cast::<c_void>()),
+                u32::try_from(size_of_val(&buffer)).unwrap_or(0),
+                &mut returned,
+            )
+        };
+        // SAFETY: `token` is the handle opened above and is closed once.
+        let _ = unsafe { CloseHandle(token) };
+        read.ok()?;
+        // SAFETY: on success the buffer starts with a `TOKEN_USER`, aligned
+        // as a word, whose SID points into the same buffer.
+        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut text = PWSTR::null();
+        // SAFETY: `sid` points to a valid SID inside `buffer`, which lives
+        // until after the call; `text` is a valid place for the string the
+        // system allocates.
+        unsafe { ConvertSidToStringSidW(sid, &mut text) }.ok()?;
+        // SAFETY: on success `text` is a NUL-terminated wide string that stays
+        // valid until it is freed below.
+        let user = String::from_utf16_lossy(unsafe { text.as_wide() });
+        // SAFETY: the string was allocated by the system for the caller to
+        // free with `LocalFree`, and is not used afterwards.
+        let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast::<c_void>()))) };
+        Some(user)
     }
 
     /// The owner and the permissions of the entry at `path`, for the tests.

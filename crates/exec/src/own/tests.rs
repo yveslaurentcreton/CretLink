@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     OwnFolder, Standing, administrators_folder, earlier_release_folder, earlier_release_in_use,
-    is_private_text, is_program_folder_text, kept_program_folder, prepare_program_folder,
-    remove_whole,
+    is_private_text, is_program_folder_text, kept_program_folder, open_webview_profile,
+    prepare_program_folder, remove_whole, webview_profile_descriptor,
 };
 
 /// A unique temp directory removed when the guard drops.
@@ -1048,4 +1048,108 @@ mod windows {
         folder.remove_if_empty();
         assert!(!folder.path().exists());
     }
+}
+
+// --- the profile folder of an elevated window (ST-M009-014) -------------------
+
+#[test]
+fn the_profile_of_an_elevated_window_is_opened_to_the_account_and_to_nothing_more() {
+    let user = "S-1-5-21-1-2-3-1001";
+    let text = webview_profile_descriptor(user).expect("a user");
+    assert_eq!(
+        text,
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)\
+         (A;;0x1201bf;;;S-1-5-21-1-2-3-1001)\
+         (A;OICIIO;FA;;;S-1-5-21-1-2-3-1001)"
+    );
+    // On the folder itself the account has no right to remove it, to remove
+    // what others made in it, or to change its permissions or its owner.
+    let rights = 0x0012_01bf_u32;
+    for withheld in [0x0001_0000_u32, 0x0004_0000, 0x0008_0000, 0x0000_0040] {
+        assert_eq!(rights & withheld, 0, "{withheld:#x}");
+    }
+    // Making files and folders in it, and reading it.
+    for granted in [
+        0x0000_0001_u32,
+        0x0000_0002,
+        0x0000_0004,
+        0x0000_0020,
+        0x0002_0000,
+    ] {
+        assert_eq!(rights & granted, granted, "{granted:#x}");
+    }
+}
+
+#[test]
+fn only_an_identifier_of_an_account_goes_into_the_permissions() {
+    for user in [
+        "",
+        "S-1-",
+        "S-1-5-",
+        "S-1-5--1",
+        "BA",
+        "S-1-5-21)(A;OICI;FA;;;WD",
+        "S-1-5-21-1 ",
+        "s-1-5-18",
+    ] {
+        assert_eq!(webview_profile_descriptor(user), None, "{user:?}");
+    }
+    assert!(webview_profile_descriptor(&format!("S-1-5{}", "-4294967295".repeat(20))).is_none());
+    assert!(webview_profile_descriptor("S-1-5-18").is_some());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_private_profile_folder_is_opened_to_the_account_of_the_desktop() {
+    if !can_make_private() {
+        return;
+    }
+    let sb = Sandbox::new();
+    let webview = OwnFolder::administrators_only(sb.data(), sb.data().join("webview"));
+    webview.prepare().expect("prepare");
+    let profile = webview.path().join("profile");
+    std::fs::create_dir(&profile).expect("create");
+    std::fs::write(profile.join("cretlink.lock"), b"").expect("lock");
+    assert!(super::tests_closed_to_others(&profile));
+
+    open_webview_profile(&profile).expect("open");
+
+    let entries = super::tests_permission_entries(&profile);
+    assert!(
+        entries.iter().any(|entry| entry == "A;OICI;FA;;;SY"),
+        "{entries:?}"
+    );
+    assert!(
+        entries.iter().any(|entry| entry == "A;OICI;FA;;;BA"),
+        "{entries:?}"
+    );
+    // The account of the desktop is written as the system writes it: by its
+    // identifier, or by a short name when it is a well-known account (the
+    // built-in administrator of a verification machine reads `LA`). So the
+    // two entries are told by their rights, and must name the same account,
+    // which is neither the system nor the administrators.
+    let account_of = |rights: &str| {
+        entries
+            .iter()
+            .find_map(|entry| entry.strip_prefix(rights))
+            .map(str::to_owned)
+    };
+    let (on_the_folder, on_what_is_made) =
+        (account_of("A;;0x1201bf;;;"), account_of("A;OICIIO;FA;;;"));
+    assert!(on_the_folder.is_some(), "{entries:?}");
+    assert_eq!(on_the_folder, on_what_is_made, "{entries:?}");
+    assert!(
+        !matches!(on_the_folder.as_deref(), Some("SY" | "BA")),
+        "{entries:?}"
+    );
+    assert_eq!(entries.len(), 4, "nobody else is admitted: {entries:?}");
+    // The folder above stays private.
+    assert!(super::tests_is_private(webview.path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn off_windows_a_profile_folder_is_left_as_it_is() {
+    let sb = Sandbox::new();
+    open_webview_profile(&sb.root).expect("nothing to do");
 }

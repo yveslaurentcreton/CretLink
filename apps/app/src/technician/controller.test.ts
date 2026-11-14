@@ -193,6 +193,16 @@ describe("technician controller", () => {
   });
 
   it("keeps the feed across tab switches and the terminal alive across renders", async () => {
+    // The terminal is mounted on the next frame. A frame of the test
+    // environment comes from a timer, which can be late on a busy machine or
+    // held back by another test's fake timers, and then this test ran into
+    // its time limit. Here a frame is the next microtask.
+    const frames = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback: FrameRequestCallback) => {
+        queueMicrotask(() => callback(0));
+        return 0;
+      });
     await boot();
     push(consoleIn({ phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" }));
     push(consoleIn({ phase: "full_control" }, { session: true, target: true }));
@@ -203,7 +213,7 @@ describe("technician controller", () => {
 
     click("#tab-terminal");
     await flush();
-    await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+    await flush();
     const xterm = app().querySelector(".fake-xterm");
     expect(xterm).not.toBeNull();
 
@@ -226,10 +236,11 @@ describe("technician controller", () => {
     await flush();
     click("#tab-terminal");
     await flush();
-    await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+    await flush();
     expect(app().querySelector(".fake-xterm")).toBe(xterm);
     expect(backend.attached).toHaveLength(1);
     expect(app().querySelectorAll(".feed > li")).toHaveLength(FEED.length);
+    frames.mockRestore();
   });
 
   it("keeps the feed after the end, refreshes the history, and clears it when the next session starts", async () => {

@@ -526,11 +526,29 @@ was doing.
    `Get-ChildItem -Recurse | Where-Object LastWriteTime -gt <start>`).
    - Expected: no session record or report exists, and `Documents\CretLink`
      does not exist (REQ-F-027, REQ-F-001).
+   - **The window after the prompt** (ST-M009-014). Start Get help from the
+     administrator account and accept the Windows prompt (consent). Expected:
+     the customer window shows its content, with no message from Microsoft
+     Edge WebView2 about its data directory; in Task Manager (*Details*, with
+     the *User name* column) the `msedgewebview2.exe` processes run as that
+     account, not elevated. Close it, then start Get help from the standard
+     account and answer the prompt with the administrator's name and
+     password. Expected: the same, and the `msedgewebview2.exe` processes run
+     as the standard account. An empty window or the message "We couldn't
+     create the data directory" is a failure: note the path it names.
    - Expected while the Get help window is open (ST-M009-014): the elevated
      window's profile is one folder `CretLink-webview-<32 digits>` in
      `C:\Program Files\CretLink Data\webview` (look as an administrator),
-     with `cretlink.lock` and the webview's data in it; `icacls` on it shows
-     the administrators and the system and nobody else. No
+     with `cretlink.lock` and the webview's data (`EBWebView`) in it.
+     `icacls` on it shows the administrators and the system with full
+     control, and the account signed in at the desktop with read and write
+     on the folder and full control over what is in it (`(OI)(CI)(IO)(F)`),
+     and nobody else; `icacls` on `C:\Program Files\CretLink Data\webview`
+     shows the administrators and the system and nobody else. In a
+     PowerShell of the account at the desktop, `Rename-Item` of the profile
+     folder and `New-Item -ItemType Junction` in `...\webview` are refused
+     with "Access denied", and `Remove-Item` cannot remove the folder itself
+     or its `cretlink.lock`. No
      `CretLink-webview-*` folder of the elevated window is in `%TEMP%`, and
      no `dev.cretlink.app` folder exists in `%LOCALAPPDATA%`. While the
      unelevated window that explains the UAC prompt is open, its own folder
