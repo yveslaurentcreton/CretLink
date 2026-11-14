@@ -20,6 +20,7 @@ import {
   technicianName,
 } from "../model";
 import { button } from "./common";
+import { keepCardView } from "./keep";
 
 export function endHeading(endedBy: EndedBy | undefined, name: string): string {
   switch (endedBy) {
@@ -176,6 +177,29 @@ function relayLost(s: CustomerSnapshot): HTMLElement | null {
   );
 }
 
+/**
+ * A support program that the customer kept is on this computer on purpose:
+ * the report says so beside the cleanup, so that it is not taken for
+ * something this session left behind (ST-M009-017, REQ-F-019).
+ */
+function keptOnPurpose(report: CustomerReport | null): HTMLElement | null {
+  const kept = report?.keptProgram;
+  if (!kept) return null;
+  return h(
+    "p",
+    { class: "note info kept-on-purpose", role: "note", "data-key": "kept-on-purpose" },
+    icon("check"),
+    h(
+      "span",
+      null,
+      h("b", null, "CretLink Support is installed on this computer because you chose to keep it. "),
+      "It was not left behind by this session. It lies in ",
+      h("code", { class: "path" }, kept.location),
+      kept.version ? `, in version ${kept.version}.` : ".",
+    ),
+  );
+}
+
 export function endView(s: CustomerSnapshot): HTMLElement[] {
   const report = s.report;
   const name = technicianName(s);
@@ -197,7 +221,11 @@ export function endView(s: CustomerSnapshot): HTMLElement[] {
       relayLost(s),
       stats(s, report),
       cleanup(report),
+      keptOnPurpose(report),
       record(s, report),
+      // Offered again once the session is over, never during it
+      // (ST-M009-017).
+      keepCardView(s),
     ),
     h(
       "div",

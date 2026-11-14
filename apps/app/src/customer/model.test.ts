@@ -6,8 +6,15 @@ import {
   CONSOLES,
   FEED,
   FEED_DONE,
+  KEEP_INSTALLED,
+  KEEP_OFFER,
+  KEEP_OLDER,
+  KEEP_PLAN,
+  KEEP_SAME,
+  KEEP_UPDATE,
   LAUNCH_READY,
   NOW,
+  REMOVE_PLAN,
   REPORT,
   VIA_RELAY,
   VIA_RELAY_ELSEWHERE,
@@ -23,7 +30,10 @@ import {
   filtered,
   happeningNow,
   initialSnapshot,
+  isKept,
+  isKeptProgram,
   isRelayFailure,
+  keepCard,
   liveCounts,
   nobodyWaitsWords,
   outcomeWords,
@@ -305,5 +315,115 @@ describe("a session through the relay (ST-M007-013)", () => {
     const lost = relayLostWords("relay.example.org");
     expect(lost.message).toContain("The relay may have stopped");
     expect(lost.next).toContain("Nothing connects again by itself");
+  });
+});
+
+describe("keeping the support program (ST-M009-017)", () => {
+  const at = (phase: Parameters<typeof viewIn>[0], patch: Partial<CustomerSnapshot> = {}): CustomerSnapshot => ({
+    ...initialSnapshot("main", NOW),
+    view: viewIn(phase),
+    launch: LAUNCH_READY,
+    ...patch,
+  });
+
+  it("the elevated customer role offers it, the unelevated one does not", () => {
+    // The backend decides: `canKeep` is true only with administrator rights.
+    expect(keepCard(at({ phase: "idle" }, { keep: KEEP_OFFER }))).toEqual({ kind: "offer" });
+    expect(keepCard(at({ phase: "idle" }, { keep: { ...KEEP_OFFER, canKeep: false } }))).toBeNull();
+    // Before the backend has answered, and where it has no answer.
+    expect(keepCard(at({ phase: "idle" }))).toBeNull();
+  });
+
+  it("a live session never offers it, in any phase and whatever is kept", () => {
+    const during = [
+      viewIn({ phase: "announced" }),
+      viewIn({ phase: "pairing" }),
+      viewIn({ phase: "awaiting_approval_compare" }),
+      viewIn({ phase: "awaiting_consent" }),
+      viewIn({ phase: "full_control", session: "s" }),
+      viewIn({ phase: "stopping" }),
+    ];
+    for (const view of during) {
+      expect(view.session_active, view.status.phase.phase).toBe(true);
+      for (const keep of [KEEP_OFFER, KEEP_UPDATE, KEEP_INSTALLED, KEEP_SAME, KEEP_OLDER]) {
+        const s = { ...initialSnapshot("main", NOW), view, launch: LAUNCH_READY, keep };
+        expect(keepCard(s), `${view.status.phase.phase} ${keep.state}`).toBeNull();
+      }
+    }
+    // Once the session is over it is offered again.
+    const ended = at({ phase: "stopped", reason: "customer_requested" }, { keep: KEEP_OFFER, hadControl: true });
+    expect(keepCard(ended)).toEqual({ kind: "offer" });
+  });
+
+  it("says what is kept, and offers an update only for a newer copy with administrator rights", () => {
+    expect(keepCard(at({ phase: "idle" }, { keep: KEEP_UPDATE }))).toEqual({
+      kind: "update",
+      kept: "1.0.0",
+      version: "1.1.0",
+    });
+    expect(keepCard(at({ phase: "idle" }, { keep: { ...KEEP_UPDATE, canKeep: false } }))).toEqual({
+      kind: "kept",
+      relation: "newer",
+      kept: "1.0.0",
+      version: "1.1.0",
+    });
+    expect(keepCard(at({ phase: "idle" }, { keep: KEEP_OLDER }))).toEqual({
+      kind: "kept",
+      relation: "older",
+      kept: "1.1.0",
+      version: "1.0.0",
+    });
+    expect(keepCard(at({ phase: "idle" }, { keep: KEEP_SAME }))?.kind).toBe("kept");
+    expect(keepCard(at({ phase: "idle" }, { keep: KEEP_INSTALLED }))).toEqual({
+      kind: "installed",
+      version: "1.1.0",
+      canRemove: true,
+      elevates: false,
+    });
+    expect(isKept(at({ phase: "idle" }, { keep: KEEP_OFFER }))).toBe(false);
+    expect(isKept(at({ phase: "idle" }, { keep: KEEP_SAME }))).toBe(true);
+    expect(isKeptProgram(at({ phase: "idle" }, { keep: KEEP_SAME }))).toBe(false);
+    expect(isKeptProgram(at({ phase: "idle" }, { keep: KEEP_INSTALLED }))).toBe(true);
+  });
+
+  it("the keep and remove screens stand over the list and the end report only", () => {
+    const keep = { kind: "keep", plan: KEEP_PLAN } as const;
+    const remove = { kind: "remove", plan: REMOVE_PLAN } as const;
+    expect(screenFor(at({ phase: "idle" }, { panel: keep }))).toBe("keep");
+    expect(screenFor(at({ phase: "idle" }, { panel: remove }))).toBe("remove");
+    expect(
+      screenFor(at({ phase: "stopped", reason: "customer_requested" }, { panel: keep, hadControl: true })),
+    ).toBe("keep");
+    // Never over a session, the admin step or the loading screen.
+    expect(screenFor(at({ phase: "full_control", session: "s" }, { panel: keep }))).toBe("live");
+    expect(screenFor(at({ phase: "awaiting_consent" }, { panel: keep }))).toBe("consent");
+    expect(
+      screenFor(at({ phase: "idle" }, { panel: keep, launch: { ...LAUNCH_READY, step: "admin", elevated: false } })),
+    ).toBe("admin");
+    expect(screenFor({ ...initialSnapshot("main", NOW), panel: keep })).toBe("loading");
+  });
+
+  it("a session that starts closes the screen, and it does not come back by itself", () => {
+    const open = at({ phase: "idle" }, { keep: KEEP_OFFER, panel: { kind: "keep", plan: KEEP_PLAN } });
+    const dialing = applyView(open, viewIn({ phase: "announced" }), NOW);
+    expect(dialing.panel).toEqual({ kind: "none" });
+    expect(screenFor(dialing)).toBe("connecting");
+    const back = applyView(dialing, viewIn({ phase: "stopped", reason: "customer_requested" }), NOW);
+    expect(screenFor(back)).toBe("find");
+  });
+
+  it("announces the keep and remove screens in words", () => {
+    expect(announcement(at({ phase: "idle" }, { panel: { kind: "keep", plan: KEEP_PLAN } }))).toBe(
+      "No access. Keep CretLink Support on this computer? Nothing is kept until you choose.",
+    );
+    expect(
+      announcement(at({ phase: "idle" }, { panel: { kind: "keep", plan: { ...KEEP_PLAN, replaces: "1.0.0" } } })),
+    ).toBe("No access. Update CretLink Support on this computer? Nothing changes until you choose.");
+    expect(announcement(at({ phase: "idle" }, { panel: { kind: "remove", plan: REMOVE_PLAN } }))).toContain(
+      "Nothing is removed until you choose.",
+    );
+    expect(
+      announcement(at({ phase: "idle" }, { panel: { kind: "removed", outcome: { state: "removed", left: [] } } })),
+    ).toBe("No access. CretLink Support was removed from this computer.");
   });
 });

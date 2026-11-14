@@ -17,6 +17,7 @@ import {
   signedInAs,
 } from "../model";
 import { button, nothingInstalled } from "./common";
+import { installedWords, keepCardView } from "./keep";
 
 /** The longest code or address the field takes (bounded input). */
 export const CODE_MAX = 64;
@@ -197,8 +198,11 @@ export function findView(s: CustomerSnapshot): HTMLElement[] {
       codeField(s),
       demo(s),
       h("div", { class: "spacer" }),
+      // Keeping the support program is offered here, before a session, and
+      // on the end report (ST-M009-017).
+      keepCardView(s),
       thisComputer(s),
     ),
-    nothingInstalled(),
+    nothingInstalled(installedWords(s)),
   ];
 }

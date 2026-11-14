@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CretLink: keep the support program (dev)</title>
+  </head>
+  <body>
+    <!-- Development only (ST-M009-017): the customer's window on a computer
+         that is held in memory, with Tauri replaced by its own mocks. The
+         real controller and views run; nothing is read, written, kept or
+         removed. Not part of the production build, which builds only
+         ../index.html. Serve with `npx vite` and open /dev/keep.html.
+         `?copy=` picks the copy that runs (portable, update, same, older,
+         kept, unelevated, kept-unelevated), `?relay=` the relay settings
+         next to it (none, plain, renamed, problem), `?fail=` what is refused
+         (plan, keep, remove, declined). -->
+    <div id="app" aria-busy="true"></div>
+    <script type="module" src="./keep.ts"></script>
+  </body>
+</html>

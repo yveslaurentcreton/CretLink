@@ -6,7 +6,19 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ActivityEntry } from "../shared/contract";
 import { upsertActivity } from "../shared/feed";
 import { DISCLOSURE_TEXT } from "../technician/disclosure";
-import { FEED_DONE, FIXTURES, MINI_FIXTURES, NOW, XSS, viewIn } from "./fixtures";
+import {
+  FEED_DONE,
+  FIXTURES,
+  KEEP_INSTALLED,
+  KEEP_OFFER,
+  KEEP_PLAN,
+  KEEP_SAME,
+  MINI_FIXTURES,
+  NOW,
+  REMOVE_PLAN,
+  XSS,
+  viewIn,
+} from "./fixtures";
 import type { CustomerSnapshot } from "./model";
 import { renderMini } from "./views/mini";
 import { renderCustomer } from "./views/shell";
@@ -720,5 +732,283 @@ describe("compact bar (#c-mini)", () => {
   it("has no Stop without a session", () => {
     const root = show("mini-idle", { view: viewIn({ phase: "stopped", reason: "customer_requested" }) });
     expect(root.querySelector('[data-action="stop"]')).toBeNull();
+  });
+});
+
+describe("keeping the support program (ST-M009-017)", () => {
+  const card = (root: HTMLElement): HTMLElement | null => root.querySelector('[data-key="keep-card"]');
+  const footer = (root: HTMLElement): string => text(root.querySelector("#installed-words"));
+
+  it("offers to keep on the list of an elevated window, and nothing is installed until then", () => {
+    const root = show("find-keep-offer");
+    expect(text(card(root))).toContain("Getting help more often?");
+    expect(text(card(root))).toContain("Nothing runs until you start it.");
+    const keep = buttonNamed(root, "Keep CretLink Support on this computer");
+    expect(keep?.dataset.action).toBe("keep-open");
+    expect(keep?.disabled).toBe(false);
+    expect(footer(root)).toBe("Nothing is installed · closing CretLink ends everything");
+    // The list of technicians and the code field are as they were.
+    expect(root.querySelectorAll(".pick")).toHaveLength(2);
+    expect(root.querySelector("#code")).not.toBeNull();
+  });
+
+  it("offers nothing without administrator rights", () => {
+    const root = show("find-unelevated-no-offer");
+    expect(card(root)).toBeNull();
+    expect(root.querySelector('[data-action="keep-open"]')).toBeNull();
+    // A window that has not heard from the backend offers nothing either.
+    expect(card(show("find"))).toBeNull();
+  });
+
+  it("offers nothing during a session, whatever the backend said before it", () => {
+    for (const name of ["connecting", "sac", "consent", "live-running", "live-none", "stopping", "live-close"]) {
+      const root = show(name, { keep: KEEP_OFFER });
+      expect(card(root), name).toBeNull();
+      expect(root.querySelector('[data-action^="keep-"]'), name).toBeNull();
+      expect(root.querySelector('[data-action^="remove-"]'), name).toBeNull();
+      // Also not in the kept program, and not with a panel left open.
+      const kept = show(name, { keep: KEEP_INSTALLED, panel: { kind: "keep", plan: KEEP_PLAN } });
+      expect(card(kept), name).toBeNull();
+      expect(kept.dataset.screen, name).not.toBe("keep");
+      expect(kept.querySelector('[data-action="keep-confirm"]'), name).toBeNull();
+    }
+  });
+
+  it("offers to update a kept program and names both versions", () => {
+    const root = show("find-keep-update");
+    expect(text(card(root))).toContain(
+      "CretLink Support is kept on this computer in version 1.0.0. This copy is version 1.1.0 and can replace it.",
+    );
+    expect(buttonNamed(root, "Update the kept program")?.dataset.action).toBe("keep-open");
+    expect(footer(root)).toBe("CretLink Support is kept on this computer · closing CretLink ends everything");
+  });
+
+  it("never offers to replace a newer program with an older copy", () => {
+    const root = show("find-kept-older-copy");
+    expect(text(card(root))).toContain("A newer CretLink Support is kept on this computer");
+    expect(text(card(root))).toContain(
+      "It is version 1.1.0; this copy is the older version 1.0.0 and does not replace it.",
+    );
+    expect(card(root)?.querySelector("button")).toBeNull();
+    // The same version, and one that cannot be compared, offer nothing either.
+    expect(card(show("find-kept-same"))?.querySelector("button")).toBeNull();
+    const unknown = show("find", { keep: { ...KEEP_SAME, state: "unknown", keptVersion: undefined } });
+    expect(text(card(unknown))).toContain("Its version cannot be compared with this copy");
+    expect(card(unknown)?.querySelector("button")).toBeNull();
+  });
+
+  it("says that the program is kept once it was kept, and how to start it next time", () => {
+    const root = show("find-kept-now");
+    expect(text(card(root))).toContain("CretLink Support is now kept on this computer");
+    expect(text(card(root))).toContain(
+      "Version 1.1.0. Next time, start CretLink Support from the Start menu. You no longer need this copy.",
+    );
+    expect(card(root)?.querySelector("button")).toBeNull();
+    expect(footer(root)).not.toContain("Nothing is installed");
+  });
+
+  it("the kept program shows that it is installed with its version, and offers to remove itself", () => {
+    const root = show("find-installed");
+    expect(text(card(root))).toContain("CretLink Support is installed on this computer");
+    expect(text(card(root))).toContain(
+      "Version 1.1.0. It starts only when you start it, and every session asks for your permission again.",
+    );
+    expect(buttonNamed(root, "Remove from this computer")?.dataset.action).toBe("remove-open");
+    expect(root.querySelector('[data-action="keep-open"]')).toBeNull();
+    expect(footer(root)).toBe("This program is kept on this computer · closing it ends everything");
+    // Also in a window that went on without administrator rights.
+    expect(buttonNamed(show("find-installed-unelevated"), "Remove from this computer")).toBeDefined();
+  });
+
+  it("the kept program explains the prompt without saying that nothing is installed", () => {
+    const root = show("admin-kept-program");
+    expect(text(root.querySelector("#admin-nothing"))).toBe(
+      "Nothing happens to this computer before step 4. This program is kept on this computer and starts only when you start it.",
+    );
+    expect(text(root)).not.toContain("nothing is installed");
+    // It still takes every step of a copy that was downloaded.
+    expect(root.querySelectorAll(".steps li")).toHaveLength(4);
+    expect(buttonNamed(root, "Continue")?.dataset.action).toBe("continue");
+    // A copy that is not kept says it as before.
+    expect(text(show("admin").querySelector("#admin-nothing"))).toBe(
+      "Nothing happens to this computer before step 4, and nothing is installed.",
+    );
+  });
+
+  it("says in plain words what is added, that nothing starts by itself, and how to remove it", () => {
+    const root = show("keep");
+    expect(root.dataset.screen).toBe("keep");
+    expect(band(root)).toBe("NO ACCESS Nobody can see or control this computer");
+    expect(text(root.querySelector("#keep-title"))).toBe("Keep CretLink Support on this computer?");
+    const adds = text(root.querySelector(".keep-adds"));
+    expect(adds).toContain("What is added to this computer");
+    expect(adds).toContain(
+      "The program, version 1.1.0, in C:\\Program Files\\CretLink Support , where only an administrator can change it.",
+    );
+    expect(adds).toContain("An entry CretLink Support in the Start menu, for everyone who uses this computer.");
+    expect(adds).toContain("An entry in Installed apps of Windows, where you can remove it again.");
+    // A copy without relay settings adds none.
+    expect(root.querySelector('[data-key="keep-relay"]')).toBeNull();
+    const whole = text(root.querySelector("#main"));
+    expect(whole).toContain(
+      "Nothing starts by itself. Nobody can connect to this computer unless you start the program and allow a session.",
+    );
+    expect(whole).toContain("you compare the code and you decide, exactly as today");
+    expect(whole).toContain("To remove it again, open Settings in Windows, then Apps, then Installed apps");
+    expect(whole).toContain("Or start it and choose Remove from this computer.");
+    // The desktop shortcut is a wish, off unless the customer ticks it.
+    const desktop = root.querySelector<HTMLInputElement>("#keep-desktop");
+    expect(desktop?.type).toBe("checkbox");
+    expect(desktop?.checked).toBe(false);
+    expect(text(root.querySelector('label[for="keep-desktop"]'))).toBe("Also put a shortcut on the desktop");
+    // Two native buttons, and neither is focused for the customer.
+    expect(buttonNamed(root, "Back")?.dataset.action).toBe("panel-back");
+    expect(buttonNamed(root, "Keep on this computer")?.dataset.action).toBe("keep-confirm");
+    expect(root.querySelector("[data-autofocus]")).toBeNull();
+    expect(root.querySelector("#main")?.getAttribute("tabindex")).toBe("-1");
+    expect(text(root.querySelector('[aria-live="polite"]'))).toBe(
+      "No access. Keep CretLink Support on this computer? Nothing is kept until you choose.",
+    );
+    // The list of technicians is not on this screen: nothing connects from it.
+    expect(root.querySelector("#code")).toBeNull();
+    expect(root.querySelector('[data-action="connect"]')).toBeNull();
+  });
+
+  it("names the relay of the copy before the customer chooses", () => {
+    const plain = show("keep-relay");
+    const relay = text(plain.querySelector('[data-key="keep-relay"]'));
+    expect(relay).toContain("The relay settings of this copy.");
+    expect(relay).toContain("the kept program connects through the relay relay.example.org , which only passes encrypted traffic on.");
+    expect(relay).not.toContain("reached at");
+    expect(relay).not.toContain("certificate file");
+    expect(relay).not.toContain("replace");
+
+    // A name that differs from where the copy connects, vouched for by a
+    // file of the copy itself: both are said, and that the kept settings go.
+    const root = show("keep-update-relay");
+    expect(text(root.querySelector("#keep-title"))).toBe("Update CretLink Support on this computer?");
+    expect(text(root.querySelector("#main .lead"))).toBe(
+      "Version 1.0.0 is kept on this computer. This copy is version 1.1.0 and replaces it.",
+    );
+    const named = text(root.querySelector('[data-key="keep-relay"]'));
+    expect(named).toContain("relay.example.org (reached at 192.0.2.1:9970 )");
+    expect(named).toContain(
+      "The relay's certificate is checked against a certificate file of this copy's relay settings, not against the certificate authorities of this computer.",
+    );
+    expect(named).toContain("They replace the relay settings that are kept now.");
+    // The shortcut that is there stays ticked, and the button says update.
+    expect(root.querySelector<HTMLInputElement>("#keep-desktop")?.checked).toBe(true);
+    expect(buttonNamed(root, "Update on this computer")?.dataset.action).toBe("keep-confirm");
+    expect(text(root.querySelector('[aria-live="polite"]'))).toContain("Update CretLink Support on this computer?");
+  });
+
+  it("says that relay settings that cannot be used are not kept", () => {
+    const root = show("keep-relay-problem");
+    expect(root.querySelector('[data-key="keep-relay"]')).toBeNull();
+    const note = text(root.querySelector('[data-key="keep-relay-problem"]'));
+    expect(note).toContain("The relay settings next to this copy are not kept.");
+    expect(note).toContain("They cannot be used: Line 2: `address` needs a port");
+    // The program can be kept without them.
+    expect(buttonNamed(root, "Keep on this computer")?.disabled).toBe(false);
+  });
+
+  it("writes every path, name and problem as text", () => {
+    const root = show("keep", {
+      panel: {
+        kind: "keep",
+        plan: {
+          ...KEEP_PLAN,
+          version: XSS,
+          location: XSS,
+          relay: { host: XSS, address: `${XSS}:443`, trust: "profile_file" },
+          relayProblem: XSS,
+        },
+      },
+    });
+    expect(root.querySelector("img, script")).toBeNull();
+    expect(root.querySelector(".keep-adds code.path")?.textContent).toBe(XSS);
+    const remove = show("remove", {
+      panel: { kind: "remove", plan: { ...REMOVE_PLAN, removes: [XSS], stays: [XSS] } },
+    });
+    expect(remove.querySelector("img, script")).toBeNull();
+    expect(text(remove.querySelector(".plain-list li"))).toBe(XSS);
+    const report = show("end-kept-on-purpose", {
+      report: { ...FIXTURES["end-kept-on-purpose"]!.report!, keptProgram: { location: XSS, version: XSS } },
+    });
+    expect(report.querySelector("img, script")).toBeNull();
+  });
+
+  it("shows what removing removes, and that a saved report stays", () => {
+    const root = show("remove");
+    expect(root.dataset.screen).toBe("remove");
+    expect(text(root.querySelector("#remove-title"))).toBe("Remove CretLink Support from this computer?");
+    const goes = Array.from(root.querySelectorAll('[aria-labelledby="remove-goes-h"] li')).map((li) => text(li));
+    expect(goes).toEqual(REMOVE_PLAN.removes);
+    expect(text(root.querySelector('[aria-labelledby="remove-stays-h"]'))).toContain(
+      "A session report that you saved stays where you saved it",
+    );
+    expect(text(root.querySelector('[data-key="remove-after-exit"]'))).toContain(
+      "its folder goes when this window has closed",
+    );
+    expect(root.querySelector('[data-key="remove-elevates"]')).toBeNull();
+    const remove = buttonNamed(root, "Remove from this computer");
+    expect(remove?.dataset.action).toBe("remove-confirm");
+    expect(remove?.classList.contains("danger")).toBe(true);
+    expect(buttonNamed(root, "Back")?.dataset.action).toBe("panel-back");
+    expect(root.querySelector("[data-autofocus]")).toBeNull();
+    expect(text(root.querySelector('[aria-live="polite"]'))).toBe(
+      "No access. Remove CretLink Support from this computer? Nothing is removed until you choose.",
+    );
+  });
+
+  it("says that Windows asks for administrator rights when the window has none", () => {
+    const root = show("remove-elevates");
+    expect(text(root.querySelector('[data-key="remove-elevates"]'))).toBe(
+      "Windows will ask for administrator rights. CretLink then shows this list once more and asks before it removes anything, and this window closes.",
+    );
+    expect(root.querySelector('[data-key="remove-after-exit"]')).toBeNull();
+  });
+
+  it("after removing, only closing is left", () => {
+    const root = show("removed");
+    expect(root.dataset.screen).toBe("removed");
+    expect(text(root.querySelector("#removed-title"))).toBe("CretLink Support was removed from this computer");
+    expect(text(root.querySelector("#main"))).toContain("The folder of the program goes when this window has closed.");
+    expect(text(root.querySelector("#main"))).toContain("A session report that you saved stays where you saved it.");
+    expect(buttons(root).map((b) => text(b))).toEqual(["Close CretLink"]);
+    expect(buttonNamed(root, "Close CretLink")?.dataset.action).toBe("close-app");
+    // Everything gone at once, and something that stayed is listed.
+    const done = show("removed", {
+      panel: { kind: "removed", outcome: { state: "removed", left: ["A folder that CretLink did not make"] } },
+    });
+    expect(text(done.querySelector("#main"))).toContain(
+      "The program, its Start-menu entry and its entry in Installed apps are gone.",
+    );
+    expect(text(done.querySelector('[aria-labelledby="removed-stays-h"]'))).toContain(
+      "A folder that CretLink did not make",
+    );
+  });
+
+  it("offers it again on the end report, never before the session is over", () => {
+    const root = show("end-keep-offer");
+    expect(root.dataset.screen).toBe("end");
+    expect(buttonNamed(root, "Keep CretLink Support on this computer")?.dataset.action).toBe("keep-open");
+    // The report is still there, and the close button still has the focus.
+    expect(buttonNamed(root, "Save a copy")).toBeDefined();
+    expect(buttonNamed(root, "Close CretLink")?.hasAttribute("data-autofocus")).toBe(true);
+    expect(card(show("end-pending", { keep: KEEP_OFFER }))).not.toBeNull();
+  });
+
+  it("the report of a session says that a kept program is there on purpose, not left behind", () => {
+    const root = show("end-kept-on-purpose");
+    const note = text(root.querySelector('[data-key="kept-on-purpose"]'));
+    expect(note).toBe(
+      "CretLink Support is installed on this computer because you chose to keep it. It was not left behind by this session. It lies in C:\\Program Files\\CretLink Support , in version 1.1.0.",
+    );
+    // The cleanup result is the session's own: a kept program is no residual.
+    expect(text(root.querySelector(".cleanup"))).toContain("Cleaned up. Nothing of this session is left on this computer.");
+    expect(text(root.querySelector(".cleanup"))).not.toContain("CretLink Support");
+    // A session on a computer without a kept program says nothing about one.
+    expect(show("end-by-customer").querySelector('[data-key="kept-on-purpose"]')).toBeNull();
   });
 });
