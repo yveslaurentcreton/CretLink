@@ -17,6 +17,12 @@
 //! The verb opens no network connection, joins no session and grants no
 //! control.
 //!
+//! The shipped programs know residue that this crate does not: the profile
+//! folders that the application's window left (ST-M009-014). They hand it to
+//! [`run_recover_with`] as an [`OtherResidue`], and it becomes part of the
+//! same report and the same exit code. The development binary has no window
+//! and looks for none.
+//!
 //! A program with administrator rights and a program without them keep their
 //! files in different places, and each covers its own (ST-M006-020; see
 //! [`crate::inventory`]). The report of a run with administrator rights says
@@ -46,6 +52,22 @@ pub struct RecoverRun {
     pub success: bool,
 }
 
+/// Residue of a kind that the program which runs the verb knows and this
+/// crate does not: the profile folders of the application's webview
+/// (ST-M009-014). What it adds is printed and counted like everything else:
+/// kept or unreadable residue is never a success (REQ-N-008).
+pub trait OtherResidue {
+    /// Adds what is there to the inventory, removing nothing: what was found,
+    /// what could not be read, and the kinds that were looked for and are
+    /// empty.
+    fn scan(&self, inventory: &mut Inventory);
+
+    /// Removes what is there, and adds to the report what was found, what
+    /// was removed, what was kept with the reason, and what could not be
+    /// read.
+    fn recover(&self, report: &mut RecoveryReport);
+}
+
 /// Runs the recovery verb on the platform defaults. Without `remove` it
 /// inspects and lists the CretLink-owned residue, removing nothing; with
 /// `remove` it removes what it can and reports honestly what was kept.
@@ -53,15 +75,32 @@ pub struct RecoverRun {
 /// `cretlink-support-agent`, or a `CretLink-Support*` copy) and names the
 /// follow-up command in the report.
 pub async fn run_recover(program: &str, remove: bool, tickets: &TicketStore) -> RecoverRun {
+    run_recover_with(program, remove, tickets, None).await
+}
+
+/// [`run_recover`] with the residue that only the program which runs the verb
+/// knows, as part of the same report and the same exit code.
+pub async fn run_recover_with(
+    program: &str,
+    remove: bool,
+    tickets: &TicketStore,
+    other: Option<&(dyn OtherResidue + Sync)>,
+) -> RecoverRun {
     let with_administrator_rights = OwnFolder::staging_for_this_process().is_private();
     let run = if remove {
-        let report = crate::inventory::recover(tickets).await;
+        let mut report = crate::inventory::recover(tickets).await;
+        if let Some(other) = other {
+            other.recover(&mut report);
+        }
         RecoverRun {
             text: recovery_report_text(&report),
             success: report.ok(),
         }
     } else {
-        let inventory = crate::inventory::scan(tickets).await;
+        let mut inventory = crate::inventory::scan(tickets).await;
+        if let Some(other) = other {
+            other.scan(&mut inventory);
+        }
         RecoverRun {
             text: inventory_text(program, &inventory),
             success: true,

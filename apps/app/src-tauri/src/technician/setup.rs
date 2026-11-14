@@ -501,6 +501,9 @@ mod tests {
             uninstall_entry: false,
             registrations: vec![],
             kept: vec![stays.to_owned()],
+            webview: None,
+            webview_after_close: false,
+            legacy_webview: None,
             audit_dir: PathBuf::from("/home/sam/.local/share/CretLink/audit"),
         };
         // A relay profile next to the program is among what stays, never

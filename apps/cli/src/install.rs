@@ -22,6 +22,12 @@
 //! than in `~/.local/bin`, which is a shared `PATH` directory; on macOS it is
 //! inside the bundle, `Contents/Resources/install.json`.
 //!
+//! The installed copy's window keeps its webview profile in the application's
+//! data folder, next to the audit trail ([`Layout::webview`], ST-M009-014).
+//! Uninstall lists and removes it, and with it the profile folder that
+//! earlier versions left ([`Layout::legacy_webview`]); see
+//! [`crate::webview_profile`].
+//!
 //! The settings of the installed copy — its relay and the network it waits on
 //! (ST-M007-011, [`crate::settings`]) — are kept next to the record, and
 //! uninstall removes them with it. A relay profile `cretlink.toml` next to the
@@ -44,6 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::relay_profile;
 use crate::setup::{self, Action, Client, RegistrationState, Runner};
+use crate::webview_profile;
 
 #[cfg(windows)]
 mod win;
@@ -200,6 +207,13 @@ pub struct Layout {
     pub entry: Option<PathBuf>,
     /// The bundle's `Info.plist` (macOS).
     pub info_plist: Option<PathBuf>,
+    /// The installed copy's webview profile, in the application's data folder
+    /// next to the audit trail (ST-M009-014). `None` on macOS, where the
+    /// webview takes no folder.
+    pub webview: Option<PathBuf>,
+    /// The webview profile folder that earlier versions created for this
+    /// user, named after the application identifier (ST-M009-014).
+    pub legacy_webview: Option<PathBuf>,
 }
 
 impl Layout {
@@ -210,6 +224,8 @@ impl Layout {
         let suffix = platform.exe_suffix();
         let exe_name = format!("cretlink{suffix}");
         let cli_name = format!("cretlink-cli{suffix}");
+        let webview = webview_profile::installed_dir(platform, dirs);
+        let legacy_webview = webview_profile::legacy_dir(platform, dirs);
         Some(match platform {
             Platform::Windows => {
                 let location = dirs
@@ -233,6 +249,8 @@ impl Layout {
                     relay_ca: location.join(RELAY_CA_FILE),
                     entry: Some(menu.join("CretLink.lnk")),
                     info_plist: None,
+                    webview,
+                    legacy_webview,
                     location,
                 }
             }
@@ -249,6 +267,8 @@ impl Layout {
                     relay_ca: resources.join(RELAY_CA_FILE),
                     entry: None,
                     info_plist: Some(contents.join("Info.plist")),
+                    webview,
+                    legacy_webview,
                     location,
                 }
             }
@@ -268,6 +288,8 @@ impl Layout {
                     relay_ca: own.join(RELAY_CA_FILE),
                     entry: Some(data.join("applications").join("cretlink.desktop")),
                     info_plist: None,
+                    webview,
+                    legacy_webview,
                     location,
                 }
             }
@@ -578,6 +600,16 @@ pub trait System {
     ///
     /// Returns an error when the removal cannot be scheduled.
     fn remove_after_exit(&self, files: &[PathBuf], dir: &Path) -> io::Result<()>;
+
+    /// Removes a webview profile folder whole, without following a link. A
+    /// webview that closed a moment ago may still hold files there, so the
+    /// removal is tried again for a few seconds (ST-M009-014). A folder that
+    /// is not there is removed already.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the folder is still there afterwards.
+    fn remove_profile(&self, dir: &Path) -> io::Result<()>;
 }
 
 /// The real operating system.
@@ -645,6 +677,10 @@ impl System for OsSystem {
             let _ = (files, dir);
             Err(windows_only())
         }
+    }
+
+    fn remove_profile(&self, dir: &Path) -> io::Result<()> {
+        webview_profile::remove_tree(dir, &mut webview_profile::Patience::a_few_seconds())
     }
 }
 
@@ -1195,6 +1231,14 @@ pub struct UninstallPlan {
     /// installed program, with whether it holds an admission key
     /// (ST-M007-011).
     pub kept: Vec<String>,
+    /// The installed copy's webview profile, when it is there (ST-M009-014).
+    pub webview: Option<PathBuf>,
+    /// Whether that profile is removed only once this process has closed its
+    /// window: the uninstall runs in the installed copy's own window, whose
+    /// webview holds the profile ([`UninstallPlan::from_its_window`]).
+    pub webview_after_close: bool,
+    /// The webview profile folder of earlier versions, when it is there.
+    pub legacy_webview: Option<PathBuf>,
     /// The audit trail, which stays.
     pub audit_dir: PathBuf,
 }
@@ -1247,6 +1291,20 @@ impl UninstallPlan {
                 removal.command
             ));
         }
+        if let Some(webview) = &self.webview {
+            let after = if self.webview_after_close {
+                " (removed once CretLink has closed)"
+            } else {
+                ""
+            };
+            lines.push(format!("The webview profile {}{after}", webview.display()));
+        }
+        if let Some(legacy) = &self.legacy_webview {
+            lines.push(format!(
+                "The webview profile of earlier versions {}",
+                legacy.display()
+            ));
+        }
         lines
     }
 
@@ -1258,6 +1316,18 @@ impl UninstallPlan {
             && self.entry.is_none()
             && !self.uninstall_entry
             && self.registrations.is_empty()
+            && self.webview.is_none()
+            && self.legacy_webview.is_none()
+    }
+
+    /// The plan of an uninstall that runs in the installed copy's own window.
+    /// Its webview holds the profile for as long as the window is open, so
+    /// the profile is left to the process, which removes it after the window
+    /// has closed (ST-M009-014). The plan and the report say so.
+    #[must_use]
+    pub fn from_its_window(mut self) -> Self {
+        self.webview_after_close = self.webview.is_some();
+        self
     }
 }
 
@@ -1335,11 +1405,21 @@ pub fn uninstall_plan(
         .zip(layout.entry.clone())
         .filter(|(_, path)| path.exists());
     let uninstall_entry = layout.platform == Platform::Windows && system.has_uninstall_entry();
+    // Whatever stands under the name of a profile folder goes with it: it is
+    // removed whole and never entered, so a link there is not followed.
+    let standing = |path: &Option<PathBuf>| {
+        path.clone()
+            .filter(|path| fs::symlink_metadata(path).is_ok())
+    };
+    let webview = standing(&layout.webview);
+    let legacy_webview = standing(&layout.legacy_webview);
     if files.is_empty()
         && settings.is_empty()
         && entry.is_none()
         && !uninstall_entry
         && record.is_none()
+        && webview.is_none()
+        && legacy_webview.is_none()
     {
         return Err(InstallError::NotInstalled(layout.location.clone()));
     }
@@ -1407,6 +1487,9 @@ pub fn uninstall_plan(
         uninstall_entry,
         registrations,
         kept,
+        webview,
+        webview_after_close: false,
+        legacy_webview,
         audit_dir: audit_dir(),
     })
 }
@@ -1501,6 +1584,42 @@ pub fn uninstall(
         }
     }
 
+    // The webview profiles (ST-M009-014): the layout's own paths, like the
+    // files below.
+    let mut webview_removed = false;
+    if let (Some(_), Some(webview)) = (&plan.webview, &layout.webview) {
+        if plan.webview_after_close {
+            report.pending.push(format!(
+                "The webview profile {}, once CretLink has closed",
+                webview.display()
+            ));
+        } else {
+            match system.remove_profile(webview) {
+                Ok(()) => {
+                    webview_removed = true;
+                    report
+                        .removed
+                        .push(format!("The webview profile {}", webview.display()));
+                }
+                Err(err) => report
+                    .failed
+                    .push(format!("The webview profile {}: {err}", webview.display())),
+            }
+        }
+    }
+    if let (Some(_), Some(legacy)) = (&plan.legacy_webview, &layout.legacy_webview) {
+        match system.remove_profile(legacy) {
+            Ok(()) => report.removed.push(format!(
+                "The webview profile of earlier versions {}",
+                legacy.display()
+            )),
+            Err(err) => report.failed.push(format!(
+                "The webview profile of earlier versions {}: {err}",
+                legacy.display()
+            )),
+        }
+    }
+
     // Only the layout's own paths are removed, never one read from the record.
     let files = layout.files();
     if plan.after_exit {
@@ -1527,6 +1646,11 @@ pub fn uninstall(
             let _ = fs::remove_dir(&dir);
         }
     }
+    if webview_removed && let Some(data) = layout.webview.as_deref().and_then(Path::parent) {
+        // The application's data folder, when the profile was all it held:
+        // the audit trail keeps it.
+        let _ = fs::remove_dir(data);
+    }
     Ok(report)
 }
 
@@ -1544,6 +1668,8 @@ mod tests {
         shortcuts: RefCell<Vec<Shortcut>>,
         entry: RefCell<Option<UninstallEntry>>,
         after_exit: RefCell<Vec<(Vec<PathBuf>, PathBuf)>>,
+        /// Profile folders that a webview still holds: removing them fails.
+        held: RefCell<Vec<PathBuf>>,
     }
 
     impl System for FakeSystem {
@@ -1576,6 +1702,14 @@ mod tests {
                 .borrow_mut()
                 .push((files.to_vec(), dir.to_path_buf()));
             Ok(())
+        }
+
+        fn remove_profile(&self, dir: &Path) -> io::Result<()> {
+            if self.held.borrow().iter().any(|held| held == dir) {
+                return Err(io::Error::other("a file in it is still in use"));
+            }
+            // The real removal, tried once.
+            webview_profile::remove_tree(dir, &mut webview_profile::Patience::none())
         }
     }
 
@@ -1766,6 +1900,16 @@ mod tests {
                 "/c/Roaming/Microsoft/Windows/Start Menu/Programs/CretLink.lnk"
             ))
         );
+        // The webview profile is in the data folder, not in the install
+        // folder (ST-M009-014).
+        assert_eq!(
+            windows.webview.as_deref(),
+            Some(Path::new("/c/Local/CretLink/webview"))
+        );
+        assert_eq!(
+            windows.legacy_webview.as_deref(),
+            Some(Path::new("/c/Local/dev.cretlink.app"))
+        );
 
         let mac = Layout::new(Platform::MacOs, &dirs).unwrap();
         assert_eq!(
@@ -1777,9 +1921,20 @@ mod tests {
             Path::new("/home/ann/Applications/CretLink.app/Contents/MacOS/cretlink")
         );
         assert_eq!(mac.entry, None);
+        // WebKit keeps its data itself on macOS.
+        assert_eq!(mac.webview, None);
+        assert_eq!(mac.legacy_webview, None);
 
         let linux = Layout::new(Platform::Linux, &dirs).unwrap();
         assert_eq!(linux.exe, Path::new("/home/ann/.local/bin/cretlink"));
+        assert_eq!(
+            linux.webview.as_deref(),
+            Some(Path::new("/home/ann/.local/share/CretLink/webview"))
+        );
+        assert_eq!(
+            linux.legacy_webview.as_deref(),
+            Some(Path::new("/home/ann/.local/share/dev.cretlink.app"))
+        );
         assert_eq!(linux.cli, Path::new("/home/ann/.local/bin/cretlink-cli"));
         assert_eq!(
             linux.entry.as_deref(),
@@ -2546,6 +2701,242 @@ mod tests {
         record_registration(&fixture.layout, Client::Gemini).unwrap();
         let record = read_record(&fixture.layout).unwrap().unwrap();
         assert_eq!(record.clients(), vec![Client::Gemini]);
+    }
+
+    /// A profile folder as a webview leaves it: nested folders and files.
+    fn profile_at(dir: &Path) {
+        write_file(&dir.join("cookies"), b"x", false).unwrap();
+        write_file(&dir.join("WebKitCache").join("index"), b"x", false).unwrap();
+    }
+
+    #[test]
+    fn uninstall_lists_and_removes_the_webview_profiles_and_keeps_the_audit_trail() {
+        let fixture = Fixture::new("webview", Platform::Linux);
+        let layout = &fixture.layout;
+        fixture.install(false, &[]).unwrap();
+        let webview = layout.webview.clone().unwrap();
+        let legacy = layout.legacy_webview.clone().unwrap();
+        let data = webview.parent().unwrap().to_path_buf();
+        assert_eq!(data, layout.record.parent().unwrap());
+        profile_at(&webview);
+        profile_at(&legacy);
+        write_file(&data.join("audit").join("session.jsonl"), b"{}", false).unwrap();
+        let elsewhere = fixture.downloads.join("cretlink");
+
+        // Shown before anything changes.
+        let plan = fixture.plan(&elsewhere);
+        assert!(!plan.webview_after_close);
+        let lines = plan.lines();
+        assert!(
+            lines.contains(&format!("The webview profile {}", webview.display())),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&format!(
+                "The webview profile of earlier versions {}",
+                legacy.display()
+            )),
+            "{lines:?}"
+        );
+        assert!(webview.exists() && legacy.exists());
+
+        let report = fixture.uninstall(&elsewhere);
+        assert!(report.complete(), "{report:?}");
+        assert!(report.pending.is_empty());
+        assert!(
+            report
+                .removed
+                .contains(&format!("The webview profile {}", webview.display())),
+            "{report:?}"
+        );
+        assert!(!webview.exists());
+        assert!(!legacy.exists());
+        // The folder earlier versions used is gone, its neighbours are not.
+        assert!(legacy.parent().unwrap().exists());
+        // The audit trail stays, and keeps the data folder.
+        assert!(data.join("audit").join("session.jsonl").exists());
+    }
+
+    #[test]
+    fn an_uninstall_from_its_own_window_leaves_the_profile_to_the_closing_process() {
+        let fixture = Fixture::new("webview-window", Platform::Linux);
+        let layout = &fixture.layout;
+        fixture.install(false, &[]).unwrap();
+        let webview = layout.webview.clone().unwrap();
+        profile_at(&webview);
+
+        let plan = fixture.plan(&layout.exe).from_its_window();
+        assert!(plan.webview_after_close);
+        assert!(
+            plan.lines().contains(&format!(
+                "The webview profile {} (removed once CretLink has closed)",
+                webview.display()
+            )),
+            "{:?}",
+            plan.lines()
+        );
+        let report = uninstall(
+            layout,
+            &fixture.system,
+            &fixture.clients,
+            &fixture.context,
+            &plan,
+            &layout.exe,
+        )
+        .unwrap();
+        assert!(report.complete(), "{report:?}");
+        assert_eq!(
+            report.pending,
+            vec![format!(
+                "The webview profile {}, once CretLink has closed",
+                webview.display()
+            )]
+        );
+        // The window is still open: its profile is not pulled from under it.
+        assert!(webview.join("cookies").exists());
+        assert!(!layout.exe.exists());
+
+        // Without a profile there is nothing to leave to the window.
+        let bare = Fixture::new("webview-window-bare", Platform::Linux);
+        bare.install(false, &[]).unwrap();
+        assert!(
+            !bare
+                .plan(&bare.layout.exe)
+                .from_its_window()
+                .webview_after_close
+        );
+    }
+
+    #[test]
+    fn a_profile_that_is_still_held_is_reported_and_can_be_uninstalled_again() {
+        let fixture = Fixture::new("webview-held", Platform::Linux);
+        let layout = &fixture.layout;
+        fixture.install(false, &[]).unwrap();
+        let webview = layout.webview.clone().unwrap();
+        profile_at(&webview);
+        fixture.system.held.borrow_mut().push(webview.clone());
+        let elsewhere = fixture.downloads.join("cretlink");
+
+        let report = fixture.uninstall(&elsewhere);
+        assert!(!report.complete());
+        assert_eq!(
+            report.failed,
+            vec![format!(
+                "The webview profile {}: a file in it is still in use",
+                webview.display()
+            )]
+        );
+        assert!(webview.exists());
+        // The program is gone, the profile is not: a second uninstall still
+        // finds it and removes it.
+        assert!(!layout.exe.exists());
+        fixture.system.held.borrow_mut().clear();
+        let plan = fixture.plan(&elsewhere);
+        assert_eq!(
+            plan.lines(),
+            vec![format!("The webview profile {}", webview.display())]
+        );
+        assert!(fixture.uninstall(&elsewhere).complete());
+        assert!(!webview.exists());
+        assert!(matches!(
+            uninstall_plan(layout, &fixture.system, &fixture.context, &elsewhere),
+            Err(InstallError::NotInstalled(_))
+        ));
+    }
+
+    #[test]
+    fn the_profile_of_an_earlier_version_is_uninstalled_without_an_install() {
+        let fixture = Fixture::new("webview-legacy", Platform::Linux);
+        let legacy = fixture.layout.legacy_webview.clone().unwrap();
+        profile_at(&legacy);
+        let elsewhere = fixture.downloads.join("cretlink");
+        let plan = fixture.plan(&elsewhere);
+        assert!(!plan.is_empty());
+        assert_eq!(
+            plan.lines(),
+            vec![format!(
+                "The webview profile of earlier versions {}",
+                legacy.display()
+            )]
+        );
+        let report = fixture.uninstall(&elsewhere);
+        assert!(report.complete(), "{report:?}");
+        assert!(!legacy.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_under_the_name_of_a_profile_is_removed_and_never_followed() {
+        let fixture = Fixture::new("webview-link", Platform::Linux);
+        let layout = &fixture.layout;
+        fixture.install(false, &[]).unwrap();
+        let theirs = fixture.root.join("theirs");
+        write_file(&theirs.join("keep.txt"), b"theirs", false).unwrap();
+        let webview = layout.webview.clone().unwrap();
+        std::os::unix::fs::symlink(&theirs, &webview).unwrap();
+
+        let report = fixture.uninstall(&fixture.downloads.join("cretlink"));
+
+        assert!(report.complete(), "{report:?}");
+        assert!(fs::symlink_metadata(&webview).is_err(), "the link is gone");
+        assert_eq!(fs::read(theirs.join("keep.txt")).unwrap(), b"theirs");
+    }
+
+    #[test]
+    fn windows_removes_the_profile_and_the_data_folder_it_emptied() {
+        let fixture = Fixture::new("webview-windows", Platform::Windows);
+        let layout = &fixture.layout;
+        fixture.install(false, &[]).unwrap();
+        let webview = layout.webview.clone().unwrap();
+        let data = webview.parent().unwrap().to_path_buf();
+        assert!(webview.ends_with("AppData/Local/CretLink/webview"));
+        // Not inside the install folder, which a helper removes after exit.
+        assert!(!webview.starts_with(&layout.location));
+        profile_at(&webview);
+        let report = fixture.uninstall(&fixture.source());
+        assert!(report.complete(), "{report:?}");
+        assert!(!webview.exists());
+        assert!(!data.exists(), "an empty data folder goes too");
+
+        // With an audit trail the data folder stays.
+        fixture.install(false, &[]).unwrap();
+        profile_at(&webview);
+        write_file(&data.join("audit").join("session.jsonl"), b"{}", false).unwrap();
+        // From the installed copy's command line: the program files wait for
+        // its exit, the profile does not, since no window holds it.
+        let report = fixture.uninstall(&layout.exe);
+        assert!(report.complete(), "{report:?}");
+        assert_eq!(report.pending.len(), 1, "{report:?}");
+        assert!(!webview.exists());
+        assert!(data.join("audit").join("session.jsonl").exists());
+    }
+
+    #[test]
+    fn macos_has_no_webview_profile_to_uninstall() {
+        let fixture = Fixture::new("webview-macos", Platform::MacOs);
+        fixture.install(false, &[]).unwrap();
+        // A folder where Linux keeps the profile is not CretLink's on macOS.
+        let stray = fixture
+            .root
+            .join("home")
+            .join(".local")
+            .join("share")
+            .join("CretLink")
+            .join("webview");
+        profile_at(&stray);
+        let plan = fixture.plan(&fixture.source());
+        assert_eq!(plan.webview, None);
+        assert_eq!(plan.legacy_webview, None);
+        assert!(
+            !plan
+                .lines()
+                .iter()
+                .any(|line| line.contains("webview profile")),
+            "{:?}",
+            plan.lines()
+        );
+        assert!(fixture.uninstall(&fixture.source()).complete());
+        assert!(stray.join("cookies").exists());
     }
 
     #[test]

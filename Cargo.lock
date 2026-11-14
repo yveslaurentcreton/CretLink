@@ -364,6 +364,7 @@ version = "0.0.0"
 dependencies = [
  "base64",
  "cretlink-console",
+ "cretlink-exec",
  "cretlink-mcp",
  "cretlink-protocol",
  "cretlink-relay",
@@ -372,6 +373,7 @@ dependencies = [
  "cretlink-support-agent",
  "cretlink-wss",
  "jsonschema",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "tokio",

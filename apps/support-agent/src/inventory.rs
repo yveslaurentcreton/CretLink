@@ -10,6 +10,13 @@
 //! nothing creates are *asserted empty* rather than omitted, so a later feature
 //! that starts creating one cannot silently escape the inventory.
 //!
+//! One kind is created outside this crate: the profile folders of the
+//! application's webview ([`ResourceKind::WebviewProfile`], ST-M009-014). A
+//! window makes them, and this crate has none, so its own scan says nothing
+//! about the kind. The shipped command line, which knows those folders, adds
+//! what it finds or removes to the [`Inventory`] and the [`RecoveryReport`]
+//! before they are printed ([`crate::recovery::OtherResidue`]).
+//!
 //! Two operations sit on top of the inventory:
 //!
 //! * [`scan_at`] reads what residue exists, removing nothing, so a customer can
@@ -90,12 +97,19 @@ pub enum ResourceKind {
     /// A temporary credential minted on the customer machine. No feature creates
     /// one yet; asserted absent.
     TemporaryCredential,
+    /// A profile folder of the application's webview that was left behind
+    /// (ST-M009-014): the temporary one of a copy that no longer runs, or the
+    /// one an earlier version kept. The application's window makes them,
+    /// never this crate, whose scan therefore neither finds the kind nor
+    /// asserts it absent ([`Self::scanned_here`]); the shipped command line
+    /// adds it.
+    WebviewProfile,
 }
 
 impl ResourceKind {
     /// Every kind, in inventory order. Iterated so a scan visits all of them and
     /// none is forgotten.
-    pub const ALL: [ResourceKind; 9] = [
+    pub const ALL: [ResourceKind; 10] = [
         ResourceKind::StagedFiles,
         ResourceKind::RebootResumeTicket,
         ResourceKind::NotCretLinks,
@@ -105,6 +119,7 @@ impl ResourceKind {
         ResourceKind::ScheduledTask,
         ResourceKind::NetworkListener,
         ResourceKind::TemporaryCredential,
+        ResourceKind::WebviewProfile,
     ];
 
     /// A short, stable, secret-free label for reports.
@@ -120,6 +135,7 @@ impl ResourceKind {
             ResourceKind::ScheduledTask => "scheduled task",
             ResourceKind::NetworkListener => "network listener",
             ResourceKind::TemporaryCredential => "temporary credential",
+            ResourceKind::WebviewProfile => "webview profile",
         }
     }
 
@@ -127,7 +143,9 @@ impl ResourceKind {
     /// feature can create it, or it can be found in CretLink's own folders. The
     /// kinds that return `false` are always asserted empty — the inventory never
     /// runs a real scanner for them, so it cannot false-positive on an unrelated
-    /// system service or task that merely resembles one.
+    /// system service or task that merely resembles one. The webview profile
+    /// is created too, by the application's window, and is looked for by the
+    /// command line that knows its folders ([`Self::scanned_here`]).
     #[must_use]
     fn is_creatable(self) -> bool {
         matches!(
@@ -136,7 +154,16 @@ impl ResourceKind {
                 | ResourceKind::RebootResumeTicket
                 | ResourceKind::NotCretLinks
                 | ResourceKind::EarlierRelease
+                | ResourceKind::WebviewProfile
         )
+    }
+
+    /// Whether [`scan_at`] and [`recover_at`] decide this kind themselves:
+    /// every kind but the webview profile, which the program that runs the
+    /// verb adds ([`crate::recovery::OtherResidue`]).
+    #[must_use]
+    pub fn scanned_here(self) -> bool {
+        self != ResourceKind::WebviewProfile
     }
 }
 
