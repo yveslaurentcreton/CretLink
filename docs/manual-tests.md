@@ -1376,6 +1376,97 @@ A platform class passes MT-E2E only when every step meets its expected outcome o
 official artifacts from a fresh environment. Record the pass (date, host, agent
 build, artifact provenance) in [`release-signoff.md`](release-signoff.md).
 
+### MT-16 — A customer keeps the support program (ST-M009-017)
+
+On a Windows computer with an account that has administrator rights and one
+that has none (a standard account). Use a release archive: `cretlink.exe`
+renamed to `CretLink-Support.exe` in `Downloads` of each account, and for
+step 6 a second, newer build. Put a `cretlink.toml` with a relay next to the
+copy for steps 2 and 6, or make the copy with **Make a customer copy…**.
+Before you start, note what is there: `Get-Service`, `Get-ScheduledTask`,
+`HKLM\Software\Microsoft\Windows\CurrentVersion\Run` and the same key under
+`HKCU`, `Get-NetTCPConnection -State Listen`, and the folders of the Start
+menu of all users and of the public desktop.
+
+1. **Not offered without administrator rights, and not by a command.** In
+   the standard account, start the copy, decline the Windows prompt and
+   choose **Continue without admin rights**. Expected: the list of
+   technicians offers nothing about keeping. From a terminal, run the copy
+   with `keep`, `install`, `--keep` and `--role customer --keep`. Expected:
+   each is refused with the words about a copy for getting help, no window
+   keeps anything, and `C:\Program Files\CretLink Support` does not exist.
+2. **Keep.** Start the copy and answer the Windows prompt with the
+   administrator's account. On the list of technicians choose **Keep CretLink
+   Support on this computer**. Expected: a screen that names the folder
+   `C:\Program Files\CretLink Support`, the Start-menu entry, the entry in
+   Installed apps, the relay of the copy with where it is reached and what
+   vouches for its name, that nothing starts by itself, and how to remove it;
+   neither button is focused, and `Escape` or **Back** changes nothing. Tick
+   the desktop shortcut and choose **Keep on this computer**. Expected: the
+   list says that CretLink Support is now kept, and the footer no longer says
+   that nothing is installed.
+3. **What was added, and nothing else.** As an administrator, look again at
+   everything noted before the start. Expected: new are only
+   `C:\Program Files\CretLink Support` with `CretLink-Support.exe`,
+   `install.json`, `cretlink.toml` (and `relay-ca.pem` when the relay has a
+   certificate file), `CretLink Support.lnk` in the Start menu of all users
+   and on the public desktop, and
+   `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\CretLink Support`
+   (*Settings → Apps → Installed apps* shows **CretLink Support** with the
+   version and the publisher). No service, no scheduled task, no Run entry,
+   no listener and no CretLink process after the window was closed.
+   `icacls "C:\Program Files\CretLink Support"` shows the administrators and
+   the system with full control, the users with read and execute, and nobody
+   else; the standard account cannot create, change or delete a file there.
+   `Get-FileHash` of the kept program equals that of the copy in `Downloads`.
+4. **Start from the Start menu.** In the standard account, start **CretLink
+   Support** from the Start menu. Expected: the explanation of the Windows
+   prompt, without the words that nothing is installed; the prompt itself;
+   then the list of technicians, which says that CretLink Support is
+   installed on this computer with its version and offers **Remove from this
+   computer**. Run a session against a technician. Expected: every step of a
+   session from a downloaded copy (choose or type, compare the code, allow),
+   nothing about keeping or removing while the session exists, and an end
+   report that says that CretLink Support is installed because it was kept,
+   and lists it under nothing that was left behind. While it is open, its
+   webview profile is a folder `CretLink-webview-…` in `%TEMP%` of the account
+   that answered the prompt, and nothing is written into
+   `C:\Program Files\CretLink Support` (ST-M009-014). `recover` (as MT-12
+   step 10 runs it) names the kept program as there on purpose and still
+   calls the computer clean.
+5. **The program that runs is what is kept.** Remove the kept program (step
+   7), then start the copy from `Downloads` again and answer the prompt.
+   While its window is open, rename `CretLink-Support.exe` in `Downloads` to
+   another name and put another file under the old name, from the standard
+   account. Choose **Keep CretLink Support on this computer** and keep it.
+   Expected: `Get-FileHash` of the kept program equals that of the renamed
+   original, not that of the other file; or the window refuses and says why.
+   Never the other file in `C:\Program Files\CretLink Support`.
+6. **Update, and an older copy.** Start the newer build from `Downloads` and
+   answer the prompt. Expected: the list says that the older version is kept
+   and offers **Update the kept program**; the screen names both versions,
+   has the desktop shortcut ticked, and says that the relay settings of this
+   copy replace the kept ones. Update. Expected: Installed apps shows the new
+   version. Now start the older build again. Expected: it says that a newer
+   CretLink Support is kept, offers nothing, and the kept program is
+   unchanged. With the kept program open, try to update from another copy.
+   Expected: a refusal that says that the kept program is running.
+7. **Remove.** Three ways, keeping the program again in between: **Remove
+   from this computer** in the kept program; **Uninstall** in Installed apps;
+   `& 'C:\Program Files\CretLink Support\CretLink-Support.exe' uninstall | Out-Host`
+   in a PowerShell of the standard account. Expected each time: the list of
+   what goes, with the words that a saved report stays; a question before
+   anything is removed; the Windows prompt where the window or the terminal
+   has no administrator rights; and afterwards no folder
+   `C:\Program Files\CretLink Support` (from the kept program itself: once
+   its window has closed), no shortcut, no entry in Installed apps, and no
+   CretLink process. A report saved with **Save a copy** is still in
+   `Documents\CretLink`.
+8. **Keyboard and Narrator.** Walk the keep and the remove screen with `Tab`,
+   `Space`, `Enter` and `Escape` only, then with Narrator. Expected: every
+   control is reached and named, the state band and the heading are read
+   when a screen opens, and the desktop wish is read with its state.
+
 ## Run log
 
 Record each hardware run here: date, host, agent build, scenarios run, and the
@@ -1396,5 +1487,6 @@ hardware.
 | _pending_ | | | MT-12 step 10 (files left from an earlier session and `cretlink recover`) and the Narrator pass (ST-M009-009, ST-M009-010) | not yet recorded on hardware |
 | _pending_ | | | The webview profile folder on Windows (ST-M009-014): MT-10 step 2 (the folder in `%TEMP%` while Get help is open, gone after each way of closing, the folder of a killed copy listed by `recover` and removed by the next start, no `dev.cretlink.app`), MT-11 step 2 (a copy that runs once) and step 6 (the installed copy's profile, removed once its window has closed) | not yet recorded on hardware; on Linux the same was checked under a virtual display |
 | _pending_ | | | MT-13 (a technician's computer on several networks, ST-M009-016) | not yet recorded on hardware |
+| _pending_ | | | MT-16 (a customer keeps the support program: not offered without administrator rights or by a command, keep, what was added and nothing else, a session from the Start menu, the program that runs is what is kept, update and an older copy, the three ways to remove, keyboard and Narrator; with a standard and an administrator account, ST-M009-017) | not yet recorded on hardware |
 | _pending_ | | | MT-15 (a session through the relay between two networks: the offer, the wait and its code, pairing through a typed code, a session with a stop from each side, a code that nobody waits on, a withdrawn key, a relay that is off, a certificate that is not trusted, a relay that stops in the middle, the network first, a copy without a relay, ST-M007-013) | not yet recorded on hardware |
 | _pending_ | | | MT-14 (the file operations of the explorer: the drives, a folder with links / through a junction / a held file / cancel and stop / swapped while it is removed, a file sent to a folder on two drives and refused for a junction, ST-M010-001; browsing in the Files tab: nothing before the tab is opened, from folder to folder with one item for the customer, a typed path under its real name, links, a refused folder, a folder of thousands of entries, views, selection, keys and the context menu, a stop while a folder arrives, and the Narrator pass of the grid, ST-M010-002; a delete, a folder removal, a new folder and a move refused through a junction, after a swap and on a substituted drive, ST-M010-004) | not yet recorded on hardware |

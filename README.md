@@ -27,7 +27,9 @@ works, how to get started, and what it promises about security.
    on several, such as a VPN next to the local network, can choose another.
 2. **The customer** starts the same program, chooses **Get help** and answers
    the Windows administrator prompt. A copy named `CretLink-Support.exe` opens
-   Get help straight away, for example from a USB stick. Nothing is installed.
+   Get help straight away, for example from a USB stick. Nothing is installed,
+   unless the customer chooses to [keep the support program](#a-customer-keeps-the-support-program)
+   for next time.
 3. The customer picks the technician from the computers found on the network,
    or types the connection code the technician gives them.
 4. Both windows show the same six digits. The technician reads them aloud;
@@ -90,7 +92,8 @@ the install made, but only while they still point at the installed copy. The
 audit trail stays. On macOS and Linux an installed copy
 opens Give help directly; a copy that is not installed shows the start screen
 so it can still be installed. A `CretLink-Support*` copy, for customers, never
-installs or uninstalls; the one command it accepts is `recover [--remove]`.
+installs or uninstalls the technician side; the commands it accepts are
+`recover [--remove]` and its own `uninstall` (see the next section).
 
 The window of `cretlink` is a webview, which keeps a profile (cache and local
 storage, no session secret) in a folder:
@@ -113,6 +116,48 @@ Known gap: on macOS the webview is WebKit, which keeps this data in its own
 folders under `~/Library`, where CretLink can neither direct nor remove it. It
 stays after a copy that runs once has closed and after an uninstall. Only the
 technician role exists on macOS.
+
+## A customer keeps the support program
+
+A customer who gets help more than once can keep the support program on the
+computer, and start it from the Start menu next time. It is the customer's
+own choice, made in the Get help window: **Keep CretLink Support on this
+computer** is offered before a session and on the end report, never during a
+session, and only in a window that Windows gave administrator rights. The
+screen says what is added before anything is added:
+
+- the program, in `%ProgramFiles%\CretLink Support\CretLink-Support.exe`,
+  where only an administrator can change it;
+- a Start-menu entry **CretLink Support** for everyone who uses the computer,
+  and a shortcut on the desktop when the customer asks for one;
+- an entry in Installed apps, with the version;
+- the relay settings of the copy that was kept (`cretlink.toml`, and the
+  certificates of its certificate file), when it had any. The screen names
+  that relay first. On the computer the settings can then be read by every
+  account, with the admission key of the relay in them.
+
+Nothing else is added: no service, no scheduled task, nothing that starts
+with Windows, no listener and no stored permission. Between sessions no
+CretLink process runs. A session from the kept program takes every step of a
+session from a downloaded copy: the customer starts it, Windows asks for
+administrator rights, the technician is chosen or the code typed, the
+approval code is compared and full control is allowed, each time.
+
+- **Update.** The kept program does not update itself and contacts nobody by
+  itself. A newer copy that the customer starts offers to update it and names
+  both versions; an older copy never replaces a newer one. Relay settings
+  next to the newer copy replace the kept ones, and the screen says so.
+- **Remove.** The kept program offers **Remove from this computer**; so does
+  its entry in Installed apps, and `CretLink-Support.exe uninstall`. Each
+  shows what it removes, asks, and asks Windows for administrator rights when
+  it has none. The program, its folder, the shortcuts and the entry go. A
+  session report that the customer saved stays where it was saved.
+- **No other way.** No command-line option, no environment variable and no
+  remote operation keeps the program: only the customer's click does.
+
+`cretlink recover` names a kept program as kept on purpose and never removes
+it, and the end report of a session says that it is installed because the
+customer chose that.
 
 ## Platforms
 

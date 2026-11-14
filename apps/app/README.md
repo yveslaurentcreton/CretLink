@@ -27,7 +27,7 @@ does, and the role then stays fixed for the life of the process:
 | `cretlink` on Windows | start screen: Get help or Give help |
 | the installed `cretlink` on macOS or Linux | Give help |
 | any other `cretlink` on macOS or Linux | start screen with Give help only: install or run once |
-| `CretLink-Support*.exe` | Get help; refuses subcommands (`install`, `uninstall` included) and Give help, except `recover [--remove]` |
+| `CretLink-Support*.exe` | Get help; refuses Give help and every subcommand except `recover [--remove]` and `uninstall`, which removes the support program that a customer kept (ST-M009-017) |
 | `cretlink --role technician` / `--role customer` | that role, never relaunching (Give help from the start screen, the elevated customer after the UAC prompt) |
 | `cretlink --role customer --from-start` | Get help from the start screen: unelevated, explains the UAC prompt first; Back returns to the start screen |
 
@@ -382,6 +382,57 @@ the rules in `cretlink_cli::webview_profile`):
   releases up to 0.24.1 left for this user; `recover --remove` removes them,
   with the exit codes it has. `cretlink uninstall` lists and removes the
   installed copy's profile and that earlier folder. The audit trail stays.
+
+## Keeping the support program (ST-M009-017)
+
+A customer who gets help more than once can keep the support program on the
+computer: `%ProgramFiles%\CretLink Support\CretLink-Support.exe`, a
+Start-menu entry for all users, a desktop shortcut on request, an entry in
+Installed apps, and the relay settings of the copy. Nothing that runs by
+itself is added, and a session from the kept program takes every step of a
+session from a downloaded copy. What is written, how the running program is
+verified and how it all goes again is in `cretlink_cli::kept` and
+`cretlink_exec` (`hold_running_program`, `prepare_program_folder`); the
+commands of the customer role are in `src-tauri/src/customer/keep.rs`:
+
+| Command | What it does |
+| --- | --- |
+| `get_keep` | `KeepView`: how this copy relates to what is kept (`not_kept`, `this`, `same`, `newer`, `older`, `unknown`), both versions, and whether this window offers to keep or to remove |
+| `keep_plan` | `KeepPlanView`: what keeping would add, with the relay that the copy's settings name; changes nothing |
+| `keep_program` `{ desktop }` | keeps the program that runs, as the plan that `keep_plan` showed says and no other; returns the new `KeepView` |
+| `remove_plan` | `RemovePlanView`: what removing would remove and what stays; changes nothing |
+| `remove_program` | removes the kept program; without administrator rights it starts `uninstall` through the elevation prompt and closes this window |
+
+- **The customer's click, and nothing else.** The commands exist in the
+  customer role only. No command-line option, environment variable or remote
+  operation keeps a program, and `launch.rs` refuses every argument of a
+  `CretLink-Support*` copy but `recover` and `uninstall`.
+- **Never during a session.** Every command refuses while a session exists
+  and before the permission step. The window offers keeping on `#c-find`
+  and on the end report (`views/keep.ts`), with one card: **Keep CretLink
+  Support on this computer**, an update that names both versions, what is
+  kept, or in the kept program **Remove from this computer**. A session that
+  starts closes the keep or remove screen.
+- **With administrator rights.** Keeping is offered only by a window that
+  has them (`keep::offer`). The kept program offers to remove itself with or
+  without them.
+- **What was shown is what is kept.** The relay settings next to the copy
+  are read once, for the plan, without following a link; the screen names
+  the relay, where the copy would connect and what vouches for the name, and
+  that value is written.
+- **The kept program** shows that it is installed, with its version, says
+  so in its footer and in the explanation of the Windows prompt in place of
+  "nothing is installed", and keeps its webview profile in a temporary
+  folder like every customer process (ST-M009-014).
+- **Reports.** The end report carries `keptProgram` and says that the
+  program is installed because the customer chose that; `recover` names it
+  as kept on purpose and never removes it.
+- **Off Windows** there is no layout: `get_keep` answers that nothing is
+  offered, and the screens show nothing about keeping.
+
+`/dev/keep.html` drives the real controller and views against a computer
+held in memory (`?copy=portable|update|same|older|kept|unelevated|kept-unelevated`,
+`?relay=none|plain|renamed|problem`, `?fail=plan|keep|remove|declined`).
 
 ## Live by default
 
@@ -751,6 +802,8 @@ apps/app/
                    a simulated copy and relay (development only)
   dev/relay-customer.html a relay code in the customer's window against a
                    simulated relay and technician (development only)
+  dev/keep.html    keeping and removing the support program in the customer's
+                   window against a computer held in memory (development only)
   vitest.config.ts frontend tests (jsdom)
   src-tauri/
     Cargo.toml     detached crate; binary `cretlink`
@@ -776,8 +829,9 @@ apps/app/
                      for names and folders of this computer in local.rs, and
                      the customer computer as they reach it in target.rs)
     src/customer/    agent state, commands, live-session driver, the end
-                     report (report.rs), the admin step (admin.rs), and the
-                     compact bar and closing (windows.rs)
+                     report (report.rs), the admin step (admin.rs), the
+                     compact bar and closing (windows.rs), and keeping the
+                     support program (keep.rs)
 ```
 
 ## Build and run
@@ -970,6 +1024,14 @@ filter and the end report.
 - A manual check on Windows that a customer session leaves no file unless
   **Save a copy** is used, and that the save dialog opens on
   `Documents\CretLink\` (ST-M009-012).
+- Keeping the support program was never run on Windows by hand: the folder
+  in `Program Files` and its permissions, the held program file, the
+  shortcuts, the entry in Installed apps, an update and the three ways to
+  remove are the steps of MT-16 in `docs/manual-tests.md`, with a standard
+  and an administrator account (ST-M009-017). Its screens were tested in
+  jsdom and driven with real mouse and key events in Chromium through
+  `dev/keep.html`, not in the application's own window, and no screen reader
+  has read them yet.
 - A manual walk-through of the technician interface on Windows and macOS, and
   a keyboard and screen-reader pass (Narrator, VoiceOver), are manual checks
   of ST-M009-008.
