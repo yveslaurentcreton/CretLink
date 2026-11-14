@@ -19,9 +19,10 @@
 //! uses the same calls for the whole computer: its entry is a key under
 //! `HKEY_LOCAL_MACHINE` ([`Hive::LocalMachine`]), its shortcuts lie in the
 //! Start menu and on the desktop of all users, which the system names
-//! ([`common_programs`], [`public_desktop`]), and the helper that removes its
-//! folder is started from the Windows folder that the system names, never
-//! from one that the environment names ([`remove_after_exit_from`]).
+//! ([`common_programs`], [`public_desktop`]). The helper that removes a folder
+//! after this process has exited, for either of them, is started by its full
+//! path in the system folder that the system names, with an environment built
+//! from the system's folders alone ([`remove_after_exit`]).
 
 #![allow(
     unsafe_code,
@@ -335,33 +336,25 @@ pub(crate) fn running_elsewhere(exe: &Path) -> io::Result<bool> {
 ///
 /// A running Windows program cannot delete its own file, and `cmd.exe` cannot
 /// wait for a process id, so the helper is the in-box Windows PowerShell
-/// (`Wait-Process`), started by its absolute path under `%SystemRoot%`. The
-/// script uses cmdlets only, so it also runs under Constrained Language mode,
-/// and the execution policy does not apply to `-Command`.
-pub(super) fn remove_after_exit(files: &[PathBuf], dir: &Path) -> io::Result<()> {
-    let system_root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    remove_after_exit_from(&system_root, files, dir)
-}
-
-/// [`remove_after_exit`] with the Windows folder given: an elevated program
-/// takes it from the system, never from its environment (ST-M009-017).
-pub(crate) fn remove_after_exit_from(
-    system_root: &Path,
-    files: &[PathBuf],
-    dir: &Path,
-) -> io::Result<()> {
-    let powershell = system_root
-        .join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
-    let script = super::removal_script(std::process::id(), files, dir);
-    Command::new(powershell)
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+/// (`Wait-Process`). It is started as [`super::removal_helper`] says: by its
+/// full path in the system folder, which the system names, in that folder,
+/// with an environment built from the system's folders alone and nothing of
+/// the environment of this process (ST-M009-017, REQ-S-024). The script uses
+/// cmdlets only, so it also runs under Constrained Language mode, and the
+/// execution policy does not apply to `-Command`.
+pub(crate) fn remove_after_exit(files: &[PathBuf], dir: &Path) -> io::Result<()> {
+    let windows = cretlink_exec::windows_folder()
+        .ok_or_else(|| io::Error::other("the Windows folder could not be read"))?;
+    let system = cretlink_exec::system_folder()
+        .ok_or_else(|| io::Error::other("the system folder could not be read"))?;
+    let helper = super::removal_helper(&windows, &system, std::process::id(), files, dir);
+    Command::new(&helper.program)
+        .args(&helper.args)
+        // Its whole environment is the helper's own: nothing is passed on.
+        .env_clear()
+        .envs(helper.env.iter().map(|(name, value)| (name, value)))
         // Not inside the folder it removes.
-        .current_dir(system_root)
+        .current_dir(&helper.current_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

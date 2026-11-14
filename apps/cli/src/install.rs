@@ -747,6 +747,63 @@ fn running_elsewhere(exe: &Path) -> io::Result<bool> {
     win::running_elsewhere(exe)
 }
 
+/// How the helper that removes files after this process has exited is
+/// started (see `win::remove_after_exit`): a program by its full path, its
+/// arguments, the folder it starts in, and its whole environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code, reason = "tested on every platform"))]
+pub(crate) struct Helper {
+    /// The program, by its full path in the system folder.
+    pub(crate) program: PathBuf,
+    /// Its arguments.
+    pub(crate) args: Vec<String>,
+    /// The folder it starts in: not one that it removes.
+    pub(crate) current_dir: PathBuf,
+    /// Its whole environment. Nothing of the environment of this process is
+    /// passed on.
+    pub(crate) env: Vec<(&'static str, PathBuf)>,
+}
+
+/// The helper that removes `files`, and then `dir` if nothing else is left
+/// in it, once the process `pid` has exited: the in-box Windows PowerShell,
+/// started by its full path in the system folder `system`, in that folder,
+/// without a profile, and with an environment built from the Windows folder
+/// `windows` and `system` alone (ST-M009-017, REQ-S-024).
+///
+/// The program that starts it can run with administrator rights, and the
+/// account that approved them owns the environment that program was started
+/// with. That environment decides what PowerShell loads (its module path,
+/// the folders of the account), so none of it is passed on: the helper gets
+/// the Windows folder (`SystemRoot`, `windir`), the system folder as its only
+/// search path, and the modules that come with PowerShell in the system
+/// folder as its only module path.
+#[cfg_attr(not(windows), allow(dead_code, reason = "tested on every platform"))]
+pub(crate) fn removal_helper(
+    windows: &Path,
+    system: &Path,
+    pid: u32,
+    files: &[PathBuf],
+    dir: &Path,
+) -> Helper {
+    let powershell = system.join("WindowsPowerShell").join("v1.0");
+    Helper {
+        program: powershell.join("powershell.exe"),
+        args: vec![
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            removal_script(pid, files, dir),
+        ],
+        current_dir: system.to_path_buf(),
+        env: vec![
+            ("SystemRoot", windows.to_path_buf()),
+            ("windir", windows.to_path_buf()),
+            ("Path", system.to_path_buf()),
+            ("PSModulePath", powershell.join("Modules")),
+        ],
+    }
+}
+
 /// The PowerShell script that removes an installed Windows copy once the
 /// process `pid` has exited (see `win::remove_after_exit`): only the given
 /// files, then the folder if nothing else is left in it. It waits without a
@@ -2963,6 +3020,58 @@ mod tests {
             "{script}"
         );
         assert!(!script.contains('"'));
+    }
+
+    /// The helper is started by its full path in the system folder, in that
+    /// folder, with an environment built from the system's folders alone:
+    /// nothing of this process's environment, and no profile (ST-M009-017).
+    #[test]
+    fn the_removal_helper_gets_an_environment_built_from_the_system() {
+        let windows = Path::new(r"C:\Windows");
+        let system = windows.join("System32");
+        let helper = removal_helper(
+            windows,
+            &system,
+            7,
+            &[PathBuf::from(
+                r"C:\Program Files\CretLink Support\CretLink-Support.exe",
+            )],
+            Path::new(r"C:\Program Files\CretLink Support"),
+        );
+        let powershell = system.join("WindowsPowerShell").join("v1.0");
+        assert_eq!(helper.program, powershell.join("powershell.exe"));
+        assert_eq!(helper.current_dir, system);
+        assert_eq!(
+            &helper.args[..3],
+            ["-NoProfile", "-NonInteractive", "-Command"]
+        );
+        assert!(helper.args[3].starts_with("Wait-Process -Id 7 "));
+        // The whole environment, each value a folder of the system.
+        assert_eq!(
+            helper.env,
+            vec![
+                ("SystemRoot", windows.to_path_buf()),
+                ("windir", windows.to_path_buf()),
+                ("Path", system.clone()),
+                ("PSModulePath", powershell.join("Modules")),
+            ]
+        );
+        // Nothing of the environment of this process is in it.
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy().to_string();
+            if !["SystemRoot", "windir", "Path", "PSModulePath"]
+                .iter()
+                .any(|own| own.eq_ignore_ascii_case(&name))
+            {
+                assert!(
+                    helper
+                        .env
+                        .iter()
+                        .all(|(own, _)| !own.eq_ignore_ascii_case(&name)),
+                    "{name}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -59,10 +59,9 @@ impl System for OsSystem {
     }
 
     fn remove_after_exit(&self, files: &[PathBuf], dir: &Path) -> io::Result<()> {
-        // The helper is started from the Windows folder that the system
-        // names: the environment of an elevated program is not asked.
-        let windows = cretlink_exec::windows_folder()
-            .ok_or_else(|| io::Error::other("the Windows folder could not be read"))?;
-        win::remove_after_exit_from(&windows, files, dir)
+        // The helper is started from the system folder that the system names,
+        // with an environment built from it: nothing of the environment of
+        // this elevated program is passed on.
+        win::remove_after_exit(files, dir)
     }
 }
