@@ -3621,7 +3621,8 @@ closed, on the customer computer too. Now every window is given its folder:
   `~/.local/share/CretLink/webview`), and uninstall lists and removes it;
 - a process with administrator rights makes its folder in `webview` in
   `CretLink Data`, the private folder of an elevated program, instead of the
-  temporary folder;
+  temporary folder, and opens that one folder to the account signed in at
+  the desktop, whose browser process uses it (see below);
 - every start of a window removes the temporary folders of copies that no
   longer run; `cretlink recover` lists those folders and the one that earlier
   releases left, and `recover --remove` removes them. With administrator
@@ -3656,10 +3657,34 @@ closed, on the customer computer too. Now every window is given its folder:
   administrator rights takes none of them: its profile is a new folder in
   `webview` in `CretLink Data`, which is created with its owner and its
   permissions in one step, or found to be such a folder already, with
-  `CretLink Data` above it (ST-M006-020); the profile folder made in it takes
-  those permissions when it is created, so no program without administrator
-  rights can read or write it. Leftovers are looked for and removed only
-  there, and a link in the place of that folder is not entered. Nothing in
+  `CretLink Data` above it (ST-M006-020). Leftovers are looked for and
+  removed only there, and a link in the place of that folder is not entered.
+- *The elevated window's browser does not run elevated.* WebView2 does not
+  run its browser with administrator rights: with an elevated host it starts
+  the browser through the desktop's shell (Explorer), with the unelevated
+  token of the account signed in at the desktop, in which the administrators
+  are a group that only refuses. After a consent elevation that is the
+  account that approved; after an elevation with another administrator's
+  password it is the standard account at the keyboard. A profile folder that
+  admits only the administrators and the system keeps that browser out
+  ("can't read and write to its data directory", an empty window), which is
+  what a preview of this change showed on a Windows computer. So the process
+  first makes its profile folder private, puts its lock file into it, and
+  then gives that one folder permissions of its own: the administrators and
+  the system keep full control; the account of the desktop (the user of the
+  shell's token, or the program's own account when there is no shell) may
+  read the folder and make files and folders in it, and has full control over
+  what is made there; it may not remove or rename the folder, remove what
+  others made in it, or change its permissions or its owner, and it has no
+  right on `webview` or `CretLink Data`. So the path of the folder stays one
+  that only administrators can change: the account cannot swap the folder
+  for a link, and cannot make it a link either, since it never sees it empty
+  (the lock file, which it cannot remove while the process holds it, is in
+  it first). The removal at the end, and the sweep of an elevated start,
+  remove that folder whole through handles and remove a link that the
+  account put inside as a link, never entering it. A folder that the account
+  emptied and made a link after its process ended is not a profile folder to
+  the sweep and is left where it is. Nothing in
   the temporary folder or the local application data, and not the folder of
   earlier versions, is removed with administrator rights: a start or a
   recovery without them removes what lies there, and the report of an
@@ -3710,7 +3735,26 @@ manual check on Windows (`docs/manual-tests.md`, MT-10). The temporary
 profiles that a window without administrator rights left, and the folder of
 earlier versions, are removed only by a start or a recovery without
 administrator rights of that account; an elevated recovery names them as
-not covered and does not call them gone. WebView2 also takes settings from
+not covered and does not call them gone. **The elevated window's profile is
+open to its account while the window runs**, and this cannot be closed while
+WebView2 hosts the window: its browser process runs without administrator
+rights as the account signed in at the desktop, and whatever that browser
+can write, any other program of that account can write too. Such a program
+can therefore change the cache and local storage of the elevated window
+(which hold no session secret and no credential) and, more directly, can
+reach the browser process itself, which runs with the same token. What the
+window shows and sends to the elevated program is then only as trustworthy
+as that account's programs; Microsoft recommends hosting WebView2 in an
+unelevated process for this reason. That boundary is not new with this
+folder — the browser has always run so — but the profile folder no longer
+pretends otherwise. The account can also take the administrators' rights off
+the files it made in a leftover folder, so that an elevated start cannot
+remove them; the folder then stays in `CretLink Data\webview` and `recover`
+names it. That WebView2 opens the elevated window with this folder, after a
+consent elevation and after an elevation with another administrator's
+password, is a manual check on Windows (`docs/manual-tests.md`, MT-16): the
+Windows computers of continuous verification run with user account control
+switched off, where the browser is not started unelevated. WebView2 also takes settings from
 policies in the registry of the account, which the program does not read or
 clear; they are outside this change. On macOS WebKit keeps
 the webview's data

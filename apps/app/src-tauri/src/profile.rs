@@ -116,9 +116,11 @@ impl Profile {
             Home::Installed(_) | Home::Temporary => {
                 // The private folder is made with its owner and its
                 // permissions in one step; the profile made in it takes
-                // them when it is created.
+                // them when it is created, and is then opened to the
+                // account whose desktop shows the window: WebView2 runs its
+                // browser as that account, without administrator rights.
                 base.prepare()?;
-                let temp = TempProfile::create_in(base.dir())?;
+                let temp = TempProfile::create_for(base)?;
                 Self::new(Some(temp.path().to_path_buf()), Some(temp), false)
             }
         };
