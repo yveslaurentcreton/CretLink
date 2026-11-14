@@ -13,7 +13,10 @@ import {
   groupTexts,
   linkedFromTree,
   linkedPackages,
+  mergePackages,
   noticeFiles,
+  npmPackages,
+  programsOf,
   renderNotices,
 } from "./third-party-notices.mjs";
 
@@ -99,6 +102,129 @@ test("the packages of the workspace itself are left out, and the rest is sorted"
     linkedPackages(metadata, linked).map((p) => `${p.name} ${p.version}`),
     ["alpha 1.0.0", "alpha 2.0.0", "zeta 1.0.0"],
   );
+});
+
+test("the tree is read the same with the line ends of Windows", () => {
+  const tree = "0program v1.0.0 (C:\\work)\r\n1plain v3.0.0\r\n1derive v1.0.0 (proc-macro)\r\n2inner v0.1.0\r\n";
+  assert.deepEqual([...linkedFromTree(tree)].sort(), ["plain 3.0.0", "program 1.0.0"]);
+});
+
+test("a package that comes from a path is left out like a member of the workspace", () => {
+  // The application is a workspace of its own and reaches the crates of the
+  // repository by path: they are no members there, and still CretLink's own.
+  const metadata = {
+    workspace_members: ["path+file:///work/app#app@0.0.0"],
+    packages: [
+      { id: "path+file:///work/app#app@0.0.0", name: "app", version: "0.0.0", source: null },
+      { id: "path+file:///work/crates/own#own@0.0.0", name: "own", version: "0.0.0", source: null },
+      pkg("/x/other", "other", "1.0.0", "MIT"),
+    ],
+  };
+  const linked = new Set(["app 0.0.0", "own 0.0.0", "other 1.0.0"]);
+  assert.deepEqual(
+    linkedPackages(metadata, linked).map((p) => `${p.name} ${p.version}`),
+    ["other 1.0.0"],
+  );
+});
+
+test("a program is named after the binaries of its package", () => {
+  const metadata = {
+    workspace_members: ["path+file:///work/app#app@0.0.0", "path+file:///work/lib#lib@0.0.0"],
+    packages: [
+      {
+        id: "path+file:///work/app#app@0.0.0",
+        name: "app",
+        targets: [
+          { kind: ["lib"], name: "app_lib" },
+          { kind: ["bin"], name: "the-program" },
+        ],
+      },
+      { id: "path+file:///work/lib#lib@0.0.0", name: "lib", targets: [{ kind: ["lib"], name: "lib" }] },
+      // Reached by path from this workspace, a member of another one.
+      { id: "path+file:///work/cli#cli@0.0.0", name: "cli", targets: [{ kind: ["bin"], name: "cli" }] },
+    ],
+  };
+  assert.deepEqual(programsOf(metadata, "app"), ["the-program"]);
+  assert.deepEqual(programsOf(metadata, "lib"), ["lib"]);
+  assert.equal(programsOf(metadata, "cli"), null);
+  assert.equal(programsOf(metadata, "ghost"), null);
+});
+
+/** An installed npm package in `folder`/node_modules. */
+function installed(folder, name, manifest, files = {}) {
+  return packageFolder(join(folder, "node_modules"), name, {
+    "package.json": JSON.stringify({ name, ...manifest }),
+    ...files,
+  });
+}
+
+test("the npm packages are the installed production dependencies of the lockfile", () => {
+  const root = mkdtempSync(join(tmpdir(), "cretlink-notices-"));
+  try {
+    installed(root, "@scope/ui", { version: "5.5.0", license: "MIT", repository: "https://example.org/ui" }, { LICENSE: "MIT, by UI" });
+    installed(root, "plain", { version: "1.2.3", license: "ISC", repository: { type: "git", url: "git+https://example.org/plain.git" } });
+    installed(root, "builder", { version: "9.0.0", license: "MIT" });
+    const lock = {
+      packages: {
+        "": { name: "frontend", dependencies: { "@scope/ui": "^5.5.0" } },
+        "node_modules/@scope/ui": { version: "5.5.0", license: "MIT" },
+        "node_modules/plain": { version: "1.2.3" },
+        // What only builds or tests the package is no part of the program.
+        "node_modules/builder": { version: "9.0.0", dev: true },
+        "node_modules/builder-helper": { version: "1.0.0", devOptional: true },
+        // An optional package for another platform is not installed here.
+        "node_modules/for-another-platform": { version: "2.0.0", optional: true },
+      },
+    };
+    const packages = npmPackages(root, lock);
+    assert.deepEqual(
+      packages.map(({ name, version, license, repository, source }) => ({ name, version, license, repository, source })),
+      [
+        { name: "@scope/ui", version: "5.5.0", license: "MIT", repository: "https://example.org/ui", source: "npm" },
+        { name: "plain", version: "1.2.3", license: "ISC", repository: "git+https://example.org/plain.git", source: "npm" },
+      ],
+    );
+    // The licence files are read from the installed package.
+    assert.deepEqual(
+      collectNotices(packages).map(({ files }) => files),
+      [[{ name: "LICENSE", text: "MIT, by UI" }], []],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("npm packages that are not installed as the lockfile says stop the run", () => {
+  const root = mkdtempSync(join(tmpdir(), "cretlink-notices-"));
+  try {
+    installed(root, "drifted", { version: "1.0.1", license: "MIT" });
+    assert.throws(
+      () => npmPackages(root, { packages: { "node_modules/missing": { version: "1.0.0" } } }),
+      /missing is not installed; run `npm ci`/,
+    );
+    assert.throws(
+      () => npmPackages(root, { packages: { "node_modules/drifted": { version: "1.0.0" } } }),
+      /drifted is version 1\.0\.1, the lockfile says 1\.0\.0/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the packages of several programs are listed once, sorted", () => {
+  const shared = pkg("/x/shared", "shared", "1.2.3", "MIT");
+  const merged = mergePackages([
+    [pkg("/x/zeta", "zeta", "1.0.0", "MIT"), shared],
+    // The same package from the lockfile of another workspace, and a newer one.
+    [pkg("/y/shared", "shared", "1.2.3", "MIT"), pkg("/y/shared-2", "shared", "2.0.0", "MIT")],
+    // An npm package with the name and version of a crate is another package.
+    [{ name: "shared", version: "1.2.3", license: "ISC", source: "npm", manifest_path: "/n/shared/package.json" }],
+  ]);
+  assert.deepEqual(
+    merged.map((p) => `${p.name} ${p.version} ${p.source === "npm" ? "npm" : "cargo"}`),
+    ["shared 1.2.3 cargo", "shared 1.2.3 npm", "shared 2.0.0 cargo", "zeta 1.0.0 cargo"],
+  );
+  assert.equal(merged[0], shared);
 });
 
 test("a linked package that the metadata does not know stops the run", () => {
@@ -207,6 +333,33 @@ test("the notices name every package, its licence, its source and the texts", ()
     // The texts follow, each with the package it came with.
     assert.match(text, /Shipped with:\n {4}a 1\.0\.0 \(LICENSE\)\n-+\n\nPermission is hereby granted, by A\./);
     assert.ok(text.endsWith("Mozilla Public License Version 2.0\n"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the notices of an archive name its programs, and an npm package with its source", () => {
+  const root = mkdtempSync(join(tmpdir(), "cretlink-notices-"));
+  try {
+    const a = packageFolder(root, "a", { LICENSE: "MIT text" });
+    const ui = packageFolder(root, "ui", { LICENSE: "MIT, by UI" });
+    const text = renderNotices(
+      ["the-app", "the-cli"],
+      collectNotices([
+        { name: "@scope/ui", version: "5.5.0", license: "MIT", repository: "https://example.org/ui", source: "npm", manifest_path: join(ui, "package.json") },
+        pkg(a, "a", "1.0.0", "MIT"),
+      ]),
+    );
+    assert.match(text, /^THIRD-PARTY NOTICES\n\nThe programs the-app and the-cli contain the packages listed\n/);
+    assert.match(text, /A\npackage is part of at least one of the programs, not always of each\./);
+    assert.match(text, /The programs themselves are published under the MIT licence; see the file\nLICENSE\./);
+    assert.match(
+      text,
+      /@scope\/ui 5\.5\.0\n {4}licence: MIT\n {4}source: {2}https:\/\/www\.npmjs\.com\/package\/@scope\/ui\/v\/5\.5\.0 \(https:\/\/example\.org\/ui\)/,
+    );
+    assert.match(text, /Shipped with:\n {4}@scope\/ui 5\.5\.0 \(LICENSE\)\n-+\n\nMIT, by UI/);
+    // Three programs read as a list.
+    assert.match(renderNotices(["x", "y", "z"], []), /The programs x, y and z contain the packages listed\n/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
