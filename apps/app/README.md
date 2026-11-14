@@ -345,6 +345,44 @@ To try the screens without a backend, run `npx vite` and open
 `/dev/relay-customer.html` (`?copy=relay|none|problem`,
 `?outcome=pair|nobody|unreachable|untrusted|key|lost`).
 
+## The webview's profile folder (ST-M009-014)
+
+The window is a webview, which keeps a profile (cache and local storage, no
+session secret) in a folder. Left to itself that is `dev.cretlink.app` in the
+per-user data folder, which stays after the window has closed. So a process
+decides the folder before its window opens (`src-tauri/src/profile.rs`, with
+the rules in `cretlink_cli::webview_profile`):
+
+| Process | Profile folder | Removed |
+| --- | --- | --- |
+| Not installed (the start screen, a technician that runs once, a `CretLink-Support*` copy), and every customer process | a new `CretLink-webview-<random>` in the temporary folder | by the process itself, after its last window has closed |
+| The installed technician copy | `%LOCALAPPDATA%\CretLink\webview`, `~/.local/share/CretLink/webview`, next to the audit trail | by `cretlink uninstall`; from the installed copy's own window, once that window has closed |
+| Any process on macOS | none: WebKit keeps its data itself | not by CretLink (a known gap) |
+
+- **One folder per process.** The main window is built in `setup` from its
+  description in `tauri.conf.json` (`"create": false`), with the folder; the
+  customer's compact bar gets the same one. A temporary folder is created new
+  under a name from the system's random source. A name that is taken is never
+  taken over, and when no folder can be created the program says so and opens
+  no window.
+- **The lock.** The process holds a lock on `cretlink.lock` in its folder for
+  as long as it runs. A folder whose lock is free belongs to no running copy:
+  every start of a CretLink window removes those, off the window's thread.
+  A folder whose lock is held is never touched, and one whose lock cannot be
+  told is left alone; `cretlink recover` names it.
+- **The end of the process.** A webview holds its profile for as long as it
+  exists, so an exit that the program asks for itself closes every window
+  first. When the last window is gone, the process stops its async runtime,
+  so that no session task, listener or IPC endpoint runs on without a window,
+  and then removes the folder whole, without following a link, trying again
+  for about five seconds while the closing webview still holds files. What
+  is still there after that goes at the next start.
+- **Recover and uninstall.** `cretlink recover` lists the temporary folders
+  of copies that no longer run and the `dev.cretlink.app` folder that
+  releases up to 0.24.1 left for this user; `recover --remove` removes them,
+  with the exit codes it has. `cretlink uninstall` lists and removes the
+  installed copy's profile and that earlier folder. The audit trail stays.
+
 ## Live by default
 
 The shipped build opens real transport only. **Clearly-labelled simulated**
@@ -722,6 +760,8 @@ apps/app/
     src/lib.rs     window per screen, process start and elevated relaunch
     src/start.rs   get_role, choose_role
     src/opener.rs  opens a validated file or folder with the platform opener
+    src/profile.rs the webview's profile folder of this process, and the end
+                   of the process that removes it
     src/relay.rs   the relay of this copy, for both roles: where its profile
                    comes from, the dial over wss, and the words of a failure
     src/relayed_session_tests.rs  a session through the relay with both
@@ -920,9 +960,13 @@ filter and the end report.
 - Install, update and uninstall on Windows (Start-menu shortcut, uninstall
   entry, folder removal after exit) and macOS (the generated bundle) are manual
   checks of ST-M009-006 (`docs/manual-tests.md`, MT-11).
-- A run-once copy writes nothing of its own but the audit trail, but the
-  webview keeps its profile in the per-user data folder Tauri chooses
-  (`dev.cretlink.app`).
+- On macOS the webview is WebKit, which keeps its data in its own folders
+  under `~/Library`: the program cannot direct or remove it there, so it
+  stays after a copy that runs once has closed and after an uninstall
+  (ST-M009-014). Only the technician role exists on macOS.
+- That WebView2 lets go of the profile folder within the few seconds the
+  process waits at its end is a manual check on Windows
+  (`docs/manual-tests.md`, MT-10 step 2 and MT-11 steps 2 and 6).
 - A manual check on Windows that a customer session leaves no file unless
   **Save a copy** is used, and that the save dialog opens on
   `Documents\CretLink\` (ST-M009-012).

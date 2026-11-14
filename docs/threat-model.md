@@ -2493,8 +2493,9 @@ scenario MT-14 in [`manual-tests.md`](manual-tests.md), not yet recorded.
   asked, so an account without rights does not choose the search path of an
   elevated session. CretLink relies on that, and MT-4b checks it on real
   hardware. The same holds for the profile of the elevated window's web
-  view, which lies in the local application data of the account that
-  approved.
+  view, which lies in a folder of its own in the temporary folder of the
+  account that approved and is removed when the window has closed
+  (ST-M009-014).
 - A program without rights can still get in the way. It can hold a file in
   the old folder open so that the folder cannot be removed, or fill the
   folder so that removing it takes long: a start and `recover --remove` wait
@@ -2829,9 +2830,10 @@ to authority-reducing continuity proof only. The owned-resource inventory and
 `cretlink recover [--remove]` (ST-M006-003, ST-M009-010; also `cretlink-cli
 recover` and a `CretLink-Support*` copy's `recover`, the only subcommand such a
 copy accepts) report and remove CretLink residue offline — staged trees,
-sealed tickets, what lies in the staging area without being CretLink's, and
-the folder of a release up to 0.24.0 (FT-7) — and assert every other ownable
-kind empty. The verb opens no
+sealed tickets, what lies in the staging area without being CretLink's,
+the folder of a release up to 0.24.0 (FT-7), and the webview profile folders
+that the application's window left (ST-M009-014, under "One application,
+two roles") — and assert every other ownable kind empty. The verb opens no
 connection and grants no control; removing exits with an error whenever
 something was kept or could not be read. The Get help role runs the startup
 sweep that reclaims staging trees a crashed run left behind before it
@@ -2850,7 +2852,7 @@ otherwise it is skipped, nothing is claimed, and a later start retries. The
 operating system releases the lock with the process, so a crash cannot strand
 it. `recover --remove` is an explicit customer action and does not take the
 lock. The same verb and sweep remain in the `cretlink-support-agent`
-development tool.
+development tool, which has no window and does not look for webview folders.
 The staging area and the ticket store of an elevated program lie in a folder
 that only administrators can write and that is private from the moment it
 exists; the folder in which earlier releases kept them, where every account
@@ -3583,12 +3585,109 @@ writes nothing of its own but the audit trail.
   `CretLink-Support*` program as well as the launch rules (REQ-F-024).
 
 **Residual risks.** The install is not code-signed yet (ST-M006-005); on
-macOS the generated bundle is unsigned and Gatekeeper may ask. The webview
-keeps its own profile in a per-user data folder (Tauri's `dev.cretlink.app`)
-for run-once and installed copies alike; uninstall does not remove it. An AI
+macOS the generated bundle is unsigned and Gatekeeper may ask. The webview's
+profile no longer stays behind: a copy that runs once keeps it in a temporary
+folder that it removes when it closes, and uninstall removes the installed
+copy's (ST-M009-014, below), except on macOS, where WebKit keeps its data
+outside the program's control. An AI
 client registration points at the installed path, so anyone who can replace
 that per-user file can run code as the user when the client starts it — the
 same as any per-user program, and the folder is the user's own.
+
+#### The webview's profile folder (ST-M009-014)
+
+**What it adds.** The application's window is a webview, which keeps a
+profile — cache and local storage, no session secret and no credential — in a
+folder. Releases up to 0.24.1 left the choice to the webview: a folder named
+`dev.cretlink.app` in the per-user data folder, which stayed after the window
+closed, on the customer computer too. Now every window is given its folder:
+
+- a copy that is not installed, and every customer process, gets a new folder
+  of its own, `CretLink-webview-<random>`, in the temporary folder, for the
+  user only where the platform has file modes, and removes it after its last
+  window has closed;
+- the installed technician copy keeps `webview` in the application's data
+  folder, next to the audit trail (`%LOCALAPPDATA%\CretLink\webview`,
+  `~/.local/share/CretLink/webview`), and uninstall lists and removes it;
+- every start of a window removes the temporary folders of copies that no
+  longer run; `cretlink recover` lists those folders and the one that earlier
+  releases left, and `recover --remove` removes them.
+
+**Threats and mitigations.**
+
+- *A folder that stays on the customer computer.* The process removes its
+  folder itself, at its very end. A webview holds its profile for as long as
+  it exists, so an exit that the program asks for closes every window first,
+  and the removal is tried again for about five seconds while the closing
+  webview still holds files. A process that could not remove its folder, or
+  was killed, leaves one whose lock is free: the next start of any CretLink
+  window removes it, `recover` lists it, and `recover --remove` removes it or
+  exits with an error and names it (REQ-F-019, REQ-N-008).
+- *A start removes the profile of a copy that is running.* Each process holds
+  a lock on `cretlink.lock` in its folder for as long as it runs; the
+  operating system gives it back with the process, however it ends. A folder
+  is removed only by a process that holds its lock, or when it has no lock
+  file at all and yet has content, which only an unfinished removal leaves: a
+  process puts nothing into its folder before it holds the lock. On Windows
+  the lock file is opened without sharing deletion, so nothing removes it
+  under the process that holds it. A folder whose lock cannot be told —
+  something that is no file stands under the lock's name, or the file cannot
+  be opened — is left alone, and `recover` names it and does not call the
+  computer clean. A process skips its own folder whatever its lock says.
+- *A folder that somebody else made first.* The customer role runs with
+  administrator rights, and the temporary folder is one that other programs
+  of the same account can write (REQ-S-024). A process uses only a folder
+  that it created itself, new, under a name of 32 digits from the system's
+  random source. A name under which anything stands — a folder, a file, a
+  link — is never taken over: the creation fails and another name is drawn.
+- *The sweep, or the removal at the end, as a way to delete something else.*
+  The sweep looks only at real folders directly inside the temporary folder
+  whose name is the prefix followed by the 32 digits the program generates: a
+  link with such a name is not one and is left where it is. A lock is opened
+  only where a file stands under its name, and nothing is read from it. A
+  folder is removed whole through the call that removes every tree of
+  CretLink: a link, as the folder itself or inside it, is removed as a link
+  and never entered. Uninstall and `recover` remove the installed copy's
+  profile and the earlier releases' folder only at their fixed paths, never
+  at a path read from a file, and in the same way.
+- *A process that goes on without a window.* Removing the folder can take a
+  few seconds. The process first stops its async runtime, so no session task,
+  listener or IPC endpoint outlives the last window: what remains for those
+  seconds only removes a folder. Windows that do not close for an exit delay
+  it by at most three seconds, after which the process ends and leaves the
+  folder to the next start.
+- *The unelevated and the elevated customer window share a profile.* They do
+  not: every customer process has a folder of its own, also when the
+  installed copy started it. The installed copy's profile is used by the
+  technician role only.
+- *A webview that falls back to the folder that stays.* When the temporary
+  folder cannot be created, the program says so and opens no window. An
+  installed copy whose data folder cannot be written runs with a temporary
+  profile.
+
+**Residual risks.** A killed process leaves its folder until the next start
+of a CretLink window by that account or `recover --remove`; on a customer
+computer that never runs CretLink again it stays, holding cache and local
+storage only. That WebView2 lets go of the folder within the few seconds is a
+manual check on Windows (`docs/manual-tests.md`, MT-10). The profile of the
+elevated customer process lies in the temporary folder of the account that
+approved the elevation, not in a place that only administrators can write:
+a program of that same account can read and change what the webview keeps
+there, and can move into the folder a tree that it may move but not remove,
+which the process then removes with the folder at its end. Nothing is removed
+that the account could not have moved there, an account without
+administrator rights whose prompt was answered with another account cannot
+write that folder at all, and Windows does not treat the elevation prompt as
+a boundary inside one account. The WebView2 runtime also reads environment
+variables that override the folder it is given; like the temporary folder
+itself they come from the environment of the process, which Windows takes
+from the account that approved the elevation (FT-7). On macOS WebKit keeps
+the webview's data
+in its own folders under `~/Library`, where CretLink can neither direct nor
+remove it; that is a limit of the technician role there, and the customer
+role does not exist on macOS. A copy of a release up to 0.24.1 that is
+running loses its profile when uninstall or `recover --remove` removes
+`dev.cretlink.app`.
 
 ### Supply chain and distribution
 

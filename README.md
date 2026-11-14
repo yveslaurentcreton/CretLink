@@ -68,8 +68,10 @@ The technician side is one program, `cretlink`, that runs from wherever it was
 unpacked. Its start screen offers, under **Give help**:
 
 - **Run once without installing.** The copy writes nothing but its audit trail
-  (in the per-user data folder). AI clients you connect from it point at this
-  copy and break when it is moved or deleted; the AI assistants screen says so.
+  (in the per-user data folder). Its window keeps its webview profile in a
+  temporary folder, which it removes when it closes (see below). AI clients
+  you connect from it point at this copy and break when it is moved or
+  deleted; the AI assistants screen says so.
 - **Install for me.** Copies `cretlink` (and `cretlink-cli`) to a fixed
   per-user location — `%LOCALAPPDATA%\Programs\CretLink\` on Windows,
   `~/Applications/CretLink.app` on macOS, `~/.local/bin/` on Linux — adds a
@@ -83,11 +85,34 @@ unpacked. Its start screen offers, under **Give help**:
 apps* entry) shows what it will remove and asks first, then removes the
 installed files, the settings of the installed copy (its relay with its key,
 and the network it waits on), the shortcut or desktop entry, the uninstall
-entry and the AI client registrations the install made, but only while they
-still point at the installed copy. The audit trail stays. On macOS and Linux an installed copy
+entry, the installed copy's webview profile and the AI client registrations
+the install made, but only while they still point at the installed copy. The
+audit trail stays. On macOS and Linux an installed copy
 opens Give help directly; a copy that is not installed shows the start screen
 so it can still be installed. A `CretLink-Support*` copy, for customers, never
 installs or uninstalls; the one command it accepts is `recover [--remove]`.
+
+The window of `cretlink` is a webview, which keeps a profile (cache and local
+storage, no session secret) in a folder:
+
+- A copy that is not installed, and Get help wherever it is started from,
+  uses a new folder of its own, `CretLink-webview-<random>`, in the temporary
+  folder, and removes it when its last window has closed. If the program is
+  killed, or the webview still holds files a few seconds after closing, the
+  folder stays until the next start of a CretLink window, which removes the
+  folders of copies that no longer run. `cretlink recover` lists them and
+  `cretlink recover --remove` removes them.
+- The installed copy keeps its profile next to the audit trail
+  (`%LOCALAPPDATA%\CretLink\webview`, `~/.local/share/CretLink/webview`).
+  Uninstall removes it.
+- Releases up to 0.24.1 kept the profile of both roles in `dev.cretlink.app`
+  in the per-user data folder (`%LOCALAPPDATA%`, `~/.local/share`) and left it
+  there. Uninstall and `cretlink recover --remove` remove that folder.
+
+Known gap: on macOS the webview is WebKit, which keeps this data in its own
+folders under `~/Library`, where CretLink can neither direct nor remove it. It
+stays after a copy that runs once has closed and after an uninstall. Only the
+technician role exists on macOS.
 
 ## Platforms
 

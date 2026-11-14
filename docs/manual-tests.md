@@ -526,6 +526,25 @@ was doing.
    `Get-ChildItem -Recurse | Where-Object LastWriteTime -gt <start>`).
    - Expected: no session record or report exists, and `Documents\CretLink`
      does not exist (REQ-F-027, REQ-F-001).
+   - Expected while the Get help window is open (ST-M009-014): `%TEMP%` holds
+     one folder `CretLink-webview-<32 digits>` for it, with `cretlink.lock`
+     and the webview's data in it, and no `dev.cretlink.app` folder exists in
+     `%LOCALAPPDATA%`. The folder of the elevated window is in the `%TEMP%`
+     of the account that answered the UAC prompt. (A `dev.cretlink.app`
+     folder that a release up to 0.24.1 left is listed by `cretlink recover`
+     and removed by `cretlink recover --remove`; remove it before this step.)
+   - Close CretLink — once outside a session, once with **Stop and close**,
+     once with **Close CretLink** on the end screen — and look again ten
+     seconds later. Expected each time: no `CretLink-webview-*` folder is left
+     in `%TEMP%`, also not of the unelevated window that explained the UAC
+     prompt, no `dev.cretlink.app` in `%LOCALAPPDATA%`, and no CretLink
+     process in Task Manager.
+   - Start Get help again and end its process in Task Manager. Expected: its
+     `CretLink-webview-*` folder stays, and `recover` (as the notice of
+     MT-12 step 10 writes the command) lists it as a webview profile left by
+     a copy that no longer runs. Start Get help once more. Expected: that
+     folder is gone, and only the folder of the window now open is in
+     `%TEMP%`.
 3. Choose **Save a copy**, then cancel the dialog.
    - Expected: the dialog opened on `Documents\CretLink\` with
      `YYYY-MM-DD <hostname>.html`; after cancelling, no file and no
@@ -549,10 +568,15 @@ the install screen and the uninstall prompt.
    the `Downloads` folder.
 2. **Run once.** Choose **Run once without installing**. The technician window
    says the copy runs once; on AI assistants, Connect warns that the
-   registration points at this copy. Close it. Expect nothing new outside the
-   audit folder (`%LOCALAPPDATA%\CretLink\audit`, `~/.local/share/CretLink/audit`
-   or the macOS equivalent) other than the webview profile (see the README's
-   known gaps).
+   registration points at this copy. While it is open, its webview profile is
+   a folder `CretLink-webview-<32 digits>` in the temporary folder (`%TEMP%`;
+   none on macOS). Close it. Expect nothing new outside the audit folder
+   (`%LOCALAPPDATA%\CretLink\audit`, `~/.local/share/CretLink/audit` or the
+   macOS equivalent): within ten seconds the `CretLink-webview-*` folder is
+   gone, also the one of the start screen, and no `dev.cretlink.app` folder
+   exists in `%LOCALAPPDATA%` (ST-M009-014). On macOS, WebKit's own folders
+   under `~/Library` stay: a known gap of the technician role there (see the
+   README).
 3. **Install.** Start it again and choose **Install for me**. The screen shows
    the location (`%LOCALAPPDATA%\Programs\CretLink` or
    `~/Applications/CretLink.app`), the Start-menu option (Windows), and each AI
@@ -575,9 +599,12 @@ the install screen and the uninstall prompt.
    the AI clients to keep working without reconnecting.
 6. **Uninstall.** In the installed copy, open Settings → **Uninstall…**. Expect
    the list of what it removes (files, shortcut, uninstall entry, the
-   registrations) and that the audit trail stays. Confirm, close the window,
+   registrations, and the webview profile `%LOCALAPPDATA%\CretLink\webview`
+   marked *removed once CretLink has closed*; none on macOS) and that the
+   audit trail stays. Confirm, close the window,
    and expect the folder (Windows: after the window closed), the shortcut, the
-   *Installed apps* entry and the registrations to be gone, and the audit
+   *Installed apps* entry and the registrations to be gone, the webview
+   profile to be gone within ten seconds (ST-M009-014), and the audit
    folder to be kept.
 7. **Uninstall entry and CLI.** Install again, then uninstall from *Installed
    apps* (Windows): a message box lists what will be removed and asks; **No**
@@ -1367,6 +1394,7 @@ hardware.
 | _pending_ | | | MT-8 (reboot-resume: arm under UAC, survive a reboot, one attended reconnect via the `K_rr` proof, single-use consumption, expired/cloned refusal, residual removal via the recovery command — ST-M006-001/002/003) | not yet recorded on hardware |
 | _pending_ | | | MT-11 steps 2, 4, 5 and 7 to 9 on Windows, and all of it on macOS (ST-M009-006) | not yet recorded on hardware |
 | _pending_ | | | MT-12 step 10 (files left from an earlier session and `cretlink recover`) and the Narrator pass (ST-M009-009, ST-M009-010) | not yet recorded on hardware |
+| _pending_ | | | The webview profile folder on Windows (ST-M009-014): MT-10 step 2 (the folder in `%TEMP%` while Get help is open, gone after each way of closing, the folder of a killed copy listed by `recover` and removed by the next start, no `dev.cretlink.app`), MT-11 step 2 (a copy that runs once) and step 6 (the installed copy's profile, removed once its window has closed) | not yet recorded on hardware; on Linux the same was checked under a virtual display |
 | _pending_ | | | MT-13 (a technician's computer on several networks, ST-M009-016) | not yet recorded on hardware |
 | _pending_ | | | MT-15 (a session through the relay between two networks: the offer, the wait and its code, pairing through a typed code, a session with a stop from each side, a code that nobody waits on, a withdrawn key, a relay that is off, a certificate that is not trusted, a relay that stops in the middle, the network first, a copy without a relay, ST-M007-013) | not yet recorded on hardware |
 | _pending_ | | | MT-14 (the file operations of the explorer: the drives, a folder with links / through a junction / a held file / cancel and stop / swapped while it is removed, a file sent to a folder on two drives and refused for a junction, ST-M010-001; browsing in the Files tab: nothing before the tab is opened, from folder to folder with one item for the customer, a typed path under its real name, links, a refused folder, a folder of thousands of entries, views, selection, keys and the context menu, a stop while a folder arrives, and the Narrator pass of the grid, ST-M010-002; a delete, a folder removal, a new folder and a move refused through a junction, after a swap and on a substituted drive, ST-M010-004) | not yet recorded on hardware |
