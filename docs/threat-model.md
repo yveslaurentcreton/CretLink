@@ -3951,7 +3951,11 @@ REQ-N-017; M001 exit criteria, ST-M001-004) — *configured and enforced on
 advisory, ban, and source checks on every pull request that changes more than
 documentation, and again on `main` after the merge, and `hygiene.yml` runs
 gitleaks secret scanning and the private-data check (ST-M006-016) on every
-pull request, with all actions SHA-pinned. The ruleset on `main` requires the
+pull request, with all actions SHA-pinned. The same job of `ci.yml` checks the
+application package, which is detached and has a lockfile and a `cargo-deny`
+configuration of its own, and audits the npm packages of the application's
+frontend and of the release tooling; the job of the documentation site audits
+the site's (ST-M006-019). The ruleset on `main` requires the
 result of both, merges a pull request only when it is up to date with `main`,
 so the merged tree is the tested one, and rejects a direct push, which the
 [release policy](releasing.md) forbids*. The committed Cargo lockfile pins the
