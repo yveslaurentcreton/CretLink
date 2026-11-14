@@ -1,14 +1,17 @@
 ---
 title: Help someone
-description: What you do and what your customer does during a CretLink session on the same network, and how you put your AI agent to work.
+description: What you do and what your customer does during a CretLink session, on the same network or through your relay, how you put your AI agent to work and how you work in their files.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 import Shot from '../../components/Shot.astro';
 import wait from '../../assets/screens/technician-wait.png';
 import networks from '../../assets/screens/technician-wait-networks.png';
+import relayCode from '../../assets/screens/technician-relay-code.png';
+import customerCode from '../../assets/screens/customer-relay-code.png';
+import files from '../../assets/screens/technician-files.png';
 
-<p class="lede">You are with your customer, or on the phone with them, and both computers are on the same network. This is the whole visit.</p>
+<p class="lede">You are with your customer, or on the phone with them. Their computer is on your network, or somewhere else on the internet. This is the whole visit.</p>
 
 ## Who does what
 
@@ -26,7 +29,7 @@ import networks from '../../assets/screens/technician-wait-networks.png';
     <h3>Your customer</h3>
     <ol>
       <li>Starts <code>CretLink-Support.exe</code> and answers <strong>Yes</strong> when Windows asks.</li>
-      <li>Picks you from the list and checks the six digits you read.</li>
+      <li>Picks you from the list, or types the code you read, and checks the six digits.</li>
       <li>Reads what full control means and allows it.</li>
       <li>Watches, and can press <strong>Stop now</strong> at any moment.</li>
     </ol>
@@ -35,27 +38,50 @@ import networks from '../../assets/screens/technician-wait-networks.png';
 
 [How a session works](/CretLink/session/) shows each of these steps with its screen.
 
-## When their program does not find you
+## On the same network
 
-Your waiting screen shows a connection code. Read it to your customer; they type it under the list of technicians.
+Their program finds your computer by itself. When it does not, read them the **connection code**; they type it under their list of technicians.
 
 <Shot
   src={wait}
   kind="wide"
-  alt="The technician's waiting screen with the connection code and, under it, the network and the address this computer waits on."
-  caption="The connection code only says where your computer is. It gives nobody access."
+  alt="The technician's waiting screen: the connection code with the network this computer waits on, and under it a card that asks Not on the same network, names the relay and offers Use relay."
+  caption="One waiting screen, both routes: the connection code for this network and, under it, your relay for everywhere else."
 />
 
-### When your computer is on more than one network
-
-A VPN or a virtual machine gives your computer networks that your customer cannot reach. Under the code, the waiting screen names the network it waits on. When that is not the network your customer is on, choose **Wait on another network** and pick theirs. The connection code changes with it.
+A VPN or a virtual machine gives your computer networks that your customer cannot reach. The waiting screen names the network it waits on. **Wait on another network** lists the others, and the connection code changes with your choice.
 
 <Shot
   src={networks}
   kind="wide"
   alt="The waiting screen with the other networks of this computer listed under the code, each with a Wait here button."
-  caption="Your choice holds until you close CretLink."
+  caption="The installed copy remembers the network you choose."
 />
+
+## Not on the same network
+
+Before the visit you need [a relay](/CretLink/relay/) that your copy knows, and [a customer copy](/CretLink/get-started/#a-copy-for-a-customer-on-another-network) that knows the same relay.
+
+1. Press **Use relay…**. Your copy now waits on the relay.
+2. Read the **relay code** to your customer: sixteen characters in four groups.
+3. Your customer types it into the same field as a connection code. Their screen names the relay it connects through.
+
+<div class="shots not-content">
+  <Shot
+    src={relayCode}
+    kind="wide"
+    alt="The technician waits for the customer on the relay: a relay code in four outlined groups, the name of the relay, and the sentence that the relay holds this code."
+    caption="You read the relay code aloud."
+  />
+  <Shot
+    src={customerCode}
+    kind="narrow"
+    alt="The customer's screen with the relay code typed into the code field. Under the field it says that this copy connects through the relay relay.example.org, which only passes encrypted traffic on."
+    caption="Your customer types it."
+  />
+</div>
+
+A relay code works once, for as long as your waiting screen is open. Like a connection code it only says where to meet: you still compare the six digits aloud, and your customer still decides. Nothing connects again by itself. When the relay stops or a connection is lost, the session ends on both sides, and both screens say so.
 
 ## Put your AI agent to work
 
@@ -69,12 +95,25 @@ Three habits make a session go well:
 - **Ask for a purpose.** The agent can state in a few words why it runs something. Your customer reads that purpose next to the real command.
 - **Read the results.** A failed command is reported as failed, a cancelled one as cancelled, and one that got lost as unknown. Nothing is reported as done when it is not.
 
-Files go both ways: the agent sends a file to the customer's computer and fetches one from it, and CretLink checks that every copy is identical to the original. A file that leaves the customer's computer is marked as such on both screens.
+## Work in their files
+
+Your agent sends files to the customer's computer and fetches files from it. You can do the same yourself: the **Files** tab of a session is a file explorer for their computer, in your own window.
+
+<Shot
+  src={files}
+  kind="wide"
+  alt="The Files tab during a session: the Documents folder of the customer's computer with its folders and files, buttons to upload, download, rename and delete, and under the list the transfers of the session."
+  caption="The customer's Documents folder, and under it the files that were sent and fetched."
+/>
+
+- **Send and fetch.** **Upload…**, or a drop on the window, sends files and folders to the open folder. **Download** copies what you selected to your own computer. A copy counts as done only when it is identical to the original.
+- **Rename and delete** what you selected. Deleting asks first, because nothing goes to a recycle bin.
+- **In sight.** Your customer sees each file that you or your agent send, fetch, rename or delete, and a file that leaves their computer is marked as such. Your audit trail records it all.
 
 ## When you are done
 
 Press **Stop session**, or let your customer press **Stop now**. CretLink cleans up on their computer and both of you get a report. On your side the session stays under **Sessions**, with its audit trail.
 
-<Aside type="note" title="Over the internet">
-<span class="planned">Planned</span> Today both computers must be on the same network. Sessions over the internet will go through [a relay that you host](/CretLink/relay/).
+<Aside type="note" title="New in this release">
+The route through a relay and the file explorer pass the automated tests. They have not been run between real computers yet: the [status in the README](https://github.com/yveslaurentcreton/CretLink#current-status) says what has.
 </Aside>
