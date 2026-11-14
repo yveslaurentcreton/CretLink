@@ -344,6 +344,9 @@ impl Closing {
     }
 }
 
+#[cfg(all(test, windows))]
+mod webview2;
+
 #[cfg(test)]
 mod tests {
     use super::*;

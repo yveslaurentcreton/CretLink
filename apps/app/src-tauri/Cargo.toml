@@ -94,6 +94,17 @@ cretlink-relay-server = { path = "../../relay-server" }
 cretlink-wss = { path = "../../../crates/wss", features = ["test-cert"] }
 base64 = "0.23"
 
+# A real WebView2 in a test, with the profile folder the elevated customer
+# window chooses (ST-M009-014, `src/profile/webview2.rs`): the bindings that
+# the webview library uses already, in the versions locked for it.
+[target.'cfg(windows)'.dev-dependencies]
+webview2-com = "0.38"
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
 [lints.rust]
 unsafe_code = "deny"
 missing_debug_implementations = "warn"
