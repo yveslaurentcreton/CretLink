@@ -176,6 +176,18 @@ export interface CustomerReport {
   cleanup: CleanupResult;
   // Every item the customer saw, oldest first.
   activity: ActivityEntry[];
+  // The support program that is kept on this computer on the customer's own
+  // choice, when there is one (ST-M009-017): not something that this session
+  // left behind.
+  keptProgram?: KeptProgram;
+}
+
+// Mirrors `cretlink_session::KeptProgram`.
+export interface KeptProgram {
+  // The folder it lies in.
+  location: string;
+  // Its version, when its record says one.
+  version?: string;
 }
 
 // --- AI clients (ST-M009-003, ST-M009-006) ---

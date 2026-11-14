@@ -15,9 +15,13 @@ import { relayWords } from "../shared/relay";
 import type {
   ConsentView,
   DiscoveredConsoleView,
+  KeepPlanView,
+  KeepView,
   LaunchView,
   PhaseName,
   RelayUseView,
+  RemoveOutcome,
+  RemovePlanView,
 } from "./api";
 
 export type WindowKind = "main" | "mini";
@@ -45,11 +49,28 @@ export interface Discovery {
   problem?: string;
 }
 
+/**
+ * The screen that stands over the list of technicians or the end report
+ * while the customer looks at what keeping the support program adds, or at
+ * what removing it removes (ST-M009-017). Never during a session.
+ */
+export type Panel =
+  | { kind: "none" }
+  | { kind: "keep"; plan: KeepPlanView }
+  | { kind: "remove"; plan: RemovePlanView }
+  | { kind: "removed"; outcome: RemoveOutcome };
+
 export interface CustomerSnapshot {
   window: WindowKind;
   // `null` until the backend has answered.
   view: ConsentView | null;
   launch: LaunchView | null;
+  // What is kept on this computer and what this window offers (ST-M009-017);
+  // `null` until the backend has answered, and where it has no answer.
+  keep: KeepView | null;
+  panel: Panel;
+  // The program was kept from this window a moment ago: said in words.
+  keptNow: boolean;
   // The feed of the current or last session, oldest first.
   activity: ActivityEntry[];
   discovery: Discovery;
@@ -84,13 +105,20 @@ export type Screen =
   | "consent"
   | "live"
   | "stopping"
-  | "end";
+  | "end"
+  // Over the list or the end report (ST-M009-017).
+  | "keep"
+  | "remove"
+  | "removed";
 
 export function initialSnapshot(window: WindowKind, now: number): CustomerSnapshot {
   return {
     window,
     view: null,
     launch: null,
+    keep: null,
+    panel: { kind: "none" },
+    keptNow: false,
     activity: [],
     discovery: { state: "idle", consoles: [] },
     filter: "all",
@@ -118,6 +146,17 @@ export function canStop(s: CustomerSnapshot): boolean {
 }
 
 export function screenFor(s: CustomerSnapshot): Screen {
+  const base = baseScreen(s);
+  // A panel stands only over the list and the end report, where no session
+  // exists; anywhere else the screen of the session wins.
+  if (s.panel.kind !== "none" && (base === "find" || base === "end") && !canStop(s)) {
+    return s.panel.kind;
+  }
+  return base;
+}
+
+/** The screen of the session and the admin step, without a panel. */
+function baseScreen(s: CustomerSnapshot): Screen {
   const view = s.view;
   if (!view) return "loading";
   if (s.launch && s.launch.step !== "ready" && !view.session_active) {
@@ -210,6 +249,9 @@ export function applyView(s: CustomerSnapshot, next: ConsentView, now: number): 
       confirmClose: false,
     };
   }
+  // A session leaves no panel open: keeping is offered before a session and
+  // after it, never during one (ST-M009-017).
+  if (next.session_active) out.panel = { kind: "none" };
   if (after === "full_control" || next.status.control_active) out.hadControl = true;
   if (isEnd(after) && !isEnd(before) && !out.hadControl) {
     out.ended = endedBeforeControl(next, technicianName(out));
@@ -233,6 +275,63 @@ function endedBeforeControl(view: ConsentView, name: string): string {
     default:
       return "The connection ended before anyone got access. Nothing was shared.";
   }
+}
+
+// --- Keeping the support program for next time (ST-M009-017) ---
+
+/**
+ * What the list of technicians and the end report say about keeping the
+ * support program, and what they offer.
+ *
+ * - `offer`: nothing is kept, and this window can keep the program.
+ * - `update`: an older version is kept, and this window can replace it.
+ * - `installed`: this is the kept program. It offers to remove itself.
+ * - `kept`: a program is kept and this copy changes nothing about it: the
+ *   same version, a newer one, one that cannot be compared, or a window
+ *   without administrator rights.
+ */
+export type KeepCard =
+  | { kind: "offer" }
+  | { kind: "update"; kept: string | undefined; version: string }
+  | { kind: "installed"; version: string; canRemove: boolean; elevates: boolean }
+  | { kind: "kept"; relation: "same" | "newer" | "older" | "unknown"; kept: string | undefined; version: string };
+
+/**
+ * The card about keeping, or nothing: before the backend has answered, in a
+ * window that can keep nothing while nothing is kept (one without
+ * administrator rights, or not on Windows), and always while a session
+ * exists.
+ */
+export function keepCard(s: CustomerSnapshot): KeepCard | null {
+  const keep = s.keep;
+  if (!keep || canStop(s)) return null;
+  switch (keep.state) {
+    case "not_kept":
+      return keep.canKeep ? { kind: "offer" } : null;
+    case "this":
+      return {
+        kind: "installed",
+        version: keep.thisVersion,
+        canRemove: keep.canRemove,
+        elevates: keep.removeElevates,
+      };
+    case "newer":
+      return keep.canKeep
+        ? { kind: "update", kept: keep.keptVersion, version: keep.thisVersion }
+        : { kind: "kept", relation: "newer", kept: keep.keptVersion, version: keep.thisVersion };
+    default:
+      return { kind: "kept", relation: keep.state, kept: keep.keptVersion, version: keep.thisVersion };
+  }
+}
+
+/** Whether a support program is kept on this computer, this one or another. */
+export function isKept(s: CustomerSnapshot): boolean {
+  return s.keep !== null && s.keep.state !== "not_kept";
+}
+
+/** Whether this window is the kept program itself. */
+export function isKeptProgram(s: CustomerSnapshot): boolean {
+  return s.keep?.state === "this";
 }
 
 // --- A session through the relay (ST-M007-013) ---
@@ -545,6 +644,14 @@ export function announcement(s: CustomerSnapshot): string {
       return "Control has ended. Cleaning up.";
     case "end":
       return s.report ? "The session has ended. The report is ready." : "The session has ended. Cleaning up.";
+    case "keep":
+      return s.panel.kind === "keep" && s.panel.plan.replaces !== undefined
+        ? "No access. Update CretLink Support on this computer? Nothing changes until you choose."
+        : "No access. Keep CretLink Support on this computer? Nothing is kept until you choose.";
+    case "remove":
+      return "No access. Remove CretLink Support from this computer? Nothing is removed until you choose.";
+    case "removed":
+      return "No access. CretLink Support was removed from this computer.";
   }
 }
 

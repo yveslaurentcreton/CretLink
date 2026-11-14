@@ -7,8 +7,11 @@ import type {
   AgentPhase,
   ConsentView,
   DiscoveredConsoleView,
+  KeepPlanView,
+  KeepView,
   LaunchView,
   RelayUseView,
+  RemovePlanView,
 } from "./api";
 import { type CustomerSnapshot, initialSnapshot } from "./model";
 
@@ -73,6 +76,73 @@ export const VIA_RELAY_ELSEWHERE: RelayUseView = {
   host: "relay.example.org",
   address: "192.0.2.1:9970",
   trust: "profile_file",
+};
+
+// --- Keeping the support program for next time (ST-M009-017) ---
+
+/** Where a kept program lies. */
+export const KEPT_FOLDER = "C:\\Program Files\\CretLink Support";
+
+/** An elevated copy on a computer where nothing is kept: it offers to keep. */
+export const KEEP_OFFER: KeepView = {
+  state: "not_kept",
+  canKeep: true,
+  canRemove: false,
+  removeElevates: false,
+  thisVersion: "1.1.0",
+  location: KEPT_FOLDER,
+};
+
+/** The same copy after it was kept: the kept program has its version. */
+export const KEEP_SAME: KeepView = {
+  ...KEEP_OFFER,
+  state: "same",
+  canKeep: false,
+  keptVersion: "1.1.0",
+};
+
+/** An elevated copy that is newer than what is kept: it offers to update. */
+export const KEEP_UPDATE: KeepView = { ...KEEP_OFFER, state: "newer", keptVersion: "1.0.0" };
+
+/** A copy that is older than what is kept: it never replaces it. */
+export const KEEP_OLDER: KeepView = {
+  ...KEEP_OFFER,
+  state: "older",
+  canKeep: false,
+  thisVersion: "1.0.0",
+  keptVersion: "1.1.0",
+};
+
+/** The kept program itself, with administrator rights. */
+export const KEEP_INSTALLED: KeepView = {
+  ...KEEP_OFFER,
+  state: "this",
+  canKeep: false,
+  canRemove: true,
+  keptVersion: "1.1.0",
+};
+
+/** What keeping would add, for a copy without relay settings. */
+export const KEEP_PLAN: KeepPlanView = {
+  version: "1.1.0",
+  location: KEPT_FOLDER,
+  program: `${KEPT_FOLDER}\\CretLink-Support.exe`,
+  desktopKept: false,
+  relayReplaces: false,
+};
+
+/** What removing would remove, from the kept program itself. */
+export const REMOVE_PLAN: RemovePlanView = {
+  removes: [
+    `${KEPT_FOLDER}\\CretLink-Support.exe (removed once CretLink has closed)`,
+    `${KEPT_FOLDER}\\install.json (removed once CretLink has closed)`,
+    `The folder ${KEPT_FOLDER} (removed once CretLink has closed)`,
+    "The shortcut C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\CretLink Support.lnk",
+    "The entry in Installed apps (HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\CretLink Support)",
+  ],
+  stays: ["A session report that you saved stays where you saved it"],
+  afterExit: true,
+  elevates: false,
 };
 
 export const LAUNCH_READY: LaunchView = {
@@ -477,6 +547,89 @@ export const FIXTURES: Record<string, CustomerSnapshot> = {
     activity: FEED_DONE,
     hadControl: true,
     report: REPORT_FAILED,
+  }),
+  // Keeping the support program for next time (ST-M009-017): the card on the
+  // list and on the end report, and the screens it leads to.
+  "find-keep-offer": base(idle, { discovery: { state: "done", consoles: CONSOLES }, keep: KEEP_OFFER }),
+  "find-keep-update": base(idle, { discovery: { state: "done", consoles: CONSOLES }, keep: KEEP_UPDATE }),
+  "find-kept-now": base(idle, {
+    discovery: { state: "done", consoles: CONSOLES },
+    keep: KEEP_SAME,
+    keptNow: true,
+  }),
+  "find-kept-same": base(idle, { discovery: { state: "done", consoles: CONSOLES }, keep: KEEP_SAME }),
+  "find-kept-older-copy": base(idle, { discovery: { state: "done", consoles: CONSOLES }, keep: KEEP_OLDER }),
+  "find-installed": base(idle, { discovery: { state: "done", consoles: CONSOLES }, keep: KEEP_INSTALLED }),
+  // The kept program after the customer went on without administrator
+  // rights: removing asks Windows for them first.
+  "find-installed-unelevated": base(idleUnelevated, {
+    discovery: { state: "done", consoles: CONSOLES },
+    keep: { ...KEEP_INSTALLED, removeElevates: true },
+  }),
+  // A window without administrator rights offers nothing while nothing is kept.
+  "find-unelevated-no-offer": base(idleUnelevated, {
+    discovery: { state: "done", consoles: CONSOLES },
+    keep: { ...KEEP_OFFER, canKeep: false },
+  }),
+  // The kept program explains the prompt without saying that nothing is installed.
+  "admin-kept-program": base(idleUnelevated, {
+    launch: { ...LAUNCH_READY, step: "admin", back: "close", elevated: false },
+    keep: { ...KEEP_INSTALLED, removeElevates: true },
+  }),
+  keep: base(idle, { keep: KEEP_OFFER, panel: { kind: "keep", plan: KEEP_PLAN } }),
+  // A copy that brings relay settings names the relay before the choice.
+  "keep-relay": base(idle, {
+    keep: KEEP_OFFER,
+    panel: { kind: "keep", plan: { ...KEEP_PLAN, relay: VIA_RELAY } },
+  }),
+  // A newer copy, whose settings name the relay otherwise than the host it
+  // connects to and check it against a certificate file of their own.
+  "keep-update-relay": base(idle, {
+    keep: KEEP_UPDATE,
+    panel: {
+      kind: "keep",
+      plan: {
+        ...KEEP_PLAN,
+        replaces: "1.0.0",
+        desktopKept: true,
+        relay: VIA_RELAY_ELSEWHERE,
+        relayReplaces: true,
+      },
+    },
+  }),
+  "keep-relay-problem": base(idle, {
+    keep: KEEP_OFFER,
+    panel: {
+      kind: "keep",
+      plan: {
+        ...KEEP_PLAN,
+        relayProblem:
+          "Line 2: `address` needs a port; write the relay's host name and port, like relay.example.org:443. The file is C:\\Users\\ann\\Downloads\\cretlink.toml.",
+      },
+    },
+  }),
+  remove: base(idle, { keep: KEEP_INSTALLED, panel: { kind: "remove", plan: REMOVE_PLAN } }),
+  "remove-elevates": base(idleUnelevated, {
+    keep: { ...KEEP_INSTALLED, removeElevates: true },
+    panel: { kind: "remove", plan: { ...REMOVE_PLAN, elevates: true } },
+  }),
+  removed: base(idle, {
+    keep: KEEP_INSTALLED,
+    panel: { kind: "removed", outcome: { state: "pending", left: [] } },
+  }),
+  "end-keep-offer": base(stoppedByCustomer, {
+    activity: FEED_DONE,
+    hadControl: true,
+    report: REPORT,
+    keep: KEEP_OFFER,
+  }),
+  // A session from the kept program: its report says that the program is
+  // there because the customer chose that.
+  "end-kept-on-purpose": base(stoppedByCustomer, {
+    activity: FEED_DONE,
+    hadControl: true,
+    report: { ...REPORT, keptProgram: { location: KEPT_FOLDER, version: "1.1.0" } },
+    keep: KEEP_INSTALLED,
   }),
   "end-saved": base(stoppedByCustomer, {
     activity: FEED_DONE,

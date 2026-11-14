@@ -165,6 +165,77 @@ export interface RelaunchOutcome {
   launch: LaunchView;
 }
 
+// --- Keeping the support program for next time (ST-M009-017) ---
+
+// How this copy relates to what is kept on this computer.
+export type KeepRelation =
+  | "not_kept"
+  // This copy is the kept program.
+  | "this"
+  // The kept program has the version of this copy.
+  | "same"
+  // This copy is newer: it can update the kept program.
+  | "newer"
+  // The kept program is newer: this copy never replaces it.
+  | "older"
+  // The kept version cannot be compared: it is not replaced.
+  | "unknown";
+
+// Mirrors the application crate's `KeepView`: what is kept on this computer,
+// and what this window offers. The backend decides the offer: to keep only
+// with administrator rights, to remove only in the kept program itself, and
+// nothing during a session.
+export interface KeepView {
+  state: KeepRelation;
+  canKeep: boolean;
+  canRemove: boolean;
+  // Removing first asks Windows for administrator rights.
+  removeElevates: boolean;
+  thisVersion: string;
+  // Absent when nothing is kept or the record does not say.
+  keptVersion?: string;
+  // The folder of the kept program; absent where no program can be kept.
+  location?: string;
+}
+
+// Mirrors `KeepPlanView`: what keeping would add, shown before the customer
+// chooses. `relay` names the relay that the settings of this copy bring, as
+// every screen names a relay: its name, where the copy connects and what
+// vouches for the name. The settings may have been written by somebody else.
+export interface KeepPlanView {
+  version: string;
+  // The version it would replace, when a program is kept already.
+  replaces?: string;
+  location: string;
+  program: string;
+  // The kept program has a desktop shortcut already.
+  desktopKept: boolean;
+  relay?: RelayUseView;
+  // Relay settings that are kept already would be replaced.
+  relayReplaces: boolean;
+  // Why the relay settings next to this copy are not kept, as a sentence.
+  relayProblem?: string;
+}
+
+// Mirrors `RemovePlanView`: what removing would remove and what stays.
+export interface RemovePlanView {
+  removes: string[];
+  stays: string[];
+  // The folder goes only once this window has closed.
+  afterExit: boolean;
+  // Windows asks for administrator rights first.
+  elevates: boolean;
+}
+
+// Mirrors `RemoveOutcome`.
+export interface RemoveOutcome {
+  // `removed`: everything is gone; `pending`: the folder goes once this
+  // window has closed; `elevating`: Windows was asked for administrator
+  // rights and this window is closing.
+  state: "removed" | "pending" | "elevating";
+  left: string[];
+}
+
 export interface CommandError {
   stage: string;
   message: string;
@@ -200,6 +271,14 @@ export const api = {
   openMain: () => invoke<void>("open_main"),
   dragWindow: () => invoke<void>("drag_window"),
   stopAndClose: () => invoke<void>("stop_and_close"),
+  // Keeping the support program (ST-M009-017). Nothing is kept or removed
+  // without the customer's click: `keepProgram` carries out the plan that
+  // `keepPlan` showed, and no other.
+  getKeep: () => invoke<KeepView>("get_keep"),
+  keepPlan: () => invoke<KeepPlanView>("keep_plan"),
+  keepProgram: (desktop: boolean) => invoke<KeepView>("keep_program", { desktop }),
+  removePlan: () => invoke<RemovePlanView>("remove_plan"),
+  removeProgram: () => invoke<RemoveOutcome>("remove_program"),
 };
 
 // The events of the backend, to both windows.

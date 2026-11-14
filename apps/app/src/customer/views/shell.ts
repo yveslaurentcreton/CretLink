@@ -27,6 +27,7 @@ import { adminView, declinedView } from "./admin";
 import { band, button } from "./common";
 import { endView } from "./end";
 import { findView } from "./find";
+import { keepView, removeView, removedView } from "./keep";
 import { compareView, connectingView, consentView, stoppingView } from "./flow";
 import { liveView, since } from "./live";
 
@@ -112,6 +113,12 @@ function content(s: CustomerSnapshot, screen: Screen): Child {
       return stoppingView();
     case "end":
       return endView(s);
+    case "keep":
+      return keepView(s);
+    case "remove":
+      return removeView(s);
+    case "removed":
+      return removedView(s);
   }
 }
 

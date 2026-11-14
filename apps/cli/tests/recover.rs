@@ -12,6 +12,12 @@
 //! Windows program without those rights on a computer where a program with
 //! them has kept files: it says that it cannot see them, which is true and
 //! is not the state these tests set up.
+//!
+//! The webview profile folders that the application's window left
+//! (ST-M009-014) lie in the temporary folder and in the data folder of the
+//! account, with or without administrator rights. Each test gives the program
+//! a temporary folder and a home of its own, so that it never looks at, or
+//! removes, what lies in the real ones.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -29,7 +35,8 @@ impl Sandbox {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("cretlink-recover-{}-{seq}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create the sandbox");
+        std::fs::create_dir_all(root.join("tmp")).expect("create the sandbox");
+        std::fs::create_dir_all(root.join("home")).expect("create the sandbox");
         Self(root)
     }
 
@@ -41,6 +48,43 @@ impl Sandbox {
     /// The folder the environment names as the account's application data.
     fn account_data(&self) -> PathBuf {
         self.0.join("account")
+    }
+
+    /// The folder the environment names as the temporary folder.
+    fn temp(&self) -> PathBuf {
+        self.0.join("tmp")
+    }
+
+    /// The folder the environment names as the home of the account.
+    fn home(&self) -> PathBuf {
+        self.0.join("home")
+    }
+
+    /// Where earlier versions kept the webview profile of the account; `None`
+    /// on macOS, where the webview takes no folder.
+    fn earlier_webview_profile(&self) -> Option<PathBuf> {
+        if cfg!(windows) {
+            Some(self.account_data().join("dev.cretlink.app"))
+        } else if cfg!(target_os = "macos") {
+            None
+        } else {
+            Some(
+                self.home()
+                    .join(".local")
+                    .join("share")
+                    .join("dev.cretlink.app"),
+            )
+        }
+    }
+
+    /// A webview profile folder in the temporary folder, as the copy number
+    /// `number` made it: with its lock file and what a webview wrote.
+    fn webview_profile(&self, number: u8) -> PathBuf {
+        let dir = self.temp().join(format!("CretLink-webview-{number:032x}"));
+        std::fs::create_dir_all(dir.join("Cache")).expect("make the profile folder");
+        std::fs::write(dir.join("cretlink.lock"), b"").expect("make its lock file");
+        std::fs::write(dir.join("Cache").join("index"), b"x").expect("fill it");
+        dir
     }
 
     /// The ticket store of the program under test: under the account's
@@ -70,9 +114,27 @@ fn recover(sandbox: &Sandbox, args: &[&str]) -> Output {
         .env("ProgramData", sandbox.machine_data())
         .env("ALLUSERSPROFILE", sandbox.machine_data())
         .env("LOCALAPPDATA", sandbox.account_data())
+        // The places of the webview profile folders (ST-M009-014).
+        .env("TMPDIR", sandbox.temp())
+        .env("TMP", sandbox.temp())
+        .env("TEMP", sandbox.temp())
+        .env("HOME", sandbox.home())
+        .env("USERPROFILE", sandbox.home())
+        .env_remove("XDG_DATA_HOME")
         .stdin(Stdio::null())
         .output()
         .expect("run cretlink-cli recover")
+}
+
+/// Whether the program under test runs as an elevated program on Windows, as
+/// its own report tells.
+fn elevated_on_windows(inspection: &str) -> bool {
+    let says = |label: &str, value: &str| {
+        inspection
+            .lines()
+            .any(|line| line.trim_start().starts_with(label) && line.trim_end().ends_with(value))
+    };
+    says("windows:", "true") && says("elevated:", "true")
 }
 
 /// Whether the program under test keeps to the sandbox, as its own report
@@ -194,6 +256,107 @@ fn an_elevated_windows_program_does_not_follow_its_environment() {
         text.contains("Note: this covers what CretLink keeps when it runs with administrator"),
         "{text}"
     );
+}
+
+/// The webview profile folders that the application's window left are part
+/// of the same report (ST-M009-014): the folder of a copy that no longer
+/// runs and the folder of an earlier version are listed and removed, and the
+/// folder of a copy that runs is neither.
+#[test]
+fn webview_folders_that_were_left_are_listed_and_removed() {
+    let sandbox = Sandbox::new();
+    let clean = stdout(&recover(&sandbox, &[]));
+    assert!(
+        clean.contains("webview profile"),
+        "the kind is looked for: {clean}"
+    );
+    let stale = sandbox.webview_profile(1);
+    let running = sandbox.webview_profile(2);
+    // A copy that runs holds the lock of its folder.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(running.join("cretlink.lock"))
+        .expect("open the lock of the running copy");
+    lock.try_lock().expect("hold the lock of the running copy");
+    let earlier = sandbox.earlier_webview_profile();
+    if let Some(earlier) = &earlier {
+        std::fs::create_dir_all(earlier.join("Cache")).expect("plant the earlier profile");
+    }
+
+    let inspect = recover(&sandbox, &[]);
+
+    assert_eq!(inspect.status.code(), Some(0));
+    let text = stdout(&inspect);
+    // A program with administrator rights looks at nothing that its
+    // environment names (REQ-S-024): the folders of the account are left to
+    // a run without those rights, and the report says so.
+    if elevated_on_windows(&text) {
+        assert!(!text.contains(&stale.display().to_string()), "{text}");
+        assert!(
+            text.contains("the webview folders in the temporary"),
+            "the report says what it does not cover: {text}"
+        );
+        assert!(
+            stale.join("Cache").exists(),
+            "nothing of the account is touched"
+        );
+        return;
+    }
+    assert!(
+        text.contains(&format!(
+            "  - webview profile: {} (left by a copy that no longer runs)",
+            stale.display()
+        )),
+        "{text}"
+    );
+    if let Some(earlier) = &earlier {
+        assert!(
+            text.contains(&format!(
+                "  - webview profile: {} (left by an earlier version)",
+                earlier.display()
+            )),
+            "{text}"
+        );
+    }
+    assert!(
+        !text.contains(&running.display().to_string()),
+        "the folder of a copy that runs is not a leftover: {text}"
+    );
+    assert!(
+        text.contains("run:  cretlink-cli recover --remove"),
+        "{text}"
+    );
+    assert!(
+        stale.join("Cache").exists(),
+        "an inspection removes nothing"
+    );
+    // The removal runs for real only where every place is the sandbox's: an
+    // elevated Windows program also removes what lies in the machine's own
+    // places, which another test of this file plants there.
+    if !sandboxed(&text) {
+        return;
+    }
+
+    let remove = recover(&sandbox, &["--remove"]);
+
+    let text = stdout(&remove);
+    assert_eq!(remove.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(&format!("  - removed webview profile: {}", stale.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains("Recovery complete — this machine is clean."),
+        "{text}"
+    );
+    assert!(!stale.exists());
+    assert!(earlier.is_none_or(|earlier| !earlier.exists()));
+    assert!(
+        running.join("Cache").join("index").exists(),
+        "the folder of a copy that runs is never touched"
+    );
+    drop(lock);
 }
 
 #[test]

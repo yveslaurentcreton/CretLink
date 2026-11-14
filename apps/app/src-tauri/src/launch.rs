@@ -7,10 +7,14 @@
 //!
 //! - A copy whose file name starts with `CretLink-Support` (any case) is for
 //!   getting help only: it opens the customer role, and refuses subcommands
-//!   (`install` and `uninstall` included, ST-M009-006) and the technician role,
-//!   so a file handed to a customer cannot be used the other way. The one
-//!   subcommand it accepts is the customer's own clean-up, `recover
-//!   [--remove]` (ST-M009-010, ST-M006-003).
+//!   and the technician role, so a file handed to a customer cannot be used
+//!   the other way. It accepts two subcommands, both the customer's own: the
+//!   clean-up `recover [--remove]` (ST-M009-010, ST-M006-003), and
+//!   `uninstall`, which removes the support program that a customer kept on
+//!   the computer (ST-M009-017) and is what its entry in Installed apps
+//!   runs. The technician's install and uninstall stay out of its reach
+//!   (ST-M009-006), and nothing on a command line keeps a program: that is a
+//!   choice in the customer's own window.
 //! - `--role technician` and `--role customer` open that role directly; the
 //!   application passes them to itself when it starts the chosen role in a new
 //!   process. The customer role exists only on Windows. Get help on the start
@@ -192,7 +196,7 @@ pub fn resolve(
     }
 
     if !args.is_empty() {
-        if customer_copy && !is_recover(args) {
+        if customer_copy && !is_recover(args) && !is_remove_kept(args) {
             return Launch::Refuse(customer_copy_message());
         }
         return Launch::Subcommand(args.to_vec());
@@ -227,6 +231,14 @@ fn is_recover(args: &[String]) -> bool {
     }
 }
 
+/// Whether the arguments are exactly `uninstall`: in a customer copy, the
+/// removal of the support program that a customer kept (ST-M009-017). It
+/// shows what it removes and asks; no option skips that, and no argument
+/// keeps a program.
+fn is_remove_kept(args: &[String]) -> bool {
+    matches!(args, [verb] if verb == "uninstall")
+}
+
 /// The program name the shared command line prints in its texts, such as the
 /// recovery command it suggests: the file name of a customer copy, quoted when
 /// it holds a space (`"CretLink-Support (1)"`), else `cretlink`.
@@ -244,7 +256,8 @@ pub fn program_name(file_stem: &str) -> String {
 fn customer_copy_message() -> String {
     "This copy of CretLink is for getting help. Start it without arguments; to list what \
      CretLink left on this computer, add 'recover' (and 'recover --remove' to remove it); to \
-     give help, use cretlink."
+     remove the support program that was kept on this computer, add 'uninstall'; to give \
+     help, use cretlink."
         .to_owned()
 }
 
@@ -310,12 +323,14 @@ mod tests {
             resolve(&args(&["mcp"]), copy, true, false),
             Launch::Refuse(_)
         ));
-        // It never installs or uninstalls (ST-M009-006), installed or not.
+        // It never installs, and never uninstalls without showing what goes
+        // and asking (ST-M009-006, ST-M009-017), installed or not.
         for command in [
             args(&["install"]),
-            args(&["uninstall"]),
             args(&["uninstall", "--yes"]),
+            args(&["uninstall", "-y"]),
             args(&["mcp", "install"]),
+            args(&["mcp", "uninstall"]),
         ] {
             for installed in [false, true] {
                 assert!(
@@ -364,6 +379,59 @@ mod tests {
         assert_eq!(
             resolve(&args(&["recover", "--remove"]), "cretlink", true, true),
             Launch::Subcommand(args(&["recover", "--remove"]))
+        );
+    }
+
+    /// The kept support program is a customer copy by its name: it refuses
+    /// every subcommand but its own two (ST-M009-017).
+    #[test]
+    fn a_customer_copy_accepts_its_own_uninstall_and_nothing_that_keeps_a_program() {
+        for name in ["CretLink-Support", "cretlink-support (1)"] {
+            assert_eq!(
+                resolve(&args(&["uninstall"]), name, true, false),
+                Launch::Subcommand(args(&["uninstall"])),
+                "{name}"
+            );
+            // No command line keeps or installs anything, in any spelling.
+            for command in [
+                args(&["keep"]),
+                args(&["--keep"]),
+                args(&["install"]),
+                args(&["install", "--yes"]),
+                args(&["--install"]),
+                args(&["update"]),
+                args(&["uninstall", "--yes"]),
+                args(&["uninstall", "uninstall"]),
+                args(&["--role", "customer", "--keep"]),
+                args(&["--role", "customer", "keep"]),
+                args(&["--role", "customer", "--from-start", "--keep"]),
+            ] {
+                assert!(
+                    matches!(resolve(&command, name, true, false), Launch::Refuse(_)),
+                    "{name} {command:?}"
+                );
+            }
+            // Every other subcommand of the shared command line stays refused.
+            for command in [
+                args(&["mcp"]),
+                args(&["mcp", "status"]),
+                args(&["shell"]),
+                args(&["version"]),
+                args(&["help"]),
+                args(&["--help"]),
+            ] {
+                assert!(
+                    matches!(resolve(&command, name, true, false), Launch::Refuse(_)),
+                    "{name} {command:?}"
+                );
+            }
+        }
+        // The same words open no window that keeps a program in the ordinary
+        // program either: there they are subcommands that the shared command
+        // line does not know, or the technician's own uninstall.
+        assert_eq!(
+            resolve(&args(&["keep"]), "cretlink", true, false),
+            Launch::Subcommand(args(&["keep"]))
         );
     }
 

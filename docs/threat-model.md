@@ -2478,8 +2478,9 @@ scenario MT-14 in [`manual-tests.md`](manual-tests.md), not yet recorded.
   file. CretLink starts no program by its name alone, but it does not check
   itself. Check the download as [`verifying-artifacts.md`](verifying-artifacts.md)
   describes, and keep it in a folder that other accounts cannot write. A
-  customer program that is installed where only administrators can write is
-  ST-M009-017.
+  customer can keep the support program where only administrators can write
+  (ST-M009-017, under "One application, two roles"): that closes this for
+  the kept program, and it stays for the copy that is downloaded first.
 - Command Prompt looks for a program that is named without its folder in the
   working directory first. A job that names no working directory starts in
   the system folder. A job or a terminal that the technician lets work in a
@@ -2492,9 +2493,12 @@ scenario MT-14 in [`manual-tests.md`](manual-tests.md), not yet recorded.
   environment of the account that approved, not that of the program that
   asked, so an account without rights does not choose the search path of an
   elevated session. CretLink relies on that, and MT-4b checks it on real
-  hardware. The same holds for the profile of the elevated window's web
-  view, which lies in the local application data of the account that
-  approved.
+  hardware. The places that the elevated program keeps for itself are not
+  taken from that environment: the profile of the elevated window's webview
+  lies in a private folder in `CretLink Data`, the variables that WebView2
+  obeys are dropped from the program's own environment before the webview is
+  created, and a helper that it starts gets an environment built from the
+  system's folders alone (ST-M009-014, ST-M009-017).
 - A program without rights can still get in the way. It can hold a file in
   the old folder open so that the folder cannot be removed, or fill the
   folder so that removing it takes long: a start and `recover --remove` wait
@@ -2827,11 +2831,12 @@ full-control consent still runs (ST-M006-002). It is the **single reviewed
 exception** to ADR-0003's "no key material persists across sessions", bounded
 to authority-reducing continuity proof only. The owned-resource inventory and
 `cretlink recover [--remove]` (ST-M006-003, ST-M009-010; also `cretlink-cli
-recover` and a `CretLink-Support*` copy's `recover`, the only subcommand such a
-copy accepts) report and remove CretLink residue offline — staged trees,
-sealed tickets, what lies in the staging area without being CretLink's, and
-the folder of a release up to 0.24.0 (FT-7) — and assert every other ownable
-kind empty. The verb opens no
+recover` and a `CretLink-Support*` copy's `recover`, one of the two subcommands
+such a copy accepts) report and remove CretLink residue offline — staged trees,
+sealed tickets, what lies in the staging area without being CretLink's,
+the folder of a release up to 0.24.0 (FT-7), and the webview profile folders
+that the application's window left (ST-M009-014, under "One application,
+two roles") — and assert every other ownable kind empty. The verb opens no
 connection and grants no control; removing exits with an error whenever
 something was kept or could not be read. The Get help role runs the startup
 sweep that reclaims staging trees a crashed run left behind before it
@@ -2850,7 +2855,7 @@ otherwise it is skipped, nothing is claimed, and a later start retries. The
 operating system releases the lock with the process, so a crash cannot strand
 it. `recover --remove` is an explicit customer action and does not take the
 lock. The same verb and sweep remain in the `cretlink-support-agent`
-development tool.
+development tool, which has no window and does not look for webview folders.
 The staging area and the ticket store of an elevated program lie in a folder
 that only administrators can write and that is private from the moment it
 exists; the folder in which earlier releases kept them, where every account
@@ -3438,8 +3443,10 @@ help from the start screen, ST-M009-009), and the subcommands.
   process, so a customer process has no way to reach them, and the reverse. A
   `CretLink-Support*` copy refuses subcommands and `--role technician`, so a
   file handed to a customer cannot serve MCP or open the console
-  (REQ-F-024). Its one accepted subcommand is the offline `recover
-  [--remove]` (ST-M009-010), which opens no connection and grants nothing.
+  (REQ-F-024). It accepts two subcommands, both offline and neither with any
+  authority over a session: `recover [--remove]` (ST-M009-010) and
+  `uninstall`, which removes the support program that a customer kept
+  (ST-M009-017, below).
 - *Silent or repeated elevation.* Get help elevates only through the visible
   UAC prompt (`ShellExecuteExW`, `runas`), and only after the unelevated
   window has explained it and the customer pressed **Continue** (`#c-admin`,
@@ -3457,10 +3464,13 @@ help from the start screen, ST-M009-009), and the subcommands.
   prompt somebody answered), no session without the customer's actions. It
   adds no hidden path (REQ-S-002). `--from-start` only changes where **Back**
   goes.
-- *Persistence through the application.* Get help installs nothing and adds no
-  auto-start entry (REQ-F-001, REQ-F-019). Only the technician role installs,
-  per user (ST-M009-006, below); the customer role never offers it, and a
-  `CretLink-Support*` copy refuses `install` and `uninstall`.
+- *Persistence through the application.* Get help installs nothing by itself
+  and adds no auto-start entry (REQ-F-001, REQ-F-019). The technician role
+  installs per user (ST-M009-006, below); the customer role never offers
+  that, and a `CretLink-Support*` copy refuses the technician's `install` and
+  `uninstall`. On the customer's own choice the support program is kept on
+  the computer, as a program that stays and never as a way in (ST-M009-017,
+  below).
 - *Missing WebView2 runtime.* The program says so in a native message box and
   starts nothing, rather than failing in a half-open state.
 
@@ -3579,16 +3589,264 @@ writes nothing of its own but the audit trail.
   a process id, which is why PowerShell is used; the script is cmdlets only and
   passes paths as single-quoted literals.
 - *A customer copy installs itself.* The customer role never shows the
-  install choice, and the install and uninstall functions refuse a
-  `CretLink-Support*` program as well as the launch rules (REQ-F-024).
+  technician's install choice, and the install and uninstall functions of the
+  technician role refuse a `CretLink-Support*` program as well as the launch
+  rules (REQ-F-024). Keeping the support program is another thing, with its
+  own rules (ST-M009-017, below).
 
 **Residual risks.** The install is not code-signed yet (ST-M006-005); on
-macOS the generated bundle is unsigned and Gatekeeper may ask. The webview
-keeps its own profile in a per-user data folder (Tauri's `dev.cretlink.app`)
-for run-once and installed copies alike; uninstall does not remove it. An AI
+macOS the generated bundle is unsigned and Gatekeeper may ask. The webview's
+profile no longer stays behind: a copy that runs once keeps it in a temporary
+folder that it removes when it closes, and uninstall removes the installed
+copy's (ST-M009-014, below), except on macOS, where WebKit keeps its data
+outside the program's control. An AI
 client registration points at the installed path, so anyone who can replace
 that per-user file can run code as the user when the client starts it — the
 same as any per-user program, and the folder is the user's own.
+
+#### The webview's profile folder (ST-M009-014)
+
+**What it adds.** The application's window is a webview, which keeps a
+profile — cache and local storage, no session secret and no credential — in a
+folder. Releases up to 0.24.1 left the choice to the webview: a folder named
+`dev.cretlink.app` in the per-user data folder, which stayed after the window
+closed, on the customer computer too. Now every window is given its folder:
+
+- a copy that is not installed, and every customer process, gets a new folder
+  of its own, `CretLink-webview-<random>`, in the temporary folder, for the
+  user only where the platform has file modes, and removes it after its last
+  window has closed;
+- the installed technician copy keeps `webview` in the application's data
+  folder, next to the audit trail (`%LOCALAPPDATA%\CretLink\webview`,
+  `~/.local/share/CretLink/webview`), and uninstall lists and removes it;
+- a process with administrator rights makes its folder in `webview` in
+  `CretLink Data`, the private folder of an elevated program, instead of the
+  temporary folder;
+- every start of a window removes the temporary folders of copies that no
+  longer run; `cretlink recover` lists those folders and the one that earlier
+  releases left, and `recover --remove` removes them. With administrator
+  rights both look only in the private folder.
+
+**Threats and mitigations.**
+
+- *A folder that stays on the customer computer.* The process removes its
+  folder itself, at its very end. A webview holds its profile for as long as
+  it exists, so an exit that the program asks for closes every window first,
+  and the removal is tried again for about five seconds while the closing
+  webview still holds files. A process that could not remove its folder, or
+  was killed, leaves one whose lock is free: the next start of any CretLink
+  window removes it, `recover` lists it, and `recover --remove` removes it or
+  exits with an error and names it (REQ-F-019, REQ-N-008).
+- *A start removes the profile of a copy that is running.* Each process holds
+  a lock on `cretlink.lock` in its folder for as long as it runs; the
+  operating system gives it back with the process, however it ends. A folder
+  is removed only by a process that holds its lock, or when it has no lock
+  file at all and yet has content, which only an unfinished removal leaves: a
+  process puts nothing into its folder before it holds the lock. On Windows
+  the lock file is opened without sharing deletion, so nothing removes it
+  under the process that holds it. A folder whose lock cannot be told —
+  something that is no file stands under the lock's name, or the file cannot
+  be opened — is left alone, and `recover` names it and does not call the
+  computer clean. A process skips its own folder whatever its lock says.
+- *The elevated window trusts the account's folders.* The account that
+  approves the elevation owns the environment the elevated program starts
+  with, its temporary folder and its local application data; a program of
+  that account without administrator rights can write there while the window
+  runs, and can lead a path there elsewhere (REQ-S-024). So a process with
+  administrator rights takes none of them: its profile is a new folder in
+  `webview` in `CretLink Data`, which is created with its owner and its
+  permissions in one step, or found to be such a folder already, with
+  `CretLink Data` above it (ST-M006-020); the profile folder made in it takes
+  those permissions when it is created, so no program without administrator
+  rights can read or write it. Leftovers are looked for and removed only
+  there, and a link in the place of that folder is not entered. Nothing in
+  the temporary folder or the local application data, and not the folder of
+  earlier versions, is removed with administrator rights: a start or a
+  recovery without them removes what lies there, and the report of an
+  elevated `recover` says that it does not cover those folders and names
+  the command to run without administrator rights. Before WebView2 is asked
+  anything, the process drops every `WEBVIEW2_*` variable from its own
+  environment (among them `WEBVIEW2_USER_DATA_FOLDER`,
+  `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` and
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`), so that the account cannot move
+  the profile, choose the browser that runs the window or give it
+  arguments.
+- *A folder that somebody else made first.* A process without administrator
+  rights makes its folder in the temporary folder, which other programs of
+  the same account can write. A process uses only a folder
+  that it created itself, new, under a name of 32 digits from the system's
+  random source. A name under which anything stands — a folder, a file, a
+  link — is never taken over: the creation fails and another name is drawn.
+- *The sweep, or the removal at the end, as a way to delete something else.*
+  The sweep looks only at real folders directly inside the temporary folder
+  whose name is the prefix followed by the 32 digits the program generates: a
+  link with such a name is not one and is left where it is. A lock is opened
+  only where a file stands under its name, and nothing is read from it. A
+  folder is removed whole through the call that removes every tree of
+  CretLink: a link, as the folder itself or inside it, is removed as a link
+  and never entered. Uninstall and `recover` remove the installed copy's
+  profile and the earlier releases' folder only at their fixed paths, never
+  at a path read from a file, and in the same way.
+- *A process that goes on without a window.* Removing the folder can take a
+  few seconds. The process first stops its async runtime, so no session task,
+  listener or IPC endpoint outlives the last window: what remains for those
+  seconds only removes a folder. Windows that do not close for an exit delay
+  it by at most three seconds, after which the process ends and leaves the
+  folder to the next start.
+- *The unelevated and the elevated customer window share a profile.* They do
+  not: every customer process has a folder of its own, also when the
+  installed copy started it. The installed copy's profile is used by the
+  technician role only.
+- *A webview that falls back to the folder that stays.* When the temporary
+  folder cannot be created, the program says so and opens no window. An
+  installed copy whose data folder cannot be written runs with a temporary
+  profile.
+
+**Residual risks.** A killed process leaves its folder until the next start
+of a CretLink window by that account or `recover --remove`; on a customer
+computer that never runs CretLink again it stays, holding cache and local
+storage only. That WebView2 lets go of the folder within the few seconds is a
+manual check on Windows (`docs/manual-tests.md`, MT-10). The temporary
+profiles that a window without administrator rights left, and the folder of
+earlier versions, are removed only by a start or a recovery without
+administrator rights of that account; an elevated recovery names them as
+not covered and does not call them gone. WebView2 also takes settings from
+policies in the registry of the account, which the program does not read or
+clear; they are outside this change. On macOS WebKit keeps
+the webview's data
+in its own folders under `~/Library`, where CretLink can neither direct nor
+remove it; that is a limit of the technician role there, and the customer
+role does not exist on macOS. A copy of a release up to 0.24.1 that is
+running loses its profile when uninstall or `recover --remove` removes
+`dev.cretlink.app`.
+
+#### A customer keeps the support program (ST-M009-017)
+
+**What it adds, and what it does not.** On the customer's own choice the
+elevated customer program writes itself to
+`%ProgramFiles%\CretLink Support\CretLink-Support.exe`, with a Start-menu
+entry for all users, a desktop shortcut on request, an entry in Installed
+apps under `HKEY_LOCAL_MACHINE`, a record of all of that, and the relay
+settings of the copy that was kept. It adds **no access path**: no service,
+no scheduled task, no entry that starts with Windows, no listener, no stored
+permission, no handler for a protocol or a kind of file. Between sessions no
+CretLink process runs, and a session from the kept program takes every step
+of a session from a downloaded copy: the customer starts it, Windows asks,
+the technician is chosen or the code typed, the approval code is compared
+and full control is allowed, each time (REQ-F-002, REQ-F-005, REQ-F-006,
+REQ-S-007). What it does add is **a program that stays**, in the version it
+was kept at.
+
+**The attacker.** A program of an account without administrator rights on
+the same computer (REQ-S-024). It can write the folder a downloaded copy was
+started from, and its account can be the one that asks an administrator to
+answer the elevation prompt. It wants the file that later asks for
+administrator rights to be its own.
+
+**Threats and mitigations.**
+
+- *Another file is installed than the one that runs.* A running program's
+  file can be renamed away, and another file put under the path it was
+  started with, so the program is not copied by a path. The system is asked
+  where the image of the process lies now; the file under that name is opened
+  for reading without sharing changes, so that from then on nobody can write
+  it, rename it or remove it; and the system is asked again. When both
+  answers are the same name, the held file is the image, and its bytes are
+  read through that one handle. What was written is read back against it
+  before it takes its name. When the file moved in between, or another
+  program holds it in a way that allows changes, nothing is kept and the
+  window says why. The file is held before anything is made, so a refusal
+  leaves nothing behind.
+- *The kept program is replaced later.* It lies in a folder that is created
+  with its owner and its permissions in one step: owned by the
+  administrators, with a list of its own that gives full control to them and
+  the system, and to the accounts of the computer the right to read and to
+  start the program and nothing more. A folder that is already there must be
+  exactly such a folder, read through one handle that follows no link; it is
+  never put right afterwards, because whoever could write it before may have
+  put something into it. `Program Files` itself must belong to Windows, the
+  system or the administrators. Every file is written new under another name
+  and then given its name; a link or a folder under a name of the program is
+  never written through; a kept program that is running is never replaced.
+  Because the folder is the program's own and not a download folder, a
+  library planted beside the program is closed for the kept program too.
+- *Relay settings that somebody else wrote.* The `cretlink.toml` next to the
+  running copy lies in that same writable folder. It is read without
+  following a link, up to a bound, refused when it or its certificate file
+  has more than one name (a hard link could give the folder a name for a
+  file that the account cannot read itself), with the reader of relay
+  profiles, which refuses everything it does not know and never repeats
+  what a file held. A
+  profile that cannot be used is not kept, and the screen says so. Before
+  the customer chooses, the screen names the relay: its name, where the copy
+  would connect when that is another host, and that a certificate file of
+  the copy vouches for the name when that is so. What is written is the
+  value that was read for that screen, never a second reading, and of the
+  certificate file only its certificates. A relay is addressing, never
+  authority (ADR-0016): a planted relay would see encrypted traffic of
+  sessions that the customer still has to allow.
+- *The program is kept without the customer.* There is no command-line
+  option, no environment variable and no remote operation for it; a copy for
+  getting help refuses every argument that is not `recover` or `uninstall`.
+  The commands exist in the customer role only, refuse while a session
+  exists and before the permission step, and carry out only the plan that
+  the window showed. The window offers keeping before a session and on the
+  end report, never during a session, and only with administrator rights.
+- *Removing removes something else.* Removal takes what the record names, as
+  far as it lies in the layout: a file directly in the folder of the kept
+  program, a shortcut in its own place, the entry under its own key. A
+  record that names anything else changes nothing about it, and that is
+  said. Every file is removed as what stands under its name: a link is
+  removed as a link and never followed, and a link in the place of the
+  folder is not entered. The record lies in the folder that only
+  administrators can write. Without a record that can be read, a shortcut
+  goes only when it starts the kept program and the entry in Installed apps
+  only when its location is the folder of the kept program; a desktop
+  shortcut that is no longer wanted goes only when it starts the kept
+  program. Removing always shows the list and asks: `uninstall --yes` is
+  refused for the kept program, also in a console build that was renamed.
+- *A helper with administrator rights loads what the account chose.* From
+  the kept program itself the folder goes once the process has exited,
+  through Windows PowerShell. It is started by its full path in the system
+  folder that the system names, in that folder, without a profile, and with
+  a cleared environment that holds only the Windows folder, the system
+  folder as its search path and the modules of PowerShell in the system
+  folder as its module path. Nothing of the environment that the elevated
+  program was started with, which the account that approved owns, is passed
+  on.
+- *An older plan replaces a newer program, or a keep is interrupted.* Once
+  the folder is prepared, keeping looks again at what is kept and in which
+  version, and refuses when that is no longer what the screen showed.
+  Keeping writes the record and each file under a temporary name before the
+  program file takes its name; a folder with any of them and no complete
+  program is a keep that did not finish. It is not reported as kept on
+  purpose: `recover` names it, with the command that removes it, and does
+  not call the computer clean.
+- *An older copy brings an old program back.* A copy replaces the kept
+  program only when it is newer by its version; an older one, the same
+  version and a version that cannot be compared never do.
+- *A session report takes the kept program for something left behind, or the
+  other way round.* The end report says beside the cleanup result that the
+  program is installed because the customer chose that, and the cleanup
+  result stays the session's own. `recover` names the program as kept on
+  purpose and never lists, counts or removes it (REQ-F-019).
+
+**Residual risks.** There is no update channel: the kept program stays at
+the version it was kept at until a newer copy is started and the customer
+updates it, also when that version has a known defect. The version is what
+the program says of itself; refusing an older copy prevents an accident, not
+an attacker who can already run a program with administrator rights. The
+copy that is downloaded first is as before: a program of its account can
+change the file before it is started, and what is then started, and kept,
+is that file. The check of the running program rests on the file system
+refusing to rename a folder while a file in it is held open, as NTFS does;
+on another file system the program is still read through a handle that
+nobody can write. The kept relay settings, with the admission key of the
+relay, can be read by every account of the computer: the key admits to the
+relay and grants nothing in a session. The Windows parts of this (the
+folder's permissions, the held program file, the entry and the shortcuts)
+are tested by continuous verification on Windows and were not run on
+customer hardware yet (`docs/manual-tests.md`, MT-16).
 
 ### Supply chain and distribution
 

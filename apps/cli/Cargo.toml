@@ -54,6 +54,13 @@ zeroize.workspace = true
 # is the one seam onto the TLS library; the support agent's library links it
 # already, so this adds nothing to the build.
 cretlink-wss.workspace = true
+# The profile folder of the application's webview (ST-M009-014): a tree is
+# removed whole without following a link, as the crate that owns the folders
+# of the customer side removes one, and the name of a temporary profile
+# folder comes from the system's random source. Both are in the build already
+# through the support agent's library.
+cretlink-exec.workspace = true
+rand.workspace = true
 
 # Attaching a GUI-subsystem process to its parent's console, and the elevated
 # relaunch through UAC (ST-M009-001); the Start-menu shortcut (COM ShellLink),

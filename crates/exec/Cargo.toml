@@ -96,7 +96,14 @@ windows = { version = "0.62", features = [
   "Win32_System_Diagnostics_Debug",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_JobObjects",
+  # The program file of this process, held and verified before a customer
+  # keeps the support program (ST-M009-017, `image.rs`): the module of the
+  # program (`Win32_System_LibraryLoader`) and the name of the file that it
+  # is mapped from (`Win32_System_ProcessStatus`). Features of the `windows`
+  # crate that is in the lockfile already: no package is added.
+  "Win32_System_LibraryLoader",
   "Win32_System_Pipes",
+  "Win32_System_ProcessStatus",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   # Interactive-desktop capture and input (ADR-0015, ST-M005-001/002/003).

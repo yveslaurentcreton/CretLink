@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     OwnFolder, Standing, administrators_folder, earlier_release_folder, earlier_release_in_use,
-    is_private_text, remove_whole,
+    is_private_text, is_program_folder_text, kept_program_folder, prepare_program_folder,
+    remove_whole,
 };
 
 /// A unique temp directory removed when the guard drops.
@@ -139,6 +140,112 @@ fn anything_else_is_not_private() {
     ] {
         assert!(!is_private_text(text), "{text}");
     }
+}
+
+// --- the rule about the folder of a kept program (ST-M009-017) -----------------
+
+#[test]
+fn the_permissions_of_the_folder_of_a_kept_program_are_recognised() {
+    for text in [
+        // As the folder is created.
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+        // As the system writes it back, in any order and spelling.
+        "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200A9;;;BU)",
+        "O:SYD:P(A;OICI;0x1200a9;;;BU)(A;OICI;0x1f01ff;;;BA)(A;OICI;FA;;;SY)",
+        "O:BAG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)",
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FXFR;;;BU)S:AI(AU;SA;FA;;;WD)",
+    ] {
+        assert!(is_program_folder_text(text), "{text}");
+        // A folder that every account may read is not a private one.
+        assert!(!is_private_text(text), "{text}");
+    }
+}
+
+#[test]
+fn anything_else_is_not_the_folder_of_a_kept_program() {
+    for text in [
+        // A private folder: no account could start the program in it.
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+        // The accounts may do more than read and start: write, change,
+        // everything.
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;BU)",
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1201bf;;;BU)",
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BU)",
+        // Someone else beside them, however little that one may do.
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;OICI;0x1200a9;;;WD)",
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;OICIIO;GA;;;CO)",
+        // Everyone in the place of the accounts of this computer.
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;WD)",
+        // Not protected, handed down from above, or not handed down to what
+        // is made in the folder.
+        "O:BAD:(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+        "O:BAD:PAI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;0x1200a9;;;BU)",
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1200a9;;;BU)",
+        // The administrators or the system missing, or with less.
+        "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+        "O:BAD:P(A;OICI;0x1200a9;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+        // The accounts twice, a refusal, another owner.
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;OICI;0x1200a9;;;BU)",
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(D;OICI;0x1200a9;;;BU)",
+        "O:S-1-5-21-1-2-3-1001D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+        "O:BUD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+        // No list, an empty one, no descriptor.
+        "O:BAD:NO_ACCESS_CONTROL",
+        "O:BAD:P",
+        "",
+    ] {
+        assert!(!is_program_folder_text(text), "{text}");
+    }
+}
+
+#[test]
+fn the_folder_of_a_kept_program_is_made_or_found_and_nothing_else_is_taken_for_it() {
+    if !can_make_private() {
+        return;
+    }
+    let sb = Sandbox::new();
+    let folder = sb.root.join("CretLink Support");
+
+    prepare_program_folder(&folder).expect("make the folder");
+    assert_eq!(Standing::of_dir(&folder), Standing::Ours);
+    // A second time it is found as it was made.
+    std::fs::write(folder.join("program"), b"x").expect("write");
+    prepare_program_folder(&folder).expect("find the folder");
+    assert!(folder.join("program").exists());
+
+    // A file under the name is an error, and is left as it is.
+    let file = sb.root.join("a file");
+    std::fs::write(&file, b"theirs").expect("write");
+    let error = prepare_program_folder(&file).expect_err("a file is no folder");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(std::fs::read(&file).expect("read"), b"theirs");
+    // The folder above is not made: it must be there, and be the system's.
+    assert!(prepare_program_folder(&sb.root.join("missing").join("CretLink Support")).is_err());
+    assert!(!sb.root.join("missing").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_place_of_the_folder_of_a_kept_program_is_an_error_and_never_followed() {
+    let sb = Sandbox::new();
+    let elsewhere = sb.root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("elsewhere");
+    let folder = sb.root.join("CretLink Support");
+    std::os::unix::fs::symlink(&elsewhere, &folder).expect("link");
+
+    let error = prepare_program_folder(&folder).expect_err("a link is no folder");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        names_in(&elsewhere).is_empty(),
+        "nothing was made behind it"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn off_windows_no_program_is_kept() {
+    assert_eq!(kept_program_folder(), None);
 }
 
 // --- what stands at a name ----------------------------------------------------
@@ -446,6 +553,9 @@ fn off_windows_there_is_one_place_and_no_earlier_release() {
     assert_eq!(administrators_folder(), None);
     assert!(!OwnFolder::staging_for_this_process().is_private());
     assert!(!OwnFolder::tickets_for_this_process().is_private());
+    // No program is elevated: the webview keeps its profile where the
+    // account's own programs do.
+    assert_eq!(OwnFolder::webview_for_this_process(), None);
     // A lock in a folder is never taken for the lock of an earlier release.
     let sb = Sandbox::new();
     let staging = sb.root.join("staging");
@@ -464,7 +574,8 @@ mod windows {
     use super::super::{administrators_own, sys};
     use super::{
         OwnFolder, Sandbox, administrators_folder, can_make_private, earlier_release_folder,
-        earlier_release_in_use, is_private_text, names_in, remove_whole,
+        earlier_release_in_use, is_private_text, is_program_folder_text, kept_program_folder,
+        names_in, prepare_program_folder, remove_whole,
     };
 
     /// The administrators, as `icacls` takes a well-known account.
@@ -788,12 +899,128 @@ mod windows {
             assert_eq!(staging.path(), data.join("staging"));
             assert_eq!(tickets.path(), data.join("reboot-resume"));
             assert_eq!(staging.chain(), vec![data.clone(), data.join("staging")]);
+            // The webview of an elevated window keeps its profiles there too.
+            let webview = OwnFolder::webview_for_this_process().expect("a private place");
+            assert!(webview.is_private());
+            assert_eq!(webview.path(), data.join("webview"));
+            assert_eq!(webview.outermost(), data);
         } else {
+            assert_eq!(OwnFolder::webview_for_this_process(), None);
             let local = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA");
             let data = Path::new(&local).join("CretLink");
             assert_eq!(staging.path(), data.join("staging"));
             assert_eq!(tickets.path(), data.join("reboot-resume"));
         }
+    }
+
+    // --- the folder of a kept program (ST-M009-017) ---
+
+    /// What the permissions in `text` give the accounts of this computer:
+    /// the rights of every entry that names them.
+    fn rights_of_the_accounts(text: &str) -> Vec<String> {
+        let (_, access) = text.split_once("D:").expect("an access list");
+        access
+            .split(')')
+            .filter_map(|entry| {
+                let fields: Vec<&str> = entry.trim_start_matches('(').split(';').collect();
+                (fields.len() == 6 && fields[5] == "BU").then(|| fields[2].to_ascii_lowercase())
+            })
+            .collect()
+    }
+
+    /// The folder of a kept program belongs to the administrators; they and
+    /// the system can change it, and every account can read it and start a
+    /// program in it, and nothing more. What is made in it has the same
+    /// permissions, handed down.
+    #[test]
+    fn the_folder_of_a_kept_program_can_be_changed_by_administrators_only() {
+        if !can_make_private() {
+            return;
+        }
+        let sb = Sandbox::new();
+        // The sandbox is open to everyone: nothing of that reaches the
+        // folder made in it.
+        open_to_everyone(&sb.root);
+        let folder = sb.root.join("CretLink Support");
+
+        prepare_program_folder(&folder).expect("make the folder");
+
+        let text = permissions(&folder);
+        assert!(is_program_folder_text(&text), "{text}");
+        assert!(!is_private_text(&text), "{text}");
+        // The program that is written into it.
+        let program = folder.join("CretLink-Support.exe");
+        std::fs::write(&program, b"x").expect("write");
+        let text = permissions(&program);
+        let named = named_in(&text);
+        assert!(
+            named
+                .iter()
+                .all(|who| ["SY", "BA", "BU"].contains(&who.as_str())),
+            "{text}"
+        );
+        assert_eq!(
+            rights_of_the_accounts(&text),
+            vec!["0x1200a9".to_owned()],
+            "the accounts may read and start it, and nothing more: {text}"
+        );
+        // A second look finds it as it was made.
+        prepare_program_folder(&folder).expect("find the folder");
+    }
+
+    /// A folder that was not made like this is never put right afterwards:
+    /// whoever could write it before may have put something into it.
+    #[test]
+    fn a_folder_with_other_permissions_is_not_taken_for_the_folder_of_a_kept_program() {
+        if !can_make_private() {
+            return;
+        }
+        let sb = Sandbox::new();
+        // As an administrator would make it by hand, open to everyone.
+        let by_hand = sb.root.join("by hand");
+        std::fs::create_dir(&by_hand).expect("create");
+        set_owner(&by_hand, ADMINISTRATORS);
+        open_to_everyone(&by_hand);
+        let before = permissions(&by_hand);
+
+        let error = prepare_program_folder(&by_hand).expect_err("not made by CretLink");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(permissions(&by_hand), before, "nothing was changed");
+
+        // A private folder of CretLink is not one either: no account could
+        // start the program in it.
+        let private = sb.root.join("private");
+        sys::create(&private).expect("create");
+        assert!(prepare_program_folder(&private).is_err());
+
+        // A folder of another owner.
+        let theirs = sb.root.join("theirs");
+        std::fs::create_dir(&theirs).expect("create");
+        set_owner(&theirs, &this_account());
+        assert!(prepare_program_folder(&theirs).is_err());
+
+        // A junction under the name: nothing is made behind it.
+        let elsewhere = sb.root.join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("elsewhere");
+        let link = sb.root.join("CretLink Support");
+        junction(&link, &elsewhere);
+        let error = prepare_program_folder(&link).expect_err("a junction is no folder");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            names_in(&elsewhere).is_empty(),
+            "nothing was made behind it"
+        );
+    }
+
+    #[test]
+    fn the_folder_of_a_kept_program_is_in_program_files_on_the_drive_of_windows() {
+        let windows = crate::system::windows_folder().expect("the Windows folder");
+        let drive = windows.ancestors().last().expect("a drive");
+        assert_eq!(
+            kept_program_folder(),
+            Some(drive.join("Program Files").join("CretLink Support"))
+        );
     }
 
     /// The real place, in continuous verification only: an elevated program

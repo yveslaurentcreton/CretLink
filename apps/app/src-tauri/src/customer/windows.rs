@@ -6,7 +6,9 @@
 //!   always on top and can be moved. It loads the same frontend, which renders
 //!   the compact view in a window with this label, and uses the customer
 //!   role's commands only. **Make small** ([`make_small`]) shows it and hides
-//!   the main window; **Open** ([`open_main`]) does the reverse.
+//!   the main window; **Open** ([`open_main`]) does the reverse. Its webview
+//!   uses the profile folder of the main window's, which this process removes
+//!   when it ends (ST-M009-014).
 //!
 //! While a session exists, the main window or the compact bar is always
 //! visible: minimising the main window shows the bar, the bar refuses to
@@ -188,16 +190,20 @@ pub(crate) fn on_window_event(window: &Window, event: &WindowEvent) {
 ///
 /// A programmatic exit (`code` is `Some`) is this module's own, made once the
 /// session was revoked and the bounded wait is over: it is let through.
-pub(crate) fn on_exit_requested(app: &AppHandle, api: &ExitRequestApi, code: Option<i32>) {
+///
+/// Returns whether the exit was held.
+pub(crate) fn on_exit_requested(app: &AppHandle, api: &ExitRequestApi, code: Option<i32>) -> bool {
     if code.is_some() {
-        return;
+        return false;
     }
     let (session, settling) = session_state(app);
     let action = close_action(WindowKind::Main, session, settling);
-    if action != CloseAction::Exit {
-        api.prevent_exit();
-        act(app, action);
+    if action == CloseAction::Exit {
+        return false;
     }
+    api.prevent_exit();
+    act(app, action);
+    true
 }
 
 /// Brings the main window to the front and asks "Stop the session and close?".
@@ -237,6 +243,11 @@ fn show_mini(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .visible(true);
     if let Some(position) = mini_position(app) {
         builder = builder.position(position.x, position.y);
+    }
+    // The profile folder of this process, as for the main window: without
+    // it the webview would fall back to the folder that stays (ST-M009-014).
+    if let Some(dir) = crate::profile::directory(app) {
+        builder = builder.data_directory(dir);
     }
     builder.build()
 }

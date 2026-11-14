@@ -17,9 +17,15 @@
 //!   ST-M009-006 (this copy's facts, the install options, install itself).
 //!
 //! The frontend asks [`start::get_role`] which interface to load.
+//!
+//! Every window's webview keeps its profile where [`profile`] says
+//! (ST-M009-014): a temporary folder of this process's own, removed when the
+//! process ends, unless this is the installed technician copy.
 
 pub mod launch;
 mod opener;
+// Where the webview keeps its profile, and that it goes again (ST-M009-014).
+mod profile;
 // The relay of this copy, for both roles (ST-M007-011).
 mod relay;
 mod start;
@@ -34,9 +40,11 @@ mod relayed_session_tests;
 use std::io;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use launch::{Entry, Role};
-use tauri::{LogicalSize, Manager, RunEvent};
+use profile::{Closing, Profile};
+use tauri::{LogicalSize, RunEvent};
 
 /// The release version this build belongs to (ST-M006-014).
 pub use cretlink_cli::RELEASE_VERSION;
@@ -83,7 +91,20 @@ pub fn run_customer(entry: Entry) -> ExitCode {
     run_screen(Screen::Role(Role::Customer), entry)
 }
 
+/// How long the async runtime gets to stop its tasks once the last window is
+/// gone, before the profile folder is removed.
+const RUNTIME_STOP_WAIT: Duration = Duration::from_secs(1);
+
 fn run_screen(screen: Screen, entry: Entry) -> ExitCode {
+    // Where the webview of this process keeps its profile: with
+    // administrator rights in its private folder, and the variables that
+    // WebView2 obeys are dropped from its environment before WebView2 is asked
+    // anything (ST-M009-014, REQ-S-024).
+    let base = cretlink_cli::webview_profile::Base::current();
+    if base.is_private() {
+        cretlink_cli::webview_profile::forget_webview_overrides();
+    }
+
     if let Err(err) = tauri::webview_version() {
         cretlink_cli::process::alert(
             "CretLink cannot open its window",
@@ -97,7 +118,41 @@ fn run_screen(screen: Screen, entry: Entry) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let builder = tauri::Builder::default().manage(start::ProcessScreen(screen));
+    // The async runtime is this function's own — the same kind Tauri would
+    // create — so that it can be stopped once the last window is gone: the
+    // removal of the profile folder may take a few seconds, and no session
+    // task, listener or IPC endpoint runs on without a window meanwhile
+    // (ST-M009-014).
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            cretlink_cli::process::alert("CretLink failed to start", &err.to_string());
+            return ExitCode::FAILURE;
+        }
+    };
+    tauri::async_runtime::set(runtime.handle().clone());
+
+    // Where the webview of this process keeps its profile, decided before any
+    // window opens (ST-M009-014).
+    let profile = match Profile::open(screen == Screen::Role(Role::Customer), &base) {
+        Ok(profile) => profile,
+        Err(err) => {
+            cretlink_cli::process::alert(
+                "CretLink cannot open its window",
+                &format!(
+                    "CretLink could not create the temporary folder for its window in {}. \
+                     Nothing was started and nothing was changed.\n\n({err})",
+                    base.dir().display()
+                ),
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let closing = Closing::default();
+
+    let builder = tauri::Builder::default()
+        .manage(start::ProcessScreen(screen))
+        .manage(profile.clone());
     let builder = match screen {
         Screen::Start => builder.invoke_handler(tauri::generate_handler![
             start::get_role,
@@ -111,12 +166,15 @@ fn run_screen(screen: Screen, entry: Entry) -> ExitCode {
         Screen::Role(Role::Customer) => customer::attach(builder, entry),
     };
     let (title, width, height) = screen.window();
+    let window_profile = profile.clone();
     let builder = builder.setup(move |app| {
-        if let Some(window) = app.get_webview_window("main") {
-            window.set_title(title)?;
-            window.set_size(LogicalSize::new(width, height))?;
-            window.center()?;
-        }
+        // The main window is not created from `tauri.conf.json` at startup:
+        // it is built here from that configuration, with the profile folder
+        // of this process.
+        let window = profile::open_main_window(app.handle(), &window_profile)?;
+        window.set_title(title)?;
+        window.set_size(LogicalSize::new(width, height))?;
+        window.center()?;
         if screen == Screen::Role(Role::Customer) {
             customer::on_window_start(app.handle());
         }
@@ -126,18 +184,44 @@ fn run_screen(screen: Screen, entry: Entry) -> ExitCode {
         Ok(app) => app,
         Err(err) => {
             cretlink_cli::process::alert("CretLink failed to start", &err.to_string());
+            let _ = profile.close();
             return ExitCode::FAILURE;
         }
     };
-    let code = app.run_return(move |handle, event| {
-        // No path ends a customer process during a session without revoking
-        // it first (ST-M009-009): the exit is held and the customer is asked.
-        if let RunEvent::ExitRequested { api, code, .. } = &event
-            && screen == Screen::Role(Role::Customer)
-        {
-            customer::on_exit_requested(handle, api, *code);
+    let code = app.run_return({
+        let (profile, closing) = (profile.clone(), closing.clone());
+        move |handle, event| match &event {
+            RunEvent::ExitRequested { api, code, .. } => {
+                // No path ends a customer process during a session without
+                // revoking it first (ST-M009-009): the exit is held and the
+                // customer is asked. Once the windows are closing for an
+                // exit, that decision was made.
+                let held = !closing.begun()
+                    && screen == Screen::Role(Role::Customer)
+                    && customer::on_exit_requested(handle, api, *code);
+                if !held {
+                    // An exit the program asks for itself closes the windows
+                    // first: a webview holds the profile folder for as long
+                    // as it exists (ST-M009-014).
+                    closing.on_exit_requested(handle, api, *code, profile.leaves_a_folder());
+                }
+            }
+            RunEvent::Exit => closing.ended(),
+            _ => {}
         }
     });
+    // The last window is gone. Stop every task before the folder is removed,
+    // so that nothing but the removal outlives the window.
+    runtime.shutdown_timeout(RUNTIME_STOP_WAIT);
+    if let Err(err) = profile.close() {
+        // No window is left to say it in. The folder's lock is free, so the
+        // next start removes it, and `recover` lists it.
+        eprintln!(
+            "cretlink: the webview profile could not be removed and is left for the next start: \
+             {err}"
+        );
+    }
+    let code = closing.code().unwrap_or(code);
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 

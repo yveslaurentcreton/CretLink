@@ -2,7 +2,8 @@
 //! (ST-M006-020, REQ-S-024).
 //!
 //! The customer-side program keeps a staging area and a store of reboot
-//! tickets. When it runs with administrator rights it acts with those rights
+//! tickets, and its window keeps the profile of its webview
+//! ([`OwnFolder::webview_for_this_process`], ST-M009-014). When it runs with administrator rights it acts with those rights
 //! on what lies there: a cleanup removes the files a manifest names, and a
 //! staged tool is run. A program of an account without rights must therefore
 //! never have been able to put anything there or to open anything there.
@@ -62,6 +63,19 @@
 //! ([`administrators_own`]): every account can make that folder again and
 //! move into it what it may move but not remove.
 //!
+//! # The support program that a customer keeps (ST-M009-017)
+//!
+//! A customer can keep the support program on the computer. It asks for
+//! administrator rights every time it is started, so it must lie where a
+//! program without those rights cannot replace it: `CretLink Support` in the
+//! same `Program Files` ([`kept_program_folder`]). Its folder is made like
+//! the private ones, with its owner and its permissions in one step, or found
+//! to be such a folder already, and never made so afterwards
+//! ([`prepare_program_folder`]). Its permissions differ in one point: every
+//! account may read the folder and start the program in it, because the
+//! program is started without administrator rights and asks for them itself.
+//! Nobody but the administrators and the system can change anything there.
+//!
 //! Off Windows the agent is a development and test tool that is never elevated
 //! on a customer computer: every place is the account's own.
 
@@ -80,6 +94,14 @@ use std::sync::{Mutex, PoisonError};
 )]
 const PRIVATE_DATA_FOLDER: &str = "CretLink Data";
 
+/// The folder of the support program that a customer keeps, in
+/// `Program Files` (ST-M009-017).
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only a Windows computer has a place of this kind")
+)]
+const KEPT_PROGRAM_FOLDER: &str = "CretLink Support";
+
 /// The folder of an unelevated program's own files, in the account's local
 /// application data, and the folder that releases up to 0.24.0 used.
 const DATA_FOLDER: &str = "CretLink";
@@ -89,6 +111,10 @@ const STAGING_FOLDER: &str = "staging";
 
 /// The store of reboot tickets inside the data folder.
 const TICKETS_FOLDER: &str = "reboot-resume";
+
+/// The webview profiles of an elevated program, inside its private data
+/// folder (ST-M009-014).
+const WEBVIEW_FOLDER: &str = "webview";
 
 /// The private folders this process has already prepared, so that an
 /// operation that needs one does not open and check it again every time.
@@ -162,6 +188,17 @@ impl OwnFolder {
     #[must_use]
     pub fn tickets_for_this_process() -> Self {
         Self::of_this_process(TICKETS_FOLDER)
+    }
+
+    /// The folder in which an elevated program keeps the profiles of its
+    /// webview (ST-M009-014): `webview` in `CretLink Data`, private like the
+    /// staging area. `None` for a process without administrator rights,
+    /// whose profiles lie in the temporary folder of its account, and off
+    /// Windows.
+    #[must_use]
+    pub fn webview_for_this_process() -> Option<Self> {
+        let folder = Self::of_this_process(WEBVIEW_FOLDER);
+        folder.private.then_some(folder)
     }
 
     fn of_this_process(name: &str) -> Self {
@@ -379,6 +416,51 @@ pub fn administrators_folder() -> Option<PathBuf> {
     sys::administrators_folder()
 }
 
+/// The folder of the support program that a customer chose to keep
+/// (ST-M009-017): `CretLink Support` in `Program Files` on the drive of the
+/// Windows folder, which the system names. `None` off Windows, and when
+/// `Program Files` is not one of the system's own folders: then no program is
+/// kept.
+#[must_use]
+pub fn kept_program_folder() -> Option<PathBuf> {
+    sys::kept_program_folder()
+}
+
+/// Makes `folder` a folder that only administrators can change and from
+/// which every account can read and start a program (ST-M009-017): the folder
+/// of a program that asks for administrator rights when it is started.
+///
+/// The folder is created with its owner and these permissions in one step.
+/// A folder that is already there is opened without following a link, and
+/// through that one handle its kind, its owner and its permissions are read:
+/// it must be such a folder of the administrators already. Nothing is put
+/// right afterwards, for the reason the module documentation gives. The
+/// folder that holds `folder` must be one that only administrators can
+/// write.
+///
+/// Blocking: it works on the file system.
+///
+/// # Errors
+///
+/// When this process is not an administrator; when a link, a file, a folder
+/// of another owner or a folder with other permissions stands under the
+/// name; or when the folder cannot be created or opened. Nothing may be put
+/// into the folder then.
+pub fn prepare_program_folder(folder: &Path) -> io::Result<()> {
+    sys::require_administrator()?;
+    sys::make_program_folder(folder)
+}
+
+/// Fails unless this process acts as a member of the administrators. Off
+/// Windows, where the agent is a development and test tool, it never fails.
+///
+/// # Errors
+///
+/// When this process is not an administrator, or that cannot be told.
+pub fn require_administrator() -> io::Result<()> {
+    sys::require_administrator()
+}
+
 /// The folder in which releases up to 0.24.0 kept the staging area and the
 /// reboot tickets: `CretLink` under the machine's application data, where
 /// every account could create files and folders. `None` off Windows, and for
@@ -457,6 +539,93 @@ pub fn remove_whole(path: &Path) -> io::Result<()> {
     }
 }
 
+/// The two spellings the system has for full control over a file.
+const FULL_CONTROL: [&str; 2] = ["FA", "0x1f01ff"];
+
+/// The spellings the system has for reading a folder and starting a program
+/// in it, and nothing more.
+const READ_AND_START: [&str; 3] = ["0x1200a9", "FRFX", "FXFR"];
+
+/// Who the permissions of one of CretLink's own folders name, each with the
+/// rights it has, when the descriptor in `text` has the form that CretLink
+/// gives a folder it creates: owned by the administrators or the system; a
+/// list of its own that refuses what the folder above would hand down; and
+/// nothing but plain grants, each handed down to the files and the folders
+/// made in the folder later, at most one for each name. `None` for a
+/// descriptor of any other form.
+///
+/// The text is what the system writes for a descriptor read back from a
+/// folder, for example `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows adapter reads permissions; the rule is tested everywhere"
+    )
+)]
+fn own_grants(text: &str) -> Option<Vec<(&str, &str)>> {
+    /// Who may own one of CretLink's own folders.
+    const OWNERS: [&str; 2] = ["SY", "BA"];
+
+    let rest = text.strip_prefix("O:")?;
+    let (owner_and_group, access) = rest.split_once("D:")?;
+    // The owner is followed by the group when the system writes one.
+    let owner = owner_and_group.split("G:").next().unwrap_or_default();
+    if !OWNERS.contains(&owner) {
+        return None;
+    }
+    // A list for auditing, if the system writes one, is not part of this rule.
+    let access = access.split("S:").next().unwrap_or_default();
+    let (flags, entries) = match access.find('(') {
+        Some(at) => access.split_at(at),
+        None => (access, ""),
+    };
+    // `P`: protected, so nothing is inherited from the folder above.
+    if !flags.contains('P') {
+        return None;
+    }
+    let mut grants: Vec<(&str, &str)> = Vec::new();
+    for entry in entries.split_inclusive(')') {
+        let fields = entry.strip_prefix('(')?.strip_suffix(')')?;
+        let fields: Vec<&str> = fields.split(';').collect();
+        let [kind, handed_down, rights, object, inherited_object, who] = fields[..] else {
+            return None;
+        };
+        // `OICI`: handed down to the files and the folders made in it.
+        if kind != "A"
+            || handed_down != "OICI"
+            || !object.is_empty()
+            || !inherited_object.is_empty()
+            || grants.iter().any(|(named, _)| *named == who)
+        {
+            return None;
+        }
+        grants.push((who, rights));
+    }
+    Some(grants)
+}
+
+/// Whether `grants` are exactly `wanted`: each name once, with rights in one
+/// of the spellings given for it, and nobody else.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows adapter reads permissions; the rule is tested everywhere"
+    )
+)]
+fn grants_are(grants: &[(&str, &str)], wanted: &[(&str, &[&str])]) -> bool {
+    grants.len() == wanted.len()
+        && wanted.iter().all(|(who, spellings)| {
+            grants.iter().any(|(named, rights)| {
+                named == who
+                    && spellings
+                        .iter()
+                        .any(|spelling| rights.eq_ignore_ascii_case(spelling))
+            })
+        })
+}
+
 /// Whether the owner and the permissions of a folder, in the text form of a
 /// security descriptor, are the private ones: owned by the administrators or
 /// the system; a list of its own that refuses what the folder above would
@@ -473,63 +642,36 @@ pub fn remove_whole(path: &Path) -> io::Result<()> {
     )
 )]
 fn is_private_text(text: &str) -> bool {
-    /// The two spellings the system has for full control over a file.
-    const FULL_CONTROL: [&str; 2] = ["FA", "0x1f01ff"];
-    /// Who has full control over a private folder.
-    const WHO: [&str; 2] = ["SY", "BA"];
+    own_grants(text)
+        .is_some_and(|grants| grants_are(&grants, &[("SY", &FULL_CONTROL), ("BA", &FULL_CONTROL)]))
+}
 
-    let Some(rest) = text.strip_prefix("O:") else {
-        return false;
-    };
-    let Some((owner_and_group, access)) = rest.split_once("D:") else {
-        return false;
-    };
-    // The owner is followed by the group when the system writes one.
-    let owner = owner_and_group.split("G:").next().unwrap_or_default();
-    if !WHO.contains(&owner) {
-        return false;
-    }
-    // A list for auditing, if the system writes one, is not part of this rule.
-    let access = access.split("S:").next().unwrap_or_default();
-    let (flags, entries) = match access.find('(') {
-        Some(at) => access.split_at(at),
-        None => (access, ""),
-    };
-    // `P`: protected, so nothing is inherited from the folder above.
-    if !flags.contains('P') {
-        return false;
-    }
-    let mut seen = [false; WHO.len()];
-    for entry in entries.split_inclusive(')') {
-        let Some(fields) = entry
-            .strip_prefix('(')
-            .and_then(|entry| entry.strip_suffix(')'))
-        else {
-            return false;
-        };
-        let fields: Vec<&str> = fields.split(';').collect();
-        let [kind, handed_down, rights, object, inherited_object, who] = fields[..] else {
-            return false;
-        };
-        let Some(index) = WHO.iter().position(|known| *known == who) else {
-            return false;
-        };
-        let full = FULL_CONTROL
-            .iter()
-            .any(|spelling| rights.eq_ignore_ascii_case(spelling));
-        // `OICI`: handed down to the files and the folders made in it.
-        if kind != "A"
-            || handed_down != "OICI"
-            || !full
-            || !object.is_empty()
-            || !inherited_object.is_empty()
-            || seen[index]
-        {
-            return false;
-        }
-        seen[index] = true;
-    }
-    seen.iter().all(|seen| *seen)
+/// Whether the owner and the permissions of a folder, in the text form of a
+/// security descriptor, are those of the folder of a kept program
+/// (ST-M009-017): as the private ones, and beside them every account may
+/// read the folder and start a program in it, and nothing more. Nobody but
+/// the administrators and the system can change anything.
+///
+/// The text is what the system writes for such a folder, for example
+/// `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows adapter reads permissions; the rule is tested everywhere"
+    )
+)]
+fn is_program_folder_text(text: &str) -> bool {
+    own_grants(text).is_some_and(|grants| {
+        grants_are(
+            &grants,
+            &[
+                ("SY", &FULL_CONTROL),
+                ("BA", &FULL_CONTROL),
+                ("BU", &READ_AND_START),
+            ],
+        )
+    })
 }
 
 #[cfg(not(windows))]
@@ -552,6 +694,18 @@ mod sys {
     /// Off Windows no program runs with administrator rights.
     pub(super) fn administrators_folder() -> Option<PathBuf> {
         None
+    }
+
+    /// Off Windows the customer role does not exist: no program is kept.
+    pub(super) fn kept_program_folder() -> Option<PathBuf> {
+        None
+    }
+
+    /// Makes `dir` exist. Off Windows there are no such permissions to set;
+    /// something that is not a folder under the name is an error all the
+    /// same.
+    pub(super) fn make_program_folder(dir: &Path) -> io::Result<()> {
+        make_private(dir)
     }
 
     /// Off Windows the earlier releases kept their files where this one does.
@@ -644,7 +798,10 @@ mod sys {
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
 
-    use super::{DATA_FOLDER, PRIVATE_DATA_FOLDER, is_private_text};
+    use super::{
+        DATA_FOLDER, KEPT_PROGRAM_FOLDER, PRIVATE_DATA_FOLDER, is_private_text,
+        is_program_folder_text,
+    };
 
     /// The private permissions of a folder with their owner, in the text form
     /// of a security descriptor: owned by the administrators (`O:BA`); a list
@@ -652,6 +809,12 @@ mod sys {
     /// full control for the system and for the administrators, for the folder
     /// and everything made in it later (`OICI`).
     const PRIVATE: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+    /// The permissions of the folder of a kept program with their owner
+    /// (ST-M009-017): as [`PRIVATE`], and every account (`BU`, the users of
+    /// this computer) may read the folder and what is made in it and start a
+    /// program there (`0x1200a9`), and nothing more.
+    const PROGRAM_FOLDER: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 
     /// The service that owns the files of Windows itself, as the system
     /// writes its identifier. It owns `Program Files`.
@@ -700,6 +863,12 @@ mod sys {
     /// `Program Files`.
     pub(super) fn administrators_folder() -> Option<PathBuf> {
         system_folder(ADMINISTRATORS_FOLDER).map(|folder| folder.join(PRIVATE_DATA_FOLDER))
+    }
+
+    /// Where the support program lies that a customer keeps: `CretLink
+    /// Support` in `Program Files`.
+    pub(super) fn kept_program_folder() -> Option<PathBuf> {
+        system_folder(ADMINISTRATORS_FOLDER).map(|folder| folder.join(KEPT_PROGRAM_FOLDER))
     }
 
     /// Where releases up to 0.24.0 kept their files: `CretLink` in the
@@ -858,7 +1027,21 @@ mod sys {
     /// below it is used: CretLink did not make it, and an administrator has
     /// to remove it.
     pub(super) fn make_private(dir: &Path) -> io::Result<()> {
-        create(dir)?;
+        make(dir, PRIVATE, is_private_text)
+    }
+
+    /// Makes `dir` the folder of a kept program, or finds it to be one: as
+    /// [`make_private`], with the permissions of such a folder
+    /// ([`PROGRAM_FOLDER`]).
+    pub(super) fn make_program_folder(dir: &Path) -> io::Result<()> {
+        make(dir, PROGRAM_FOLDER, is_program_folder_text)
+    }
+
+    /// Creates `dir` with the owner and the permissions of `descriptor` in
+    /// one step, or finds it to be a folder of the administrators whose
+    /// permissions `fits` accepts already.
+    fn make(dir: &Path, descriptor: &str, fits: fn(&str) -> bool) -> io::Result<()> {
+        create_with(dir, descriptor)?;
         let folder = open(dir, READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0)?;
         if !is_plain_folder(&folder)? {
             return Err(io::Error::new(
@@ -872,7 +1055,7 @@ mod sys {
                 "the folder does not belong to the administrators",
             ));
         }
-        if is_private_text(&permissions_text(&folder)?) {
+        if fits(&permissions_text(&folder)?) {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -887,9 +1070,18 @@ mod sys {
     /// the folder never exists without them. A name that is taken is not an
     /// error: what stands there is looked at by the caller, and is left as it
     /// is.
+    #[cfg(test)]
     pub(super) fn create(dir: &Path) -> io::Result<()> {
+        create_with(dir, PRIVATE)
+    }
+
+    /// Creates `dir` with the owner and the permissions that the text
+    /// `descriptor` describes, in one step: the folder never exists without
+    /// them. A name that is taken is not an error: what stands there is
+    /// looked at by the caller, and is left as it is.
+    fn create_with(dir: &Path, descriptor: &str) -> io::Result<()> {
         let path = HSTRING::from(dir.as_os_str());
-        let descriptor = Descriptor::from_text(PRIVATE)?;
+        let descriptor = Descriptor::from_text(descriptor)?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of_u32::<SECURITY_ATTRIBUTES>(),
             lpSecurityDescriptor: descriptor.0.0,

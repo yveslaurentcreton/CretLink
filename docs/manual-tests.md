@@ -526,6 +526,45 @@ was doing.
    `Get-ChildItem -Recurse | Where-Object LastWriteTime -gt <start>`).
    - Expected: no session record or report exists, and `Documents\CretLink`
      does not exist (REQ-F-027, REQ-F-001).
+   - Expected while the Get help window is open (ST-M009-014): the elevated
+     window's profile is one folder `CretLink-webview-<32 digits>` in
+     `C:\Program Files\CretLink Data\webview` (look as an administrator),
+     with `cretlink.lock` and the webview's data in it; `icacls` on it shows
+     the administrators and the system and nobody else. No
+     `CretLink-webview-*` folder of the elevated window is in `%TEMP%`, and
+     no `dev.cretlink.app` folder exists in `%LOCALAPPDATA%`. While the
+     unelevated window that explains the UAC prompt is open, its own folder
+     is in `%TEMP%` of the account that started it. (A `dev.cretlink.app`
+     folder that a release up to 0.24.1 left is listed by `cretlink recover`
+     without administrator rights and removed by `cretlink recover --remove`;
+     remove it before this step.)
+   - Before starting Get help, set `WEBVIEW2_USER_DATA_FOLDER` to a folder of
+     the standard account in a PowerShell of that account and start the copy
+     from there. Expected: the elevated window's profile is still in
+     `C:\Program Files\CretLink Data\webview`, and nothing is written into
+     the folder that the variable names.
+   - Close CretLink — once outside a session, once with **Stop and close**,
+     once with **Close CretLink** on the end screen — and look again ten
+     seconds later. Expected each time: no `CretLink-webview-*` folder is left
+     in `C:\Program Files\CretLink Data\webview` or in `%TEMP%`, also not of
+     the unelevated window that explained the UAC prompt, no
+     `dev.cretlink.app` in `%LOCALAPPDATA%`, and no CretLink process in Task
+     Manager.
+   - Start Get help again and end its elevated process in Task Manager.
+     Expected: its `CretLink-webview-*` folder stays in
+     `C:\Program Files\CretLink Data\webview`, and `recover` in an
+     administrator PowerShell (as the notice of MT-12 step 10 writes the
+     command) lists it as a webview profile left by a copy that no longer
+     runs, and ends with the note that the folders of the account are not
+     covered, naming `recover` and `recover --remove` to run without
+     administrator rights. Start Get help once more. Expected: that folder is
+     gone, and only the folder of the window now open is there.
+   - With a folder `CretLink-webview-<32 digits>` planted in `%TEMP%` of the
+     standard account (with an empty `cretlink.lock`), run
+     `recover --remove` in the administrator PowerShell. Expected: the
+     planted folder is not listed and stays. Run the same command in a
+     PowerShell of the standard account. Expected: it is listed and
+     removed.
 3. Choose **Save a copy**, then cancel the dialog.
    - Expected: the dialog opened on `Documents\CretLink\` with
      `YYYY-MM-DD <hostname>.html`; after cancelling, no file and no
@@ -549,10 +588,15 @@ the install screen and the uninstall prompt.
    the `Downloads` folder.
 2. **Run once.** Choose **Run once without installing**. The technician window
    says the copy runs once; on AI assistants, Connect warns that the
-   registration points at this copy. Close it. Expect nothing new outside the
-   audit folder (`%LOCALAPPDATA%\CretLink\audit`, `~/.local/share/CretLink/audit`
-   or the macOS equivalent) other than the webview profile (see the README's
-   known gaps).
+   registration points at this copy. While it is open, its webview profile is
+   a folder `CretLink-webview-<32 digits>` in the temporary folder (`%TEMP%`;
+   none on macOS). Close it. Expect nothing new outside the audit folder
+   (`%LOCALAPPDATA%\CretLink\audit`, `~/.local/share/CretLink/audit` or the
+   macOS equivalent): within ten seconds the `CretLink-webview-*` folder is
+   gone, also the one of the start screen, and no `dev.cretlink.app` folder
+   exists in `%LOCALAPPDATA%` (ST-M009-014). On macOS, WebKit's own folders
+   under `~/Library` stay: a known gap of the technician role there (see the
+   README).
 3. **Install.** Start it again and choose **Install for me**. The screen shows
    the location (`%LOCALAPPDATA%\Programs\CretLink` or
    `~/Applications/CretLink.app`), the Start-menu option (Windows), and each AI
@@ -575,9 +619,12 @@ the install screen and the uninstall prompt.
    the AI clients to keep working without reconnecting.
 6. **Uninstall.** In the installed copy, open Settings → **Uninstall…**. Expect
    the list of what it removes (files, shortcut, uninstall entry, the
-   registrations) and that the audit trail stays. Confirm, close the window,
+   registrations, and the webview profile `%LOCALAPPDATA%\CretLink\webview`
+   marked *removed once CretLink has closed*; none on macOS) and that the
+   audit trail stays. Confirm, close the window,
    and expect the folder (Windows: after the window closed), the shortcut, the
-   *Installed apps* entry and the registrations to be gone, and the audit
+   *Installed apps* entry and the registrations to be gone, the webview
+   profile to be gone within ten seconds (ST-M009-014), and the audit
    folder to be kept.
 7. **Uninstall entry and CLI.** Install again, then uninstall from *Installed
    apps* (Windows): a message box lists what will be removed and asks; **No**
@@ -1349,6 +1396,116 @@ A platform class passes MT-E2E only when every step meets its expected outcome o
 official artifacts from a fresh environment. Record the pass (date, host, agent
 build, artifact provenance) in [`release-signoff.md`](release-signoff.md).
 
+### MT-16 — A customer keeps the support program (ST-M009-017)
+
+On a Windows computer with an account that has administrator rights and one
+that has none (a standard account). Use a release archive: `cretlink.exe`
+renamed to `CretLink-Support.exe` in `Downloads` of each account, and for
+step 6 a second, newer build. Put a `cretlink.toml` with a relay next to the
+copy for steps 2 and 6, or make the copy with **Make a customer copy…**.
+Before you start, note what is there: `Get-Service`, `Get-ScheduledTask`,
+`HKLM\Software\Microsoft\Windows\CurrentVersion\Run` and the same key under
+`HKCU`, `Get-NetTCPConnection -State Listen`, and the folders of the Start
+menu of all users and of the public desktop.
+
+1. **Not offered without administrator rights, and not by a command.** In
+   the standard account, start the copy, decline the Windows prompt and
+   choose **Continue without admin rights**. Expected: the list of
+   technicians offers nothing about keeping. From a terminal, run the copy
+   with `keep`, `install`, `--keep` and `--role customer --keep`. Expected:
+   each is refused with the words about a copy for getting help, no window
+   keeps anything, and `C:\Program Files\CretLink Support` does not exist.
+2. **Keep.** Start the copy and answer the Windows prompt with the
+   administrator's account. On the list of technicians choose **Keep CretLink
+   Support on this computer**. Expected: a screen that names the folder
+   `C:\Program Files\CretLink Support`, the Start-menu entry, the entry in
+   Installed apps, the relay of the copy with where it is reached and what
+   vouches for its name, that nothing starts by itself, and how to remove it;
+   neither button is focused, and `Escape` or **Back** changes nothing. Tick
+   the desktop shortcut and choose **Keep on this computer**. Expected: the
+   list says that CretLink Support is now kept, and the footer no longer says
+   that nothing is installed.
+3. **What was added, and nothing else.** As an administrator, look again at
+   everything noted before the start. Expected: new are only
+   `C:\Program Files\CretLink Support` with `CretLink-Support.exe`,
+   `install.json`, `cretlink.toml` (and `relay-ca.pem` when the relay has a
+   certificate file), `CretLink Support.lnk` in the Start menu of all users
+   and on the public desktop, and
+   `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\CretLink Support`
+   (*Settings → Apps → Installed apps* shows **CretLink Support** with the
+   version and the publisher). No service, no scheduled task, no Run entry,
+   no listener and no CretLink process after the window was closed.
+   `icacls "C:\Program Files\CretLink Support"` shows the administrators and
+   the system with full control, the users with read and execute, and nobody
+   else; the standard account cannot create, change or delete a file there.
+   `Get-FileHash` of the kept program equals that of the copy in `Downloads`.
+4. **Start from the Start menu.** In the standard account, start **CretLink
+   Support** from the Start menu. Expected: the explanation of the Windows
+   prompt, without the words that nothing is installed; the prompt itself;
+   then the list of technicians, which says that CretLink Support is
+   installed on this computer with its version and offers **Remove from this
+   computer**. Run a session against a technician. Expected: every step of a
+   session from a downloaded copy (choose or type, compare the code, allow),
+   nothing about keeping or removing while the session exists, and an end
+   report that says that CretLink Support is installed because it was kept,
+   and lists it under nothing that was left behind. While it is open, its
+   webview profile is a folder `CretLink-webview-…` in
+   `C:\Program Files\CretLink Data\webview`, and nothing is written into
+   `C:\Program Files\CretLink Support` or into `%TEMP%` of the account that
+   answered the prompt (ST-M009-014). `recover` (as MT-12
+   step 10 runs it) names the kept program as there on purpose and still
+   calls the computer clean.
+5. **The program that runs is what is kept.** Remove the kept program (step
+   7), then start the copy from `Downloads` again and answer the prompt.
+   While its window is open, rename `CretLink-Support.exe` in `Downloads` to
+   another name and put another file under the old name, from the standard
+   account. Choose **Keep CretLink Support on this computer** and keep it.
+   Expected: `Get-FileHash` of the kept program equals that of the renamed
+   original, not that of the other file; or the window refuses and says why.
+   Never the other file in `C:\Program Files\CretLink Support`.
+6. **Update, and an older copy.** Start the newer build from `Downloads` and
+   answer the prompt. Expected: the list says that the older version is kept
+   and offers **Update the kept program**; the screen names both versions,
+   has the desktop shortcut ticked, and says that the relay settings of this
+   copy replace the kept ones. Update. Expected: Installed apps shows the new
+   version. Now start the older build again. Expected: it says that a newer
+   CretLink Support is kept, offers nothing, and the kept program is
+   unchanged. With the kept program open, try to update from another copy.
+   Expected: a refusal that says that the kept program is running.
+7. **Remove.** Three ways, keeping the program again in between: **Remove
+   from this computer** in the kept program; **Uninstall** in Installed apps;
+   `& 'C:\Program Files\CretLink Support\CretLink-Support.exe' uninstall | Out-Host`
+   in a PowerShell of the standard account. Expected each time: the list of
+   what goes, with the words that a saved report stays; a question before
+   anything is removed; the Windows prompt where the window or the terminal
+   has no administrator rights; and afterwards no folder
+   `C:\Program Files\CretLink Support` (from the kept program itself: once
+   its window has closed), no shortcut, no entry in Installed apps, and no
+   CretLink process. A report saved with **Save a copy** is still in
+   `Documents\CretLink`. `uninstall --yes` is refused with exit code 2 and
+   removes nothing, also with `cretlink-cli.exe` renamed to
+   `CretLink-Support-console.exe`. From the kept program, while its
+   removal waits for it to close, the helper that removes the folder is
+   `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` (Process
+   Explorer, *Properties → Environment*): its environment holds `SystemRoot`,
+   `windir`, `Path` and `PSModulePath`, each a folder of Windows, and nothing
+   else.
+8. **Keyboard and Narrator.** Walk the keep and the remove screen with `Tab`,
+   `Space`, `Enter` and `Escape` only, then with Narrator. Expected: every
+   control is reached and named, the state band and the heading are read
+   when a screen opens, and the desktop wish is read with its state.
+9. **An interrupted keep, and what points elsewhere.** As an administrator,
+   create the folder `C:\Program Files\CretLink Support` and put an empty
+   `install.json` into it. Run `recover`. Expected: it lists an unfinished
+   kept support program with the command `CretLink-Support.exe uninstall`,
+   and does not say that the computer is clean; `recover --remove` exits
+   with an error and names the same command. Run that command from a copy in
+   `Downloads`. Expected: the folder is gone. Keep the program again with a
+   desktop shortcut, delete `install.json`, and change the target of the
+   desktop shortcut to `notepad.exe`. Remove it. Expected: the list says that
+   the desktop shortcut stays because it does not start the kept program,
+   and afterwards it is still there.
+
 ## Run log
 
 Record each hardware run here: date, host, agent build, scenarios run, and the
@@ -1367,6 +1524,8 @@ hardware.
 | _pending_ | | | MT-8 (reboot-resume: arm under UAC, survive a reboot, one attended reconnect via the `K_rr` proof, single-use consumption, expired/cloned refusal, residual removal via the recovery command — ST-M006-001/002/003) | not yet recorded on hardware |
 | _pending_ | | | MT-11 steps 2, 4, 5 and 7 to 9 on Windows, and all of it on macOS (ST-M009-006) | not yet recorded on hardware |
 | _pending_ | | | MT-12 step 10 (files left from an earlier session and `cretlink recover`) and the Narrator pass (ST-M009-009, ST-M009-010) | not yet recorded on hardware |
+| _pending_ | | | The webview profile folder on Windows (ST-M009-014): MT-10 step 2 (the folder in `%TEMP%` while Get help is open, gone after each way of closing, the folder of a killed copy listed by `recover` and removed by the next start, no `dev.cretlink.app`), MT-11 step 2 (a copy that runs once) and step 6 (the installed copy's profile, removed once its window has closed) | not yet recorded on hardware; on Linux the same was checked under a virtual display |
 | _pending_ | | | MT-13 (a technician's computer on several networks, ST-M009-016) | not yet recorded on hardware |
+| _pending_ | | | MT-16 (a customer keeps the support program: not offered without administrator rights or by a command, keep, what was added and nothing else, a session from the Start menu, the program that runs is what is kept, update and an older copy, the three ways to remove, keyboard and Narrator; with a standard and an administrator account, ST-M009-017) | not yet recorded on hardware |
 | _pending_ | | | MT-15 (a session through the relay between two networks: the offer, the wait and its code, pairing through a typed code, a session with a stop from each side, a code that nobody waits on, a withdrawn key, a relay that is off, a certificate that is not trusted, a relay that stops in the middle, the network first, a copy without a relay, ST-M007-013) | not yet recorded on hardware |
 | _pending_ | | | MT-14 (the file operations of the explorer: the drives, a folder with links / through a junction / a held file / cancel and stop / swapped while it is removed, a file sent to a folder on two drives and refused for a junction, ST-M010-001; browsing in the Files tab: nothing before the tab is opened, from folder to folder with one item for the customer, a typed path under its real name, links, a refused folder, a folder of thousands of entries, views, selection, keys and the context menu, a stop while a folder arrives, and the Narrator pass of the grid, ST-M010-002; a delete, a folder removal, a new folder and a move refused through a junction, after a swap and on a substituted drive, ST-M010-004) | not yet recorded on hardware |

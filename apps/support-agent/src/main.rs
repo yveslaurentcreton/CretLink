@@ -33,7 +33,9 @@
 //! [--remove]`, which replace it in the product (ST-M009-010) — the agent runs a
 //! self-contained, offline pass over the resources it owns on the customer
 //! machine — staged file trees and sealed reboot-resume tickets today, with
-//! every other ownable kind asserted empty. Without `--remove` it only inspects
+//! every other ownable kind asserted empty. The profile folders of the
+//! application's window are not this binary's: only the shipped command line
+//! lists and removes them (ST-M009-014). Without `--remove` it only inspects
 //! and prints the residue; with `--remove` it removes what it can and reports
 //! honestly what was kept and how to remediate it. The verb opens no network
 //! connection, joins no session, and grants no control (REQ-F-019, REQ-N-008).

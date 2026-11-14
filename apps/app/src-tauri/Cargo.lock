@@ -611,12 +611,14 @@ dependencies = [
 name = "cretlink-cli"
 version = "0.0.0"
 dependencies = [
+ "cretlink-exec",
  "cretlink-mcp",
  "cretlink-protocol",
  "cretlink-relay",
  "cretlink-shared",
  "cretlink-support-agent",
  "cretlink-wss",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "tokio",

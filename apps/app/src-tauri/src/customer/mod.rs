@@ -86,6 +86,8 @@ use crate::relay;
 
 // Before the UAC prompt (ST-M009-009).
 mod admin;
+// Keeping the support program for next time (ST-M009-017).
+mod keep;
 // The end report and its saved copy (ST-M009-012).
 mod report;
 mod session_driver;
@@ -1179,6 +1181,7 @@ pub(crate) fn attach(
     let builder = builder
         .manage(AppState::with_relay(relay))
         .manage(admin::AdminState::new(entry, elevated))
+        .manage(keep::KeepState::of_this_process())
         .on_window_event(windows::on_window_event);
 
     // The shipped exe exposes only the real-transport command surface. The
@@ -1207,7 +1210,12 @@ pub(crate) fn attach(
         windows::make_small,
         windows::open_main,
         windows::drag_window,
-        windows::stop_and_close
+        windows::stop_and_close,
+        keep::get_keep,
+        keep::keep_plan,
+        keep::keep_program,
+        keep::remove_plan,
+        keep::remove_program
     ]);
     #[cfg(not(feature = "dev-simulate"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -1230,7 +1238,12 @@ pub(crate) fn attach(
         windows::make_small,
         windows::open_main,
         windows::drag_window,
-        windows::stop_and_close
+        windows::stop_and_close,
+        keep::get_keep,
+        keep::keep_plan,
+        keep::keep_program,
+        keep::remove_plan,
+        keep::remove_program
     ]);
     builder
 }
