@@ -1,16 +1,14 @@
 ---
 title: Host your own relay
-description: What a CretLink relay is for, what it can and cannot see, and what exists today.
+description: What a CretLink relay is for, what it can and cannot see, and how you run one with the container image, a certificate and one key for each customer.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Steps } from '@astrojs/starlight/components';
 import RelayView from '../../components/RelayView.astro';
+import Shot from '../../components/Shot.astro';
+import settings from '../../assets/screens/technician-relay-settings.png';
 
 <p class="lede">A relay lets two computers that are not on the same network find each other. It is a small server that you host yourself, and it never sees what a session does.</p>
-
-<Aside type="caution" title="Not in the application yet">
-<span class="planned">Planned</span> The application cannot connect through a relay yet. That is planned for a later release, together with a ready-made container image. This page explains the idea and says what exists already.
-</Aside>
 
 ## Why a relay
 
@@ -26,10 +24,68 @@ The six digits, the customer's consent, the Stop button and the cleanup work bet
 
 There is no central CretLink relay, on purpose. The relay does see who connects to whom and when, so it belongs to the person who gives the support: you. Hosting it yourself also means that nobody else can switch it off.
 
-## What exists today
+## Run it
 
-- **The relay server** ships with every release, as one program for Windows, macOS and Linux. It keeps nothing on disk and needs no special rights.
-- **A password for the relay** keeps strangers from using your server. It gives no access to any computer.
-- **A certificate** lets the relay prove who it is and hides the remaining details from the network in between.
+You need a server with Docker that the internet can reach, a name for it such as `relay.example.org`, and a certificate for that name. `<version>` is the release your copies of CretLink come from; update the relay together with them.
 
-[Relay server operation](https://github.com/yveslaurentcreton/CretLink/blob/main/docs/relay-server.md) describes the server for people who want to run it now. Until the application can use it, only the development tools in the source tree can connect through it.
+<Steps>
+
+1. **Make your own key, and the key file**
+
+   ```sh
+   docker run --rm \
+     ghcr.io/yveslaurentcreton/cretlink-relay-server:<version> keygen
+   ```
+
+   The command prints a new key. Put it in a file, as `label:key` on a line of its own. The label says whose key it is. Every customer gets a line of their own later, when you make their copy:
+
+   ```text
+   # /etc/cretlink/relay.keys
+   sam-laptop:5f2c9d0e…
+   acme:9a41c7b3…
+   ```
+
+2. **Put the certificate next to it**
+
+   `relay.crt` holds the certificate with its chain, and `relay.key` its private key, both as PEM files in the same folder. The user the relay runs as (`65532`) must be able to read the three files, and nobody else should.
+
+3. **Start the relay**
+
+   ```sh
+   docker run --detach --name cretlink-relay --restart unless-stopped \
+     --read-only --cap-drop ALL --security-opt no-new-privileges \
+     --publish 443:9970 \
+     --volume /etc/cretlink:/config:ro \
+     --env CRETLINK_RELAY_TLS_CERT=/config/relay.crt \
+     --env CRETLINK_RELAY_TLS_KEY=/config/relay.key \
+     --env CRETLINK_RELAY_KEYS=/config/relay.keys \
+     ghcr.io/yveslaurentcreton/cretlink-relay-server:<version>
+   ```
+
+   `docker logs cretlink-relay` then says that it serves `wss://` and how many keys it knows.
+
+</Steps>
+
+- **One key for each customer** means that you can take one away. Delete its line: within seconds the relay refuses that key, without a restart.
+- **A key only opens the relay.** It shows no session and controls none.
+- **The image holds one program** and nothing else: no shell, no package manager, and a user without rights. Before you run a version, check that it was built from this project:
+
+  ```sh
+  gh attestation verify oci://ghcr.io/yveslaurentcreton/cretlink-relay-server:<version> \
+    --repo yveslaurentcreton/CretLink
+  ```
+
+## Tell your copies which relay to use
+
+<Shot
+  src={settings}
+  kind="wide"
+  alt="Settings, Relay, in the technician's installed copy: the relay's address, the admission key, the certificate authority and the name in the certificate, with the buttons Save, Test and Remove."
+  caption="The relay of your installed copy. Its key is never shown again once it is saved."
+/>
+
+- **Your installed copy:** open **Settings** and enter the relay's address and your own key under **Relay**. **Test** says in words whether the relay lets this copy in.
+- **Your customer's copy** reads the relay from a file `cretlink.toml` next to the program. You do not write it by hand: [CretLink makes the customer's copy](/CretLink/get-started/#a-copy-for-a-customer-on-another-network), with a key of that customer's own.
+- **A certificate from an authority of your own** works too: give your copy that authority's certificate file. A copy never talks to a relay without TLS.
+
+[Relay server operation](https://github.com/yveslaurentcreton/CretLink/blob/main/docs/relay-server.md) has the rest: a relay behind a reverse proxy that holds your certificates, the server as a plain program or a service, and what each failure on the screen means.

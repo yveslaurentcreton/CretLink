@@ -1,11 +1,13 @@
 ---
 title: Get started
-description: Download CretLink, install it on your own computer, connect your AI agent and prepare the copy your customer runs.
+description: Download CretLink, install it on your own computer, connect your AI agent and prepare the copy your customer runs, which a customer can keep for next time.
 ---
 
 import { Steps, Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 import Shot from '../../components/Shot.astro';
 import install from '../../assets/screens/install.png';
+import customerCopy from '../../assets/screens/technician-customer-copy.png';
+import keep from '../../assets/screens/customer-keep.png';
 
 <p class="lede">Four steps on your own computer. They take a few minutes, and you do them once.</p>
 
@@ -62,7 +64,9 @@ import install from '../../assets/screens/install.png';
 
 4. **Prepare your customer's copy**
 
-   Take `cretlink.exe` from the **Windows** archive, name the copy `CretLink-Support.exe` and bring it to your customer, for example on a USB stick. A copy with that name opens **Get help** straight away and can never install anything.
+   Take `cretlink.exe` from the **Windows** archive, name the copy `CretLink-Support.exe` and bring it to your customer, for example on a USB stick. A copy with that name opens **Get help** straight away and never installs your side of CretLink.
+
+   For a customer who is not on your network, let CretLink [make the copy](#a-copy-for-a-customer-on-another-network).
 
 </Steps>
 
@@ -70,12 +74,68 @@ import install from '../../assets/screens/install.png';
 A session starts only when both programs speak the same version of the protocol. When you update your own copy, replace the customer's copy too.
 </Aside>
 
+## A copy for a customer on another network
+
+A customer who is not on your network reaches you through [a relay that you host](/CretLink/relay/). Once your copy knows that relay, **Settings** offers **Make a customer copy…** under **Relay**. It writes one folder to hand over:
+
+```text
+CretLink-Support-acme/
+  CretLink-Support.exe   the support program
+  cretlink.toml          your relay, and this customer's own key
+  README.txt             a few lines for the customer
+```
+
+<Shot
+  src={customerCopy}
+  kind="wide"
+  alt="Make a customer copy, in Settings under Relay: the relay, a label for the customer, the program that is copied, and a new admission key for this customer as the line to add to the relay's key file."
+  caption="One folder for one customer. The label names the folder and the customer's key."
+/>
+
+- **A key of their own.** **Generate** makes one and shows the line to add to your relay's key file. Your own key never goes into a customer copy.
+- **A certificate authority of your own** comes along: the folder then also holds its certificate file.
+- **Nothing leaves your computer.** CretLink writes the folder; getting it to your customer is up to you. On macOS you first point at `cretlink.exe` from the Windows archive.
+
+## A customer who needs help more often
+
+Your customer can keep the support program and start it from the Start menu next time. It is their own choice, on their own screen, before a session or on the report after it. Nobody can do it for them: not you, not your AI agent and not a command.
+
+<div class="shots keep not-content">
+  <Shot
+    src={keep}
+    kind="narrow"
+    alt="The customer is asked whether to keep CretLink Support on this computer: the program in Program Files, an entry in the Start menu, an entry in Installed apps and the relay settings of the copy are added, and nothing starts by itself."
+    caption="The screen says what is added before anything is added."
+  />
+  <div class="keep-lists">
+    <div class="lane cust">
+      <h3>What keeping adds</h3>
+      <ul>
+        <li>the program, where only an administrator can change it</li>
+        <li>an entry in the Start menu, and a desktop shortcut on request</li>
+        <li>an entry in Installed apps, to remove it again</li>
+        <li>the relay settings of the copy, when it had any</li>
+      </ul>
+    </div>
+    <div class="lane">
+      <h3>What it never adds</h3>
+      <ul>
+        <li>a service, a scheduled task or anything that starts with Windows</li>
+        <li>anything that listens: between sessions no CretLink program runs</li>
+        <li>a stored permission: every session asks Windows, the six digits and the customer again</li>
+        <li>an update by itself: a newer copy offers to update it</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
 ## Good to know
 
 - **Windows warns about an unknown publisher.** The releases are not code-signed yet, so the checksum of step 1 is how you know the file is genuine.
 - **macOS as your own computer** builds and passes the automated tests, but has not been checked on a real Mac yet.
-- **Updating** is the same as installing: start the newer download and choose **Install for me** again. Your AI agents stay connected.
-- **Removing it** is `cretlink uninstall`, or **Uninstall** in Settings. It shows what it will remove and asks first. The audit trail stays.
+- **The customer copy and the kept program are new.** They pass the automated tests and have not been tried on real computers yet.
+- **Updating your own copy** is the same as installing: start the newer download and choose **Install for me** again. Your AI agents stay connected.
+- **Removing your own copy** is `cretlink uninstall`, or **Uninstall** in Settings. It shows what it will remove and asks first. The audit trail stays.
 
 ## Next
 
