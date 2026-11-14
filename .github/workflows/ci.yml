@@ -214,18 +214,28 @@ jobs:
       # action sets; `+1.95` makes this job compile on the MSRV itself.
       - run: cargo +1.95 check --workspace --locked
 
+  # The locked Rust dependencies (ST-M006-019): the Cargo workspace, and the
+  # application package, which is detached and has a lockfile and a
+  # configuration of its own (apps/app/src-tauri/deny.toml).
   deny:
     name: Dependency licenses, advisories, and sources
     needs: changes
     if: needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - name: Check the workspace (cargo deny)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
+          command: check licenses advisories bans sources
+      - name: Check the application package (cargo deny)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: apps/app/src-tauri/Cargo.toml
+          arguments: --all-features --config apps/app/src-tauri/deny.toml
           command: check licenses advisories bans sources
 
   # The documentation site (ST-M011-001): its build, the tests of its check,
