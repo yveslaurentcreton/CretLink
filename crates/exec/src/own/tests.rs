@@ -1123,19 +1123,26 @@ fn a_private_profile_folder_is_opened_to_the_account_of_the_desktop() {
         entries.iter().any(|entry| entry == "A;OICI;FA;;;BA"),
         "{entries:?}"
     );
-    assert!(
+    // The account of the desktop is written as the system writes it: by its
+    // identifier, or by a short name when it is a well-known account (the
+    // built-in administrator of a verification machine reads `LA`). So the
+    // two entries are told by their rights, and must name the same account,
+    // which is neither the system nor the administrators.
+    let account_of = |rights: &str| {
         entries
             .iter()
-            .any(|entry| entry.starts_with("A;;0x1201bf;;;S-1-")),
-        "{entries:?}"
-    );
+            .find_map(|entry| entry.strip_prefix(rights))
+            .map(str::to_owned)
+    };
+    let (on_the_folder, on_what_is_made) =
+        (account_of("A;;0x1201bf;;;"), account_of("A;OICIIO;FA;;;"));
+    assert!(on_the_folder.is_some(), "{entries:?}");
+    assert_eq!(on_the_folder, on_what_is_made, "{entries:?}");
     assert!(
-        entries
-            .iter()
-            .any(|entry| entry.starts_with("A;OICIIO;FA;;;S-1-")),
+        !matches!(on_the_folder.as_deref(), Some("SY" | "BA")),
         "{entries:?}"
     );
-    assert_eq!(entries.len(), 4, "{entries:?}");
+    assert_eq!(entries.len(), 4, "nobody else is admitted: {entries:?}");
     // The folder above stays private.
     assert!(super::tests_is_private(webview.path()));
 }
