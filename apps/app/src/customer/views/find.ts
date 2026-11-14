@@ -8,6 +8,7 @@
 
 import { h } from "../../shared/dom";
 import { icon } from "../../shared/icons";
+import { relayLabel, trustWords } from "../../shared/relay";
 import type { DiscoveredConsoleView } from "../api";
 import {
   type CustomerSnapshot,
@@ -16,6 +17,7 @@ import {
   signedInAs,
 } from "../model";
 import { button, nothingInstalled } from "./common";
+import { installedWords, keepCardView } from "./keep";
 
 /** The longest code or address the field takes (bounded input). */
 export const CODE_MAX = 64;
@@ -82,6 +84,11 @@ function consoles(s: CustomerSnapshot): HTMLElement {
 }
 
 function codeField(s: CustomerSnapshot): HTMLElement {
+  // A copy that is set up for a relay says through which one a relay code
+  // connects, before any code is typed (ST-M007-011, ST-M007-013): its name,
+  // where this copy would connect when that is another host, and what
+  // vouches for the name when it is a file of this copy's profile.
+  const relay = s.view?.relay_of_copy ?? undefined;
   return h(
     "div",
     { class: "code-field" },
@@ -99,7 +106,7 @@ function codeField(s: CustomerSnapshot): HTMLElement {
         maxlength: CODE_MAX,
         placeholder: "6RRR-2H8F",
         "data-key": "code",
-        "aria-describedby": "code-hint",
+        "aria-describedby": relay ? "code-hint relay-ready" : "code-hint",
       }),
       button("Connect", "connect-code", { disabled: s.busy !== undefined }),
     ),
@@ -108,6 +115,16 @@ function codeField(s: CustomerSnapshot): HTMLElement {
       { class: "muted", id: "code-hint" },
       "The code only says where to connect. It grants nothing.",
     ),
+    relay
+      ? h(
+          "p",
+          { class: "muted relay-ready", id: "relay-ready", "data-key": "relay-ready" },
+          "If your technician is not on this network, they give you a longer relay code. This copy then connects through the relay ",
+          relayLabel(relay),
+          ", which only passes encrypted traffic on.",
+          trustWords(relay) ? [" ", trustWords(relay)] : null,
+        )
+      : null,
   );
 }
 
@@ -181,8 +198,11 @@ export function findView(s: CustomerSnapshot): HTMLElement[] {
       codeField(s),
       demo(s),
       h("div", { class: "spacer" }),
+      // Keeping the support program is offered here, before a session, and
+      // on the end report (ST-M009-017).
+      keepCardView(s),
       thisComputer(s),
     ),
-    nothingInstalled(),
+    nothingInstalled(installedWords(s)),
   ];
 }

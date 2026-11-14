@@ -12,6 +12,7 @@
 import { h } from "../../shared/dom";
 import { formatElapsed, formatTime, plural } from "../../shared/feed";
 import { type IconName, icon } from "../../shared/icons";
+import { viaRelay } from "../../shared/relay";
 import {
   type CustomerSnapshot,
   FILTERS,
@@ -23,6 +24,7 @@ import {
   plainLine,
   screenUse,
   screenWords,
+  sessionRelay,
   technicianName,
 } from "../model";
 import { button, operationLine, timelineItem, whoChip } from "./common";
@@ -197,6 +199,7 @@ export function liveView(s: CustomerSnapshot): HTMLElement[] {
         : null,
       now(s, name),
       tiles(s),
+      viaRelay(sessionRelay(s)),
       h("div", { class: "tlhead" }, h("h4", { id: "tl-h" }, "What happened"), filterBar(s)),
       timeline(s, name),
       h(

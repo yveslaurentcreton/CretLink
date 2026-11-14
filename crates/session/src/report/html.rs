@@ -149,6 +149,11 @@ pub fn render(report: &CustomerReport) -> String {
         }
         out.push_str("</ul>\n");
     }
+    // What is on this computer on purpose is said beside the cleanup, so that
+    // it is not taken for something this session left (ST-M009-017).
+    if let Some(kept) = &report.kept_program {
+        let _ = writeln!(out, "<p>{}</p>", escape(&kept.words()));
+    }
 
     out.push_str("<h2>Activity</h2>\n");
     if report.activity.is_empty() {

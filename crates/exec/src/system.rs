@@ -31,6 +31,14 @@ pub fn windows_folder() -> Option<PathBuf> {
     sys::windows_folder()
 }
 
+/// The system folder as the system names it, for example
+/// `C:\Windows\System32`, in which Windows keeps its own programs. `None` off
+/// Windows, and when the system does not answer.
+#[must_use]
+pub fn system_folder() -> Option<PathBuf> {
+    sys::system_folder()
+}
+
 /// The folder a job starts in when its request names none: the system folder,
 /// where only administrators can put anything. `None` off Windows, where a job
 /// starts in the working directory of this process, and when the system does

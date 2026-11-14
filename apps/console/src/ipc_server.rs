@@ -2396,7 +2396,7 @@ impl CallAudit {
 /// length, verified digest, resume/restart detail, failure reason, and the
 /// mapped terminal outcome.
 #[allow(clippy::too_many_arguments)]
-fn transfer_detail(
+pub(crate) fn transfer_detail(
     entry: &mut AuditEntry,
     canonical_path: Option<&str>,
     len: u64,
@@ -2481,7 +2481,7 @@ fn env_value(env: &BTreeMap<String, String>) -> AuditValue {
 /// The Appendix A `path` value for a remote path argument. An absolute path is
 /// recorded as its validated text; a staging name is prefixed so the two
 /// authority domains stay distinguishable in the log.
-fn remote_path_value(path: &RemotePath) -> AuditValue {
+pub(crate) fn remote_path_value(path: &RemotePath) -> AuditValue {
     match path {
         RemotePath::Absolute { path } => truncate_field(path),
         RemotePath::Staging { name } => truncate_field(&format!("staging:{name}")),
@@ -2494,13 +2494,13 @@ fn job_id_value(job: JobId) -> AuditValue {
 }
 
 /// An audit integer for a byte length or count, saturating into `i64`.
-fn len_value(len: u64) -> AuditValue {
+pub(crate) fn len_value(len: u64) -> AuditValue {
     AuditValue::Int(i64::try_from(len).unwrap_or(i64::MAX))
 }
 
 /// Maps a job/transfer terminal outcome onto the audit vocabulary — honest,
 /// never a fabricated success (REQ-N-008).
-fn job_outcome_to_audit(outcome: JobOutcome) -> Outcome {
+pub(crate) fn job_outcome_to_audit(outcome: JobOutcome) -> Outcome {
     match outcome {
         JobOutcome::Completed => Outcome::Ok,
         JobOutcome::Failed => Outcome::Failed,
@@ -2531,7 +2531,7 @@ fn trigger_label(trigger: CleanupTrigger) -> &'static str {
 }
 
 /// Wall-clock milliseconds since `started`, saturating into `u64`.
-fn elapsed_ms(started: Instant) -> u64 {
+pub(crate) fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 

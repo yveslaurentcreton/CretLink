@@ -3,7 +3,16 @@
 
 import type { ActivityEntry, ActivityItem, CustomerReport } from "../shared/contract";
 import { DISCLOSURE_TEXT } from "../technician/disclosure";
-import type { AgentPhase, ConsentView, DiscoveredConsoleView, LaunchView } from "./api";
+import type {
+  AgentPhase,
+  ConsentView,
+  DiscoveredConsoleView,
+  KeepPlanView,
+  KeepView,
+  LaunchView,
+  RelayUseView,
+  RemovePlanView,
+} from "./api";
 import { type CustomerSnapshot, initialSnapshot } from "./model";
 
 /** 2026-11-03 14:44:00 UTC: the fixtures' "now". */
@@ -43,9 +52,98 @@ export function viewIn(phase: AgentPhase, patch: Partial<ConsentView> = {}): Con
         ? null
         : { display_name: "Sam", provenance: "as the technician's computer reports it" },
     startup_cleanup: null,
+    relay: null,
+    failure_next: null,
+    relay_of_copy: null,
     ...patch,
   };
 }
+
+/** The relay of the fixtures. */
+export const VIA_RELAY: RelayUseView = {
+  host: "relay.example.org",
+  address: "relay.example.org:443",
+  trust: "system_authorities",
+};
+
+/**
+ * A relay whose certificate carries another name than the host this copy
+ * connects to, checked against a certificate file of the profile: the window
+ * then shows the address beside the name and says what vouches for the name
+ * (ST-M007-011).
+ */
+export const VIA_RELAY_ELSEWHERE: RelayUseView = {
+  host: "relay.example.org",
+  address: "192.0.2.1:9970",
+  trust: "profile_file",
+};
+
+// --- Keeping the support program for next time (ST-M009-017) ---
+
+/** Where a kept program lies. */
+export const KEPT_FOLDER = "C:\\Program Files\\CretLink Support";
+
+/** An elevated copy on a computer where nothing is kept: it offers to keep. */
+export const KEEP_OFFER: KeepView = {
+  state: "not_kept",
+  canKeep: true,
+  canRemove: false,
+  removeElevates: false,
+  thisVersion: "1.1.0",
+  location: KEPT_FOLDER,
+};
+
+/** The same copy after it was kept: the kept program has its version. */
+export const KEEP_SAME: KeepView = {
+  ...KEEP_OFFER,
+  state: "same",
+  canKeep: false,
+  keptVersion: "1.1.0",
+};
+
+/** An elevated copy that is newer than what is kept: it offers to update. */
+export const KEEP_UPDATE: KeepView = { ...KEEP_OFFER, state: "newer", keptVersion: "1.0.0" };
+
+/** A copy that is older than what is kept: it never replaces it. */
+export const KEEP_OLDER: KeepView = {
+  ...KEEP_OFFER,
+  state: "older",
+  canKeep: false,
+  thisVersion: "1.0.0",
+  keptVersion: "1.1.0",
+};
+
+/** The kept program itself, with administrator rights. */
+export const KEEP_INSTALLED: KeepView = {
+  ...KEEP_OFFER,
+  state: "this",
+  canKeep: false,
+  canRemove: true,
+  keptVersion: "1.1.0",
+};
+
+/** What keeping would add, for a copy without relay settings. */
+export const KEEP_PLAN: KeepPlanView = {
+  version: "1.1.0",
+  location: KEPT_FOLDER,
+  program: `${KEPT_FOLDER}\\CretLink-Support.exe`,
+  desktopKept: false,
+  relayReplaces: false,
+};
+
+/** What removing would remove, from the kept program itself. */
+export const REMOVE_PLAN: RemovePlanView = {
+  removes: [
+    `${KEPT_FOLDER}\\CretLink-Support.exe (removed once CretLink has closed)`,
+    `${KEPT_FOLDER}\\install.json (removed once CretLink has closed)`,
+    `The folder ${KEPT_FOLDER} (removed once CretLink has closed)`,
+    "The shortcut C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\CretLink Support.lnk",
+    "The entry in Installed apps (HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\CretLink Support)",
+  ],
+  stays: ["A session report that you saved stays where you saved it"],
+  afterExit: true,
+  elevates: false,
+};
 
 export const LAUNCH_READY: LaunchView = {
   step: "ready",
@@ -266,6 +364,20 @@ export const FIXTURES: Record<string, CustomerSnapshot> = {
     { discovery: { state: "done", consoles: CONSOLES } },
   ),
   "find-searching": base(idle, { discovery: { state: "searching", consoles: [] } }),
+  // A copy that is set up for a relay names it beside the code field
+  // (ST-M007-011, ST-M007-013).
+  "find-relay-ready": base(
+    { ...idle, relay_of_copy: VIA_RELAY },
+    { discovery: { state: "done", consoles: [] } },
+  ),
+  // The profile file next to the program names the relay otherwise than the
+  // host this copy connects to, and checks it against a certificate file of
+  // its own: the window shows the address beside the name and says what
+  // vouches for the name (ST-M007-011).
+  "find-relay-ready-elsewhere": base(
+    { ...idle, relay_of_copy: VIA_RELAY_ELSEWHERE },
+    { discovery: { state: "done", consoles: [] } },
+  ),
   "find-none": base(idleUnelevated, {
     discovery: {
       state: "done",
@@ -280,6 +392,120 @@ export const FIXTURES: Record<string, CustomerSnapshot> = {
   "find-connect-failed": base(
     viewIn({ phase: "failed", stage: "connect", message: "could not reach the technician: connection refused" }),
     { discovery: { state: "done", consoles: CONSOLES }, ended: "" },
+  ),
+  // A relay code (ST-M007-013): what was typed is not on the same network.
+  "find-nobody-waits": base(
+    viewIn(
+      { phase: "failed", stage: "rendezvous", message: "nobody joined the rendezvous on the relay" },
+      { relay: VIA_RELAY, technician: null },
+    ),
+    { discovery: { state: "done", consoles: [] }, ended: "" },
+  ),
+  "find-relay-unreachable": base(
+    viewIn(
+      {
+        phase: "failed",
+        stage: "relay_unreachable",
+        message:
+          "CretLink could not connect to the relay at relay.example.org:443. The relay may be off, the address may be wrong, or this network does not let this computer reach it.",
+      },
+      {
+        relay: VIA_RELAY,
+        technician: null,
+        failure_next:
+          "Check that this computer is online, then try again. If it stays like this, tell your technician that the relay relay.example.org cannot be reached. Nobody has access to this computer.",
+      },
+    ),
+    { discovery: { state: "done", consoles: [] }, ended: "" },
+  ),
+  "find-relay-untrusted": base(
+    viewIn(
+      {
+        phase: "failed",
+        stage: "relay_untrusted",
+        message:
+          "The relay at relay.example.org:443 showed no certificate that this computer trusts for the name relay.example.org, so nothing was sent to it.",
+      },
+      {
+        relay: VIA_RELAY,
+        technician: null,
+        failure_next:
+          "Tell your technician that this computer does not trust the certificate of the relay relay.example.org. Nobody has access to this computer.",
+      },
+    ),
+    { discovery: { state: "done", consoles: [] }, ended: "" },
+  ),
+  "find-relay-key": base(
+    viewIn(
+      {
+        phase: "failed",
+        stage: "relay_key_refused",
+        message:
+          "The relay relay.example.org does not know the admission key of this copy. The key may be mistyped, or it was withdrawn.",
+      },
+      {
+        relay: VIA_RELAY,
+        technician: null,
+        failure_next:
+          "Ask your technician for a new copy of CretLink, or to look at the keys of their relay.",
+      },
+    ),
+    { discovery: { state: "done", consoles: [] }, ended: "" },
+  ),
+  "find-relay-lost": base(
+    viewIn(
+      {
+        phase: "failed",
+        stage: "relay_lost",
+        message: "The connection through the relay relay.example.org was lost.",
+      },
+      { relay: VIA_RELAY },
+    ),
+    { discovery: { state: "done", consoles: [] }, ended: "" },
+  ),
+  "find-relay-lost-before-code": base(
+    viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY }),
+    {
+      discovery: { state: "done", consoles: [] },
+      ended:
+        "The connection through the relay relay.example.org was lost before anyone got access. Nothing was shared.",
+    },
+  ),
+  "relay-connecting": base(viewIn({ phase: "announced" }, { technician: null, relay: VIA_RELAY })),
+  "relay-sac": base(
+    viewIn({ phase: "awaiting_approval_compare" }, { approval_code: "482913", relay: VIA_RELAY }),
+  ),
+  "relay-consent": base(viewIn({ phase: "awaiting_consent" }, { relay: VIA_RELAY })),
+  "relay-live": base(
+    { ...live, relay: VIA_RELAY },
+    { activity: FEED, hadControl: true },
+  ),
+  "relay-end": base(
+    { ...stoppedByCustomer, relay: VIA_RELAY },
+    { activity: FEED_DONE, hadControl: true, report: REPORT },
+  ),
+  "relay-end-lost": base(
+    viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY }),
+    { activity: FEED_DONE, hadControl: true, report: REPORT_UNKNOWN },
+  ),
+  // A session through a relay that is reached at another host than its name
+  // says, checked against a certificate file of the profile.
+  "relay-connecting-elsewhere": base(
+    viewIn({ phase: "announced" }, { technician: null, relay: VIA_RELAY_ELSEWHERE }),
+  ),
+  "relay-sac-elsewhere": base(
+    viewIn(
+      { phase: "awaiting_approval_compare" },
+      { approval_code: "482913", relay: VIA_RELAY_ELSEWHERE },
+    ),
+  ),
+  "relay-live-elsewhere": base(
+    { ...live, relay: VIA_RELAY_ELSEWHERE },
+    { activity: FEED, hadControl: true },
+  ),
+  "relay-end-lost-elsewhere": base(
+    viewIn({ phase: "stopped", reason: "disconnected" }, { relay: VIA_RELAY_ELSEWHERE }),
+    { activity: FEED_DONE, hadControl: true, report: REPORT_UNKNOWN },
   ),
   connecting: base(viewIn({ phase: "announced" }, { technician: null })),
   sac: base(viewIn({ phase: "awaiting_approval_compare" }, { approval_code: "482913" })),
@@ -321,6 +547,89 @@ export const FIXTURES: Record<string, CustomerSnapshot> = {
     activity: FEED_DONE,
     hadControl: true,
     report: REPORT_FAILED,
+  }),
+  // Keeping the support program for next time (ST-M009-017): the card on the
+  // list and on the end report, and the screens it leads to.
+  "find-keep-offer": base(idle, { discovery: { state: "done", consoles: CONSOLES }, keep: KEEP_OFFER }),
+  "find-keep-update": base(idle, { discovery: { state: "done", consoles: CONSOLES }, keep: KEEP_UPDATE }),
+  "find-kept-now": base(idle, {
+    discovery: { state: "done", consoles: CONSOLES },
+    keep: KEEP_SAME,
+    keptNow: true,
+  }),
+  "find-kept-same": base(idle, { discovery: { state: "done", consoles: CONSOLES }, keep: KEEP_SAME }),
+  "find-kept-older-copy": base(idle, { discovery: { state: "done", consoles: CONSOLES }, keep: KEEP_OLDER }),
+  "find-installed": base(idle, { discovery: { state: "done", consoles: CONSOLES }, keep: KEEP_INSTALLED }),
+  // The kept program after the customer went on without administrator
+  // rights: removing asks Windows for them first.
+  "find-installed-unelevated": base(idleUnelevated, {
+    discovery: { state: "done", consoles: CONSOLES },
+    keep: { ...KEEP_INSTALLED, removeElevates: true },
+  }),
+  // A window without administrator rights offers nothing while nothing is kept.
+  "find-unelevated-no-offer": base(idleUnelevated, {
+    discovery: { state: "done", consoles: CONSOLES },
+    keep: { ...KEEP_OFFER, canKeep: false },
+  }),
+  // The kept program explains the prompt without saying that nothing is installed.
+  "admin-kept-program": base(idleUnelevated, {
+    launch: { ...LAUNCH_READY, step: "admin", back: "close", elevated: false },
+    keep: { ...KEEP_INSTALLED, removeElevates: true },
+  }),
+  keep: base(idle, { keep: KEEP_OFFER, panel: { kind: "keep", plan: KEEP_PLAN } }),
+  // A copy that brings relay settings names the relay before the choice.
+  "keep-relay": base(idle, {
+    keep: KEEP_OFFER,
+    panel: { kind: "keep", plan: { ...KEEP_PLAN, relay: VIA_RELAY } },
+  }),
+  // A newer copy, whose settings name the relay otherwise than the host it
+  // connects to and check it against a certificate file of their own.
+  "keep-update-relay": base(idle, {
+    keep: KEEP_UPDATE,
+    panel: {
+      kind: "keep",
+      plan: {
+        ...KEEP_PLAN,
+        replaces: "1.0.0",
+        desktopKept: true,
+        relay: VIA_RELAY_ELSEWHERE,
+        relayReplaces: true,
+      },
+    },
+  }),
+  "keep-relay-problem": base(idle, {
+    keep: KEEP_OFFER,
+    panel: {
+      kind: "keep",
+      plan: {
+        ...KEEP_PLAN,
+        relayProblem:
+          "Line 2: `address` needs a port; write the relay's host name and port, like relay.example.org:443. The file is C:\\Users\\ann\\Downloads\\cretlink.toml.",
+      },
+    },
+  }),
+  remove: base(idle, { keep: KEEP_INSTALLED, panel: { kind: "remove", plan: REMOVE_PLAN } }),
+  "remove-elevates": base(idleUnelevated, {
+    keep: { ...KEEP_INSTALLED, removeElevates: true },
+    panel: { kind: "remove", plan: { ...REMOVE_PLAN, elevates: true } },
+  }),
+  removed: base(idle, {
+    keep: KEEP_INSTALLED,
+    panel: { kind: "removed", outcome: { state: "pending", left: [] } },
+  }),
+  "end-keep-offer": base(stoppedByCustomer, {
+    activity: FEED_DONE,
+    hadControl: true,
+    report: REPORT,
+    keep: KEEP_OFFER,
+  }),
+  // A session from the kept program: its report says that the program is
+  // there because the customer chose that.
+  "end-kept-on-purpose": base(stoppedByCustomer, {
+    activity: FEED_DONE,
+    hadControl: true,
+    report: { ...REPORT, keptProgram: { location: KEPT_FOLDER, version: "1.1.0" } },
+    keep: KEEP_INSTALLED,
   }),
   "end-saved": base(stoppedByCustomer, {
     activity: FEED_DONE,

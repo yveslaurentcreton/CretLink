@@ -149,9 +149,13 @@ impl SessionJoiner {
     ///
     /// # Errors
     ///
-    /// [`SessionError::Io`] if the dialer cannot obtain the stream — an
-    /// unreachable relay, a rejected preamble, or a never-matched peer all fail
-    /// closed here and never fabricate a session (REQ-N-008, REQ-N-015).
+    /// The dialer's error if it cannot obtain the stream: [`SessionError::Relay`]
+    /// with its reason for a relay that cannot be reached, is not trusted, does
+    /// not answer or refuses, and [`SessionError::Io`] for a direct dial. Both
+    /// fail closed here and never fabricate a session (REQ-N-008, REQ-N-015).
+    /// A relay that admitted the leg while nobody waits on its ticket is not
+    /// an error of the dial: the session then ends at the stage `rendezvous`
+    /// ([`JoiningDial`](crate::JoiningDial) bounds the wait for the peer).
     ///
     #[allow(clippy::too_many_arguments)]
     pub async fn join_with_reboot_resume_over<D: Dial>(

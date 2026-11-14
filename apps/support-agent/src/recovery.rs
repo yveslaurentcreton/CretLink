@@ -17,6 +17,12 @@
 //! The verb opens no network connection, joins no session and grants no
 //! control.
 //!
+//! The shipped programs know residue that this crate does not: the profile
+//! folders that the application's window left (ST-M009-014). They hand it to
+//! [`run_recover_with`] as an [`OtherResidue`], and it becomes part of the
+//! same report and the same exit code. The development binary has no window
+//! and looks for none.
+//!
 //! A program with administrator rights and a program without them keep their
 //! files in different places, and each covers its own (ST-M006-020; see
 //! [`crate::inventory`]). The report of a run with administrator rights says
@@ -46,6 +52,31 @@ pub struct RecoverRun {
     pub success: bool,
 }
 
+/// Residue of a kind that the program which runs the verb knows and this
+/// crate does not: the profile folders of the application's webview
+/// (ST-M009-014). What it adds is printed and counted like everything else:
+/// kept or unreadable residue is never a success (REQ-N-008).
+pub trait OtherResidue {
+    /// Adds what is there to the inventory, removing nothing: what was found,
+    /// what could not be read, and the kinds that were looked for and are
+    /// empty.
+    fn scan(&self, inventory: &mut Inventory);
+
+    /// Removes what is there, and adds to the report what was found, what
+    /// was removed, what was kept with the reason, and what could not be
+    /// read.
+    fn recover(&self, report: &mut RecoveryReport);
+
+    /// What is on this computer on purpose, one sentence each: the support
+    /// program that a customer chose to keep (ST-M009-017). It is no residue
+    /// and is never listed, counted or removed as such; it is said after the
+    /// report, so that nobody takes it for something a session left behind
+    /// (REQ-F-019).
+    fn on_purpose(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 /// Runs the recovery verb on the platform defaults. Without `remove` it
 /// inspects and lists the CretLink-owned residue, removing nothing; with
 /// `remove` it removes what it can and reports honestly what was kept.
@@ -53,40 +84,83 @@ pub struct RecoverRun {
 /// `cretlink-support-agent`, or a `CretLink-Support*` copy) and names the
 /// follow-up command in the report.
 pub async fn run_recover(program: &str, remove: bool, tickets: &TicketStore) -> RecoverRun {
+    run_recover_with(program, remove, tickets, None).await
+}
+
+/// [`run_recover`] with the residue that only the program which runs the verb
+/// knows, as part of the same report and the same exit code.
+pub async fn run_recover_with(
+    program: &str,
+    remove: bool,
+    tickets: &TicketStore,
+    other: Option<&(dyn OtherResidue + Sync)>,
+) -> RecoverRun {
     let with_administrator_rights = OwnFolder::staging_for_this_process().is_private();
     let run = if remove {
-        let report = crate::inventory::recover(tickets).await;
+        let mut report = crate::inventory::recover(tickets).await;
+        if let Some(other) = other {
+            other.recover(&mut report);
+        }
         RecoverRun {
             text: recovery_report_text(&report),
             success: report.ok(),
         }
     } else {
-        let inventory = crate::inventory::scan(tickets).await;
+        let mut inventory = crate::inventory::scan(tickets).await;
+        if let Some(other) = other {
+            other.scan(&mut inventory);
+        }
         RecoverRun {
             text: inventory_text(program, &inventory),
             success: true,
         }
     };
+    let on_purpose = other.map(OtherResidue::on_purpose).unwrap_or_default();
     RecoverRun {
-        text: with_scope_note(run.text, with_administrator_rights),
+        text: with_scope_note(
+            with_what_is_there_on_purpose(run.text, &on_purpose),
+            program,
+            with_administrator_rights,
+        ),
         success: run.success,
     }
 }
 
-/// What the report of a run with administrator rights does not cover. (A run
-/// without them that cannot see the administrators' folder says so itself,
-/// as something it could not read.)
-const OTHER_KEEPER_NOTE: &str = concat!(
-    "  Note: this covers what CretLink keeps when it runs with administrator rights.\n",
-    "  What it kept while it ran without them lies in the folder of that account;\n",
-    "  run this command there without administrator rights to see or remove it.\n",
-);
+/// A report, with what is on the computer on purpose said after it: not as
+/// residue, and without a word about removing it with this command.
+fn with_what_is_there_on_purpose(mut text: String, on_purpose: &[String]) -> String {
+    for sentence in on_purpose {
+        let _ = writeln!(text, "  Not left behind, but there on purpose: {sentence}");
+    }
+    text
+}
+
+/// What the report of a run with administrator rights does not cover, with
+/// the command that covers it. (A run without them that cannot see the
+/// administrators' folder says so itself, as something it could not read.)
+///
+/// A run with administrator rights removes nothing in a folder that the
+/// environment names (REQ-S-024): the account that approved the rights owns
+/// that environment. So what lies in the account's own folders, also the
+/// webview folders of a window without administrator rights in its
+/// temporary folder and its local application data (ST-M009-014), is left
+/// to a run without them.
+fn other_keeper_note(program: &str) -> String {
+    format!(
+        "  Note: this covers what CretLink keeps when it runs with administrator rights.\n\
+         \x20 What it kept while it ran without them, and the webview folders in the temporary\n\
+         \x20 folder and the local application data of an account, lie in the folders of that\n\
+         \x20 account and are not looked at here. To see or remove them, run in that account\n\
+         \x20 without administrator rights:  {program} recover  or  {}\n",
+        recover_command(program)
+    )
+}
 
 /// A report, with what a run with administrator rights does not cover said
 /// after it.
-fn with_scope_note(mut text: String, with_administrator_rights: bool) -> String {
+fn with_scope_note(mut text: String, program: &str, with_administrator_rights: bool) -> String {
     if with_administrator_rights {
-        text.push_str(OTHER_KEEPER_NOTE);
+        text.push_str(&other_keeper_note(program));
     }
     text
 }
@@ -1195,20 +1269,50 @@ mod tests {
         assert!(needs_administrator(&earlier, false));
     }
 
+    /// A support program that a customer kept is not residue: it is said
+    /// after the report, which stays the report of a clean computer
+    /// (ST-M009-017).
+    #[test]
+    fn what_is_there_on_purpose_is_said_and_is_no_residue() {
+        let clean = inventory_text("cretlink", &Inventory::default());
+        assert_eq!(with_what_is_there_on_purpose(clean.clone(), &[]), clean);
+        let kept = "CretLink Support is installed in C:/Program Files/CretLink Support.".to_owned();
+        let text = with_what_is_there_on_purpose(clean.clone(), std::slice::from_ref(&kept));
+        assert!(text.starts_with(&clean), "{text}");
+        assert!(text.contains("This machine is clean"), "{text}");
+        assert!(
+            text.ends_with(
+                "  Not left behind, but there on purpose: CretLink Support is installed in \
+                 C:/Program Files/CretLink Support.\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("recover --remove"), "{text}");
+    }
+
     #[test]
     fn a_run_with_administrator_rights_says_what_it_does_not_cover() {
         let report = recovery_report_text(&RecoveryReport::default());
-        let with_rights = with_scope_note(report.clone(), true);
+        let with_rights = with_scope_note(report.clone(), "CretLink-Support.exe", true);
         assert!(with_rights.starts_with(&report));
         assert!(
             with_rights.ends_with(
-                "  run this command there without administrator rights to see or remove it.\n"
+                "  without administrator rights:  CretLink-Support.exe recover  or  \
+                 CretLink-Support.exe recover --remove\n"
             ),
             "{with_rights}"
         );
         assert!(with_rights.contains("  Note: this covers what CretLink keeps when it runs"));
+        // The webview folders of the account are named as not covered.
+        assert!(
+            with_rights.contains("the webview folders in the temporary\n  folder"),
+            "{with_rights}"
+        );
         // A run without them covers the folder of its account, and says what
         // it cannot see as something it could not read.
-        assert_eq!(with_scope_note(report.clone(), false), report);
+        assert_eq!(
+            with_scope_note(report.clone(), "CretLink-Support.exe", false),
+            report
+        );
     }
 }

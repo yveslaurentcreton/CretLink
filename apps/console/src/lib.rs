@@ -22,6 +22,9 @@
 //!   each file's chain and seal verified (ST-M009-012);
 //! - [`audit_entries`]: one session's audit entries for the technician's Audit
 //!   tab (ST-M009-008);
+//! - [`files`]: the technician's own file actions — the drive list, the
+//!   removal of a folder with its content, a file sent into a folder — run on
+//!   the session service and recorded in the audit trail (ST-M010-001);
 //! - [`session`]: the plaintext test-harness client ([`SessionClient`] and its
 //!   [`SessionTarget`] MCP adapter) used by tests against the simulator.
 
@@ -30,6 +33,8 @@ pub mod audit;
 pub mod audit_entries;
 pub mod display_name;
 pub mod driver;
+pub mod explorer;
+pub mod files;
 pub mod history;
 pub mod ipc_server;
 pub mod service;
@@ -39,24 +44,27 @@ pub mod state;
 pub use activity::{TechnicianActivity, UNKNOWN_CLIENT_LABEL, client_label};
 pub use audit::{
     AUDIT_CHANNEL_CAPACITY, AuditServiceConfig, CLEANUP_REPORT_ACTION, ManualActivity, PruneReport,
-    SESSION_ENDED_ACTION, SessionAuditStart, TARGET_IDENTITY_ACTION, console_cancel,
-    console_exec_finished, console_exec_refused, console_exec_started, default_audit_dir,
-    open_session_log, prune_audit_dir, report_prune, spawn_audit_service, terminal_closed,
-    terminal_open_started, terminal_opened,
+    SESSION_ENDED_ACTION, SESSION_ROUTE_ACTION, SessionAuditStart, TARGET_IDENTITY_ACTION,
+    console_cancel, console_exec_finished, console_exec_refused, console_exec_started,
+    default_audit_dir, open_session_log, prune_audit_dir, relay_route_entry, report_prune,
+    spawn_audit_service, terminal_closed, terminal_open_started, terminal_opened,
 };
 pub use audit_entries::{AuditActorView, AuditEntryView, session_entries};
 pub use display_name::technician_display_name;
 pub use driver::{DriverError, EventContext, EventOutcome, apply_session_event};
+pub use explorer::{FolderEvent, FolderReport, ListingEnd, MAX_FOLDER_ENTRIES};
+pub use files::TechnicianFiles;
 pub use history::{ActionCounts, Integrity, SessionSummary, list_sessions, read_session};
 pub use ipc_server::{
     AuditEntry, AuditReceiver, ChannelAudit, ClosedRoute, ConsoleRoute, IpcAudit, IpcServer,
     LiveEcho, NoIpcAudit, SHUTDOWN_GRACE,
 };
 pub use service::{
-    ConsoleSessionService, MAX_TERM_CONSUMERS, MAX_TERMINALS, TermAttachment, TermEvent,
+    ConsoleSessionService, MAX_TERM_CONSUMERS, MAX_TERMINALS, ProgressSink, SendToFolder,
+    TermAttachment, TermEvent,
 };
 pub use session::{ExecCollection, ExecRequest, SessionClient, SessionError, SessionTarget};
 pub use state::{
-    ConsoleState, ControlLevel, DiscoveredTarget, DiscoverySource, SessionPhase, StateError,
-    StopReason, TargetId, TechnicianHost,
+    ConsoleState, ControlLevel, DiscoveredTarget, DiscoverySource, RelayRoute, RelayTrust,
+    SessionPhase, StateError, StopReason, TargetId, TechnicianHost,
 };

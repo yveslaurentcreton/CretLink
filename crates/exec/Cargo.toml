@@ -42,10 +42,21 @@ png = "0.18"
 # set); its platform wrappers are gated internally, so this stays portable.
 process-wrap = { version = "9.1", features = ["tokio1"] }
 
+# Off Windows the file store asks the system two things the standard library
+# does not offer: the size and free space of the root file system (`statvfs`,
+# for the drive list) and the flag that refuses to open through a symbolic link
+# (`O_NOFOLLOW`, for the part of a transfer). Both come from nix's safe `fs`
+# API, so the crate needs no unsafe block of its own for them (ST-M010-001).
+# nix is MIT (deny.toml allow set) and already in the graph with this feature
+# through process-wrap, so no package enters the lockfile. Non-Windows agents
+# are for development and tests only.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+
 # Windows-only bindings, confined to `cfg(windows)` so the workspace test matrix
 # (windows, macos, ubuntu) still builds everywhere. windows-rs is MIT OR
 # Apache-2.0 (deny.toml allow set); pinned to the 0.62 line already in the
-# lockfile (see apps/support-agent). Two localized adapters use them:
+# lockfile (see apps/support-agent). Three localized adapters use them:
 #   - ConPTY interactive execution (ADR-0006 Mode B, ST-M003-008): the
 #     pseudo-console, the Job Object that contains the tree (REQ-S-014), the
 #     anonymous pipes bridged to tokio, and CreateProcessW with the
@@ -53,9 +64,26 @@ process-wrap = { version = "9.1", features = ["tokio1"] }
 #   - Piped-mode kill-on-close containment (ST-M006-007): its own Job Object
 #     assigned while the child is suspended, then resumed via the Toolhelp thread
 #     snapshot — so a hard `TerminateProcess` of the agent still reaps the tree.
+#   - The drive list (ST-M010-001): the volume queries behind `FsDrives`, with
+#     the thread's error mode set so that an empty card reader shows no system
+#     dialog (`Win32_System_Diagnostics_Debug`).
+#   - The verified folder behind the removal of a folder with its content and
+#     behind a file sent to a folder (ST-M010-001, `fs/anchor.rs`): the final
+#     path and the identifier of an opened entry and its removal through that
+#     same handle (`Win32_Storage_FileSystem`); the comparison of two paths
+#     without regard to case, as the system compares names
+#     (`Win32_Globalization`); and the two native calls that Win32 has no
+#     equal for: an open of one name relative to an opened folder
+#     (`NtCreateFile`) and a rename inside the folder a file lies in
+#     (`NtSetInformationFile`), with their structures (`Wdk_Foundation`,
+#     `Wdk_Storage_FileSystem`, `Win32_System_IO`). These are features of the
+#     `windows` crate that is in the lockfile already: no package is added.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
+  "Wdk_Foundation",
+  "Wdk_Storage_FileSystem",
   "Win32_Foundation",
+  "Win32_Globalization",
   "Win32_Security",
   # What the system itself names (ST-M006-020): its Windows folder and its
   # system folder, for the folders CretLink keeps for itself and for the shells
@@ -65,9 +93,17 @@ windows = { version = "0.62", features = [
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
+  "Win32_System_Diagnostics_Debug",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_JobObjects",
+  # The program file of this process, held and verified before a customer
+  # keeps the support program (ST-M009-017, `image.rs`): the module of the
+  # program (`Win32_System_LibraryLoader`) and the name of the file that it
+  # is mapped from (`Win32_System_ProcessStatus`). Features of the `windows`
+  # crate that is in the lockfile already: no package is added.
+  "Win32_System_LibraryLoader",
   "Win32_System_Pipes",
+  "Win32_System_ProcessStatus",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   # Interactive-desktop capture and input (ADR-0015, ST-M005-001/002/003).
@@ -80,6 +116,7 @@ windows = { version = "0.62", features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_DataExchange",
+  "Win32_System_IO",
   "Win32_System_Memory",
   "Win32_System_StationsAndDesktops",
   "Win32_System_RemoteDesktop",

@@ -153,15 +153,41 @@ async fn clean_machine_scans_clean_and_asserts_every_kind_empty() {
     assert!(inventory.found.is_empty());
     assert!(inventory.unreadable.is_empty());
 
-    // Every kind is accounted for by an honest empty assertion — none omitted.
-    for kind in ResourceKind::ALL {
+    // Every kind this crate scans is accounted for by an honest empty
+    // assertion — none omitted.
+    let scanned: Vec<ResourceKind> = ResourceKind::ALL
+        .into_iter()
+        .filter(|kind| kind.scanned_here())
+        .collect();
+    for kind in &scanned {
         assert!(
-            inventory.asserted_empty.contains(&kind),
+            inventory.asserted_empty.contains(kind),
             "kind {} is asserted empty on a clean machine",
             kind.label()
         );
     }
-    assert_eq!(inventory.asserted_empty.len(), ResourceKind::ALL.len());
+    assert_eq!(inventory.asserted_empty.len(), scanned.len());
+    // The webview profile is the application's (ST-M009-014), and so is an
+    // unfinished keep of the support program (ST-M009-017): this scan cannot
+    // see their folders, so it says nothing about them rather than "none".
+    // The program that runs the verb adds the kinds.
+    assert_eq!(
+        ResourceKind::ALL.len() - scanned.len(),
+        2,
+        "only the webview profile and an unfinished keep are left to the caller"
+    );
+    assert!(!ResourceKind::WebviewProfile.scanned_here());
+    assert!(!ResourceKind::UnfinishedKeep.scanned_here());
+    assert!(
+        !inventory
+            .asserted_empty
+            .contains(&ResourceKind::UnfinishedKeep)
+    );
+    assert!(
+        !inventory
+            .asserted_empty
+            .contains(&ResourceKind::WebviewProfile)
+    );
 }
 
 #[tokio::test]

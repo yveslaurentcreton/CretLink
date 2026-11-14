@@ -444,7 +444,7 @@ impl HostHandle {
         let attribution = attribution.into();
         let by = &attribution;
         let DownloadRequest { source, dest } = request;
-        let temp = download_temp_path(&dest);
+        let temp = download_part_path(&dest);
 
         // Total + existence from a single stat (never errors on absence).
         let total = match self
@@ -1016,8 +1016,14 @@ async fn publish_temp(mut temp_file: fs::File, temp: &Path, dest: &Path) -> std:
     fs::rename(temp, dest).await
 }
 
-/// The sibling temp path a download streams into before the verified rename.
-fn download_temp_path(dest: &Path) -> PathBuf {
+/// The part beside `dest` that a download streams into before the verified
+/// rename: `dest` with `.cretlink-part` after its name.
+///
+/// A download that was cancelled leaves it there, so that a later download of
+/// the same file can go on from it. A caller that will not resume removes it
+/// by this name (ST-M010-002).
+#[must_use]
+pub fn download_part_path(dest: &Path) -> PathBuf {
     let mut name = dest
         .file_name()
         .map(std::ffi::OsStr::to_os_string)

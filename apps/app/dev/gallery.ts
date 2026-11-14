@@ -41,6 +41,12 @@ if (root && customer) {
     .querySelector('[data-keep="terminal-badge"]')
     ?.append(h("span", { class: "sh-badge" }, "Terminal live"));
   root.replaceChildren(screen);
+  // The explorer's list where its fixture has it scrolled to (ST-M010-002).
+  const list = screen.querySelector<HTMLElement>("#xp-scroll");
+  if (list) {
+    list.scrollTop = fixture.explorer.viewport.top;
+    list.scrollLeft = fixture.explorer.viewport.left;
+  }
 } else if (root) {
   root.replaceChildren(
     h(

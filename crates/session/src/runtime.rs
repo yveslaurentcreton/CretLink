@@ -22,6 +22,17 @@
 //! **closed**: the AEAD record layer rejects any desynchronised read, poisoning
 //! the channel rather than misinterpreting bytes.
 //!
+//! # An answer that cannot be sent (ST-M010-005)
+//!
+//! The secure channel refuses a frame that breaks a bound of the protocol, or
+//! that is larger than one record, before it touches the stream; the channel
+//! is then as it was. The agent's loop tells that refusal from a channel that
+//! is gone (`Unsent`). An answer to a request that is refused this way fails
+//! that one request with the reason (`answer`), and the session goes on: a
+//! folder, a file or a clipboard that somebody filled must not be a way to
+//! end the session. A frame that answers no request — streamed output, a
+//! heartbeat — has no request to fail and ends the session as before.
+//!
 //! # Console output buffering (REQ-N-006)
 //!
 //! The console session task publishes lifecycle and streamed-output
@@ -45,10 +56,10 @@ use cretlink_exec::{
     Admission, Broker, BrokerEvent, CaptureReject, CaptureRequest, FileStore, JobSpec,
 };
 use cretlink_protocol::{
-    B64Bytes, CAP_DESKTOP_V1, CAP_TERM_V1, CleanupTrigger, ControlMessage, DesktopAccess,
-    ErrorCode, ErrorStage, EventKind, JobId, JobOutcome, JobSummary, Message, OpResult, Operation,
-    OutputStream, ProtocolVersion, RequestId, RevokeReason, SessionId, TargetIdentity,
-    canonical_capabilities, limits,
+    B64Bytes, CAP_DESKTOP_V1, CAP_FS_V2, CAP_TERM_V1, CleanupTrigger, ControlMessage,
+    DesktopAccess, ErrorCode, ErrorStage, EventKind, JobId, JobOutcome, JobSummary, Message,
+    OpResult, Operation, OutputStream, ProtocolVersion, RequestId, RevokeReason, SessionId,
+    TargetIdentity, TreeState, canonical_capabilities, limits,
 };
 use cretlink_shared::{Actor, Outcome};
 use cretlink_transport::{Pairing, Role, SecureChannel, SecureChannelError};
@@ -243,6 +254,35 @@ struct ActivityTap {
     /// last reported request, so the in-flight chunks of one refused transfer
     /// yield one item rather than one each.
     refused_steps: HashSet<String>,
+    /// Folder removals that have begun and not ended, keyed by the remote
+    /// path text (ST-M010-001). Bounded by [`MAX_OPEN_REMOVALS`].
+    removing: HashMap<String, Removing>,
+}
+
+/// The most folder removals one session keeps open at once in its activity
+/// bookkeeping (REQ-N-006). A console removes one folder at a time; one that
+/// opened more would have its oldest closed as "result not known".
+const MAX_OPEN_REMOVALS: usize = 64;
+
+/// One folder removal that has begun: its first step removed something and
+/// said that more remains.
+#[derive(Debug)]
+struct Removing {
+    id: u64,
+    attribution: Attribution,
+    operation: String,
+    path: Option<String>,
+    started: Instant,
+}
+
+/// What the agent's answer to one step of a folder removal says about the
+/// removal (ST-M010-001).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemovalStep {
+    /// Where the removal stands after the step.
+    state: TreeState,
+    /// The reason of the first entry the step could not remove.
+    first_failure: Option<ErrorCode>,
 }
 
 /// One file that has started to leave the customer computer.
@@ -453,6 +493,174 @@ impl ActivityTap {
         }
     }
 
+    /// Reports one step of a folder removal, and records the removal in the
+    /// audit trail (ST-M010-001, REQ-F-017, REQ-S-017).
+    ///
+    /// A removal is one item for the customer, however many steps it takes:
+    /// the first step that leaves more to do opens it as in progress (and
+    /// audits `fs_remove_tree_start`), the steps in between are not reported,
+    /// and the step that ends it gives the item its final state (and audits
+    /// `fs_remove_tree`): done only when the folder is gone, cancelled when
+    /// the caller stopped it, failed with the first reason when something
+    /// could not be removed or the step was refused. Never done for a folder
+    /// that is still there (REQ-N-008).
+    #[allow(clippy::too_many_arguments)]
+    fn removal(
+        &mut self,
+        tx: &mpsc::Sender<SessionEvent>,
+        audit: &dyn SessionAudit,
+        attribution: Attribution,
+        operation: String,
+        path: Option<String>,
+        outcome: ActionOutcome,
+        step: Option<RemovalStep>,
+        started: Instant,
+    ) {
+        let key = path.clone().unwrap_or_default();
+        let ended = match (outcome, step) {
+            (ActionOutcome::Succeeded, Some(step)) => match step.state {
+                // More remains and the caller is expected to go on.
+                TreeState::More => {
+                    if !self.removing.contains_key(&key) {
+                        self.begin_removal(tx, audit, key, attribution, operation, path, started);
+                    }
+                    return;
+                }
+                TreeState::Removed => ActionOutcome::Succeeded,
+                TreeState::Stopped => ActionOutcome::Cancelled,
+                TreeState::Incomplete | TreeState::Blocked => ActionOutcome::Failed {
+                    code: step.first_failure.unwrap_or(ErrorCode::DirNotEmpty),
+                },
+            },
+            // An answer that is not a removal step says nothing about the
+            // folder: the result is not known.
+            (ActionOutcome::Succeeded, None) => ActionOutcome::Unknown,
+            (other, _) => other,
+        };
+        audit.record(
+            Actor::Console,
+            "fs_remove_tree",
+            match ended {
+                ActionOutcome::Succeeded => Outcome::Ok,
+                ActionOutcome::Cancelled => Outcome::Cancelled,
+                ActionOutcome::Failed { .. } => Outcome::Failed,
+                ActionOutcome::InProgress | ActionOutcome::Unknown => Outcome::Unknown,
+            },
+        );
+        // The step that ends a removal closes the item its first step opened;
+        // a removal of one step is opened and closed here.
+        let (id, attribution, operation, path, started) = match self.removing.remove(&key) {
+            Some(open) => (
+                open.id,
+                open.attribution,
+                open.operation,
+                open.path,
+                open.started,
+            ),
+            None => (self.mint(), attribution, operation, path, started),
+        };
+        self.settle(path.as_deref());
+        self.emit(
+            tx,
+            SessionEvent::RequestHandled {
+                id,
+                origin: attribution.origin,
+                purpose: attribution.purpose,
+                kind: ActivityKind::FileOperation,
+                operation,
+                path,
+                bytes: None,
+                outcome: ended,
+                duration_ms: Some(elapsed_ms(started)),
+            },
+        );
+    }
+
+    /// Opens the item of a folder removal whose first step left more to do.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_removal(
+        &mut self,
+        tx: &mpsc::Sender<SessionEvent>,
+        audit: &dyn SessionAudit,
+        key: String,
+        attribution: Attribution,
+        operation: String,
+        path: Option<String>,
+        started: Instant,
+    ) {
+        // Keep the bookkeeping bounded: the oldest open removal gives way and
+        // is closed as "result not known", never as done.
+        if self.removing.len() >= MAX_OPEN_REMOVALS
+            && let Some(oldest) = self
+                .removing
+                .iter()
+                .min_by_key(|(_, open)| open.started)
+                .map(|(key, _)| key.clone())
+            && let Some(open) = self.removing.remove(&oldest)
+        {
+            audit.record(Actor::Console, "fs_remove_tree", Outcome::Unknown);
+            self.end_removal(tx, open, ActionOutcome::Unknown);
+        }
+        let id = self.mint();
+        audit.record(Actor::Console, "fs_remove_tree_start", Outcome::Ok);
+        self.emit(
+            tx,
+            SessionEvent::RequestHandled {
+                id,
+                origin: attribution.origin,
+                purpose: attribution.purpose.clone(),
+                kind: ActivityKind::FileOperation,
+                operation: operation.clone(),
+                path: path.clone(),
+                bytes: None,
+                outcome: ActionOutcome::InProgress,
+                duration_ms: None,
+            },
+        );
+        self.removing.insert(
+            key,
+            Removing {
+                id,
+                attribution,
+                operation,
+                path,
+                started,
+            },
+        );
+    }
+
+    /// Gives the item of an open folder removal its final state.
+    fn end_removal(
+        &mut self,
+        tx: &mpsc::Sender<SessionEvent>,
+        open: Removing,
+        outcome: ActionOutcome,
+    ) {
+        self.emit(
+            tx,
+            SessionEvent::RequestHandled {
+                id: open.id,
+                origin: open.attribution.origin,
+                purpose: open.attribution.purpose,
+                kind: ActivityKind::FileOperation,
+                operation: open.operation,
+                path: open.path,
+                bytes: None,
+                outcome,
+                duration_ms: Some(elapsed_ms(open.started)),
+            },
+        );
+    }
+
+    /// Records, when the session ends, every folder removal that had begun
+    /// and never ended: its result is not known (REQ-N-008). The customer's
+    /// own feed marks the item as ended with the session.
+    fn close_removals(&mut self, audit: &dyn SessionAudit) {
+        for _ in self.removing.drain() {
+            audit.record(Actor::Console, "fs_remove_tree", Outcome::Unknown);
+        }
+    }
+
     fn end_sending(
         &mut self,
         tx: &mpsc::Sender<SessionEvent>,
@@ -572,18 +780,77 @@ async fn recv_frame<T: AsyncRead + AsyncWrite + Unpin>(channel: &mut SecureChann
     }
 }
 
+/// Why a frame was not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unsent {
+    /// The frame itself cannot be sent: it is larger than one record of the
+    /// secure channel, or it breaks a bound of the protocol. It was refused
+    /// before anything reached the wire, so the channel is as it was and the
+    /// session goes on.
+    Refused(Refusal),
+    /// The channel failed. It is closed for good.
+    Lost,
+}
+
+/// What is wrong with a frame that cannot be sent, in the wire vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Refusal {
+    /// The category: [`ErrorCode::OversizedMessage`] for a frame that is too
+    /// large, else the category of the bound it breaks.
+    code: ErrorCode,
+    /// The stage that refused the frame.
+    stage: ErrorStage,
+}
+
+impl Unsent {
+    /// Tells apart why a send on the secure channel failed. The channel checks
+    /// a frame against the bounds of the protocol and the size of a record
+    /// before it touches the stream, and such a refusal leaves it unpoisoned;
+    /// every other failure poisons it for good.
+    fn of(error: &SecureChannelError, poisoned: bool) -> Self {
+        if poisoned {
+            return Self::Lost;
+        }
+        match error {
+            SecureChannelError::Oversized { .. } => Self::Refused(Refusal {
+                code: ErrorCode::OversizedMessage,
+                stage: ErrorStage::Transport,
+            }),
+            SecureChannelError::Decode(protocol) => {
+                let code = protocol.code();
+                let stage = if code == ErrorCode::OversizedMessage {
+                    ErrorStage::Transport
+                } else {
+                    ErrorStage::Validation
+                };
+                Self::Refused(Refusal { code, stage })
+            }
+            // A failure on the stream always poisons the channel; one that
+            // did not is still not a refusal of the frame.
+            SecureChannelError::Io(_)
+            | SecureChannelError::Noise(_)
+            | SecureChannelError::Eof
+            | SecureChannelError::Poisoned => Self::Lost,
+        }
+    }
+}
+
 /// Where the agent writes one outbound frame: the secure channel itself, or a
 /// [`ReplyTap`] that also notes how a request was answered (ST-M009-007). Every
 /// agent reply helper is generic over it, so the request handler reports each
 /// request's honest outcome without threading it through every branch.
 trait FrameSink {
-    /// Sends one frame, mapping any channel fault to `()`.
-    async fn send_frame(&mut self, message: &Message) -> Result<(), ()>;
+    /// Sends one frame, and says whether a frame that was not sent was
+    /// refused as it is or lost with the channel.
+    async fn send_frame(&mut self, message: &Message) -> Result<(), Unsent>;
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> FrameSink for SecureChannel<T> {
-    async fn send_frame(&mut self, message: &Message) -> Result<(), ()> {
-        self.send(message).await.map_err(|_| ())
+    async fn send_frame(&mut self, message: &Message) -> Result<(), Unsent> {
+        match self.send(message).await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(Unsent::of(&error, self.is_poisoned())),
+        }
     }
 }
 
@@ -593,7 +860,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> FrameSink for SecureChannel<T> {
 /// the real result beside the stated purpose (REQ-F-026, REQ-N-008). Other
 /// frames (a desktop-activity event) pass through unrecorded. The answer is
 /// noted before the send, because the operation already ran even if the reply
-/// then fails to reach the console.
+/// then fails to reach the console. An answer that could not be sent as it is
+/// (ST-M010-005) is followed by the `Error` that fails the request, and that
+/// is then the answer noted: it is what the console was told.
 struct ReplyTap<'a, C> {
     inner: &'a mut C,
     request: RequestId,
@@ -601,6 +870,10 @@ struct ReplyTap<'a, C> {
     /// What a successful file read answered, so a file leaving the computer is
     /// reported with its byte count (ST-M009-011).
     read: Option<ReadData>,
+    /// What a step of a folder removal answered, so the removal is reported
+    /// by where it stands and not by the mere fact that the step was answered
+    /// (ST-M010-001).
+    removal: Option<RemovalStep>,
 }
 
 impl<'a, C: FrameSink> ReplyTap<'a, C> {
@@ -610,6 +883,7 @@ impl<'a, C: FrameSink> ReplyTap<'a, C> {
             request,
             outcome: None,
             read: None,
+            removal: None,
         }
     }
 
@@ -620,7 +894,7 @@ impl<'a, C: FrameSink> ReplyTap<'a, C> {
 }
 
 impl<C: FrameSink> FrameSink for ReplyTap<'_, C> {
-    async fn send_frame(&mut self, message: &Message) -> Result<(), ()> {
+    async fn send_frame(&mut self, message: &Message) -> Result<(), Unsent> {
         match message {
             Message::Response { id, result, .. } if *id == self.request => {
                 self.outcome = Some(ActionOutcome::Succeeded);
@@ -636,11 +910,21 @@ impl<C: FrameSink> FrameSink for ReplyTap<'_, C> {
                         file_len: *file_len,
                     });
                 }
+                if let OpResult::TreeRemoval { state, failed, .. } = result {
+                    self.removal = Some(RemovalStep {
+                        state: *state,
+                        first_failure: failed.first().map(|failure| failure.code),
+                    });
+                }
             }
             Message::Error {
                 id: Some(id), code, ..
             } if *id == self.request => {
                 self.outcome = Some(ActionOutcome::Failed { code: *code });
+                // What a response that was not sent said is not what the
+                // console was told.
+                self.read = None;
+                self.removal = None;
             }
             _ => {}
         }
@@ -648,10 +932,88 @@ impl<C: FrameSink> FrameSink for ReplyTap<'_, C> {
     }
 }
 
-/// Sends one already-built message, mapping any channel fault to `()` (the caller
-/// treats a failed send as a terminal disconnect).
-async fn send_message<C: FrameSink>(channel: &mut C, message: Message) -> Result<(), ()> {
+/// Sends one already-built message. A caller that sends anything but an answer
+/// to a request treats every failure as a terminal disconnect; an answer goes
+/// through [`answer`], which tells a refused frame from a lost channel.
+async fn send_message<C: FrameSink>(channel: &mut C, message: Message) -> Result<(), Unsent> {
     channel.send_frame(&message).await
+}
+
+/// What became of the answer to a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// The answer was sent.
+    Sent,
+    /// The answer could not be sent as it is, and the request was failed with
+    /// the reason instead. The session goes on.
+    Failed,
+    /// The channel is gone.
+    Lost,
+}
+
+impl Answer {
+    /// What the agent's active loop does next.
+    fn step(self) -> AgentStep {
+        match self {
+            Self::Sent | Self::Failed => AgentStep::Continue,
+            Self::Lost => AgentStep::Disconnected,
+        }
+    }
+}
+
+/// What the console is told when the answer to its request is larger than one
+/// record of the secure channel.
+const ANSWER_TOO_LARGE: &str = "the answer is too large to send: it does not fit one message of \
+                                the session. The operation itself ran.";
+
+/// What the console is told when the answer to its request breaks a bound of
+/// the protocol.
+const ANSWER_OUT_OF_BOUNDS: &str = "the answer could not be sent: it breaks a bound of the \
+                                    protocol. The operation itself ran.";
+
+/// Answers the request `id` with `result`.
+///
+/// An answer that cannot be sent never ends the session (ST-M010-005,
+/// REQ-N-008). One that is larger than one record of the secure channel, or
+/// that breaks a bound of the protocol, is refused before anything of it
+/// reaches the wire: the request is then failed with that reason, in fixed
+/// words that hold nothing of the answer (REQ-N-015), and the session goes
+/// on. Only a channel that is gone is a disconnect.
+async fn answer<C: FrameSink>(
+    channel: &mut C,
+    session: SessionId,
+    id: RequestId,
+    result: OpResult,
+) -> Answer {
+    let response = Message::Response {
+        id,
+        session,
+        result,
+    };
+    let refusal = match send_message(channel, response).await {
+        Ok(()) => return Answer::Sent,
+        Err(Unsent::Lost) => return Answer::Lost,
+        Err(Unsent::Refused(refusal)) => refusal,
+    };
+    let reason = if refusal.code == ErrorCode::OversizedMessage {
+        ANSWER_TOO_LARGE
+    } else {
+        ANSWER_OUT_OF_BOUNDS
+    };
+    match send_error(
+        channel,
+        Some(id),
+        Some(session),
+        refusal.code,
+        reason,
+        refusal.stage,
+    )
+    .await
+    {
+        Err(Unsent::Lost) => Answer::Lost,
+        // The error is a few fixed words: nothing refuses it.
+        Ok(()) | Err(Unsent::Refused(_)) => Answer::Failed,
+    }
 }
 
 /// Sends a secret-free wire `Error` for a rejected request (bad session, unknown
@@ -664,7 +1026,7 @@ async fn send_error<C: FrameSink>(
     code: ErrorCode,
     message: &str,
     stage: ErrorStage,
-) -> Result<(), ()> {
+) -> Result<(), Unsent> {
     send_message(
         channel,
         Message::Error {
@@ -692,6 +1054,12 @@ fn outcome_to_audit(outcome: JobOutcome) -> Outcome {
 
 /// Fails every outstanding console request with a fresh error, so a torn-down
 /// session never leaves a caller awaiting a reply that cannot come (fail closed).
+///
+/// Every caller first takes control away from the session
+/// (`set_control_active(false)`): a caller whose request fails here may ask
+/// again at once, before the teardown has run, and that request must be
+/// refused as "not active", never sent into a session that is ending and
+/// then lost with it.
 fn fail_pending(
     pending: &mut HashMap<RequestId, oneshot::Sender<Result<OpResult, SessionError>>>,
     make: impl Fn() -> SessionError,
@@ -808,7 +1176,7 @@ fn finish_with_report<T: AsyncRead + AsyncWrite + Unpin>(
     // Explicit drop: releasing the `SecureChannel` invalidates the Noise
     // session keys and closes the stream. The session is single-use.
     drop(channel);
-    let control_granted = shared.control_active();
+    let control_granted = shared.control_granted();
     shared.set_control_active(false);
     let ended_by = ended_by(ending);
     shared.set_ended_by(ended_by);
@@ -865,6 +1233,7 @@ async fn agent_active_finish<T: AsyncRead + AsyncWrite + Unpin>(
     actor: Actor,
     ending: Ending,
 ) {
+    activity.close_removals(audit);
     let fs = sweep_staging_on_exit(file_store, audit).await;
     let report = teardown_report(ending, fs);
     // A lost or faulted channel cannot carry the report; the console then
@@ -933,10 +1302,16 @@ async fn sweep_staging_on_exit(file_store: &FileStore, audit: &dyn SessionAudit)
         }
         Err(error) => {
             audit.record(Actor::System, "fs_cleanup", Outcome::Failed);
-            FsCleanup {
-                ok: false,
-                notes: vec![format!("{TEARDOWN_FAILED_NOTE_PREFIX}{}", error.message)],
-            }
+            // A cleanup that fails as a whole has removed the parts of
+            // unfinished transfers to a folder first. The ones it could not
+            // remove are named beside its failure.
+            let mut notes = vec![format!("{TEARDOWN_FAILED_NOTE_PREFIX}{}", error.message)];
+            notes.extend(file_store.unfinished_parts().into_iter().map(|part| {
+                format!(
+                    "{RESIDUAL_NOTE_PREFIX}{part} (the part of an unfinished transfer; not removed)"
+                )
+            }));
+            FsCleanup { ok: false, notes }
         }
     }
 }
@@ -952,6 +1327,29 @@ struct EarlyFailure {
     action: &'static str,
     /// The audit outcome.
     outcome: Outcome,
+}
+
+/// How a failed pairing is reported. Over a relay, a stream that ends before
+/// the peer was heard is no failed handshake: nobody joined the rendezvous
+/// ([`crate::dial::rendezvous_lapsed`], ST-M007-012). It gets a stage of its
+/// own, so that a front end says "nobody is waiting on this code" instead of a
+/// pairing failure of unknown cause (REQ-N-015).
+fn pairing_failure(error: &cretlink_transport::PairingError) -> EarlyFailure {
+    if crate::dial::rendezvous_lapsed(error) {
+        EarlyFailure {
+            stage: "rendezvous",
+            message: "nobody joined the rendezvous on the relay",
+            action: "error",
+            outcome: Outcome::Timeout,
+        }
+    } else {
+        EarlyFailure {
+            stage: "pairing",
+            message: "secure pairing failed",
+            action: "error",
+            outcome: Outcome::Failed,
+        }
+    }
 }
 
 /// Locally revokes the session: sends the `Revoke`, then keeps the connection
@@ -1372,18 +1770,13 @@ pub(crate) async fn host_task_over_stream<S>(
             shared.set_approval_code(paired.approval_code);
             paired.channel
         }
-        Ok(Err(_)) => {
+        Ok(Err(error)) => {
             return fail_before_channel(
                 &shared,
                 &tx,
                 audit,
                 Actor::Console,
-                EarlyFailure {
-                    stage: "pairing",
-                    message: "secure pairing failed",
-                    action: "error",
-                    outcome: Outcome::Failed,
-                },
+                pairing_failure(&error),
             );
         }
         Err(_elapsed) => {
@@ -1740,6 +2133,7 @@ async fn host_active<T: AsyncRead + AsyncWrite + Unpin>(
             biased;
             cmd = revoke_rx.recv() => {
                 let reason = cmd.unwrap_or(RevokeReason::TechnicianRequested);
+                shared.set_control_active(false);
                 fail_pending(&mut pending, || SessionError::RevokedLocally);
                 finish_running_unknown(&running, tx);
                 return finish_local_revoke(channel, session, reason, shared, tx, audit, Actor::Console).await;
@@ -1791,6 +2185,7 @@ async fn host_active<T: AsyncRead + AsyncWrite + Unpin>(
                     }
                     Err(_) => {
                         let _ = command.reply.send(Err(SessionError::Disconnected));
+                        shared.set_control_active(false);
                         fail_pending(&mut pending, || SessionError::Disconnected);
                         finish_running_unknown(&running, tx);
                         return finish(channel, shared, tx, audit, Actor::Console, Ending::ActiveDisconnect);
@@ -1848,12 +2243,14 @@ async fn host_active<T: AsyncRead + AsyncWrite + Unpin>(
                 Frame::Message(Message::Control { control: ControlMessage::Heartbeat { seq }, .. }) => {
                     shared.record_heartbeat();
                     if send_control(&mut channel, session, ControlMessage::Heartbeat { seq }).await.is_err() {
+                        shared.set_control_active(false);
                         fail_pending(&mut pending, || SessionError::Disconnected);
                         finish_running_unknown(&running, tx);
                         return finish(channel, shared, tx, audit, Actor::Console, Ending::ActiveDisconnect);
                     }
                 }
                 Frame::Message(Message::Control { control: ControlMessage::Revoke { reason }, .. }) => {
+                    shared.set_control_active(false);
                     fail_pending(&mut pending, || SessionError::RevokedByPeer);
                     finish_running_unknown(&running, tx);
                     return finish(channel, shared, tx, audit, Actor::Agent, Ending::PeerRevoke(reason));
@@ -1899,16 +2296,19 @@ async fn host_active<T: AsyncRead + AsyncWrite + Unpin>(
                 // Any other message (a stray Request, consent control, Hello) is a
                 // protocol violation on the console side and fails closed.
                 Frame::Message(_) => {
+                    shared.set_control_active(false);
                     fail_pending(&mut pending, || SessionError::Protocol("active".to_string()));
                     finish_running_unknown(&running, tx);
                     return finish(channel, shared, tx, audit, Actor::Console, Ending::Protocol("active"));
                 }
                 Frame::Disconnected => {
+                    shared.set_control_active(false);
                     fail_pending(&mut pending, || SessionError::Disconnected);
                     finish_running_unknown(&running, tx);
                     return finish(channel, shared, tx, audit, Actor::Console, Ending::ActiveDisconnect);
                 }
                 Frame::ChannelFault => {
+                    shared.set_control_active(false);
                     fail_pending(&mut pending, || SessionError::Disconnected);
                     finish_running_unknown(&running, tx);
                     return finish(channel, shared, tx, audit, Actor::Console, Ending::ChannelFault("active"));
@@ -1960,6 +2360,12 @@ pub(crate) async fn join_task<S>(
     // operation with `Unsupported` (REQ-N-012, REQ-S-009, ST-M005-001).
     let desktop_enabled = capabilities.iter().any(|c| c == CAP_DESKTOP_V1);
 
+    // Whether this agent advertises the explorer file operations (the drive
+    // list and the removal of a folder with its content, ST-M010-001).
+    // Enforced the same way: both are answered `Unsupported`, before anything
+    // is listed or removed, unless CAP_FS_V2 is advertised (REQ-N-012).
+    let fs_v2_enabled = capabilities.iter().any(|c| c == CAP_FS_V2);
+
     // Prologue binds the version-canonical set (see the responder side in
     // `host_task`): both peers must hash an identical set or the downgrade
     // tripwire fires on every honest asymmetric pair. The agent's served
@@ -2003,19 +2409,8 @@ pub(crate) async fn join_task<S>(
             }
             (paired.channel, paired.handshake_hash)
         }
-        Ok(Err(_)) => {
-            return fail_before_channel(
-                &shared,
-                &tx,
-                audit,
-                Actor::Agent,
-                EarlyFailure {
-                    stage: "pairing",
-                    message: "secure pairing failed",
-                    action: "error",
-                    outcome: Outcome::Failed,
-                },
-            );
+        Ok(Err(error)) => {
+            return fail_before_channel(&shared, &tx, audit, Actor::Agent, pairing_failure(&error));
         }
         Err(_elapsed) => {
             return fail_before_channel(
@@ -2116,7 +2511,7 @@ pub(crate) async fn join_task<S>(
                 emit(&tx, SessionEvent::Active);
                 audit.record(Actor::Agent, "consent_granted", Outcome::Ok);
                 let sysinfo = SystemInfoSource { identity: identity.clone(), reboot_probe };
-                join_active(channel, session, &sysinfo, terminal_enabled, desktop_enabled, &handshake_hash, armer.as_ref(), &shared, &tx, &mut revoke_rx, &mut arm_rx, audit).await;
+                join_active(channel, session, &sysinfo, terminal_enabled, desktop_enabled, fs_v2_enabled, &handshake_hash, armer.as_ref(), &shared, &tx, &mut revoke_rx, &mut arm_rx, audit).await;
             }
             Some(ConsentDecision::Deny(reason)) => {
                 let _ = send_control(&mut channel, session, ControlMessage::ConsentDenied { reason }).await;
@@ -2188,6 +2583,7 @@ async fn join_active<T: AsyncRead + AsyncWrite + Unpin>(
     sysinfo: &SystemInfoSource,
     terminal_enabled: bool,
     desktop_enabled: bool,
+    fs_v2_enabled: bool,
     handshake_hash: &[u8; 32],
     armer: &dyn RebootResumeArmer,
     shared: &Shared,
@@ -2261,7 +2657,7 @@ async fn join_active<T: AsyncRead + AsyncWrite + Unpin>(
             frame = recv_frame(&mut channel) => {
                 let step = match frame {
                     Frame::Message(message) => {
-                        handle_agent_frame(&mut channel, session, &broker, &file_store, &desktop, &mut capture_governor, &mut input_governor, sysinfo, terminal_enabled, desktop_enabled, shared, message, tx, &mut activity, audit).await
+                        handle_agent_frame(&mut channel, session, &broker, &file_store, &desktop, &mut capture_governor, &mut input_governor, sysinfo, terminal_enabled, desktop_enabled, fs_v2_enabled, shared, message, tx, &mut activity, audit).await
                     }
                     Frame::Disconnected => AgentStep::Disconnected,
                     Frame::ChannelFault => {
@@ -2392,6 +2788,10 @@ async fn handle_arm_command<T: AsyncRead + AsyncWrite + Unpin>(
 /// single encrypted record; a job's terminal report becomes a `JobExited` event,
 /// is surfaced locally as [`SessionEvent::ExecFinished`] (so the customer sees
 /// the outcome — visible activity, REQ-F-017/S-002), and audited honestly.
+///
+/// An event answers no request, so there is none to fail: an event that is
+/// not sent, for whatever reason, ends the session as a disconnect. Output
+/// that was dropped unmarked would read as complete (REQ-N-008).
 async fn forward_broker_event<T: AsyncRead + AsyncWrite + Unpin>(
     channel: &mut SecureChannel<T>,
     session: SessionId,
@@ -2415,7 +2815,8 @@ async fn forward_broker_event<T: AsyncRead + AsyncWrite + Unpin>(
                         },
                     },
                 )
-                .await?;
+                .await
+                .map_err(|_| ())?;
             }
             Ok(())
         }
@@ -2434,7 +2835,8 @@ async fn forward_broker_event<T: AsyncRead + AsyncWrite + Unpin>(
                     },
                 },
             )
-            .await;
+            .await
+            .map_err(|_| ());
             activity.emit_job(
                 tx,
                 SessionEvent::ExecFinished {
@@ -2496,6 +2898,7 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
     sysinfo: &SystemInfoSource,
     terminal_enabled: bool,
     desktop_enabled: bool,
+    fs_v2_enabled: bool,
     shared: &Shared,
     message: Message,
     tx: &mpsc::Sender<SessionEvent>,
@@ -2545,6 +2948,9 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                 _ => None,
             };
             let is_exec = matches!(op, Operation::Exec { .. });
+            // A step of a folder removal this agent serves. One it does not
+            // serve is refused like any other request and reported as such.
+            let is_removal = fs_v2_enabled && matches!(op, Operation::RemoveTree { .. });
             let started = Instant::now();
             let attribution = Attribution::new(origin, purpose);
             let mut tap = ReplyTap::new(channel, id);
@@ -2559,6 +2965,7 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
                 sysinfo,
                 terminal_enabled,
                 desktop_enabled,
+                fs_v2_enabled,
                 id,
                 attribution.clone(),
                 op,
@@ -2569,7 +2976,21 @@ async fn handle_agent_frame<T: AsyncRead + AsyncWrite + Unpin>(
             .await;
             let outcome = tap.outcome();
             let read = tap.read;
-            if let Some(offset) = read_offset {
+            let removal = tap.removal;
+            if is_removal {
+                // A folder removal: one item from its first step to its last,
+                // with the state the folder is really in (ST-M010-001).
+                activity.removal(
+                    tx,
+                    audit,
+                    attribution,
+                    operation,
+                    path,
+                    outcome,
+                    removal,
+                    started,
+                );
+            } else if let Some(offset) = read_offset {
                 // A file read: reported when the file starts to leave the
                 // computer and again when sending ends (ST-M009-011).
                 activity.read(
@@ -2711,6 +3132,7 @@ async fn handle_agent_request<C: FrameSink>(
     sysinfo: &SystemInfoSource,
     terminal_enabled: bool,
     desktop_enabled: bool,
+    fs_v2_enabled: bool,
     id: RequestId,
     attribution: Attribution,
     op: Operation,
@@ -2743,18 +3165,18 @@ async fn handle_agent_request<C: FrameSink>(
                     // received, so relative-path semantics are unambiguous on
                     // the console/AI side (ST-M003-003, REQ-F-009).
                     let working_dir = started.working_dir.to_string_lossy().into_owned();
-                    if send_message(
+                    let answered = answer(
                         channel,
-                        Message::Response {
-                            id,
-                            session,
-                            result: OpResult::ExecStarted { job, working_dir },
-                        },
+                        session,
+                        id,
+                        OpResult::ExecStarted { job, working_dir },
                     )
-                    .await
-                    .is_err()
-                    {
-                        return AgentStep::Disconnected;
+                    .await;
+                    if answered != Answer::Sent {
+                        // The caller never learned of this job: nobody could
+                        // read what it writes or stop it, so it is ended.
+                        let _ = broker.cancel(started.job);
+                        return answered.step();
                     }
                     // Visible activity: the customer sees exactly what is run
                     // (REQ-F-017, REQ-S-002), and the start is audited.
@@ -2815,20 +3237,9 @@ async fn handle_agent_request<C: FrameSink>(
                     running: summary.running,
                 })
                 .collect();
-            if send_message(
-                channel,
-                Message::Response {
-                    id,
-                    session,
-                    result: OpResult::Jobs { jobs },
-                },
-            )
-            .await
-            .is_err()
-            {
-                return AgentStep::Disconnected;
-            }
-            AgentStep::Continue
+            answer(channel, session, id, OpResult::Jobs { jobs })
+                .await
+                .step()
         }
         // --- Interactive terminal (ADR-0013, ST-M003-009, CAP_TERM_V1) ---
         // A terminal is a job: it spawns an interactive (ConPTY) job and reuses
@@ -2888,20 +3299,13 @@ async fn handle_agent_request<C: FrameSink>(
                     // ST-M003-006). The console stamps Origin::Terminal on the
                     // request.
                     audit.record(Actor::Terminal, "term_open", Outcome::Ok);
-                    if send_message(
-                        channel,
-                        Message::Response {
-                            id,
-                            session,
-                            result: OpResult::TermOpened { job },
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return AgentStep::Disconnected;
+                    let answered = answer(channel, session, id, OpResult::TermOpened { job }).await;
+                    if answered != Answer::Sent {
+                        // As for a command: a terminal nobody learned of is
+                        // ended.
+                        let _ = broker.cancel(started.job);
                     }
-                    AgentStep::Continue
+                    answered.step()
                 }
                 // Off Windows there is no pseudo-console backend: honest
                 // Unsupported, never a silently degraded piped job (REQ-N-008).
@@ -3126,23 +3530,18 @@ async fn handle_agent_request<C: FrameSink>(
                         }
                         image_opt => {
                             let image = image_opt.map(B64Bytes::from);
-                            if send_message(
+                            let answered = answer(
                                 channel,
-                                Message::Response {
-                                    id,
-                                    session,
-                                    result: OpResult::DesktopFrame {
-                                        meta: frame.meta,
-                                        image,
-                                        staged: None,
-                                    },
+                                session,
+                                id,
+                                OpResult::DesktopFrame {
+                                    meta: frame.meta,
+                                    image,
+                                    staged: None,
                                 },
                             )
-                            .await
-                            .is_err()
-                            {
-                                AgentStep::Disconnected
-                            } else {
+                            .await;
+                            if answered == Answer::Sent {
                                 // A frame reached the console: screen observation
                                 // is active, signalled so both surfaces reflect it
                                 // (ST-M005-005). The class is all that crosses —
@@ -3154,8 +3553,8 @@ async fn handle_agent_request<C: FrameSink>(
                                     DesktopAccess::Observe,
                                 )
                                 .await;
-                                AgentStep::Continue
                             }
+                            answered.step()
                         }
                     }
                 }
@@ -3269,20 +3668,14 @@ async fn handle_agent_request<C: FrameSink>(
                     // (ST-M005-005). Emitted before the reply, so the state is
                     // recorded even if the response never lands.
                     signal_desktop_activity(channel, session, tx, DesktopAccess::Observe).await;
-                    if send_message(
+                    answer(
                         channel,
-                        Message::Response {
-                            id,
-                            session,
-                            result: OpResult::ClipboardContents { text: Some(text) },
-                        },
+                        session,
+                        id,
+                        OpResult::ClipboardContents { text: Some(text) },
                     )
                     .await
-                    .is_err()
-                    {
-                        return AgentStep::Disconnected;
-                    }
-                    AgentStep::Continue
+                    .step()
                 }
                 Err(err) => desktop_backend_error(channel, id, session, &err).await,
             }
@@ -3306,23 +3699,17 @@ async fn handle_agent_request<C: FrameSink>(
         // signal observed" (documented best-effort).
         Operation::SystemInfo {} => {
             let reboot_pending = (sysinfo.reboot_probe)();
-            if send_message(
+            answer(
                 channel,
-                Message::Response {
-                    id,
-                    session,
-                    result: OpResult::SystemInfo {
-                        target: sysinfo.identity.clone(),
-                        reboot_pending,
-                    },
+                session,
+                id,
+                OpResult::SystemInfo {
+                    target: sysinfo.identity.clone(),
+                    reboot_pending,
                 },
             )
             .await
-            .is_err()
-            {
-                return AgentStep::Disconnected;
-            }
-            AgentStep::Continue
+            .step()
         }
         // File operations (ADR-0012, CAP_FS_V1) run against a real filesystem at
         // the agent's privilege via the session file store. Mutating operations
@@ -3340,27 +3727,33 @@ async fn handle_agent_request<C: FrameSink>(
         | Operation::FsDelete { .. }
         | Operation::RemoveDir { .. }
         | Operation::ListStaged {}
-        | Operation::StagingCleanup { .. } => {
+        | Operation::StagingCleanup { .. }
+        | Operation::FsDrives {}
+        | Operation::RemoveTree { .. } => {
+            // The drive list and the removal of a folder with its content
+            // (ST-M010-001) are served only by an agent that advertises
+            // CAP_FS_V2: a peer that never saw the capability is answered
+            // `Unsupported` before anything is listed or removed (REQ-N-012).
+            if !fs_v2_enabled && matches!(op, Operation::FsDrives {} | Operation::RemoveTree { .. })
+            {
+                let _ = send_error(
+                    channel,
+                    Some(id),
+                    Some(session),
+                    ErrorCode::Unsupported,
+                    "explorer file capability (fs.v2) is not advertised by this agent",
+                    ErrorStage::Execution,
+                )
+                .await;
+                return AgentStep::Continue;
+            }
             let audit_action = fs_audit_action(&op);
             match file_store.perform(op).await {
                 Ok(result) => {
                     if let Some(action) = audit_action {
                         audit.record(Actor::Console, action, Outcome::Ok);
                     }
-                    if send_message(
-                        channel,
-                        Message::Response {
-                            id,
-                            session,
-                            result,
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return AgentStep::Disconnected;
-                    }
-                    AgentStep::Continue
+                    answer(channel, session, id, result).await.step()
                 }
                 Err(fs_err) => {
                     if let Some(action) = audit_action {
@@ -3386,6 +3779,11 @@ async fn handle_agent_request<C: FrameSink>(
 /// read-only inspection. Only operations with a visible filesystem side effect
 /// (or a staging purge) are audited, mirroring how command starts — not stdin
 /// writes — are recorded on the exec path.
+///
+/// A folder removal ([`Operation::RemoveTree`]) is not in this table: it takes
+/// several requests, and one answered request says nothing about the folder.
+/// It is audited as a whole, by where it ends, in [`ActivityTap::removal`]
+/// (`fs_remove_tree_start` when it begins, `fs_remove_tree` when it ends).
 fn fs_audit_action(op: &Operation) -> Option<&'static str> {
     match op {
         Operation::CreateDir { .. } => Some("fs_create_dir"),
@@ -3398,23 +3796,9 @@ fn fs_audit_action(op: &Operation) -> Option<&'static str> {
     }
 }
 
-/// Sends a payload-free `Ack` response, mapping a failed send to a disconnect.
+/// Sends a payload-free `Ack` response, mapping a lost channel to a disconnect.
 async fn reply_ack<C: FrameSink>(channel: &mut C, session: SessionId, id: RequestId) -> AgentStep {
-    if send_message(
-        channel,
-        Message::Response {
-            id,
-            session,
-            result: OpResult::Ack {},
-        },
-    )
-    .await
-    .is_err()
-    {
-        AgentStep::Disconnected
-    } else {
-        AgentStep::Continue
-    }
+    answer(channel, session, id, OpResult::Ack {}).await.step()
 }
 
 /// Refuses a desktop operation the agent did not advertise support for.
@@ -3532,6 +3916,7 @@ async fn teardown_agent_revoke<T: AsyncRead + AsyncWrite + Unpin>(
     // Sweep and report before the `Revoke`, so the console still reads the
     // report on its way out (protocol minor 11, ST-M009-012).
     let ending = Ending::LocalRevoke(reason);
+    activity.close_removals(audit);
     let fs = sweep_staging_on_exit(file_store, audit).await;
     let report = teardown_report(ending, fs);
     send_cleanup_report(&mut channel, session, &report).await;
@@ -3685,6 +4070,489 @@ mod tests {
         fn record(&self, _actor: Actor, action: &'static str, outcome: Outcome) {
             self.records.lock().unwrap().push((action, outcome));
         }
+    }
+
+    /// One answered step of a folder removal, as the reply tap notes it.
+    fn step(state: TreeState, first_failure: Option<ErrorCode>) -> Option<RemovalStep> {
+        Some(RemovalStep {
+            state,
+            first_failure,
+        })
+    }
+
+    /// Reports one removal step on `path` the way the request handler does.
+    fn report_step(
+        tap: &mut ActivityTap,
+        tx: &mpsc::Sender<SessionEvent>,
+        audit: &RecordingAudit,
+        path: &str,
+        outcome: ActionOutcome,
+        step: Option<RemovalStep>,
+    ) {
+        tap.removal(
+            tx,
+            audit,
+            Attribution::default(),
+            format!("delete the folder {path} and everything in it"),
+            Some(path.to_owned()),
+            outcome,
+            step,
+            Instant::now(),
+        );
+    }
+
+    /// The `(id, outcome)` of every activity item delivered so far.
+    fn handled(rx: &mut mpsc::Receiver<SessionEvent>) -> Vec<(u64, ActionOutcome)> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let SessionEvent::RequestHandled { id, outcome, .. } = event {
+                out.push((id, outcome));
+            }
+        }
+        out
+    }
+
+    // A folder removal is one item however many steps it takes, and it ends
+    // in the state the folder is really in: done only when the folder is gone,
+    // failed with the first reason when something was left, cancelled when the
+    // caller stopped it (ST-M010-001, REQ-N-008). The audit trail records its
+    // start once and its end once.
+    #[tokio::test]
+    async fn a_folder_removal_is_one_item_that_ends_in_its_honest_state() {
+        for (last, ended, audited) in [
+            (
+                step(TreeState::Removed, None),
+                ActionOutcome::Succeeded,
+                Outcome::Ok,
+            ),
+            (
+                step(TreeState::Incomplete, Some(ErrorCode::FileInUse)),
+                ActionOutcome::Failed {
+                    code: ErrorCode::FileInUse,
+                },
+                Outcome::Failed,
+            ),
+            (
+                step(TreeState::Blocked, Some(ErrorCode::AccessDenied)),
+                ActionOutcome::Failed {
+                    code: ErrorCode::AccessDenied,
+                },
+                Outcome::Failed,
+            ),
+            (
+                step(TreeState::Stopped, None),
+                ActionOutcome::Cancelled,
+                Outcome::Cancelled,
+            ),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<SessionEvent>(SESSION_EVENT_CHANNEL_CAPACITY);
+            let audit = RecordingAudit::default();
+            let mut tap = ActivityTap::default();
+            let more = step(TreeState::More, None);
+            // Three steps that leave more to do, then the one that ends it.
+            for _ in 0..3 {
+                report_step(
+                    &mut tap,
+                    &tx,
+                    &audit,
+                    "C:\\old",
+                    ActionOutcome::Succeeded,
+                    more,
+                );
+            }
+            report_step(
+                &mut tap,
+                &tx,
+                &audit,
+                "C:\\old",
+                ActionOutcome::Succeeded,
+                last,
+            );
+
+            assert_eq!(
+                handled(&mut rx),
+                vec![(1, ActionOutcome::InProgress), (1, ended)],
+                "{last:?}"
+            );
+            assert_eq!(
+                *audit.records.lock().unwrap(),
+                vec![
+                    ("fs_remove_tree_start", Outcome::Ok),
+                    ("fs_remove_tree", audited)
+                ],
+                "{last:?}"
+            );
+            assert!(tap.removing.is_empty(), "an ended removal is forgotten");
+        }
+    }
+
+    // A step the agent refused, or one whose answer never left, ends the
+    // removal as failed or as not known: never as done.
+    #[tokio::test]
+    async fn a_refused_or_unanswered_removal_step_never_ends_as_done() {
+        for (outcome, audited) in [
+            (
+                ActionOutcome::Failed {
+                    code: ErrorCode::PathNotFound,
+                },
+                Outcome::Failed,
+            ),
+            (ActionOutcome::Unknown, Outcome::Unknown),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<SessionEvent>(SESSION_EVENT_CHANNEL_CAPACITY);
+            let audit = RecordingAudit::default();
+            let mut tap = ActivityTap::default();
+            report_step(
+                &mut tap,
+                &tx,
+                &audit,
+                "C:\\old",
+                ActionOutcome::Succeeded,
+                step(TreeState::More, None),
+            );
+            report_step(&mut tap, &tx, &audit, "C:\\old", outcome, None);
+
+            assert_eq!(
+                handled(&mut rx),
+                vec![(1, ActionOutcome::InProgress), (1, outcome)]
+            );
+            assert_eq!(
+                audit.records.lock().unwrap().last(),
+                Some(&("fs_remove_tree", audited))
+            );
+        }
+
+        // An answer that is not a removal step says nothing about the folder.
+        let (tx, mut rx) = mpsc::channel::<SessionEvent>(SESSION_EVENT_CHANNEL_CAPACITY);
+        let audit = RecordingAudit::default();
+        let mut tap = ActivityTap::default();
+        report_step(
+            &mut tap,
+            &tx,
+            &audit,
+            "C:\\old",
+            ActionOutcome::Succeeded,
+            None,
+        );
+        assert_eq!(handled(&mut rx), vec![(1, ActionOutcome::Unknown)]);
+    }
+
+    // The removals the agent keeps open are bounded: one more than the bound
+    // closes the oldest as "result not known", and a session that ends records
+    // every removal still open the same way (REQ-N-006, REQ-N-008).
+    #[tokio::test]
+    async fn open_folder_removals_are_bounded_and_closed_honestly() {
+        // Room for every item: the bound under test is the bookkeeping's.
+        let (tx, mut rx) = mpsc::channel::<SessionEvent>(4 * MAX_OPEN_REMOVALS);
+        let audit = RecordingAudit::default();
+        let mut tap = ActivityTap::default();
+        let more = step(TreeState::More, None);
+        for n in 0..=MAX_OPEN_REMOVALS {
+            report_step(
+                &mut tap,
+                &tx,
+                &audit,
+                &format!("C:\\folder-{n}"),
+                ActionOutcome::Succeeded,
+                more,
+            );
+        }
+
+        assert_eq!(tap.removing.len(), MAX_OPEN_REMOVALS);
+        assert!(
+            !tap.removing.contains_key("C:\\folder-0"),
+            "the oldest gave way"
+        );
+        let items = handled(&mut rx);
+        assert_eq!(
+            items.iter().filter(|(id, _)| *id == 1).collect::<Vec<_>>(),
+            vec![
+                &(1, ActionOutcome::InProgress),
+                &(1, ActionOutcome::Unknown)
+            ],
+            "it is closed as not known, never as done"
+        );
+
+        audit.records.lock().unwrap().clear();
+        tap.close_removals(&audit);
+        assert!(tap.removing.is_empty());
+        let records = audit.records.lock().unwrap();
+        assert_eq!(records.len(), MAX_OPEN_REMOVALS);
+        assert!(
+            records
+                .iter()
+                .all(|record| *record == ("fs_remove_tree", Outcome::Unknown))
+        );
+    }
+
+    // --- an answer that cannot be sent (ST-M010-005) ------------------------
+
+    /// A sink that takes a frame as the secure channel does: one that breaks
+    /// a bound of the protocol, or that is larger than one record, is refused
+    /// before anything is sent, and the sink is as it was.
+    #[derive(Debug, Default)]
+    struct RecordSink {
+        sent: Vec<Message>,
+        lost: bool,
+    }
+
+    impl FrameSink for RecordSink {
+        async fn send_frame(&mut self, message: &Message) -> Result<(), Unsent> {
+            if self.lost {
+                return Err(Unsent::of(&SecureChannelError::Eof, true));
+            }
+            let payload = match message.encode() {
+                Ok(payload) => payload,
+                Err(error) => return Err(Unsent::of(&SecureChannelError::Decode(error), false)),
+            };
+            if payload.len() > limits::MAX_RECORD_BYTES {
+                let oversized = SecureChannelError::Oversized {
+                    len: payload.len(),
+                    max: limits::MAX_RECORD_BYTES,
+                };
+                return Err(Unsent::of(&oversized, false));
+            }
+            self.sent.push(message.clone());
+            Ok(())
+        }
+    }
+
+    /// A file read of `len` bytes, as the agent answers it.
+    fn file_data(len: usize) -> OpResult {
+        OpResult::FileData {
+            data: B64Bytes::new(vec![0x5A; len]),
+            eof: true,
+            file_len: len as u64,
+        }
+    }
+
+    /// The one error the sink took, as (request, session, code, message,
+    /// stage).
+    fn the_error(
+        sink: &RecordSink,
+    ) -> (
+        Option<RequestId>,
+        Option<SessionId>,
+        ErrorCode,
+        String,
+        ErrorStage,
+    ) {
+        match sink.sent.as_slice() {
+            [
+                Message::Error {
+                    id,
+                    session,
+                    code,
+                    message,
+                    stage,
+                },
+            ] => (*id, *session, *code, message.clone(), *stage),
+            other => panic!("expected one error and nothing else, got {other:?}"),
+        }
+    }
+
+    // A frame that the channel refused before it touched the stream is told
+    // apart from a channel that is gone: only the first leaves the session
+    // usable.
+    #[test]
+    fn a_frame_refused_before_the_wire_is_told_apart_from_a_lost_channel() {
+        let too_large = SecureChannelError::Oversized {
+            len: 70_000,
+            max: 1,
+        };
+        assert_eq!(
+            Unsent::of(&too_large, false),
+            Unsent::Refused(Refusal {
+                code: ErrorCode::OversizedMessage,
+                stage: ErrorStage::Transport,
+            })
+        );
+        let out_of_bounds =
+            SecureChannelError::Decode(cretlink_protocol::ProtocolError::LimitExceeded {
+                field: "file_entry name length",
+                len: 2,
+                max: 1,
+            });
+        assert_eq!(
+            Unsent::of(&out_of_bounds, false),
+            Unsent::Refused(Refusal {
+                code: ErrorCode::LimitExceeded,
+                stage: ErrorStage::Validation,
+            })
+        );
+        let frame_too_large =
+            SecureChannelError::Decode(cretlink_protocol::ProtocolError::Oversized {
+                len: 2,
+                max: 1,
+            });
+        assert_eq!(
+            Unsent::of(&frame_too_large, false),
+            Unsent::Refused(Refusal {
+                code: ErrorCode::OversizedMessage,
+                stage: ErrorStage::Transport,
+            })
+        );
+        // Whatever the error says, a poisoned channel is gone; and so is one
+        // whose stream failed.
+        for error in [too_large, out_of_bounds, frame_too_large] {
+            assert_eq!(Unsent::of(&error, true), Unsent::Lost);
+        }
+        for error in [SecureChannelError::Eof, SecureChannelError::Poisoned] {
+            assert_eq!(Unsent::of(&error, false), Unsent::Lost);
+            assert_eq!(Unsent::of(&error, true), Unsent::Lost);
+        }
+    }
+
+    // An answer that fits is sent as it is.
+    #[tokio::test]
+    async fn an_answer_that_fits_is_sent() {
+        let session = SessionId::new();
+        let mut sink = RecordSink::default();
+        let answered = answer(&mut sink, session, RequestId(7), file_data(1024)).await;
+        assert_eq!(answered, Answer::Sent);
+        assert!(matches!(answered.step(), AgentStep::Continue));
+        assert_eq!(
+            sink.sent,
+            vec![Message::Response {
+                id: RequestId(7),
+                session,
+                result: file_data(1024),
+            }]
+        );
+    }
+
+    // An answer that is larger than one record of the secure channel is not
+    // sent, and the session does not end over it: the request is failed with
+    // the reason, in fixed words, and the agent goes on.
+    #[tokio::test]
+    async fn an_answer_larger_than_a_record_fails_its_request_and_the_session_goes_on() {
+        let session = SessionId::new();
+        let mut sink = RecordSink::default();
+        // Within every bound of the protocol, and far larger than a record
+        // once it is encoded.
+        let large = file_data(limits::MAX_CHUNK_BYTES);
+
+        let answered = answer(&mut sink, session, RequestId(7), large).await;
+
+        assert_eq!(answered, Answer::Failed);
+        assert!(matches!(answered.step(), AgentStep::Continue));
+        let (id, stamped, code, message, stage) = the_error(&sink);
+        assert_eq!((id, stamped), (Some(RequestId(7)), Some(session)));
+        assert_eq!(code, ErrorCode::OversizedMessage);
+        assert_eq!(stage, ErrorStage::Transport);
+        assert_eq!(message, ANSWER_TOO_LARGE);
+    }
+
+    // The same for an answer that breaks a bound of the protocol: here a name
+    // longer than a name may be.
+    #[tokio::test]
+    async fn an_answer_that_breaks_a_bound_fails_its_request_and_the_session_goes_on() {
+        let session = SessionId::new();
+        let mut sink = RecordSink::default();
+        let out_of_bounds = OpResult::DirEntries {
+            entries: vec![cretlink_protocol::FileEntry {
+                name: "n".repeat(limits::MAX_NAME_BYTES + 1),
+                kind: cretlink_protocol::FileKind::File,
+                len: 1,
+                modified_ms: None,
+                readonly: false,
+            }],
+            end: true,
+        };
+
+        let answered = answer(&mut sink, session, RequestId(9), out_of_bounds).await;
+
+        assert_eq!(answered, Answer::Failed);
+        let (id, stamped, code, message, stage) = the_error(&sink);
+        assert_eq!((id, stamped), (Some(RequestId(9)), Some(session)));
+        assert_eq!(code, ErrorCode::LimitExceeded);
+        assert_eq!(stage, ErrorStage::Validation);
+        assert_eq!(message, ANSWER_OUT_OF_BOUNDS);
+    }
+
+    // The words that fail such a request are themselves an answer that fits,
+    // whatever the request identifier.
+    #[test]
+    fn the_reason_of_an_answer_that_cannot_be_sent_always_fits() {
+        for (code, reason, stage) in [
+            (
+                ErrorCode::OversizedMessage,
+                ANSWER_TOO_LARGE,
+                ErrorStage::Transport,
+            ),
+            (
+                ErrorCode::LimitExceeded,
+                ANSWER_OUT_OF_BOUNDS,
+                ErrorStage::Validation,
+            ),
+        ] {
+            let encoded = Message::Error {
+                id: Some(RequestId(u64::MAX)),
+                session: Some(SessionId::new()),
+                code,
+                message: reason.to_string(),
+                stage,
+            }
+            .encode()
+            .expect("within the bounds of the wire");
+            assert!(encoded.len() < 1024, "{} bytes", encoded.len());
+            assert!(!reason.contains(['\n', '\r']), "one line: {reason:?}");
+        }
+    }
+
+    // A channel that is gone is a disconnect, for the answer and for the
+    // error that would have failed the request.
+    #[tokio::test]
+    async fn an_answer_on_a_lost_channel_is_a_disconnect() {
+        let mut sink = RecordSink {
+            lost: true,
+            ..RecordSink::default()
+        };
+        let answered = answer(&mut sink, SessionId::new(), RequestId(1), file_data(16)).await;
+        assert_eq!(answered, Answer::Lost);
+        assert!(matches!(answered.step(), AgentStep::Disconnected));
+        assert!(sink.sent.is_empty());
+    }
+
+    // The customer is shown what the console was told: a request whose answer
+    // could not be sent is a failed one, with the reason, and what the unsent
+    // answer said about a file leaving the computer is not kept.
+    #[tokio::test]
+    async fn the_customer_sees_a_request_whose_answer_could_not_be_sent_as_failed() {
+        let session = SessionId::new();
+        let mut sink = RecordSink::default();
+        let mut tap = ReplyTap::new(&mut sink, RequestId(3));
+
+        let answered = answer(
+            &mut tap,
+            session,
+            RequestId(3),
+            file_data(limits::MAX_CHUNK_BYTES),
+        )
+        .await;
+
+        assert_eq!(answered, Answer::Failed);
+        assert_eq!(
+            tap.outcome(),
+            ActionOutcome::Failed {
+                code: ErrorCode::OversizedMessage
+            }
+        );
+        assert_eq!(tap.read, None, "nothing of the file left the computer");
+
+        // An answer that was sent is noted as it always was.
+        let mut tap = ReplyTap::new(&mut sink, RequestId(4));
+        let answered = answer(&mut tap, session, RequestId(4), file_data(64)).await;
+        assert_eq!(answered, Answer::Sent);
+        assert_eq!(tap.outcome(), ActionOutcome::Succeeded);
+        assert_eq!(
+            tap.read,
+            Some(ReadData {
+                len: 64,
+                eof: true,
+                file_len: 64
+            })
+        );
     }
 
     // The agent must autonomously sweep its own staging area when the session

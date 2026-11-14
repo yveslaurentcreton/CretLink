@@ -1574,6 +1574,8 @@ mod tests {
             | Operation::RemoveDir { .. }
             | Operation::ListStaged {}
             | Operation::StagingCleanup { .. }
+            | Operation::FsDrives {}
+            | Operation::RemoveTree { .. }
             | Operation::TermOpen { .. }
             | Operation::TermResize { .. }
             | Operation::TermClose { .. }

@@ -164,7 +164,6 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm test
-      - run: npm audit --omit=dev
       - run: cargo fmt --check
         working-directory: apps/app/src-tauri
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -214,19 +213,45 @@ jobs:
       # action sets; `+1.95` makes this job compile on the MSRV itself.
       - run: cargo +1.95 check --workspace --locked
 
+  # Every locked dependency is checked (ST-M006-019): the Cargo workspace; the
+  # application package, which is detached and has a lockfile and a
+  # configuration of its own (apps/app/src-tauri/deny.toml); the npm packages
+  # of the application's frontend and of the release tooling. The npm packages
+  # of the documentation site are audited in its own job below.
   deny:
     name: Dependency licenses, advisories, and sources
     needs: changes
     if: needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - name: Check the workspace (cargo deny)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check licenses advisories bans sources
+      - name: Check the application package (cargo deny)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: apps/app/src-tauri/Cargo.toml
+          arguments: --all-features --config apps/app/src-tauri/deny.toml
+          command: check licenses advisories bans sources
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      # `npm audit` reads the lockfile and asks the registry; nothing is
+      # installed. For the frontend any advisory fails, also in what only
+      # builds and tests it.
+      - name: Audit the application's frontend (npm)
+        working-directory: apps/app
+        run: npm audit
+      # The release tooling packs a package manager with dependencies that no
+      # lockfile here can move, so its check fails on an advisory of high or
+      # critical severity that has a fix (scripts/check-npm-audit.mjs).
+      - name: Audit the release tooling (npm)
+        run: node scripts/check-npm-audit.mjs
 
   # The documentation site (ST-M011-001): its build, the tests of its check,
   # and the check of every link and picture of the built pages. pages.yml
@@ -255,13 +280,49 @@ jobs:
       - run: node --test "scripts/*.test.mjs"
       - run: npm run check
 
+  # The relay server as a container image (ST-M007-015, REQ-N-023), on both
+  # architectures it is published for, each on a runner of that architecture.
+  # The image is built from apps/relay-server/Dockerfile exactly as a release
+  # builds it and then run: one program on an empty base, a user without
+  # rights, a read-only root file system, and a rendezvous over wss with a
+  # mounted certificate and key file (apps/relay-server/tests/relay_image.rs).
+  # Nothing is pushed anywhere: only the release workflow publishes.
+  image:
+    name: Relay server image (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.code != 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the image
+        run: docker build --file apps/relay-server/Dockerfile --tag cretlink-relay-server:test .
+      - name: Run the image
+        env:
+          CRETLINK_RELAY_IMAGE: cretlink-relay-server:test
+        run: cargo test --locked -p cretlink-relay-server --test relay_image -- --ignored
+
   # The one check the ruleset on main requires from this workflow. It runs
   # whatever happened before it: a failed or cancelled job fails it, a skipped
   # job does not.
   result:
     name: CI result
     if: always()
-    needs: [changes, lint, test, app, msrv, deny, website]
+    needs: [changes, lint, test, app, msrv, deny, website, image]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

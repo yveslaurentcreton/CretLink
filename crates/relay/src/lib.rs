@@ -66,14 +66,18 @@ pub mod rendezvous;
 pub mod splice;
 pub mod ticket;
 
-pub use admission::{AdmissionError, AdmissionPolicy, AdmissionToken, ClientId};
+pub use admission::{
+    AdmissionError, AdmissionPolicy, AdmissionToken, ClientId, GENERATED_KEY_BYTES,
+    KeyGenerationError, generate_key,
+};
 pub use cancel::{StopHandle, StopSignal};
 pub use control::{AdmissionControl, ControlConfig, Denied, SessionGuard};
 pub use events::{EventLog, OpEvent, OpEventKind, RetentionPolicy};
 pub use metrics::{MetricsSnapshot, RelayMetrics};
 pub use preamble::{
     MAX_PREAMBLE_TOKEN_BYTES, PREAMBLE_MAGIC, PREAMBLE_VERSION, Preamble, PreambleError,
-    read_preamble, write_preamble,
+    RELAY_ANSWER_LEN, RelayAnswer, RelayRefusal, read_answer, read_preamble, write_answer,
+    write_preamble,
 };
 pub use quota::{QuotaError, QuotaState, SessionQuota};
 pub use ratelimit::{RateLimit, RateLimiter};
@@ -81,4 +85,7 @@ pub use rendezvous::{Matched, Rendezvous, RendezvousError};
 pub use splice::{
     Direction, MAX_RELAY_FRAME_BYTES, SpliceLimits, SpliceOutcome, SpliceReport, splice,
 };
-pub use ticket::{RENDEZVOUS_TICKET_LEN, RendezvousTicket, TicketError};
+pub use ticket::{
+    MAX_RELAY_HOST_LEN, RENDEZVOUS_SEED_LEN, RENDEZVOUS_TICKET_LEN, RendezvousTicket, TicketError,
+    canonical_relay_host,
+};

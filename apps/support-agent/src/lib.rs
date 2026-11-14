@@ -52,7 +52,10 @@ pub use privilege::{EffectiveIdentity, IntegrityLevel, current_identity, integri
 pub use reboot_resume::{
     TicketStore, VaultArmer, default_ticket_store_path, reboot_resume_arming_disclosure,
 };
-pub use recovery::{RecoverRun, removal_needs_administrator, run_recover, sweep_stale_staging};
+pub use recovery::{
+    OtherResidue, RecoverRun, removal_needs_administrator, run_recover, run_recover_with,
+    sweep_stale_staging,
+};
 pub use state::{AgentError, AgentPhase, AgentState, StopReason, VisibleStatus};
 
 #[cfg(windows)]

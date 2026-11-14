@@ -179,7 +179,7 @@ async fn run_session(
                         token,
                     )
                     .map_err(|error| {
-                        format!("could not establish the relay TLS trust store: {error}")
+                        format!("could not use the relay settings: {}", with_causes(&error))
                     })?;
                     SessionHost::host_dialed(
                         dialer,
@@ -189,7 +189,9 @@ async fn run_session(
                         Arc::new(audit.clone()),
                     )
                     .await
-                    .map_err(|error| format!("could not reach the relay: {error}"))?
+                    .map_err(|error| {
+                        format!("no session through the relay: {}", with_causes(&error))
+                    })?
                 }
                 None => SessionHost::host_dialed(
                     RelayDial::new(relay, ticket, token),
@@ -199,7 +201,9 @@ async fn run_session(
                     Arc::new(audit.clone()),
                 )
                 .await
-                .map_err(|error| format!("could not reach the relay: {error}"))?,
+                .map_err(|error| {
+                    format!("no session through the relay: {}", with_causes(&error))
+                })?,
             };
             announce_relay(relay, has_token, is_wss);
             (handle, None)
@@ -363,6 +367,20 @@ fn announce_lan(handle: &HostHandle) -> Result<Option<Advertiser>, String> {
     );
     println!("  Press Ctrl+C to stop and revoke at any time.\n");
     Ok(advertiser)
+}
+
+/// An error with the causes behind it, on one line. A failed relay dial says
+/// in its cause what went wrong: unreachable, not trusted, no answer, or the
+/// reason of the relay's refusal (ST-M007-012).
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(inner) = cause {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    text
 }
 
 /// Opens the relay rendezvous surface (ADR-0016 §5): the console has already

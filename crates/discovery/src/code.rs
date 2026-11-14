@@ -33,17 +33,21 @@
 //! transcription check, **not** a guarantee — connecting to a wrong address
 //! still grants nothing before the Session Approval Code is compared.
 //!
-//! v1 encodes IPv4 only; IPv6-only LANs use the raw `[ipv6]:port` path until a
-//! v2 format is defined (the version nibble is reserved for it, which is why a
-//! well-formed but higher-versioned code is rejected distinctly as
-//! [`ManualEntryError::UnsupportedVersion`]).
+//! v1 encodes IPv4 only; IPv6-only LANs use the raw `[ipv6]:port` path. The
+//! version nibble tells the formats of the family apart: version 2 is the
+//! sixteen-character relay code ([`crate::RelayCode`], ST-M007-012), and a
+//! well-formed twelve-character code of another version is rejected distinctly
+//! as [`ManualEntryError::UnsupportedVersion`]. [`parse_entry`] reads either
+//! format from one input field.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use thiserror::Error;
 
+use crate::relay_code::{RelayCode, has_relay_code_length};
+
 /// Crockford Base32 alphabet (excludes `I`, `L`, `O`, `U`).
-const ALPHABET: [u8; 32] = *b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+pub(crate) const ALPHABET: [u8; 32] = *b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// Number of Base32 characters in a connection code (excluding grouping).
 const CODE_LEN: usize = 12;
@@ -98,9 +102,10 @@ impl ConnectionTarget {
 /// [`ChecksumMismatch`]: ManualEntryError::ChecksumMismatch
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ManualEntryError {
-    /// The code did not contain exactly 12 Base32 characters (after removing
-    /// grouping hyphens and whitespace).
-    #[error("connection code must be exactly 12 Crockford Base32 characters")]
+    /// The code did not have the length of its format once grouping hyphens
+    /// and whitespace are removed: 12 Base32 characters for a connection code
+    /// of the LAN, 16 for a relay code.
+    #[error("a connection code has 12 characters and a relay code has 16")]
     BadLength,
 
     /// The code contained a character outside the Crockford Base32 alphabet.
@@ -229,6 +234,39 @@ pub fn parse_manual_entry(input: &str) -> Result<ConnectionTarget, ManualEntryEr
     } else {
         ConnectionCode::parse(trimmed)
     }
+}
+
+/// What a typed entry names: a console on the same network, or a rendezvous
+/// on the relay (ST-M007-012).
+///
+/// Either way it is an untrusted addressing hint that grants no authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualEntry {
+    /// A LAN connection code or a raw `host:port`: where the console listens.
+    Lan(ConnectionTarget),
+    /// A relay code: the rendezvous seed of a session through the relay of
+    /// this copy's relay profile.
+    Relay(RelayCode),
+}
+
+/// Parses what a person typed into the one code field: a LAN connection code,
+/// a relay code, or a raw `host:port` / `[ipv6]:port` (REQ-F-004, ST-M007-012).
+///
+/// The shapes are told apart without guessing. An input with a colon is a raw
+/// address. Otherwise sixteen characters (hyphens and whitespace left out) are
+/// a relay code, and anything else is read as a LAN connection code, twelve
+/// characters. A relay code that carries a typing error is therefore reported
+/// as such, and never tried as a LAN code.
+///
+/// # Errors
+///
+/// Returns the [`ManualEntryError`] of the format the input was read as.
+pub fn parse_entry(input: &str) -> Result<ManualEntry, ManualEntryError> {
+    let trimmed = input.trim();
+    if !trimmed.contains(':') && has_relay_code_length(trimmed) {
+        return RelayCode::parse(trimmed).map(ManualEntry::Relay);
+    }
+    parse_manual_entry(trimmed).map(ManualEntry::Lan)
 }
 
 /// Packs `[version:4][ipv4:32][port:16]` into the low 52 bits of a `u64`.

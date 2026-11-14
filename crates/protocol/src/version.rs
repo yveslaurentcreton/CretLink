@@ -121,9 +121,37 @@ use crate::error::ProtocolError;
 /// omitted when unknown, so an identity without it keeps its minor-10 wire
 /// form, and validated on decode (trimmed, single line, 1 to
 /// [`crate::limits::MAX_ACCOUNT_NAME_CHARS`] characters).
+///
+/// Minor `12` adds the additive file operations a file explorer needs
+/// (ST-M010-001, ADR-0012), advertised by the [`crate::CAP_FS_V2`] capability.
+/// [`crate::Operation::FsDrives`] is answered [`crate::OpResult::Drives`]: each
+/// drive of the target with its root, kind, label and total and free space,
+/// where a value the target cannot read is absent rather than invented.
+/// [`crate::Operation::RemoveTree`] is answered [`crate::OpResult::TreeRemoval`]
+/// and removes a folder with everything in it **one bounded step at a time**
+/// (at most [`crate::limits::MAX_TREE_STEP_ENTRIES`] entries and about
+/// [`crate::limits::MAX_TREE_STEP_MS`] milliseconds per request): the caller
+/// repeats the request while the answer is [`crate::TreeState::More`], the
+/// agent keeps no state between two steps, and so a stop, a revocation or a
+/// cancellation takes effect between them. One removal is about one folder:
+/// an answer that says more remains carries a `folder_id` (at most
+/// [`crate::limits::MAX_FOLDER_ID_BYTES`] bytes) that the next request gives
+/// back, and a step that finds another folder at the path, or a path that
+/// leads to the folder through a link, removes nothing. A step never leaves
+/// the folder — a link is removed as a link and never walked — and it names
+/// the first entries it could not remove with their reasons; only
+/// [`crate::TreeState::Removed`] is a success (REQ-N-008). An agent that does
+/// not advertise [`crate::CAP_FS_V2`] answers both operations with
+/// [`crate::ErrorCode::Unsupported`] before it lists or removes anything
+/// (REQ-N-012); a peer on an older minor does not get as far as a request,
+/// because the pairing prologue commits both endpoints to the identical
+/// version. Sending a file to a folder on any drive needs no addition:
+/// `FsWrite` and `FsCommit` take an absolute destination since minor `1`, and
+/// the part of such a transfer lies beside its destination, so the verified
+/// rename never crosses a volume.
 pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion {
     major: 1,
-    minor: 11,
+    minor: 12,
 };
 
 /// A `major.minor` protocol version.

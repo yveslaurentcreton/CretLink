@@ -37,9 +37,47 @@
 
 use core::fmt;
 
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroize;
+
+/// Number of random bytes in a generated admission key (256 bits).
+pub const GENERATED_KEY_BYTES: usize = 32;
+
+/// The operating system's randomness source failed while an admission key was
+/// generated. No key was produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("the operating system gave no randomness for an admission key")]
+pub struct KeyGenerationError;
+
+/// Generates a new admission key for one customer copy or technician
+/// (ST-M007-014): [`GENERATED_KEY_BYTES`] bytes of the operating system's
+/// randomness as 64 lowercase hexadecimal characters.
+///
+/// The text is what an operator puts in the relay's key file and what the
+/// copy presents in its rendezvous preamble. It is a secret of the operator's
+/// relay and nothing more: it admits to the forwarder and gives no control
+/// over any session (ADR-0016 §4).
+///
+/// # Errors
+///
+/// Returns [`KeyGenerationError`] if the randomness source fails.
+pub fn generate_key() -> Result<String, KeyGenerationError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0u8; GENERATED_KEY_BYTES];
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_| KeyGenerationError)?;
+    let mut key = String::with_capacity(GENERATED_KEY_BYTES * 2);
+    for byte in bytes {
+        key.push(HEX[usize::from(byte >> 4)] as char);
+        key.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    bytes.zeroize();
+    Ok(key)
+}
 
 /// A non-secret, log-safe label identifying an admitted client for rate
 /// limiting, quotas, and accountability. It is **never** the credential itself.
@@ -318,6 +356,20 @@ mod tests {
             policy.admit(Some(&long), "peer").unwrap_err(),
             AdmissionError::CredentialRejected
         );
+    }
+
+    #[test]
+    fn a_generated_key_is_256_random_bits_in_hexadecimal() {
+        let first = generate_key().unwrap();
+        let second = generate_key().unwrap();
+        assert_eq!(first.len(), GENERATED_KEY_BYTES * 2);
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "lowercase hexadecimal only"
+        );
+        assert_ne!(first, second, "two generated keys must not collide");
     }
 
     #[test]

@@ -12,6 +12,7 @@
 //! profile: a root sets `BasicConstraints.ca = true`, which rustls correctly
 //! rejects at handshake as `CaUsedAsEndEntity`.
 
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -63,17 +64,21 @@ impl BuilderProfile for SelfSignedLeaf {
     }
 }
 
-/// Mints a fresh self-signed server leaf for `dns_name`, returning the
+/// Mints a fresh self-signed server leaf for `name`, returning the
 /// certificate (DER) and its private key (PKCS#8 DER) ready for
 /// [`crate::server_config`]. Pin the same certificate with [`crate::pinned_roots`]
 /// on the client to complete the trust path.
 ///
+/// `name` is a DNS name or an IP address in its standard text form. An IP
+/// address becomes an `iPAddress` subject alternative name, which is what a
+/// client checks when it reaches a relay by its address.
+///
 /// # Errors
 ///
 /// Returns [`WssError::TestCert`] if key generation or certificate encoding
-/// fails, which in practice only happens on a malformed `dns_name`.
+/// fails, which in practice only happens on a malformed `name`.
 pub fn self_signed(
-    dns_name: &str,
+    name: &str,
 ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), WssError> {
     let map = |e: &dyn std::fmt::Display| WssError::TestCert(e.to_string());
 
@@ -85,7 +90,7 @@ pub fn self_signed(
         .to_vec();
     let spki = SubjectPublicKeyInfo::from_key(signer.verifying_key()).map_err(|e| map(&e))?;
 
-    let subject = Name::from_str(&format!("CN={dns_name}")).map_err(|e| map(&e))?;
+    let subject = Name::from_str(&format!("CN={name}")).map_err(|e| map(&e))?;
     let profile = SelfSignedLeaf { subject };
     let serial = SerialNumber::from(1u32);
     let validity = Validity::from_now(TEST_CERT_TTL).map_err(|e| map(&e))?;
@@ -98,9 +103,12 @@ pub fn self_signed(
             path_len_constraint: None,
         })
         .map_err(|e| map(&e))?;
-    let san = Ia5String::new(dns_name).map_err(|e| map(&e))?;
+    let san = match name.parse::<IpAddr>() {
+        Ok(address) => GeneralName::from(address),
+        Err(_) => GeneralName::DnsName(Ia5String::new(name).map_err(|e| map(&e))?),
+    };
     builder
-        .add_extension(&SubjectAltName(vec![GeneralName::DnsName(san)]))
+        .add_extension(&SubjectAltName(vec![san]))
         .map_err(|e| map(&e))?;
     builder
         .add_extension(&ExtendedKeyUsage(vec![ID_KP_SERVER_AUTH]))

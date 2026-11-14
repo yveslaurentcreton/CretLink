@@ -68,6 +68,10 @@ cretlink-exec.workspace = true
 # whose `unseal` returns the same `Zeroizing<Vec<u8>>` the real DPAPI sealer does
 # (ST-M006-002, ADR-0014).
 zeroize.workspace = true
+# The test of what an endpoint trusts mints certificates for the run, with
+# the test-only helper of the TLS crate; no key material is committed
+# (REQ-N-017, ST-M007-011).
+cretlink-wss = { workspace = true, features = ["system-roots", "test-cert"] }
 
 [lints]
 workspace = true

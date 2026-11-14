@@ -9,7 +9,7 @@
 // end report use the shared contract (`../shared/contract`).
 
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivityEntry, CustomerReport } from "../shared/contract";
+import type { ActivityEntry, CustomerReport, RelayTrust } from "../shared/contract";
 
 // Mirrors `cretlink_support_agent::privilege::IntegrityLevel` (snake_case).
 export type IntegrityLevel = "untrusted" | "low" | "medium" | "high" | "system" | "unknown";
@@ -103,6 +103,34 @@ export interface ConsentView {
   technician: TechnicianNameView | null;
   // `null` when the startup sweep kept nothing (or has not finished).
   startup_cleanup: StartupCleanupView | null;
+  // The relay this session runs through: its name, where this copy connects
+  // and what vouches for the name; `null` for a session on one network
+  // (ST-M007-013). It stays after the end, until the next dial.
+  relay: RelayUseView | null;
+  // What to do next about the failure this dial ended with, when the failure
+  // has a next step of its own (a relay that cannot be reached, a key the
+  // relay refuses, ...); `null` otherwise.
+  failure_next: string | null;
+  // The relay this copy is set up for, from the profile file next to the
+  // program; `null` without a profile that can be used (ST-M007-011). Shown
+  // beside the code field: the customer sees the relay's name, where this
+  // copy would connect and what vouches for the name before connecting
+  // through it.
+  relay_of_copy: RelayUseView | null;
+}
+
+// The relay of a session (ST-M007-013, ADR-0016): a label. The relay passes
+// the encrypted session on, cannot look inside and grants nothing.
+//
+// `host` is the name the relay's certificate carries, `address` is where
+// this copy connects, and `trust` is what vouches for the name. The window
+// shows the address beside the name when its host is another one, and says
+// when the certificate is checked against a file of the profile
+// (`shared/relay.ts`): whoever wrote the profile file chose both.
+export interface RelayUseView {
+  host: string;
+  address: string;
+  trust: RelayTrust;
 }
 
 // One technician console found on the LAN (ADR-0007). Untrusted: never
@@ -135,6 +163,77 @@ export interface RelaunchOutcome {
   outcome: "started" | "declined" | "failed";
   message: string;
   launch: LaunchView;
+}
+
+// --- Keeping the support program for next time (ST-M009-017) ---
+
+// How this copy relates to what is kept on this computer.
+export type KeepRelation =
+  | "not_kept"
+  // This copy is the kept program.
+  | "this"
+  // The kept program has the version of this copy.
+  | "same"
+  // This copy is newer: it can update the kept program.
+  | "newer"
+  // The kept program is newer: this copy never replaces it.
+  | "older"
+  // The kept version cannot be compared: it is not replaced.
+  | "unknown";
+
+// Mirrors the application crate's `KeepView`: what is kept on this computer,
+// and what this window offers. The backend decides the offer: to keep only
+// with administrator rights, to remove only in the kept program itself, and
+// nothing during a session.
+export interface KeepView {
+  state: KeepRelation;
+  canKeep: boolean;
+  canRemove: boolean;
+  // Removing first asks Windows for administrator rights.
+  removeElevates: boolean;
+  thisVersion: string;
+  // Absent when nothing is kept or the record does not say.
+  keptVersion?: string;
+  // The folder of the kept program; absent where no program can be kept.
+  location?: string;
+}
+
+// Mirrors `KeepPlanView`: what keeping would add, shown before the customer
+// chooses. `relay` names the relay that the settings of this copy bring, as
+// every screen names a relay: its name, where the copy connects and what
+// vouches for the name. The settings may have been written by somebody else.
+export interface KeepPlanView {
+  version: string;
+  // The version it would replace, when a program is kept already.
+  replaces?: string;
+  location: string;
+  program: string;
+  // The kept program has a desktop shortcut already.
+  desktopKept: boolean;
+  relay?: RelayUseView;
+  // Relay settings that are kept already would be replaced.
+  relayReplaces: boolean;
+  // Why the relay settings next to this copy are not kept, as a sentence.
+  relayProblem?: string;
+}
+
+// Mirrors `RemovePlanView`: what removing would remove and what stays.
+export interface RemovePlanView {
+  removes: string[];
+  stays: string[];
+  // The folder goes only once this window has closed.
+  afterExit: boolean;
+  // Windows asks for administrator rights first.
+  elevates: boolean;
+}
+
+// Mirrors `RemoveOutcome`.
+export interface RemoveOutcome {
+  // `removed`: everything is gone; `pending`: the folder goes once this
+  // window has closed; `elevating`: Windows was asked for administrator
+  // rights and this window is closing.
+  state: "removed" | "pending" | "elevating";
+  left: string[];
 }
 
 export interface CommandError {
@@ -172,6 +271,14 @@ export const api = {
   openMain: () => invoke<void>("open_main"),
   dragWindow: () => invoke<void>("drag_window"),
   stopAndClose: () => invoke<void>("stop_and_close"),
+  // Keeping the support program (ST-M009-017). Nothing is kept or removed
+  // without the customer's click: `keepProgram` carries out the plan that
+  // `keepPlan` showed, and no other.
+  getKeep: () => invoke<KeepView>("get_keep"),
+  keepPlan: () => invoke<KeepPlanView>("keep_plan"),
+  keepProgram: (desktop: boolean) => invoke<KeepView>("keep_program", { desktop }),
+  removePlan: () => invoke<RemovePlanView>("remove_plan"),
+  removeProgram: () => invoke<RemoveOutcome>("remove_program"),
 };
 
 // The events of the backend, to both windows.

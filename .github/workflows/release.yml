@@ -114,8 +114,9 @@ jobs:
           CRETLINK_SIGN_PFX_PASSWORD: ${{ secrets.CRETLINK_SIGN_PFX_PASSWORD }}
           CRETLINK_SIGN_TIMESTAMP_URL: ${{ secrets.CRETLINK_SIGN_TIMESTAMP_URL }}
         run: pwsh -File scripts/sign-windows.ps1
-      # Checksums, the per-OS archive, the dependency inventory and the SBOMs,
-      # over the (possibly signed) staged binaries (ST-M009-004).
+      # Checksums, the per-OS archive with the third-party notices of its
+      # programs (ST-M006-019), the dependency inventory and the SBOMs, over
+      # the (possibly signed) staged binaries (ST-M009-004).
       - name: Pack the archive and its metadata
         shell: bash
         env:
@@ -142,9 +143,87 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # The relay server as a container image (ST-M007-015, REQ-N-023), for both
+  # architectures, each built on a runner of that architecture from the commit
+  # that semantic-release will tag and stamped with the version. The image is
+  # run before anything is published (apps/relay-server/tests/relay_image.rs),
+  # and the release below waits for it: a release never appears without an
+  # image that passed. This job publishes nothing; it hands the tested image
+  # and its bill of materials to `publish-image`.
+  image:
+    name: Relay server image (${{ matrix.arch }})
+    needs: version
+    if: github.repository == 'yveslaurentcreton/CretLink' && needs.version.outputs.version != ''
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      CRETLINK_VERSION: ${{ needs.version.outputs.version }}
+      IMAGE: cretlink-relay-server:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Build the image
+        run: |
+          docker build --file apps/relay-server/Dockerfile \
+            --build-arg "CRETLINK_VERSION=$CRETLINK_VERSION" --tag "$IMAGE" .
+      - name: Run the image
+        env:
+          CRETLINK_RELAY_IMAGE: ${{ env.IMAGE }}
+        run: cargo test --locked -p cretlink-relay-server --test relay_image -- --ignored
+      # The program in the image reports the release version.
+      - name: Check the version of the program
+        run: test "$(docker run --rm "$IMAGE" --version)" = "cretlink-relay-server $CRETLINK_VERSION"
+      - name: Install cargo-cyclonedx (SBOM generator)
+        run: cargo install cargo-cyclonedx --locked --version 0.5.9
+      # The bill of materials of the relay server for the target of this
+      # image, with the release version as the version of its own component.
+      - name: Write the bill of materials
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/image"
+          (cd apps/relay-server && cargo cyclonedx --format json --target "$TARGET" \
+            --override-filename cretlink-sbom)
+          node -e '
+            const fs = require("fs");
+            const [from, to, version] = process.argv.slice(1);
+            const sbom = JSON.parse(fs.readFileSync(from, "utf8"));
+            if (!sbom.metadata || !sbom.metadata.component) throw new Error("no component in the SBOM");
+            sbom.metadata.component.version = version;
+            fs.writeFileSync(to, JSON.stringify(sbom, null, 2) + "\n");
+          ' apps/relay-server/cretlink-sbom.json "$RUNNER_TEMP/image/sbom-$ARCH.cdx.json" "$CRETLINK_VERSION"
+      - name: Save the image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: docker save "$IMAGE" --output "$RUNNER_TEMP/image/image-$ARCH.tar"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: relay-image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image/
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     name: semantic-release
-    needs: [version, build]
+    needs: [version, build, image]
     if: github.repository == 'yveslaurentcreton/CretLink' && needs.version.outputs.version != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -179,3 +258,77 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CRETLINK_EXPECTED_VERSION: ${{ needs.version.outputs.version }}
+
+  # Publishes the relay server image that the `image` job built and ran
+  # (ST-M007-015, REQ-N-023), once the release exists: the same bytes, for
+  # amd64 and arm64, as ghcr.io/yveslaurentcreton/cretlink-relay-server with
+  # the version and `latest` as tags, with a provenance attestation that names
+  # this commit and a bill of materials for each architecture. Only this job
+  # may write packages, and it runs for a release only: a pull request never
+  # reaches it (REQ-S-020).
+  publish-image:
+    name: Publish the relay server image
+    needs: [version, release]
+    if: github.repository == 'yveslaurentcreton/CretLink' && needs.version.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      CRETLINK_VERSION: ${{ needs.version.outputs.version }}
+      REGISTRY_IMAGE: ghcr.io/yveslaurentcreton/cretlink-relay-server
+    steps:
+      - name: Gather the images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: image
+          pattern: relay-image-*
+          merge-multiple: true
+      - name: Log in to the registry
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      # Each architecture is pushed under a tag of its own; the version and
+      # `latest` then name both, so that `docker pull` takes the right one.
+      - name: Push the images
+        id: push
+        run: |
+          for arch in amd64 arm64; do
+            docker load --input "image/image-$arch.tar"
+            docker tag "cretlink-relay-server:$CRETLINK_VERSION-$arch" "$REGISTRY_IMAGE:$CRETLINK_VERSION-$arch"
+            docker push "$REGISTRY_IMAGE:$CRETLINK_VERSION-$arch"
+            digest="$(docker buildx imagetools inspect "$REGISTRY_IMAGE:$CRETLINK_VERSION-$arch" --format '{{.Manifest.Digest}}')"
+            echo "$arch=$digest" >> "$GITHUB_OUTPUT"
+          done
+          docker buildx imagetools create \
+            --tag "$REGISTRY_IMAGE:$CRETLINK_VERSION" --tag "$REGISTRY_IMAGE:latest" \
+            "$REGISTRY_IMAGE:$CRETLINK_VERSION-amd64" "$REGISTRY_IMAGE:$CRETLINK_VERSION-arm64"
+          digest="$(docker buildx imagetools inspect "$REGISTRY_IMAGE:$CRETLINK_VERSION" --format '{{.Manifest.Digest}}')"
+          echo "index=$digest" >> "$GITHUB_OUTPUT"
+          echo "published $REGISTRY_IMAGE:$CRETLINK_VERSION@$digest"
+      - name: Attest the provenance of the image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.index }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest the bill of materials (amd64)
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.REGISTRY_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.amd64 }}
+          sbom-path: image/sbom-amd64.cdx.json
+          push-to-registry: true
+      - name: Attest the bill of materials (arm64)
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.REGISTRY_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.arm64 }}
+          sbom-path: image/sbom-arm64.cdx.json
+          push-to-registry: true
+

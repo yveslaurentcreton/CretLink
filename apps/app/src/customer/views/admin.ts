@@ -5,7 +5,7 @@
 
 import { h } from "../../shared/dom";
 import { icon } from "../../shared/icons";
-import type { CustomerSnapshot } from "../model";
+import { type CustomerSnapshot, isKeptProgram } from "../model";
 import { button } from "./common";
 
 const STEPS = [
@@ -61,7 +61,15 @@ export function adminView(s: CustomerSnapshot): HTMLElement[] {
         "Your technician usually needs administrator rights to fix things. In the next window, Windows asks whether CretLink may make changes.",
       ),
       steps(),
-      h("p", { class: "muted" }, "Nothing happens to this computer before step 4, and nothing is installed."),
+      h(
+        "p",
+        { class: "muted", id: "admin-nothing" },
+        // The kept support program is installed, on the customer's own
+        // choice (ST-M009-017): it does not say that nothing is.
+        isKeptProgram(s)
+          ? "Nothing happens to this computer before step 4. This program is kept on this computer and starts only when you start it."
+          : "Nothing happens to this computer before step 4, and nothing is installed.",
+      ),
       devNote(s),
     ),
     h(
@@ -106,7 +114,13 @@ export function declinedView(s: CustomerSnapshot): HTMLElement[] {
         h("b", null, "Yes"),
         " when Windows asks. Or continue without administrator rights: you can still get help with everything your own account can do.",
       ),
-      h("p", { class: "muted" }, "Nothing has happened to this computer, and nothing is installed."),
+      h(
+        "p",
+        { class: "muted" },
+        isKeptProgram(s)
+          ? "Nothing has happened to this computer."
+          : "Nothing has happened to this computer, and nothing is installed.",
+      ),
       devNote(s),
     ),
     h(

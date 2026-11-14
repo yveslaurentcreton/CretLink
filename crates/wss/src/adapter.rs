@@ -31,6 +31,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 
 /// Adapts a [`WebSocketStream`] into an [`AsyncRead`] + [`AsyncWrite`] byte
 /// stream so a byte-oriented protocol rides over WebSocket framing unchanged.
@@ -72,11 +73,25 @@ impl<S> fmt::Debug for WsByteStream<S> {
     }
 }
 
-/// Maps a tungstenite error onto an [`io::Error`], preserving the underlying IO
-/// error unchanged and wrapping anything else as [`io::ErrorKind::Other`].
+/// Maps a tungstenite error onto an [`io::Error`]: the underlying I/O error
+/// unchanged, a connection that is gone as the kind a socket reports for it,
+/// and anything else as [`io::ErrorKind::Other`].
+///
+/// A connection can end without a WebSocket close frame although the layer
+/// below ended in order, for example when a proxy that ends TLS in front of a
+/// relay closes it. To the byte stream above that is a connection that was cut
+/// short, the same as on a bare socket, so it gets the same kind
+/// ([`io::ErrorKind::UnexpectedEof`]); a caller that tells a cut from other
+/// faults then needs to know nothing about WebSocket.
 fn ws_err(e: WsError) -> io::Error {
     match e {
         WsError::Io(io) => io,
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
+            io::Error::new(io::ErrorKind::UnexpectedEof, e.to_string())
+        }
+        WsError::ConnectionClosed | WsError::AlreadyClosed => {
+            io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())
+        }
         other => io::Error::other(other.to_string()),
     }
 }
@@ -169,5 +184,37 @@ where
             Poll::Ready(Err(e)) => Poll::Ready(Err(ws_err(e))),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn a_connection_that_is_gone_keeps_the_kind_a_socket_gives_it() {
+        // An I/O error of the transport passes through unchanged.
+        let reset = ws_err(WsError::Io(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "reset by peer",
+        )));
+        assert_eq!(reset.kind(), io::ErrorKind::ConnectionReset);
+
+        // The transport ended without a close frame: cut short.
+        let cut = ws_err(WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake,
+        ));
+        assert_eq!(cut.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Use after a close.
+        for closed in [WsError::ConnectionClosed, WsError::AlreadyClosed] {
+            assert_eq!(ws_err(closed).kind(), io::ErrorKind::BrokenPipe);
+        }
+
+        // Any other protocol fault stays a fault of its own.
+        let other = ws_err(WsError::Protocol(ProtocolError::UnmaskedFrameFromClient));
+        assert_eq!(other.kind(), io::ErrorKind::Other);
     }
 }

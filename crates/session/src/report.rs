@@ -390,6 +390,44 @@ pub struct CustomerReport {
     pub cleanup: CleanupResult,
     /// Every activity item the customer saw, oldest first.
     pub activity: Vec<ActivityEntry>,
+    /// The support program that is kept on this computer on the customer's
+    /// own choice, when there is one (ST-M009-017). It is not something that
+    /// this session left behind, and the report says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_program: Option<KeptProgram>,
+}
+
+/// The support program that a customer chose to keep on the computer
+/// (ST-M009-017): what an end report says about it, so that nobody takes it
+/// for something a session left behind (REQ-F-019).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeptProgram {
+    /// The folder it lies in.
+    pub location: String,
+    /// Its version, when its record says one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+impl KeptProgram {
+    /// What a report says about it, in one sentence each: that it is there
+    /// because it was kept, and how it goes again.
+    #[must_use]
+    pub fn words(&self) -> String {
+        let version = self
+            .version
+            .as_deref()
+            .map(|version| format!(", version {version}"))
+            .unwrap_or_default();
+        format!(
+            "CretLink Support is installed on this computer ({}{version}) because it was kept \
+             there on purpose. It was not left behind by this session. To remove it, use \
+             Installed apps in the settings of Windows, or start it and choose Remove from this \
+             computer.",
+            self.location
+        )
+    }
 }
 
 /// The inputs of a [`CustomerReport`], gathered by the customer window during
@@ -412,6 +450,8 @@ pub struct CustomerReportInput {
     pub cleanup: Option<CleanupReport>,
     /// The activity feed, oldest first.
     pub activity: Vec<ActivityEntry>,
+    /// The support program that is kept on this computer, when there is one.
+    pub kept_program: Option<KeptProgram>,
 }
 
 impl CustomerReport {
@@ -436,6 +476,7 @@ impl CustomerReport {
             counts: CustomerCounts::of_feed(&input.activity),
             cleanup,
             activity: input.activity,
+            kept_program: input.kept_program,
         }
     }
 

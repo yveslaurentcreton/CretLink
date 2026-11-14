@@ -153,6 +153,14 @@ h1, h2, h3, h4 { letter-spacing: -0.02em; }
 @media (max-width: 40rem) {
   .shots { grid-template-columns: 1fr; }
 }
+/* A narrow screenshot with what it means beside it, in two lists. */
+.shots.keep { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); }
+.keep-lists { display: grid; gap: 1rem; }
+.keep-lists .lane ul { margin: 0; padding-left: 1.2rem; font-size: 0.95rem; }
+.keep-lists .lane li { margin: 0.35rem 0; }
+@media (max-width: 40rem) {
+  .shots.keep { grid-template-columns: 1fr; }
+}
 
 /* Short facts in a row of cards. */
 .facts {

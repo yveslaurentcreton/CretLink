@@ -1,6 +1,6 @@
 ---
 title: Security in short
-description: What CretLink promises about consent, visibility, stopping and cleanup, where its limits are, and what it will never contain.
+description: What CretLink promises about consent, visibility, stopping and cleanup, what a relay and a kept support program are and are not, where the limits are, and what it will never contain.
 ---
 
 <p class="lede">CretLink gives someone administrator access to another person's computer. That is only acceptable when the owner of that computer stays in charge. These are the promises, and the limits.</p>
@@ -22,16 +22,40 @@ description: What CretLink promises about consent, visibility, stopping and clea
   </li>
   <li>
     <strong>Nothing hidden stays</strong>
-    <span>Nothing is installed on the customer's computer, and nothing is left that starts by itself. At the end CretLink removes what it placed and names what it could not remove.</span>
+    <span>Nothing is installed on the customer's computer unless the customer chooses to keep the support program, and nothing is ever left that starts by itself. At the end CretLink removes what it placed and names what it could not remove.</span>
   </li>
 </ul>
 
 ## How the connection is protected
 
 - **Encrypted from end to end** between the two programs, with an established protocol and established libraries. CretLink contains no cryptography of its own invention.
-- **The six digits** on both screens come from that connection. Equal digits mean nobody sits in between.
+- **The six digits** on both screens come from that connection. Equal digits mean that nobody in between can read or change it.
+- **A relay only passes it on.** Through [a relay](/CretLink/relay/) the session is the same encrypted connection. The relay sees who connects and when, and it can drop a session. It cannot read one, start one or approve one.
 - **Your AI account stays with you.** Credentials, tokens and keys of your AI service never go to the customer's computer.
 - **A record on your side.** Your computer keeps an audit trail of every session, and CretLink checks each record for damage when it shows the history.
+
+## When a customer keeps the support program
+
+A customer can [keep the support program](/CretLink/get-started/#a-customer-who-needs-help-more-often) for next time. That changes where the program is, and nothing about who is in charge.
+
+<ul class="facts not-content">
+  <li>
+    <strong>It is their choice</strong>
+    <span>Only the customer's own click keeps the program, and never during a session. No command and no remote action can do it.</span>
+  </li>
+  <li>
+    <strong>It is not access</strong>
+    <span>No service, no scheduled task, nothing that starts with Windows and nothing that listens. Between sessions no CretLink program runs.</span>
+  </li>
+  <li>
+    <strong>Every session asks again</strong>
+    <span>The customer starts it, Windows asks, the six digits are compared and full control is allowed, each time. No permission is stored.</span>
+  </li>
+  <li>
+    <strong>It goes when they say so</strong>
+    <span>The program and Installed apps in Windows both remove it. Each shows what goes and asks first.</span>
+  </li>
+</ul>
 
 ## Where the limits are
 
@@ -42,6 +66,7 @@ CretLink makes misuse visible and stoppable. It cannot make it impossible.
 - **Your AI service sees what the agent reads.** Command output and files that the agent asks for are processed by your AI provider. The customer is told so before they consent.
 - **A computer that is already compromised stays compromised.** CretLink does not defend a technician's or a customer's computer against malware that was there before.
 - **People can be rushed.** Confirming the digits without looking, or consenting under pressure, weakens every check above.
+- **A kept program keeps its relay settings readable.** Every account on that computer can read them, with that customer's relay key in them. The key opens the relay and nothing else, and you can take it away.
 - **The releases are not signed yet.** Until they are, the checksums are how you know a download is genuine.
 
 ## What it will never contain

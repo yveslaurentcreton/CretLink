@@ -66,7 +66,7 @@ local builds report `0.0.0-dev`. The local semantic-release plugin
 decides a different one, so a release never carries binaries stamped with
 another version.
 
-### Release artifacts (ST-M006-004, ST-M009-004, ST-M009-010)
+### Release artifacts (ST-M006-004, ST-M006-019, ST-M009-004, ST-M009-010)
 
 Every release attaches verifiable platform artifacts, built by the `build`
 matrix in `release.yml` from the exact commit semantic-release tags and gathered
@@ -77,13 +77,24 @@ into the GitHub release by `@semantic-release/github`:
   and `cretlink-<version>-linux-x86_64.tar.gz`. Each holds a folder of the same
   name with the application `cretlink` (both roles; on Windows also the
   program the customer runs, ST-M009-005) and its console build
-  `cretlink-cli`, plus `README.txt`, `LICENSE` and the target's checksum file.
+  `cretlink-cli`, plus `README.txt`, `LICENSE`, `THIRD-PARTY-NOTICES.txt` (see
+  "Third-party notices" below) and the target's checksum file.
   The development tools `cretlink-console` and `cretlink-support-agent` are not
   released (ST-M009-010);
 - `SHA256SUMS.txt` — SHA-256 over the archives, written by the `release` job;
 - `cretlink-relay-server-<target>[.exe]` — operator-hosted public
   infrastructure on neither endpoint (see [`docs/relay-server.md`](relay-server.md)),
   attached on its own and not in the archives;
+- the relay server as a container image (ST-M007-015, REQ-N-023), not as a
+  release file but in the registry:
+  `ghcr.io/yveslaurentcreton/cretlink-relay-server:<version>` and `:latest`,
+  for `linux/amd64` and `linux/arm64`. The `image` jobs build it from
+  `apps/relay-server/Dockerfile` on a runner of each architecture and run it
+  (`apps/relay-server/tests/relay_image.rs`) before the release is made; the
+  release waits for them. `publish-image` then pushes exactly those images,
+  with a provenance attestation that names the commit and a bill of materials
+  per architecture. It is the only job that may write packages, and no pull
+  request reaches it;
 - `CHECKSUMS-<target>.txt` — SHA-256 over every binary for that target;
 - `dependency-inventory-<target>.txt` — the resolved normal-dependency graph and
   pinned versions of the shipped packages (`cretlink`, `cretlink-cli`,
@@ -93,6 +104,35 @@ into the GitHub release by `@semantic-release/github`:
   its own component stamped with the release version. Official artifacts fail
   without them; locally a missing `cargo-cyclonedx` is a warning, never a silent
   gap, and the dependency inventory is the portable fallback.
+
+### Third-party notices (ST-M006-019)
+
+Every archive holds `THIRD-PARTY-NOTICES.txt` (REQ-N-016): the packages of
+other authors that its two programs are built from, each with its license and
+the place of its source, the license texts and notices that those packages
+ship, and where the source of the files under MPL-2.0 is found.
+`scripts/gen-artifacts.sh --pack` writes it with
+`scripts/third-party-notices.mjs` before it packs the archive, from the locked
+dependencies for the target of the archive:
+
+- `cretlink` from `apps/app/src-tauri/Cargo.lock`, and the npm packages of its
+  frontend from `apps/app/package-lock.json`, as `--stage` installed them;
+- `cretlink-cli` from `Cargo.lock`.
+
+The file lists what is linked into a program: not what only builds or tests
+it, and not CretLink's own crates, which `LICENSE` covers. A package that
+cannot be read stops the script, so an archive is never packed without its
+notices. To read them from an archive:
+
+```sh
+tar -xzOf dist/cretlink-<version>-linux-x86_64.tar.gz \
+  cretlink-<version>-linux-x86_64/THIRD-PARTY-NOTICES.txt | less
+```
+
+The container image of the relay server holds the same for its program
+(`/THIRD-PARTY-NOTICES.txt`), written by the same script when the image is
+built. The relay server that a release attaches as a single file has no
+notices beside it.
 
 ### Preview builds
 
@@ -270,6 +310,12 @@ commit must remain valid and the merge strategy must be documented here.
   its check and checks every link of the built pages. `pages.yml` publishes
   the site from `main`; it holds no release secret and is no part of a
   release.
+- The dependency job checks every lockfile that a build or a release reads
+  (ST-M006-019): `cargo deny` for the workspace and, with a configuration of
+  its own, for the application package; `npm audit` for the application's
+  frontend; `scripts/check-npm-audit.mjs` for the release tooling. The job of
+  the site audits the packages of the site. What each check fails on is in
+  [`CONTRIBUTING.md`](../CONTRIBUTING.md) under "Dependency checks".
 - Its last job, `CI result`, always runs and fails when a job before it
   failed or was cancelled. The ruleset on `main` requires that check and
   `Secret scan and private-data check` of the hygiene workflow
@@ -341,6 +387,7 @@ The mature release pipeline publishes:
 - platform-specific artifacts for every shipped binary — done;
 - checksums — done;
 - dependency inventory and SBOM — done;
+- third-party notices in every archive and in the relay server image — done;
 - signatures, gated on a configured signing identity — signing is implemented,
   but no signing identity is configured yet, so releases are unsigned;
 - build provenance attestation — not yet implemented.

@@ -55,7 +55,7 @@ const steps: Step[] = [
     link: 'none',
     text: [
       'The technician starts CretLink, chooses Give help and waits for the customer.',
-      'The customer starts the same program and chooses Get help. A copy named CretLink-Support.exe opens Get help straight away, for example from a USB stick. Nothing is installed.',
+      'The customer starts the same program and chooses Get help. A copy named CretLink-Support.exe opens Get help straight away, for example from a USB stick. Nothing is installed, unless the customer chooses to keep the support program for next time.',
     ],
     shots: [{ src: start, alt: 'The start screen with two choices: Get help and Give help.', kind: 'wide' }],
   },
@@ -68,11 +68,11 @@ const steps: Step[] = [
     link: 'none',
     text: [
       'CretLink first says what will happen. Then Windows asks whether it may make changes to the computer: with that permission the technician can do administrator work later.',
-      'The customer picks the technician from the computers found on the network, or types the connection code the technician gives them. That code only says where to connect. It grants nothing.',
+      'The customer picks the technician from the computers found on the network, or types the code the technician reads to them: a connection code on the same network, a relay code when the two are on different networks. The code only says where to connect. It grants nothing.',
     ],
     shots: [
       { src: permission, alt: 'The customer reads that Windows will ask for permission, and the four steps that follow.', kind: 'narrow' },
-      { src: find, alt: 'The customer chooses the technician from the computers found nearby, or enters a connection code.', kind: 'narrow' },
+      { src: find, alt: 'The customer chooses the technician from the computers found nearby, or enters a code. Under it, the offer to keep the support program for next time.', kind: 'narrow' },
     ],
   },
   {

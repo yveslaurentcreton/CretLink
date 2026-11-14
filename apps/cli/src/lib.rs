@@ -12,21 +12,33 @@
 //!   (ST-M008-002), see [`shell`].
 //! - `cretlink-cli version` prints the release version (ST-M006-014).
 //! - `cretlink-cli uninstall` removes the per-user install of the technician
-//!   role, after showing what it removes (ST-M009-006), see [`install`].
+//!   role, with the settings of the installed copy ([`settings`],
+//!   ST-M007-011) and its webview profile (ST-M009-014), after showing what
+//!   it removes (ST-M009-006), see [`install`].
 //! - `cretlink-cli recover [--remove]` lists, or removes, what CretLink left on
 //!   a customer computer (ST-M006-003, ST-M009-010): the report and the
 //!   fail-closed exit codes of the support agent's recovery verb, which it
-//!   replaces in the product ([`cretlink_support_agent::recovery`]). A
-//!   `CretLink-Support*` copy of the application accepts this command only.
+//!   replaces in the product ([`cretlink_support_agent::recovery`]), with the
+//!   webview profile folders that the application's window left added to it
+//!   (ST-M009-014, [`webview_profile`]). A `CretLink-Support*` copy of the
+//!   application accepts this command and the next one only.
+//! - `CretLink-Support.exe uninstall` removes the support program that a
+//!   customer kept on the computer (ST-M009-017, [`kept`]): the same verb, in
+//!   a copy for getting help. Nothing on the command line keeps a program:
+//!   that is a choice in the customer's own window.
 //!
 //! None of the subcommands opens a session, a listener or a window. The
 //! dispatch is a library so the one CretLink application (ST-M009-005) can run
 //! the same subcommands before it opens its window.
 
 pub mod install;
+pub mod kept;
 pub mod process;
+pub mod relay_profile;
+pub mod settings;
 pub mod setup;
 pub mod shell;
+pub mod webview_profile;
 
 /// The release version this build belongs to (ST-M006-014).
 pub use cretlink_shared::RELEASE_VERSION;
@@ -224,6 +236,12 @@ pub async fn run(program: &str, args: impl IntoIterator<Item = String>) -> ExitC
 /// always succeeds; removing succeeds only when the computer was proved clean,
 /// so kept or unreadable residue is never reported as success (REQ-N-008). It
 /// opens no connection and grants no control.
+///
+/// The webview profile folders that the application's window left are part
+/// of the same report (ST-M009-014): the temporary folders of copies that no
+/// longer run, and the folder that earlier versions kept. The folder of a
+/// copy that runs is not a leftover and is never touched; a folder whose lock
+/// cannot be told is named and left alone.
 async fn recover_command(program: &str, remove: bool) -> ExitCode {
     use cretlink_support_agent::recovery;
     print!(
@@ -231,13 +249,181 @@ async fn recover_command(program: &str, remove: bool) -> ExitCode {
         recovery::identity_text(program, &cretlink_support_agent::current_identity())
     );
     let store = cretlink_support_agent::TicketStore::for_this_process();
-    let run = recovery::run_recover(program, remove, &store).await;
+    let more = MoreResidue {
+        webview: webview_profile::Places::current(),
+        kept: kept::Layout::current(),
+    };
+    let run = recovery::run_recover_with(program, remove, &store, Some(&more)).await;
     print!("{}", run.text);
     if run.success {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// What the shipped command line knows beside the residue of sessions: the
+/// webview profile folders that the application's window left, which the
+/// recovery verb lists and removes (ST-M009-014), and the support program
+/// that a customer chose to keep, which is no residue and is only named
+/// (ST-M009-017).
+struct MoreResidue {
+    webview: webview_profile::Places,
+    /// The places of a kept program; `None` off Windows.
+    kept: Option<kept::Layout>,
+}
+
+impl cretlink_support_agent::OtherResidue for MoreResidue {
+    fn scan(&self, inventory: &mut cretlink_support_agent::Inventory) {
+        add_webview_inventory(inventory, &webview_profile::leftovers(&self.webview));
+        let unfinished = self.kept.as_ref().and_then(kept::unfinished_text);
+        add_unfinished_inventory(inventory, unfinished);
+    }
+
+    fn recover(&self, report: &mut cretlink_support_agent::RecoveryReport) {
+        let mut patience = webview_profile::Patience::a_few_seconds();
+        add_webview_recovery(
+            report,
+            &webview_profile::recover(&self.webview, &mut patience),
+        );
+        let unfinished = self.kept.as_ref().and_then(kept::unfinished_text);
+        add_unfinished_recovery(report, unfinished);
+    }
+
+    fn on_purpose(&self) -> Vec<String> {
+        self.kept
+            .as_ref()
+            .and_then(kept::on_purpose)
+            .into_iter()
+            .collect()
+    }
+}
+
+/// What a keep of the support program that was interrupted left
+/// (ST-M009-017), as a resource of the inventory: named with the command
+/// that removes it.
+fn unfinished_resource(text: String) -> cretlink_support_agent::OwnedResource {
+    cretlink_support_agent::OwnedResource {
+        kind: cretlink_support_agent::ResourceKind::UnfinishedKeep,
+        description: text,
+        session: None,
+    }
+}
+
+/// Adds an unfinished keep to the inventory, so that the computer is never
+/// called clean while it is there.
+fn add_unfinished_inventory(
+    inventory: &mut cretlink_support_agent::Inventory,
+    unfinished: Option<String>,
+) {
+    inventory.found.extend(unfinished.map(unfinished_resource));
+}
+
+/// Adds an unfinished keep to the recovery report: found, and kept with the
+/// command that removes it. The recovery does not remove it itself: what
+/// keeping added is removed by `uninstall`, from its record and its layout.
+fn add_unfinished_recovery(
+    report: &mut cretlink_support_agent::RecoveryReport,
+    unfinished: Option<String>,
+) {
+    let Some(text) = unfinished else {
+        return;
+    };
+    report.found.push(unfinished_resource(text.clone()));
+    report.failed.push(cretlink_support_agent::RecoveryFailure {
+        kind: cretlink_support_agent::ResourceKind::UnfinishedKeep,
+        description: text,
+        reason: "a keep of the support program did not finish; recover does not remove it"
+            .to_owned(),
+        remediation: format!(
+            "run '{} uninstall' as an administrator, or use Installed apps in the settings of \
+             Windows",
+            kept::PROGRAM_FILE
+        ),
+    });
+}
+
+/// A webview folder that was left, as a resource of the inventory.
+fn webview_resource(leftover: &webview_profile::Leftover) -> cretlink_support_agent::OwnedResource {
+    cretlink_support_agent::OwnedResource {
+        kind: cretlink_support_agent::ResourceKind::WebviewProfile,
+        description: leftover.describe(),
+        // A profile belongs to a process, not to a session.
+        session: None,
+    }
+}
+
+/// What cannot be said about the webview folders: a temporary folder that
+/// could not be listed, and each folder whose lock cannot be told. Such a
+/// folder is left alone; whether a copy runs with it is not known.
+fn webview_unknowns(
+    unreadable: Option<&String>,
+    unknown: &[webview_profile::Untold],
+) -> Vec<cretlink_support_agent::UnreadableKind> {
+    let kind = cretlink_support_agent::ResourceKind::WebviewProfile;
+    unreadable
+        .cloned()
+        .into_iter()
+        .chain(unknown.iter().map(|folder| {
+            format!(
+                "{}: {}; it was left alone",
+                folder.path.display(),
+                folder.reason
+            )
+        }))
+        .map(|reason| cretlink_support_agent::UnreadableKind { kind, reason })
+        .collect()
+}
+
+/// Adds the webview folders that were found to the inventory: each one as a
+/// resource, what cannot be said as "could not read", and an honest "checked
+/// and empty" when there is nothing of either (ST-M009-014).
+fn add_webview_inventory(
+    inventory: &mut cretlink_support_agent::Inventory,
+    leftovers: &webview_profile::Leftovers,
+) {
+    inventory
+        .found
+        .extend(leftovers.found.iter().map(webview_resource));
+    let unknowns = webview_unknowns(leftovers.unreadable.as_ref(), &leftovers.unknown);
+    if leftovers.found.is_empty() && unknowns.is_empty() {
+        inventory
+            .asserted_empty
+            .push(cretlink_support_agent::ResourceKind::WebviewProfile);
+    }
+    inventory.unreadable.extend(unknowns);
+}
+
+/// Adds what happened to the webview folders to the recovery report: found,
+/// removed, kept with the reason and what to do by hand, and what cannot be
+/// said (ST-M009-014).
+fn add_webview_recovery(
+    report: &mut cretlink_support_agent::RecoveryReport,
+    recovery: &webview_profile::Recovery,
+) {
+    report
+        .found
+        .extend(recovery.found.iter().map(webview_resource));
+    report
+        .removed
+        .extend(recovery.removed.iter().map(webview_resource));
+    report
+        .failed
+        .extend(recovery.kept.iter().map(|(leftover, reason)| {
+            cretlink_support_agent::RecoveryFailure {
+                kind: cretlink_support_agent::ResourceKind::WebviewProfile,
+                description: leftover.describe(),
+                reason: reason.clone(),
+                remediation: format!(
+                    "close every CretLink window, then delete the folder manually: {}",
+                    leftover.path.display()
+                ),
+            }
+        }));
+    report.unreadable.extend(webview_unknowns(
+        recovery.unreadable.as_ref(),
+        &recovery.unknown,
+    ));
 }
 
 /// `cretlink uninstall`: shows what it will remove, asks, then removes the
@@ -271,6 +457,12 @@ fn uninstall_command(program: &str, yes: bool, console: process::ConsoleAttach) 
             return ExitCode::FAILURE;
         }
     };
+    // A copy for getting help has no install of the technician role: its
+    // `uninstall` removes the support program that a customer kept on this
+    // computer (ST-M009-017).
+    if install::is_customer_copy(&exe) {
+        return kept::uninstall_command(program, yes, in_box);
+    }
     let Some(layout) = install::Layout::current() else {
         tell(
             "CretLink",
@@ -358,7 +550,7 @@ fn uninstall_command(program: &str, yes: bool, console: process::ConsoleAttach) 
 
 /// Reads one answer line: only `y` or `yes` (any case) confirms; end of
 /// input or anything else does not.
-fn confirmed(input: &mut dyn std::io::BufRead) -> bool {
+pub(crate) fn confirmed(input: &mut dyn std::io::BufRead) -> bool {
     let mut line = String::new();
     match input.read_line(&mut line) {
         Ok(0) | Err(_) => false,
@@ -426,13 +618,18 @@ Commands:
   mcp status          Show where CretLink is registered.
   shell [OPTIONS]     Open a terminal on the consented session
                       (see '{program} shell --help').
-  uninstall [--yes]   Remove CretLink installed for this user: its files, menu
-                      entry, uninstall entry and the AI client registrations it
-                      made. Shows what it removes and asks first, unless --yes.
-                      The audit trail stays.
+  uninstall [--yes]   Remove CretLink installed for this user: its files, its
+                      settings (the relay and its key), menu entry, uninstall
+                      entry, webview profile and the AI client registrations
+                      it made. Shows what it removes and what stays, and asks
+                      first, unless --yes. The audit trail stays, and so does
+                      a relay profile cretlink.toml next to the program:
+                      uninstall says where it lies and whether it holds a key.
   recover [--remove]  List what CretLink left on this computer (staged files,
-                      reboot-resume tickets); with --remove, remove it. Exits
-                      with an error when something could not be removed.
+                      reboot-resume tickets, webview profile folders); with
+                      --remove, remove it. Exits with an error when something
+                      could not be removed. A support program that a customer
+                      chose to keep is named, and never removed by this.
   version             Print the version.
   help                Print this help.
 
@@ -568,6 +765,25 @@ mod tests {
         assert!(parse(args(&["install"])).is_err());
     }
 
+    /// Nothing on a command line keeps the support program on a computer
+    /// (ST-M009-017): that is a choice in the customer's own window, and the
+    /// shared command line has no word for it.
+    #[test]
+    fn no_command_keeps_a_program() {
+        for words in [
+            args(&["keep"]),
+            args(&["--keep"]),
+            args(&["install"]),
+            args(&["install", "--yes"]),
+            args(&["update"]),
+            args(&["uninstall", "--keep"]),
+            args(&["recover", "--keep"]),
+            args(&["version", "--keep"]),
+        ] {
+            assert!(parse(words.clone()).is_err(), "{words:?}");
+        }
+    }
+
     #[test]
     fn only_yes_confirms_an_uninstall() {
         for (answer, expected) in [
@@ -588,16 +804,69 @@ mod tests {
         let plan = install::UninstallPlan {
             location: std::path::PathBuf::from("/home/ann/.local/bin"),
             files: vec![std::path::PathBuf::from("/home/ann/.local/bin/cretlink")],
+            settings: vec![std::path::PathBuf::from(
+                "/home/ann/.local/share/CretLink/settings.toml",
+            )],
             after_exit: false,
             entry: None,
             uninstall_entry: false,
             registrations: vec![],
-            kept: vec!["The Codex CLI registration, which now starts /x mcp".to_owned()],
+            kept: vec![
+                "The Codex CLI registration, which now starts /x mcp".to_owned(),
+                "The relay profile /home/ann/.local/bin/cretlink.toml, which CretLink did not \
+                 write and does not remove. It holds the admission key of a relay in readable \
+                 form: remove the file yourself when nobody else should be able to read that key"
+                    .to_owned(),
+            ],
+            webview: Some(std::path::PathBuf::from(
+                "/home/ann/.local/share/CretLink/webview",
+            )),
+            webview_after_close: false,
+            legacy_webview: Some(std::path::PathBuf::from(
+                "/home/ann/.local/share/dev.cretlink.app",
+            )),
             audit_dir: std::path::PathBuf::from("/home/ann/.local/share/CretLink/audit"),
         };
         let text = uninstall_plan_text(&plan);
+        // The webview profiles go (ST-M009-014); the audit trail, which lies
+        // next to the installed copy's profile, stays.
+        assert!(
+            text.contains(
+                "  - The webview profile /home/ann/.local/share/CretLink/webview\n  - The \
+                 webview profile of earlier versions /home/ann/.local/share/dev.cretlink.app\n"
+            ),
+            "{text}"
+        );
+        // From the installed copy's own window, which holds the profile.
+        let from_window = uninstall_plan_text(&plan.clone().from_its_window());
+        assert!(
+            from_window.contains(
+                "  - The webview profile /home/ann/.local/share/CretLink/webview (removed once \
+                 CretLink has closed)\n"
+            ),
+            "{from_window}"
+        );
+        // A relay profile next to the program stays, and the plan says so
+        // under what stays, with where it lies and that it holds a key.
+        let stays = text.split_once("This stays:\n").map(|(_, stays)| stays);
+        assert!(
+            stays.is_some_and(|stays| stays.contains(
+                "  - The relay profile /home/ann/.local/bin/cretlink.toml, which CretLink did \
+                 not write and does not remove. It holds the admission key of a relay in \
+                 readable form"
+            )),
+            "{text}"
+        );
         assert!(
             text.contains("This removes:\n  - /home/ann/.local/bin/cretlink\n"),
+            "{text}"
+        );
+        // The settings hold the relay's key: the plan says that they go too.
+        assert!(
+            text.contains(
+                "  - Your settings (the relay with its key, the network to wait on): \
+                 /home/ann/.local/share/CretLink/settings.toml\n"
+            ),
             "{text}"
         );
         assert!(text.contains("  - The Codex CLI registration, which now starts /x mcp\n"));
@@ -615,6 +884,256 @@ mod tests {
         );
         assert!(text.contains("The audit trail in /home/ann/.local/share/CretLink/audit"));
         assert!(text.contains("not completely uninstalled"));
+        // What stayed is said again once the uninstall is done.
+        let report = install::UninstallReport {
+            kept: plan.kept.clone(),
+            ..install::UninstallReport::default()
+        };
+        let text = uninstall_report_text(&report, &plan.audit_dir);
+        let left = text.split_once("Left in place:\n").map(|(_, left)| left);
+        assert!(
+            left.is_some_and(|left| left
+                .contains("  - The relay profile /home/ann/.local/bin/cretlink.toml, which")),
+            "{text}"
+        );
+    }
+
+    fn leftover(path: &str, origin: webview_profile::Origin) -> webview_profile::Leftover {
+        webview_profile::Leftover {
+            path: std::path::PathBuf::from(path),
+            origin,
+        }
+    }
+
+    fn untold(path: &str) -> webview_profile::Untold {
+        webview_profile::Untold {
+            path: std::path::PathBuf::from(path),
+            reason: "its lock could not be opened (permission denied)".to_owned(),
+        }
+    }
+
+    #[test]
+    fn recover_lists_the_webview_folders_with_the_other_residue() {
+        use cretlink_support_agent::recovery::inventory_text;
+        use cretlink_support_agent::{Inventory, ResourceKind};
+        use webview_profile::{Leftovers, Origin};
+
+        // Nothing left: an honest "checked and empty", and a clean computer.
+        let mut clean = Inventory::default();
+        add_webview_inventory(&mut clean, &Leftovers::default());
+        assert_eq!(clean.asserted_empty, vec![ResourceKind::WebviewProfile]);
+        assert!(clean.is_clean());
+        let text = inventory_text("cretlink", &clean);
+        assert!(
+            text.contains("Checked and empty: webview profile."),
+            "{text}"
+        );
+        assert!(text.contains("This machine is clean"), "{text}");
+
+        // The folder of a copy that was killed and the one of an earlier
+        // version: found, with the removal command, and not asserted empty.
+        let mut inventory = Inventory::default();
+        add_webview_inventory(
+            &mut inventory,
+            &Leftovers {
+                found: vec![
+                    leftover("/tmp/CretLink-webview-01", Origin::Stale),
+                    leftover(
+                        "/home/ann/.local/share/dev.cretlink.app",
+                        Origin::EarlierVersion,
+                    ),
+                ],
+                ..Leftovers::default()
+            },
+        );
+        assert!(inventory.asserted_empty.is_empty());
+        assert!(
+            inventory
+                .found
+                .iter()
+                .all(|resource| resource.kind == ResourceKind::WebviewProfile
+                    && resource.session.is_none())
+        );
+        let text = inventory_text("cretlink", &inventory);
+        assert!(text.contains("Found 2 resource(s)"), "{text}");
+        assert!(
+            text.contains(
+                "  - webview profile: /tmp/CretLink-webview-01 (left by a copy that no longer \
+                 runs)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  - webview profile: /home/ann/.local/share/dev.cretlink.app (left by an \
+                 earlier version)\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("run:  cretlink recover --remove"), "{text}");
+
+        // A folder whose lock cannot be told is named, and the computer is
+        // not called clean.
+        let mut unknown = Inventory::default();
+        add_webview_inventory(
+            &mut unknown,
+            &Leftovers {
+                unknown: vec![untold("/tmp/CretLink-webview-02")],
+                ..Leftovers::default()
+            },
+        );
+        assert!(unknown.asserted_empty.is_empty());
+        assert!(!unknown.is_clean());
+        let text = inventory_text("cretlink", &unknown);
+        assert!(
+            text.contains(
+                "! Could not read webview profile (/tmp/CretLink-webview-02: its lock could not \
+                 be opened (permission denied); it was left alone)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("is clean"), "{text}");
+
+        // A temporary folder that cannot be listed is unknown, never clean.
+        let mut unlisted = Inventory::default();
+        add_webview_inventory(
+            &mut unlisted,
+            &Leftovers {
+                unreadable: Some("the temporary folder /tmp could not be listed (denied)".into()),
+                ..Leftovers::default()
+            },
+        );
+        assert!(unlisted.asserted_empty.is_empty());
+        assert!(!unlisted.is_clean());
+        assert!(inventory_text("cretlink", &unlisted).contains(
+            "! Could not read webview profile (the temporary folder /tmp could not be \
+                 listed (denied))"
+        ));
+    }
+
+    /// A keep that was interrupted is named, with the command that removes
+    /// it, and the computer is never called clean then (ST-M009-017).
+    #[test]
+    fn an_unfinished_keep_is_named_and_the_computer_is_not_clean() {
+        use cretlink_support_agent::recovery::{inventory_text, recovery_report_text};
+        use cretlink_support_agent::{Inventory, RecoveryReport, ResourceKind};
+
+        let layout = kept::Layout::new(
+            std::path::PathBuf::from("/x/CretLink Support"),
+            std::path::Path::new("/x/Start Menu"),
+            std::path::Path::new("/x/Desktop"),
+        );
+        // Nothing of a kept program is there: nothing is added.
+        assert_eq!(kept::unfinished_text(&layout), None);
+        let mut inventory = Inventory::default();
+        add_unfinished_inventory(&mut inventory, None);
+        assert_eq!(inventory, Inventory::default());
+
+        let unfinished = "C:/Program Files/CretLink Support: keeping CretLink Support on this \
+                          computer did not finish. To remove what it left, run \
+                          'CretLink-Support.exe uninstall' as an administrator"
+            .to_owned();
+        add_unfinished_inventory(&mut inventory, Some(unfinished.clone()));
+        assert!(!inventory.is_clean());
+        assert_eq!(inventory.found[0].kind, ResourceKind::UnfinishedKeep);
+        let text = inventory_text("CretLink-Support.exe", &inventory);
+        assert!(!text.contains("This machine is clean"), "{text}");
+        assert!(text.contains("'CretLink-Support.exe uninstall'"), "{text}");
+
+        let mut report = RecoveryReport::default();
+        add_unfinished_recovery(&mut report, Some(unfinished));
+        assert!(!report.ok(), "an unfinished keep is never a clean result");
+        let text = recovery_report_text(&report);
+        assert!(!text.contains("this machine is clean"), "{text}");
+        assert!(
+            text.contains(
+                "      remediation: run 'CretLink-Support.exe uninstall' as an administrator"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn recover_reports_a_webview_folder_it_could_not_remove_and_fails() {
+        use cretlink_support_agent::recovery::recovery_report_text;
+        use cretlink_support_agent::{RecoveryReport, ResourceKind};
+        use webview_profile::{Origin, Recovery};
+
+        let removed = leftover("/tmp/CretLink-webview-01", Origin::Stale);
+        let kept = leftover("/tmp/CretLink-webview-02", Origin::Stale);
+        let mut report = RecoveryReport::default();
+        add_webview_recovery(
+            &mut report,
+            &Recovery {
+                found: vec![removed.clone(), kept.clone()],
+                removed: vec![removed],
+                kept: vec![(kept, "a file in it is in use".to_owned())],
+                ..Recovery::default()
+            },
+        );
+        assert!(!report.ok(), "a kept folder is never a success");
+        assert_eq!(report.failed[0].kind, ResourceKind::WebviewProfile);
+        let text = recovery_report_text(&report);
+        assert!(text.contains("Removed 1 of 2 resource(s) found."), "{text}");
+        assert!(
+            text.contains("  - removed webview profile: /tmp/CretLink-webview-01"),
+            "{text}"
+        );
+        assert!(
+            text.contains("KEPT 1 resource(s) that could NOT be removed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("      reason:      a file in it is in use\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "      remediation: close every CretLink window, then delete the folder \
+                 manually: /tmp/CretLink-webview-02\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Recovery did NOT fully complete"), "{text}");
+
+        // Everything removed: clean. Nothing there: nothing to remove.
+        let gone = leftover("/tmp/CretLink-webview-03", Origin::Stale);
+        let mut report = RecoveryReport::default();
+        add_webview_recovery(
+            &mut report,
+            &Recovery {
+                found: vec![gone.clone()],
+                removed: vec![gone],
+                ..Recovery::default()
+            },
+        );
+        assert!(report.ok());
+        assert!(recovery_report_text(&report).contains("this machine is clean"));
+        let mut report = RecoveryReport::default();
+        add_webview_recovery(&mut report, &Recovery::default());
+        assert!(recovery_report_text(&report).contains("nothing to remove"));
+
+        // A folder whose lock cannot be told was left alone: that is said,
+        // and the recovery does not call the computer clean.
+        let mut report = RecoveryReport::default();
+        add_webview_recovery(
+            &mut report,
+            &Recovery {
+                unknown: vec![untold("/tmp/CretLink-webview-04")],
+                ..Recovery::default()
+            },
+        );
+        assert!(!report.ok());
+        let text = recovery_report_text(&report);
+        assert!(!text.contains("nothing to remove"), "{text}");
+        assert!(
+            text.contains(
+                "! Could not read webview profile (/tmp/CretLink-webview-04: its lock could not \
+                 be opened (permission denied); it was left alone) — state unknown."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Recovery did NOT fully complete"), "{text}");
     }
 
     #[test]

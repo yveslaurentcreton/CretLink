@@ -5,7 +5,8 @@
 import { h } from "../../shared/dom";
 import { groupCode } from "../../shared/feed";
 import { type IconName, icon } from "../../shared/icons";
-import { type CustomerSnapshot, capName, technicianName } from "../model";
+import { relayLabel, trustWords, viaRelay } from "../../shared/relay";
+import { type CustomerSnapshot, capName, sessionRelay, technicianName } from "../model";
 import { button } from "./common";
 
 function stopFooter(label: string, s: CustomerSnapshot, variant = "danger block big"): HTMLElement {
@@ -30,12 +31,34 @@ function provenance(s: CustomerSnapshot): HTMLElement | null {
 }
 
 export function connectingView(s: CustomerSnapshot): HTMLElement[] {
+  // A relay code: the connection goes through the relay of this copy
+  // (ST-M007-013). The screen says through which, where this copy connects
+  // when that is another host than the name says, what vouches for the name
+  // when it is a file of this copy's profile, and what a relay is.
+  const relay = sessionRelay(s);
   return [
     h(
       "main",
       { class: "cbody center", id: "main", tabindex: -1, "data-key": "main-connecting" },
       h("span", { class: "spinner lg", "aria-hidden": "true" }),
-      h("h3", null, "Connecting to your technician"),
+      relay
+        ? h(
+            "h3",
+            { id: "connecting-h" },
+            "Connecting through the relay ",
+            h("span", { class: "relay-host" }, relayLabel(relay)),
+          )
+        : h("h3", { id: "connecting-h" }, "Connecting to your technician"),
+      relay
+        ? h(
+            "p",
+            { class: "relay-explained" },
+            "The relay only passes encrypted traffic on. It cannot look into the session, and it gives nobody access to this computer.",
+          )
+        : null,
+      relay && trustWords(relay)
+        ? h("p", { class: "muted relay-trust", id: "relay-trust" }, trustWords(relay))
+        : null,
       h("p", null, "Setting up an encrypted connection. Nothing is shared yet."),
     ),
     stopFooter("Cancel", s, "block big"),
@@ -67,6 +90,7 @@ export function compareView(s: CustomerSnapshot): HTMLElement[] {
         h("span", { class: "spinner", "aria-hidden": "true" }),
         `Waiting for ${name} to confirm…`,
       ),
+      viaRelay(sessionRelay(s)),
     ),
     stopFooter("It doesn't match — stop", s),
   ];
@@ -104,6 +128,7 @@ export function consentView(s: CustomerSnapshot): HTMLElement[] {
         h("span", { class: "i" }, icon("check")),
         "You see everything they do, and you can stop at any time.",
       ),
+      viaRelay(sessionRelay(s)),
       h("h4", { id: "disclosure-head" }, "What you agree to"),
       // The canonical disclosure, verbatim from the backend; it stays visible.
       h(

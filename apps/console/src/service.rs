@@ -13,6 +13,36 @@
 //! - executes command requests (`run_command`, `write_stdin`, `cancel_job`,
 //!   `list_jobs`, `stop`) on the handle, correlated by one-shot replies.
 //!
+//! # The technician's file explorer (ST-M010-001, ST-M010-002)
+//!
+//! Beside the MCP-facing file surface, which attributes every call to the AI,
+//! the service offers the operations of the technician's own file explorer,
+//! attributed to the technician ([`Origin::Console`]):
+//! [`ConsoleSessionService::list_drives`],
+//! [`ConsoleSessionService::list_folder`],
+//! [`ConsoleSessionService::remove_tree`],
+//! [`ConsoleSessionService::send_to_folder`] and
+//! [`ConsoleSessionService::download_file`], and the changes to one entry:
+//! [`ConsoleSessionService::stat_entry`],
+//! [`ConsoleSessionService::create_folder`],
+//! [`ConsoleSessionService::move_entry`] and
+//! [`ConsoleSessionService::delete_entry`]. The removal and the two transfers
+//! can run long, so the caller hands in a [`CancelToken`] to cancel them and
+//! may hand in a [`ProgressSink`]; a revoke or stop cancels them like any
+//! transfer. They add no authority: they work only on the consented session
+//! and fail closed with it. The MCP tool surface offers the same wire
+//! operations for one entry and for a transfer under the AI's own name; it
+//! does not offer the drive list, the removal of a folder with its content or
+//! a file sent into a folder.
+//!
+//! The service also keeps, for its session only, what the target has
+//! confirmed about the places the explorer went to (see [`crate::explorer`]).
+//!
+//! The service does not write the audit trail; whoever drives an action
+//! records it. For these that is [`crate::TechnicianFiles`], which a
+//! screen calls instead of the service: it records each action before and
+//! after it runs.
+//!
 //! # Fail-closed (REQ-S-009, ST-M004-004)
 //!
 //! The service is the routing authority's local face. It is created only for an
@@ -42,14 +72,17 @@ use cretlink_protocol::{
     SessionId, Shell, TargetIdentity,
 };
 use cretlink_session::{
-    Attribution, CancelToken, CleanupTrigger, DownloadRequest, ExecRequest as HostExecRequest,
-    HostHandle, OpResult, Operation, Origin, OutputStream, Purpose, RemotePath, RevokeReason,
-    SessionError as HostSessionError, SessionEvent, StagedEntry, StartedJob, TransferReport,
+    Attribution, CancelToken, CleanupPolicy, CleanupTrigger, DownloadRequest, DriveEntry,
+    ExecRequest as HostExecRequest, HostHandle, OpResult, Operation, Origin, OutputStream, Purpose,
+    RemotePath, RevokeReason, SessionError as HostSessionError, SessionEvent, StagedEntry,
+    StartedJob, TransferProgress, TransferReport, TreeRemovalProgress, TreeRemovalReport,
     UploadRequest,
 };
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+use crate::explorer::{Browsed, FolderSource};
 
 /// Capacity of the broadcast event stream. Each `ExecOutput` event carries at
 /// most one wire output chunk (~32 KiB), so buffered output is bounded at
@@ -75,6 +108,66 @@ pub const MAX_TERM_CONSUMERS: usize = 8;
 /// with an honest `Dropped` frame rather than corrupting the shared VT stream
 /// by dropping bytes for the other consumers (REQ-N-006).
 const TERM_CONSUMER_CAPACITY: usize = 256;
+
+/// Where a long operation reports its progress, when the caller wants to
+/// follow it (ST-M010-001). It is called on the service's driver task after
+/// each step the target answered, so it must return quickly and never wait
+/// for the service. It may cancel the operation's [`CancelToken`] or stop the
+/// session: neither waits.
+pub type ProgressSink<T> = Box<dyn FnMut(T) + Send>;
+
+/// A file to send from the technician computer into a folder of the target
+/// (ST-M010-001).
+///
+/// The file is committed in that folder under `name` only after its length
+/// and SHA-256 are verified, on whatever drive the folder lies. It is the
+/// customer's to keep: it is not staged, and no cleanup removes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendToFolder {
+    /// The file on the technician computer to read.
+    pub local_path: PathBuf,
+    /// The folder on the target that receives the file: an absolute remote
+    /// path such as `C:\Users\ann\Documents`, or a drive root.
+    pub folder: String,
+    /// The name the file gets in that folder: one name, not a path.
+    pub name: String,
+    /// Whether a file of that name that is already there may be replaced.
+    /// Without it such a file fails the transfer and is left as it is.
+    pub overwrite: bool,
+}
+
+impl SendToFolder {
+    /// The remote path the file is committed at: `name` in `folder`.
+    ///
+    /// # Errors
+    ///
+    /// An `invalid_path` [`TargetError`] when `folder` is not a rooted path
+    /// on a drive, when `name` is not one name — it holds a separator, so it
+    /// would reach into another folder — or when the resulting path breaks
+    /// the rules for remote paths. Nothing is sent then.
+    pub fn dest(&self) -> Result<RemotePath, TargetError> {
+        let invalid = |message: String| TargetError::Remote {
+            code: ErrorCode::InvalidPath,
+            message,
+            stage: ErrorStage::Validation,
+        };
+        // The folder is checked on its own first: joined to a name, a bare
+        // drive (`C:`) would read as the root of that drive, which is another
+        // folder than the one it names.
+        cretlink_protocol::validate_remote_absolute_path("folder", &self.folder)
+            .map_err(|error| invalid(error.to_string()))?;
+        if self.name.is_empty() || self.name.contains(['\\', '/']) {
+            return Err(invalid(
+                "the name of the file must be one name, without a folder".to_string(),
+            ));
+        }
+        let folder = self.folder.trim_end_matches(['\\', '/']);
+        let path = format!("{folder}\\{}", self.name);
+        cretlink_protocol::validate_remote_absolute_path("dest", &path)
+            .map_err(|error| invalid(error.to_string()))?;
+        Ok(RemotePath::Absolute { path })
+    }
+}
 
 /// A command the service asks its driver task to run on the owned handle.
 enum DriverCommand {
@@ -116,18 +209,35 @@ enum DriverCommand {
         reply: oneshot::Sender<Result<OpResult, HostSessionError>>,
     },
     /// A resumable, verified upload driven inline by the transfer engine
-    /// (ST-M004-003, REQ-N-007). The driver mints the [`CancelToken`] under the
-    /// transfer gate so a concurrent revoke aborts it within one chunk.
+    /// (ST-M004-003, REQ-N-007). The driver publishes the [`CancelToken`] into
+    /// the transfer gate — the caller's own when it handed one in, else a
+    /// fresh one — so a concurrent revoke aborts it within one chunk.
     Upload {
         request: UploadRequest,
         attribution: Attribution,
+        cancel: Option<CancelToken>,
+        progress: Option<ProgressSink<TransferProgress>>,
         reply: oneshot::Sender<Result<TransferReport, HostSessionError>>,
     },
+    /// The removal of a folder with its content, driven inline by the removal
+    /// engine in bounded steps (ST-M010-001). Its [`CancelToken`] is published
+    /// into the transfer gate like a transfer's, so a revoke ends it between
+    /// two steps.
+    RemoveTree {
+        path: RemotePath,
+        attribution: Attribution,
+        cancel: CancelToken,
+        progress: Option<ProgressSink<TreeRemovalProgress>>,
+        reply: oneshot::Sender<Result<TreeRemovalReport, HostSessionError>>,
+    },
     /// A resumable, verified download driven inline by the transfer engine
-    /// (ST-M004-003, REQ-N-007).
+    /// (ST-M004-003, REQ-N-007). Like an upload it runs under the caller's own
+    /// [`CancelToken`] when it handed one in (ST-M010-002).
     Download {
         request: DownloadRequest,
         attribution: Attribution,
+        cancel: Option<CancelToken>,
+        progress: Option<ProgressSink<TransferProgress>>,
         reply: oneshot::Sender<Result<TransferReport, HostSessionError>>,
     },
     Stop {
@@ -415,6 +525,15 @@ struct Inner {
     /// from an idle bridge connection (ST-M004-006). Shared with the IPC server,
     /// which increments/decrements it under an RAII guard; the CLI reads it.
     ai_in_flight: Arc<AtomicU64>,
+    /// The last id minted for an action of the technician's own that the
+    /// console audits as a start record and a completion record
+    /// (ST-M010-001). One counter for the session, so two such actions never
+    /// share an id whoever records them.
+    technician_actions: AtomicU64,
+    /// What the target has confirmed about the places the technician's
+    /// explorer went to in this session (ST-M010-002). It ends with the
+    /// session, so nothing of one customer computer is taken to the next.
+    browsed: Mutex<Browsed>,
 }
 
 /// One owner of a live console session, shareable across the CLI and the IPC
@@ -459,6 +578,8 @@ impl ConsoleSessionService {
             transfer_gate: Mutex::new(TransferGate::default()),
             terminals: Mutex::new(TerminalRegistry::default()),
             ai_in_flight: Arc::new(AtomicU64::new(0)),
+            technician_actions: AtomicU64::new(0),
+            browsed: Mutex::new(Browsed::default()),
         });
         let driver = tokio::spawn(drive(handle, command_rx, event_tx, Arc::clone(&inner)));
         (Self { inner }, driver)
@@ -478,6 +599,19 @@ impl ConsoleSessionService {
     #[must_use]
     pub fn activity_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.inner.ai_in_flight)
+    }
+
+    /// Mints the id that the start record and the completion record of one
+    /// technician action share in the audit trail (`action_id`): unique in
+    /// this session and rising (ST-M010-001).
+    pub(crate) fn next_technician_action(&self) -> u64 {
+        self.inner.technician_actions.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// What this session remembers of the places the technician's explorer
+    /// went to (ST-M010-002).
+    pub(crate) fn browsed(&self) -> &Mutex<Browsed> {
+        &self.inner.browsed
     }
 
     /// The routed session id (REQ-F-016).
@@ -839,6 +973,18 @@ impl ConsoleSessionService {
         purpose: Option<Purpose>,
         op: Operation,
     ) -> Result<OpResult, TargetError> {
+        // A single AI-driven operation is attributed to the AI, with its
+        // stated purpose (ST-M004-006, ST-M009-007).
+        self.file_op(mcp(purpose), op).await
+    }
+
+    /// Runs one bounded file operation on the target with the given
+    /// attribution, gated fail-closed.
+    async fn file_op(
+        &self,
+        attribution: Attribution,
+        op: Operation,
+    ) -> Result<OpResult, TargetError> {
         if !self.is_active() {
             return Err(TargetError::NoConsentedSession);
         }
@@ -847,9 +993,7 @@ impl ConsoleSessionService {
             .commands
             .send(DriverCommand::FileOp {
                 op,
-                // A single AI-driven operation is attributed to the AI, with
-                // its stated purpose (ST-M004-006, ST-M009-007).
-                attribution: mcp(purpose),
+                attribution,
                 reply: reply_tx,
             })
             .map_err(|_| TargetError::Disconnected)?;
@@ -1268,12 +1412,26 @@ impl ConsoleSessionService {
             cleanup: params.cleanup,
             overwrite: params.overwrite,
         };
+        self.dispatch_upload(request, mcp(purpose), None, None)
+            .await
+    }
+
+    /// Queues one upload on the driver and awaits its honest report.
+    async fn dispatch_upload(
+        &self,
+        request: UploadRequest,
+        attribution: Attribution,
+        cancel: Option<CancelToken>,
+        progress: Option<ProgressSink<TransferProgress>>,
+    ) -> Result<UploadReport, TargetError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
             .send(DriverCommand::Upload {
                 request,
-                attribution: mcp(purpose),
+                attribution,
+                cancel,
+                progress,
                 reply: reply_tx,
             })
             .map_err(|_| TargetError::Disconnected)?;
@@ -1282,6 +1440,253 @@ impl ConsoleSessionService {
             .unwrap_or(Err(HostSessionError::Disconnected))
             .map_err(session_to_target)?;
         Ok(upload_report_from(report))
+    }
+
+    // --- The technician's file explorer (ST-M010-001, ST-M010-002) ---
+    //
+    // These are the technician's own actions: every request they issue
+    // is stamped `Origin::Console`, so the agent and the attended customer
+    // attribute them to the technician, not to the AI (REQ-F-017, REQ-S-023).
+    // `TechnicianFiles` runs them and records them in the audit trail.
+
+    /// Lists the drives of the target: each with its root, kind, label and
+    /// total and free space, where a value the target could not read is
+    /// absent.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive. A target that does
+    /// not serve the operation answers `Unsupported`.
+    pub async fn list_drives(&self) -> Result<Vec<DriveEntry>, TargetError> {
+        match self
+            .file_op(Origin::Console.into(), Operation::FsDrives {})
+            .await?
+        {
+            OpResult::Drives { drives } => {
+                // The roots are what the explorer names a drive by.
+                self.inner
+                    .browsed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set_roots(&drives);
+                Ok(drives)
+            }
+            _ => Err(TargetError::Unexpected),
+        }
+    }
+
+    /// Lists one page of a folder of the target for the technician: the
+    /// entries after the name `continue_after`, ordered by name, and whether
+    /// the folder ends with them (ST-M010-002). A page is as long as fits one
+    /// record of the secure channel, so pages differ in length
+    /// (ST-M010-005).
+    ///
+    /// This is one request. [`crate::TechnicianFiles::open_folder`] lists a
+    /// whole folder with it and records that in the audit trail.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive.
+    pub async fn list_folder(
+        &self,
+        path: RemotePath,
+        continue_after: Option<String>,
+    ) -> Result<DirPage, TargetError> {
+        match self
+            .file_op(
+                Origin::Console.into(),
+                Operation::FsList {
+                    path,
+                    continue_after,
+                },
+            )
+            .await?
+        {
+            OpResult::DirEntries { entries, end } => Ok(DirPage { entries, end }),
+            _ => Err(TargetError::Unexpected),
+        }
+    }
+
+    /// Removes a folder of the target with everything in it and returns the
+    /// honest [`TreeRemovalReport`]: completed only when the folder is gone,
+    /// failed with the first entries that could not be removed and their
+    /// reasons, or cancelled with what was removed until then. The files are
+    /// deleted, not moved to a recycle bin.
+    ///
+    /// Setting `cancel` ends the removal between two of its steps, and so does
+    /// a revoke or stop of the session. `progress` receives the counts after
+    /// each step.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive or revoked. A
+    /// removal the target refused or could not finish is not an error of the
+    /// call: it is a `Failed` report.
+    pub async fn remove_tree(
+        &self,
+        path: RemotePath,
+        cancel: CancelToken,
+        progress: Option<ProgressSink<TreeRemovalProgress>>,
+    ) -> Result<TreeRemovalReport, TargetError> {
+        if !self.is_active() {
+            return Err(TargetError::NoConsentedSession);
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(DriverCommand::RemoveTree {
+                path,
+                attribution: Origin::Console.into(),
+                cancel,
+                progress,
+                reply: reply_tx,
+            })
+            .map_err(|_| TargetError::Disconnected)?;
+        reply_rx
+            .await
+            .unwrap_or(Err(HostSessionError::Disconnected))
+            .map_err(session_to_target)
+    }
+
+    /// Sends a file of the technician computer into a folder of the target,
+    /// on any drive, and commits it there under its name once its length and
+    /// SHA-256 are verified. A file of that name that is already there is
+    /// replaced only when [`SendToFolder::overwrite`] says so.
+    ///
+    /// Setting `cancel` ends the transfer and discards its unfinished part;
+    /// a revoke or stop does the same. `progress` receives the bytes
+    /// confirmed so far.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]: `invalid_path` when the folder or the name
+    /// is refused (nothing is sent), fail-closed when inactive or revoked. A
+    /// transfer that failed on either computer is not an error of the call:
+    /// it is a `Failed` report, as for [`Self::upload`].
+    pub async fn send_to_folder(
+        &self,
+        send: SendToFolder,
+        cancel: CancelToken,
+        progress: Option<ProgressSink<TransferProgress>>,
+    ) -> Result<UploadReport, TargetError> {
+        if !self.is_active() {
+            return Err(TargetError::NoConsentedSession);
+        }
+        let request = UploadRequest {
+            dest: send.dest()?,
+            source: send.local_path,
+            // A file sent to a folder is not staged: it has no source label
+            // in a manifest and no cleanup policy applies to it.
+            source_label: String::new(),
+            cleanup: CleanupPolicy::Keep,
+            overwrite: send.overwrite,
+        };
+        self.dispatch_upload(request, Origin::Console.into(), Some(cancel), progress)
+            .await
+    }
+
+    /// Copies a file of the target to `dest` on the technician computer, for
+    /// the technician (ST-M010-002). The bytes land in a part beside `dest`,
+    /// and the file gets its name only after its whole-file SHA-256 matches
+    /// the target's; a file that lies at `dest` is replaced by that step.
+    ///
+    /// Setting `cancel` ends the transfer, and so does a revoke or stop. The
+    /// part of a cancelled download stays beside `dest` for a later resume;
+    /// [`cretlink_session::download_part_path`] names it for a caller that
+    /// wants it gone. `progress` receives the bytes confirmed so far.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive or revoked. A
+    /// transfer that failed on either computer is not an error of the call:
+    /// it is a `Failed` report, as for [`Self::download`].
+    pub async fn download_file(
+        &self,
+        source: RemotePath,
+        dest: PathBuf,
+        cancel: CancelToken,
+        progress: Option<ProgressSink<TransferProgress>>,
+    ) -> Result<DownloadReport, TargetError> {
+        if !self.is_active() {
+            return Err(TargetError::NoConsentedSession);
+        }
+        let request = DownloadRequest { source, dest };
+        self.dispatch_download(request, Origin::Console.into(), Some(cancel), progress)
+            .await
+    }
+
+    /// Looks one path of the target up for the technician: the entry that
+    /// lies there, or none, and the length of an unfinished part of a
+    /// transfer to it (ST-M010-002). A link is described, never followed.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive.
+    pub async fn stat_entry(&self, path: RemotePath) -> Result<StatReport, TargetError> {
+        match self
+            .file_op(Origin::Console.into(), Operation::FsStat { path })
+            .await?
+        {
+            OpResult::PathStat { entry, partial_len } => Ok(StatReport { entry, partial_len }),
+            _ => Err(TargetError::Unexpected),
+        }
+    }
+
+    /// Creates one folder on the target for the technician (ST-M010-002): the
+    /// folder that holds it must exist, and a name that is taken is refused.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive.
+    pub async fn create_folder(&self, path: RemotePath) -> Result<(), TargetError> {
+        match self
+            .file_op(Origin::Console.into(), Operation::CreateDir { path })
+            .await?
+        {
+            OpResult::Ack {} => Ok(()),
+            _ => Err(TargetError::Unexpected),
+        }
+    }
+
+    /// Moves or renames one entry of the target for the technician
+    /// (ST-M010-002). A destination that is taken is refused and left as it
+    /// is: the technician's explorer never replaces by a move.
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive.
+    pub async fn move_entry(&self, from: RemotePath, to: RemotePath) -> Result<(), TargetError> {
+        match self
+            .file_op(
+                Origin::Console.into(),
+                Operation::FsMove {
+                    from,
+                    to,
+                    overwrite: false,
+                },
+            )
+            .await?
+        {
+            OpResult::Ack {} => Ok(()),
+            _ => Err(TargetError::Unexpected),
+        }
+    }
+
+    /// Deletes one file or one link of the target for the technician
+    /// (ST-M010-002). A link is removed as the link, never what it points at;
+    /// a folder is refused ([`Self::remove_tree`] removes one).
+    ///
+    /// # Errors
+    ///
+    /// A mapped [`TargetError`]; fail-closed when inactive.
+    pub async fn delete_entry(&self, path: RemotePath) -> Result<(), TargetError> {
+        match self
+            .file_op(Origin::Console.into(), Operation::FsDelete { path })
+            .await?
+        {
+            OpResult::Ack {} => Ok(()),
+            _ => Err(TargetError::Unexpected),
+        }
     }
 
     /// Downloads a target file to a local path, driven inline by the console
@@ -1301,17 +1706,31 @@ impl ConsoleSessionService {
         if !self.is_active() {
             return Err(TargetError::NoConsentedSession);
         }
-        let local_path = params.local_path.clone();
         let request = DownloadRequest {
             source: params.source,
             dest: PathBuf::from(params.local_path),
         };
+        self.dispatch_download(request, mcp(purpose), None, None)
+            .await
+    }
+
+    /// Queues one download on the driver and awaits its honest report.
+    async fn dispatch_download(
+        &self,
+        request: DownloadRequest,
+        attribution: Attribution,
+        cancel: Option<CancelToken>,
+        progress: Option<ProgressSink<TransferProgress>>,
+    ) -> Result<DownloadReport, TargetError> {
+        let local_path = request.dest.display().to_string();
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
             .send(DriverCommand::Download {
                 request,
-                attribution: mcp(purpose),
+                attribution,
+                cancel,
+                progress,
                 reply: reply_tx,
             })
             .map_err(|_| TargetError::Disconnected)?;
@@ -1653,16 +2072,32 @@ async fn run_command(handle: &HostHandle, inner: &Inner, command: DriverCommand)
         DriverCommand::Upload {
             request,
             attribution,
+            cancel,
+            progress,
             reply,
         } => {
-            let _ = reply.send(run_upload(handle, inner, request, attribution).await);
+            let _ =
+                reply.send(run_upload(handle, inner, request, attribution, cancel, progress).await);
+        }
+        DriverCommand::RemoveTree {
+            path,
+            attribution,
+            cancel,
+            progress,
+            reply,
+        } => {
+            let _ = reply
+                .send(run_remove_tree(handle, inner, path, attribution, cancel, progress).await);
         }
         DriverCommand::Download {
             request,
             attribution,
+            cancel,
+            progress,
             reply,
         } => {
-            let _ = reply.send(run_download(handle, inner, request, attribution).await);
+            let _ = reply
+                .send(run_download(handle, inner, request, attribution, cancel, progress).await);
         }
         DriverCommand::OpenTerminal {
             shell,
@@ -1748,23 +2183,57 @@ fn mcp(purpose: Option<Purpose>) -> Attribution {
 
 /// Runs one upload inline on the owned handle, gated against revoke.
 ///
-/// The cancel token is minted and published into the transfer gate under one
-/// lock so a concurrent [`ConsoleSessionService::revoke`] either bars the start
-/// (`revoked` already set) or reaches the token to cancel it (REQ-S-004,
-/// REQ-S-009). The gate is released before the `await` so the driver's own
-/// revoke path is never blocked by the running transfer.
+/// The cancel token — the caller's own, or a fresh one — is published into the
+/// transfer gate under one lock so a concurrent
+/// [`ConsoleSessionService::revoke`] either bars the start (`revoked` already
+/// set) or reaches the token to cancel it (REQ-S-004, REQ-S-009). The gate is
+/// released before the `await` so the driver's own revoke path is never
+/// blocked by the running transfer.
 async fn run_upload(
     handle: &HostHandle,
     inner: &Inner,
     request: UploadRequest,
     attribution: Attribution,
+    cancel: Option<CancelToken>,
+    mut progress: Option<ProgressSink<TransferProgress>>,
 ) -> Result<TransferReport, HostSessionError> {
-    let token = match enter_transfer(inner) {
+    let token = match enter_transfer(inner, cancel) {
         Some(token) => token,
         None => return Err(HostSessionError::NotActive),
     };
     let result = handle
-        .upload_file_as(request, attribution, &token, |_| {})
+        .upload_file_as(request, attribution, &token, |step| {
+            if let Some(sink) = progress.as_mut() {
+                sink(step);
+            }
+        })
+        .await;
+    leave_transfer(inner);
+    result
+}
+
+/// Runs the removal of one folder inline on the owned handle, gated against
+/// revoke exactly like a transfer (see [`run_upload`]): a revoke cancels the
+/// token, and the removal ends between two of its steps (ST-M010-001,
+/// REQ-S-004).
+async fn run_remove_tree(
+    handle: &HostHandle,
+    inner: &Inner,
+    path: RemotePath,
+    attribution: Attribution,
+    cancel: CancelToken,
+    mut progress: Option<ProgressSink<TreeRemovalProgress>>,
+) -> Result<TreeRemovalReport, HostSessionError> {
+    let token = match enter_transfer(inner, Some(cancel)) {
+        Some(token) => token,
+        None => return Err(HostSessionError::NotActive),
+    };
+    let result = handle
+        .remove_tree_as(path, attribution, &token, |step| {
+            if let Some(sink) = progress.as_mut() {
+                sink(step);
+            }
+        })
         .await;
     leave_transfer(inner);
     result
@@ -1777,27 +2246,34 @@ async fn run_download(
     inner: &Inner,
     request: DownloadRequest,
     attribution: Attribution,
+    cancel: Option<CancelToken>,
+    mut progress: Option<ProgressSink<TransferProgress>>,
 ) -> Result<TransferReport, HostSessionError> {
-    let token = match enter_transfer(inner) {
+    let token = match enter_transfer(inner, cancel) {
         Some(token) => token,
         None => return Err(HostSessionError::NotActive),
     };
     let result = handle
-        .download_file_as(request, attribution, &token, |_| {})
+        .download_file_as(request, attribution, &token, |step| {
+            if let Some(sink) = progress.as_mut() {
+                sink(step);
+            }
+        })
         .await;
     leave_transfer(inner);
     result
 }
 
-/// Claims the transfer gate for a new transfer, returning its cancel token, or
-/// `None` when the session is revoked or inactive (fail-closed). A poisoned gate
-/// is treated as revoked.
-fn enter_transfer(inner: &Inner) -> Option<CancelToken> {
+/// Claims the transfer gate for a new transfer or folder removal, returning
+/// its cancel token — `own` when the caller handed one in, else a fresh one —
+/// or `None` when the session is revoked or inactive (fail-closed). A poisoned
+/// gate is treated as revoked.
+fn enter_transfer(inner: &Inner, own: Option<CancelToken>) -> Option<CancelToken> {
     let mut gate = inner.transfer_gate.lock().ok()?;
     if gate.revoked || !inner.active.load(Ordering::SeqCst) {
         return None;
     }
-    let token = CancelToken::new();
+    let token = own.unwrap_or_default();
     gate.current = Some(token.clone());
     Some(token)
 }
@@ -1983,6 +2459,21 @@ fn download_report_from(report: TransferReport, local_path: String) -> DownloadR
     }
 }
 
+/// The technician's explorer reads the target through the service, so every
+/// request it makes is the technician's ([`Origin::Console`]) and fails closed
+/// with the session (ST-M010-002).
+#[async_trait::async_trait]
+impl FolderSource for ConsoleSessionService {
+    async fn drives(&self) -> Result<Vec<DriveEntry>, TargetError> {
+        self.list_drives().await
+    }
+
+    async fn page(&self, folder: &RemotePath, after: Option<&str>) -> Result<DirPage, TargetError> {
+        self.list_folder(folder.clone(), after.map(str::to_owned))
+            .await
+    }
+}
+
 /// Maps a session-runtime error onto the honest MCP [`TargetError`], keeping a
 /// fail-closed no-session distinct from a remote failure and a lost session.
 fn session_to_target(err: HostSessionError) -> TargetError {
@@ -2005,11 +2496,13 @@ fn session_to_target(err: HostSessionError) -> TargetError {
         | HostSessionError::RevokedLocally
         | HostSessionError::RevokedByPeer
         | HostSessionError::ConsentDenied => TargetError::NoConsentedSession,
-        // `Io` is the connection's (binding, dialing). An error on the
-        // technician's own file never arrives here: the transfer engine reports
-        // it as a failed transfer in the stage `local` (ST-M003-005).
+        // `Io` and `Relay` are the connection's (binding, dialing, the relay).
+        // An error on the technician's own file never arrives here: the
+        // transfer engine reports it as a failed transfer in the stage `local`
+        // (ST-M003-005).
         HostSessionError::Disconnected
         | HostSessionError::Io(_)
+        | HostSessionError::Relay(_)
         | HostSessionError::Channel(_)
         | HostSessionError::Pairing(_)
         | HostSessionError::Timeout => TargetError::Disconnected,
@@ -2245,5 +2738,112 @@ mod session_error_mapping_tests {
         ] {
             assert_eq!(session_to_target(error), TargetError::Disconnected);
         }
+    }
+}
+
+#[cfg(test)]
+mod send_to_folder_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    fn send(folder: &str, name: &str) -> SendToFolder {
+        SendToFolder {
+            local_path: PathBuf::from("report.pdf"),
+            folder: folder.to_owned(),
+            name: name.to_owned(),
+            overwrite: false,
+        }
+    }
+
+    fn dest(folder: &str, name: &str) -> String {
+        match send(folder, name).dest() {
+            Ok(RemotePath::Absolute { path }) => path,
+            other => panic!("expected an absolute destination, got {other:?}"),
+        }
+    }
+
+    fn refused(folder: &str, name: &str) -> String {
+        match send(folder, name).dest() {
+            Err(TargetError::Remote {
+                code: ErrorCode::InvalidPath,
+                message,
+                stage: ErrorStage::Validation,
+            }) => message,
+            other => panic!("expected an invalid path for {folder:?} + {name:?}, got {other:?}"),
+        }
+    }
+
+    /// The file goes under its name into the folder, on any drive, a drive
+    /// root included, and the folder's own trailing separator is not doubled.
+    #[test]
+    fn the_destination_is_the_name_in_the_folder() {
+        assert_eq!(
+            dest("C:\\Users\\ann\\Documents", "report.pdf"),
+            "C:\\Users\\ann\\Documents\\report.pdf"
+        );
+        assert_eq!(
+            dest("C:\\Users\\ann\\Documents\\", "report.pdf"),
+            "C:\\Users\\ann\\Documents\\report.pdf"
+        );
+        assert_eq!(dest("D:\\", "setup.exe"), "D:\\setup.exe");
+        assert_eq!(dest("E:/Tools", "a b.txt"), "E:/Tools\\a b.txt");
+    }
+
+    /// A name is one name: it cannot reach into another folder, up or down.
+    #[test]
+    fn a_name_that_is_a_path_is_refused() {
+        for name in [
+            "",
+            "sub\\report.pdf",
+            "sub/report.pdf",
+            "..\\report.pdf",
+            "\\report.pdf",
+            "/report.pdf",
+        ] {
+            assert!(
+                refused("C:\\Users\\ann", name).contains("one name"),
+                "{name:?}"
+            );
+        }
+        // One component that still names another place or another file.
+        for name in [
+            "..",
+            ".",
+            "report.pdf:hidden",
+            "NUL",
+            "nul.txt",
+            "report.pdf.",
+            "report.pdf ",
+        ] {
+            refused("C:\\Users\\ann", name);
+        }
+    }
+
+    /// The folder is a rooted path on a drive, by the same rules as every
+    /// remote path: no drive-relative, relative, UNC or device path, and no
+    /// way up.
+    #[test]
+    fn a_folder_that_is_not_a_rooted_path_on_a_drive_is_refused() {
+        for folder in [
+            "",
+            "C:",
+            "Documents",
+            "\\Users\\ann",
+            "\\\\server\\share",
+            "\\\\?\\C:\\Users",
+            "C:\\Users\\..\\Windows",
+            "C:\\Users\\ann\n",
+        ] {
+            refused(folder, "report.pdf");
+        }
+    }
+
+    /// A destination that would be too long for a remote path is refused
+    /// here, before anything is sent.
+    #[test]
+    fn a_destination_that_is_too_long_is_refused() {
+        let name = "n".repeat(cretlink_protocol::limits::MAX_NAME_BYTES + 1);
+        refused("C:\\Users\\ann", &name);
     }
 }

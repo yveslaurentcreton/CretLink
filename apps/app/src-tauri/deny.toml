@@ -1,0 +1,117 @@
+# cargo-deny configuration of the application package (ST-M006-019).
+#
+# The application is a detached package with a lockfile of its own (ADR-0011),
+# so the check of the workspace (`deny.toml` at the root of the repository)
+# never sees Tauri's dependency tree. CI runs this one beside it:
+#
+#   cargo deny --manifest-path apps/app/src-tauri/Cargo.toml --all-features \
+#     --config apps/app/src-tauri/deny.toml check licenses advisories bans sources
+#
+# The policy is the one of the workspace (CONTRIBUTING.md, "Dependency and
+# license policy"; REQ-N-016, REQ-S-005, REQ-S-019). What differs is listed
+# here, each entry with the reason it was accepted for and with what would
+# make it worth another look. Nothing here allows a licence or an advisory for
+# a crate that the entry does not name.
+
+[graph]
+all-features = true
+
+[licenses]
+# The same list as the workspace.
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+# MPL-2.0, for the five crates below and no other (reviewed on 2026-11-12).
+# Only Tauri's dependencies bring them; CretLink names none of them itself.
+#
+# The Mozilla Public License 2.0 covers the files it is put on and not the
+# program they are built into (its section 3.3), so CretLink stays under the
+# MIT licence. It asks that whoever passes on a program can find the source of
+# the covered files (section 3.2). CretLink uses these crates as crates.io
+# publishes them, without a change, and the third-party notices in every
+# release archive repeat the licence and name where the source of each of them
+# is found (scripts/third-party-notices.mjs).
+#
+# Worth another look: a crate under MPL-2.0 that is not in this list fails the
+# check and needs its own review; a change that would edit one of these crates
+# (a patch or a fork) would have to publish that change under MPL-2.0.
+exceptions = [
+  # Servo's CSS parser and selector matching, with their number formatting.
+  # They come with `dom_query`, which `tauri-utils` uses to rewrite the
+  # application's HTML pages when it is built.
+  { allow = ["MPL-2.0"], crate = "cssparser" },
+  { allow = ["MPL-2.0"], crate = "cssparser-macros" },
+  { allow = ["MPL-2.0"], crate = "dtoa-short" },
+  { allow = ["MPL-2.0"], crate = "selectors" },
+  # An extension trait of `Option`, which comes with `dirs`: the folders of
+  # the user's profile, as `tauri`, `tauri-build` and `wry` look them up.
+  { allow = ["MPL-2.0"], crate = "option-ext" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+# The program holds its whole dependency tree, so an advisory counts wherever
+# in the tree it is, not only for the crates the application names itself.
+unmaintained = "all"
+unsound = "all"
+# Advisories without a fix inside the dependency lines of the locked Tauri
+# (2.11). cargo-deny warns about an entry that no longer matches a crate;
+# delete it then.
+ignore = [
+  # glib 0.18: `glib::VariantStrIter` is unsound (GHSA-wrw7-89jp-8q8g). The
+  # fix is in glib 0.20. Tauri's Linux webview is built on the GTK 3 crates
+  # (`gtk` 0.18, `webkit2gtk` 2.0), which need glib 0.18; that holds for every
+  # release of Tauri 2 up to 2.12. Only the Linux build links glib. No crate of
+  # the locked dependencies and nothing in CretLink uses that iterator or
+  # `Variant::array_iter_str`, which returns it (searched on 2026-11-14).
+  # Worth another look: a release of Tauri whose Linux webview uses glib 0.20
+  # or newer, or code that starts to iterate over GLib string arrays.
+  { id = "RUSTSEC-2024-0429", reason = "glib 0.18 is the only line Tauri's GTK 3 webview can use; the unsound iterator is not used" },
+  # proc-macro-error 1.0: no longer maintained. `glib-macros` 0.18 and
+  # `gtk3-macros` 0.18, the procedural macros of the same GTK 3 line, need it.
+  # It runs in the compiler while those macros expand; nothing of it is in the
+  # program.
+  # Worth another look: together with glib above. An advisory about a
+  # vulnerability in it would have its own identifier and fail the check.
+  { id = "RUSTSEC-2024-0370", reason = "a build-time helper of the GTK 3 macros (glib-macros 0.18, gtk3-macros 0.18); not part of the program" },
+  # The `unic-*` crates: no longer maintained. They hold tables of Unicode
+  # character properties. `urlpattern` 0.3 reads them to parse a URL pattern,
+  # and `tauri-utils` 2.9, which Tauri 2.11 needs, needs `urlpattern` 0.3.
+  # Tauri parses the URL patterns of a capability with it; the application's
+  # capabilities name no remote URL.
+  # Worth another look: when the lockfile moves to Tauri 2.12 or newer. Its
+  # `tauri-utils` 2.10 needs `urlpattern` 0.6, which uses `icu_properties`
+  # instead, and these five entries go.
+  { id = "RUSTSEC-2025-0075", reason = "unic-char-range comes with urlpattern 0.3, which tauri-utils 2.9 needs; gone with Tauri 2.12" },
+  { id = "RUSTSEC-2025-0080", reason = "unic-common comes with urlpattern 0.3, which tauri-utils 2.9 needs; gone with Tauri 2.12" },
+  { id = "RUSTSEC-2025-0081", reason = "unic-char-property comes with urlpattern 0.3, which tauri-utils 2.9 needs; gone with Tauri 2.12" },
+  { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version comes with urlpattern 0.3, which tauri-utils 2.9 needs; gone with Tauri 2.12" },
+  { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident comes with urlpattern 0.3, which tauri-utils 2.9 needs; gone with Tauri 2.12" },
+]
+
+[bans]
+# Tauri's tree holds several versions of many crates, which is not CretLink's
+# to change; a warning for each would bury the findings of the other checks.
+# The workspace keeps warning about its own.
+multiple-versions = "allow"
+# A dependency without a version is refused, except the path dependencies on
+# the crates of this repository: they are built from the same commit and are
+# never published (`publish = false`).
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -4,7 +4,11 @@
 //! This crate lets the console **advertise** itself and the support agent
 //! **browse** for it over standard mDNS/DNS-SD ([`SERVICE_TYPE`]), and it
 //! provides the mandatory manual [`ConnectionCode`] fallback for networks
-//! where multicast is blocked (REQ-F-004).
+//! where multicast is blocked (REQ-F-004). For two computers that are not on
+//! one network it holds the second format of the same code family, the
+//! [`RelayCode`] (ST-M007-012): a rendezvous seed that both copies look up on
+//! the relay of their relay profile. [`parse_entry`] reads either from the
+//! one code field.
 //!
 //! # Discovery grants no authority (trust boundary)
 //!
@@ -52,6 +56,7 @@ mod code;
 mod error;
 mod interface;
 mod listen;
+mod relay_code;
 
 mod advertiser;
 mod browser;
@@ -59,11 +64,13 @@ mod browser;
 pub use advertiser::Advertiser;
 pub use browser::{Browser, DiscoveredConsole};
 pub use code::{
-    ConnectionCode, ConnectionTarget, ManualEntryError, TargetSource, parse_manual_entry,
+    ConnectionCode, ConnectionTarget, ManualEntry, ManualEntryError, TargetSource, parse_entry,
+    parse_manual_entry,
 };
 pub use error::DiscoveryError;
 pub use interface::{is_private_addr, private_interface_addrs};
 pub use listen::{ListenCandidate, default_route_addr, first_choice, listen_candidates};
+pub use relay_code::{RELAY_CODE_SEED_LEN, RelayCode, RelayCodeRandomnessError};
 
 /// The DNS-SD service type CretLink consoles advertise and agents browse for
 /// (ADR-0007).

@@ -33,7 +33,9 @@
 //! [--remove]`, which replace it in the product (ST-M009-010) — the agent runs a
 //! self-contained, offline pass over the resources it owns on the customer
 //! machine — staged file trees and sealed reboot-resume tickets today, with
-//! every other ownable kind asserted empty. Without `--remove` it only inspects
+//! every other ownable kind asserted empty. The profile folders of the
+//! application's window are not this binary's: only the shipped command line
+//! lists and removes them (ST-M009-014). Without `--remove` it only inspects
 //! and prints the residue; with `--remove` it removes what it can and reports
 //! honestly what was kept and how to remediate it. The verb opens no network
 //! connection, joins no session, and grants no control (REQ-F-019, REQ-N-008).
@@ -47,8 +49,8 @@ use cretlink_discovery::{Browser, parse_manual_entry};
 use cretlink_protocol::{PROTOCOL_V1, TargetIdentity};
 use cretlink_session::{
     ActionOutcome, ActivityKind, AdmissionToken, DesktopAccess, Dial, JoinHandle, NoAudit, Origin,
-    RebootResumeArmer, RelayDial, RendezvousTicket, RevokeReason, SessionError, SessionEvent,
-    SessionJoiner, WssRelayDial,
+    RebootResumeArmer, RelayDial, RelayFailure, RendezvousTicket, RevokeReason, SessionError,
+    SessionEvent, SessionJoiner, WssRelayDial,
 };
 use cretlink_support_agent::{
     EffectiveIdentity, TicketStore, current_identity, reboot_resume_arming_disclosure, sysinfo,
@@ -443,6 +445,7 @@ fn outcome_label(outcome: ActionOutcome) -> String {
         ActionOutcome::InProgress => "in progress".to_string(),
         ActionOutcome::Succeeded => "done".to_string(),
         ActionOutcome::Failed { code } => format!("refused or failed ({code:?})"),
+        ActionOutcome::Cancelled => "cancelled by the technician".to_string(),
         ActionOutcome::Unknown => "result unknown".to_string(),
     }
 }
@@ -523,6 +526,10 @@ fn print_reboot_resume_disclosure() {
 /// - `fs.v1` — always. The [`FileStore`] backend is cross-platform (ADR-0012,
 ///   ST-M003-004/005). Its gate is advisory (file ops are served regardless),
 ///   but advertising it lets a peer negotiate honestly.
+/// - `fs.v2` — always. The drive list and the removal of a folder with its
+///   content are served by the same file store on every platform; the runtime
+///   enforces this gate, so they answer `Unsupported` unless it is advertised
+///   here (ST-M010-001).
 /// - `term.v1` — Windows only. The ConPTY interactive backend exists solely on
 ///   Windows; off Windows the broker answers `InteractiveUnsupported`, so
 ///   advertising a terminal there would be a lie (ADR-0013, ST-M003-009).
@@ -534,10 +541,11 @@ fn print_reboot_resume_disclosure() {
 ///   persisting a single-use ticket (ADR-0014, ST-M006-001); elsewhere
 ///   reboot-resume stays off and nothing can be armed.
 fn build_reboot_resume() -> (Arc<dyn RebootResumeArmer>, Vec<String>, bool) {
-    use cretlink_protocol::CAP_FS_V1;
+    use cretlink_protocol::{CAP_FS_V1, CAP_FS_V2};
 
-    // Cross-platform base: file operations are always available.
-    let mut capabilities = vec![CAP_FS_V1.to_string()];
+    // Cross-platform base: file operations are always available, the drive
+    // list and the folder removal of the file explorer among them.
+    let mut capabilities = vec![CAP_FS_V1.to_string(), CAP_FS_V2.to_string()];
 
     // The interactive terminal is served only where a pseudo-console backend
     // exists (Windows). Gate the advertisement on the same condition the broker
@@ -958,7 +966,7 @@ async fn connect_relay_with_retries(
     let wss = match &tls {
         Some(tls) => {
             let connector = WssRelayDial::connector(tls.ca_pem.as_deref()).map_err(|error| {
-                format!("could not establish the relay TLS trust store: {error}")
+                format!("could not use the relay settings: {}", with_causes(&error))
             })?;
             println!(
                 "  Wrapping the relay leg in wss/TLS (validating the certificate for {}).",
@@ -994,10 +1002,9 @@ async fn connect_relay_with_retries(
                 println!("Connected to the console through the relay.");
                 return Ok(Some(handle));
             }
-            // The relay is unreachable, or no peer arrived before the relay's
-            // rendezvous window closed: keep waiting rather than giving up.
+            // The relay is unreachable: keep waiting rather than giving up.
             RelayAttempt::Retry => {
-                println!("  Relay or peer not ready yet — retrying...");
+                println!("  Relay not reachable yet — retrying...");
             }
             // A reached-but-failed handshake is a real problem, not a wait.
             RelayAttempt::Fatal(message) => return Err(message),
@@ -1016,8 +1023,7 @@ async fn connect_relay_with_retries(
 enum RelayAttempt {
     /// The end-to-end session was established.
     Connected(JoinHandle),
-    /// A transport fault (relay unreachable, or no peer before the rendezvous
-    /// window closed): wait and try again.
+    /// The relay cannot be reached yet: wait and try again.
     Retry,
     /// A reached-but-failed handshake: fatal, do not retry.
     Fatal(String),
@@ -1044,9 +1050,31 @@ async fn join_relay_attempt<D: Dial>(
     .await
     {
         Ok(handle) => RelayAttempt::Connected(handle),
-        Err(SessionError::Io(_)) => RelayAttempt::Retry,
-        Err(other) => RelayAttempt::Fatal(format!("could not establish the session: {other}")),
+        // The relay is not there yet: wait and try again.
+        Err(SessionError::Io(_) | SessionError::Relay(RelayFailure::Unreachable(_))) => {
+            RelayAttempt::Retry
+        }
+        // The relay answered and refused, is not trusted, or is no relay of
+        // this version: trying again changes nothing, so say why and stop.
+        Err(other) => RelayAttempt::Fatal(format!(
+            "could not establish the session: {}",
+            with_causes(&other)
+        )),
     }
+}
+
+/// An error with the causes behind it, on one line. A failed relay dial says
+/// in its cause what went wrong: unreachable, not trusted, no answer, or the
+/// reason of the relay's refusal (ST-M007-012).
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(inner) = cause {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    text
 }
 
 /// One mDNS browse round. Returns the first console advertising a usable

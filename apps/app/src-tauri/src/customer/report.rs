@@ -80,6 +80,7 @@ pub(crate) fn finish(
         ended_unix_millis: now_unix_millis,
         cleanup: handle.cleanup_report(),
         activity: session.activity.entries(),
+        kept_program: super::keep::kept_program(),
     };
     session.report.report = Some(CustomerReport::build(input));
 }
@@ -308,6 +309,7 @@ mod tests {
             ended_unix_millis: 1_000,
             cleanup: None,
             activity: Vec::new(),
+            kept_program: None,
         });
         assert_eq!(report.cleanup.state, CleanupState::Unknown);
         let dir = std::env::temp_dir().join(format!("cretlink-report-{}", std::process::id()));

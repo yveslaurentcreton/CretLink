@@ -14,6 +14,7 @@
 //! cretlink_console::SessionPhase::Failed); no dropped connection can leave a
 //! stale "under control" surface on screen (REQ-S-009).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -29,6 +30,31 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{broadcast, oneshot};
 
 use super::bridge::{BridgeSlot, BridgeStatus, lock_bridge, tool_count};
+
+/// Where the task of a session writes outside this process: the audit folder,
+/// and the endpoint of the local MCP bridge. The application uses the user's
+/// own ([`Place::of_this_user`]); a test names a folder and an endpoint of its
+/// own, so that it never touches a technician's audit trail or bridge.
+#[derive(Debug, Clone)]
+pub(crate) struct Place {
+    /// The audit service's configuration, with the folder of the session
+    /// logs.
+    pub(crate) audit: AuditServiceConfig,
+    /// The endpoint the MCP bridge is hosted on while a session is under full
+    /// control.
+    pub(crate) bridge: IpcEndpoint,
+}
+
+impl Place {
+    /// The audit folder and the bridge endpoint of the user who runs this
+    /// copy.
+    pub(crate) fn of_this_user() -> Self {
+        Self {
+            audit: AuditServiceConfig::default(),
+            bridge: IpcEndpoint::user_default(),
+        }
+    }
+}
 
 /// The sender half of the button-intent channel, held by [`AppState`](super::AppState)
 /// so the synchronous Tauri commands can hand a technician decision to the async
@@ -176,6 +202,69 @@ pub(crate) fn lock(shared: &Mutex<ConsoleState>) -> MutexGuard<'_, ConsoleState>
     shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Which wait the shared console state belongs to (ST-M007-013).
+///
+/// Every wait for a customer, on a network or on a relay, has a task of its
+/// own, and the state on screen belongs to the latest one. A change of wait
+/// stops the old task and waits a bounded moment for it; a task that does not
+/// let go in time lives on beside the new one. It must then leave alone what
+/// belongs to the newer wait: the console state, and the slots that the
+/// commands read (the session's service, its audit sink, the activity feed
+/// and the bridge status). The customer side has the same rule
+/// (`customer::session_driver::lock_current`).
+///
+/// The number changes only while the console state is locked
+/// ([`Waits::begin`]). A task that finds its number current while it holds
+/// that lock ([`Turn::lock`]) therefore holds the state of its own wait until
+/// it lets go.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Waits(Arc<AtomicU64>);
+
+impl Waits {
+    /// Begins a new wait on `state`, which the caller holds locked: from now
+    /// on the state belongs to this wait, and every task of an earlier one is
+    /// a stranger to it. The state no longer names the relay of the session
+    /// before: a wait that then fails to start is not said to go through a
+    /// relay that it never touched.
+    pub(crate) fn begin(&self, state: &mut ConsoleState) -> Turn {
+        state.relay = None;
+        Turn {
+            mine: self.0.fetch_add(1, Ordering::AcqRel) + 1,
+            waits: self.clone(),
+        }
+    }
+}
+
+/// The claim of one wait's task on the shared console state ([`Waits`]).
+#[derive(Debug, Clone)]
+pub(crate) struct Turn {
+    waits: Waits,
+    mine: u64,
+}
+
+impl Turn {
+    /// Locks the shared state only while it still belongs to this wait. A
+    /// task that gets `None` was outlived by a newer wait: it writes nothing
+    /// more and ends what it holds.
+    pub(crate) fn lock<'a>(
+        &self,
+        shared: &'a Mutex<ConsoleState>,
+    ) -> Option<MutexGuard<'a, ConsoleState>> {
+        let state = lock(shared);
+        (self.waits.0.load(Ordering::Acquire) == self.mine).then_some(state)
+    }
+
+    /// Runs `change` while the state still belongs to this wait, with the
+    /// state locked so that no newer wait can begin meanwhile. It is how a
+    /// task writes a slot that the commands read: a task that was outlived
+    /// leaves the slot of the newer wait alone.
+    pub(crate) fn while_current(&self, shared: &Mutex<ConsoleState>, change: impl FnOnce()) {
+        if let Some(_state) = self.lock(shared) {
+            change();
+        }
+    }
+}
+
 /// True once the console model has reached a terminal phase and must not be
 /// folded further. A local emergency stop moves the phase to `Stopped` before
 /// the wire echoes its `Revoked`; without this guard a late event folded on top
@@ -259,19 +348,29 @@ const LIVE_ECHO_CAPACITY: usize = 256;
 /// The GUI has no stdin, so — unlike the CLI's interactive prompt — a log that
 /// cannot be opened is fail-closed: the session is revoked and the model driven
 /// to `Failed` rather than run unaudited (REQ-F-017).
+///
+/// The state is written only while it still belongs to this session's wait
+/// (`turn`). A task that a newer wait outlived revokes its session, writes
+/// nothing and ends: a late event of the session before can then never show
+/// as a customer of the wait that is on screen.
 #[allow(clippy::too_many_arguments)]
-pub async fn pump(
+pub(crate) async fn pump(
     mut handle: HostHandle,
     shared: Arc<Mutex<ConsoleState>>,
+    turn: Turn,
     sink: Arc<dyn StateSink>,
     mut intents: UnboundedReceiver<Intent>,
     audit: ChannelAudit,
-    audit_config: AuditServiceConfig,
+    place: Place,
     start_tx: oneshot::Sender<SessionAuditStart>,
     service_slot: ServiceSlot,
     activity: ActivitySlot,
     bridge: BridgeSlot,
 ) {
+    let Place {
+        audit: audit_config,
+        bridge: endpoint,
+    } = place;
     // The consent-bound identity, captured from `ConsentGranted` before the fold,
     // so it can be moved into the hosted service at handoff (REQ-F-016).
     let mut identity: Option<TargetIdentity> = None;
@@ -305,12 +404,13 @@ pub async fn pump(
                         }
                         Err(error) => {
                             let _ = handle.revoke(RevokeReason::TechnicianRequested);
-                            let mut state = lock(&shared);
-                            state.fail(
-                                "audit",
-                                format!("the session audit log could not be opened: {error}"),
-                            );
-                            sink.emit(&state);
+                            if let Some(mut state) = turn.lock(&shared) {
+                                state.fail(
+                                    "audit",
+                                    format!("the session audit log could not be opened: {error}"),
+                                );
+                                sink.emit(&state);
+                            }
                             return;
                         }
                     }
@@ -320,12 +420,24 @@ pub async fn pump(
                     approval_code: code.as_deref(),
                     session: handle.session(),
                 };
+                let ended_by = handle.ended_by();
                 // Fold the event under the lock, then release the guard BEFORE any
                 // await. The `MutexGuard` is `!Send`, so computing the decision in
                 // a narrow scope (rather than holding it across the hand-off await)
                 // is what keeps this spawned pump future `Send`.
-                let decision = {
-                    let mut state = lock(&shared);
+                let decision = 'fold: {
+                    let Some(mut state) = turn.lock(&shared) else {
+                        break 'fold FoldStep::Outlived;
+                    };
+                    // A session through a relay whose connection was lost
+                    // before full control says so, with the relay
+                    // (ST-M007-013).
+                    let relay = state
+                        .relay
+                        .as_ref()
+                        .map(|relay| crate::relay::named(&relay.host, &relay.address));
+                    let event =
+                        crate::relay::name_lost_connection(event, ended_by, relay.as_deref());
                     if is_terminal(&state) {
                         // A local emergency stop already ended the model. Do not
                         // fold further wire events (a late event could flip a clean
@@ -347,6 +459,12 @@ pub async fn pump(
                         terminated = true;
                         break;
                     }
+                    FoldStep::Outlived => {
+                        // A newer wait took the screen. This session has
+                        // none any more: it ends, and nothing is written.
+                        let _ = handle.revoke(RevokeReason::TechnicianRequested);
+                        return;
+                    }
                     FoldStep::Continue => {}
                     FoldStep::HandOff => {
                         let session = handle.session();
@@ -356,8 +474,8 @@ pub async fn pump(
                                 // Run the post-active loop that renders live
                                 // activity (ST-M004-007); the guard is out of scope.
                                 run_active(
-                                    handle, session, target, shared, sink, intents,
-                                    audit, service_slot, activity, bridge,
+                                    handle, session, target, shared, turn, sink, intents,
+                                    audit, service_slot, activity, bridge, endpoint,
                                 )
                                 .await;
                                 return;
@@ -367,12 +485,13 @@ pub async fn pump(
                                 // consent-bound identity cannot happen on the real
                                 // wire; fail closed rather than host an
                                 // unattributable session.
-                                let mut state = lock(&shared);
-                                state.fail(
-                                    "session",
-                                    "full control was reached without a consent-bound identity",
-                                );
-                                sink.emit(&state);
+                                if let Some(mut state) = turn.lock(&shared) {
+                                    state.fail(
+                                        "session",
+                                        "full control was reached without a consent-bound identity",
+                                    );
+                                    sink.emit(&state);
+                                }
                                 return;
                             }
                         }
@@ -402,11 +521,11 @@ pub async fn pump(
             }
         }
     }
-    if !terminated {
+    if !terminated && let Some(mut state) = turn.lock(&shared) {
         // The stream ended without a Revoked/Failed event: the transport dropped
         // mid-session. Fail closed so the UI shows an honest end, not a frozen
-        // "connected" surface (REQ-S-009).
-        let mut state = lock(&shared);
+        // "connected" surface (REQ-S-009). Only this wait's own state: when a
+        // newer wait took the screen, there is nothing of this one to end on it.
         if !is_terminal(&state) {
             state.fail("session", "the transport closed before the session ended");
         }
@@ -425,6 +544,9 @@ enum FoldStep {
     Continue,
     /// Full control was reached; hand the live handle to the session service.
     HandOff,
+    /// The state belongs to a newer wait: this session has no screen any
+    /// more ([`Turn`]).
+    Outlived,
 }
 
 /// Hosts the consented session after full control is reached (ST-M004-007).
@@ -456,12 +578,14 @@ async fn run_active(
     session: SessionId,
     target: TargetIdentity,
     shared: Arc<Mutex<ConsoleState>>,
+    turn: Turn,
     sink: Arc<dyn StateSink>,
     mut intents: UnboundedReceiver<Intent>,
     audit: ChannelAudit,
     service_slot: ServiceSlot,
     activity: ActivitySlot,
     bridge: BridgeSlot,
+    endpoint: IpcEndpoint,
 ) {
     // Hand the live handle to the hosted session service; its driver task now
     // solely owns the handle and pumps every wire event into the broadcast.
@@ -472,7 +596,9 @@ async fn run_active(
     // resize a technician terminal on THIS consented session (ST-M008-001). The
     // slot is cleared on teardown below, so no terminal command outlives the
     // session; the service also fails closed on its own once `stop`ped.
-    *lock_service(&service_slot) = Some(service.clone());
+    turn.while_current(&shared, || {
+        *lock_service(&service_slot) = Some(service.clone());
+    });
 
     // Echo bridge-originated audit start-lines to the Activity feed. One-shot;
     // the sender lives inside `audit`, which this function owns for its scope.
@@ -483,7 +609,6 @@ async fn run_active(
     // Host the local MCP bridge endpoint so Claude routes through THIS consented
     // GUI session (REQ-F-013). Best-effort single-instance: a busy endpoint (a
     // CLI console already hosting) fails the bind honestly without crashing.
-    let endpoint = IpcEndpoint::user_default();
     let ipc_server = match IpcListener::bind(&endpoint) {
         Ok(listener) => {
             let route: Arc<dyn ConsoleRoute> = Arc::new(service.clone());
@@ -530,7 +655,12 @@ async fn run_active(
                             // A lifecycle terminal: fold through the shared adapter
                             // so the model ends fail-closed and the terminal
                             // snapshot renders.
-                            let mut state = lock(&shared);
+                            let Some(mut state) = turn.lock(&shared) else {
+                                // A newer wait took the screen: the session
+                                // is over, and its end is not written there.
+                                terminated = true;
+                                break;
+                            };
                             if is_terminal(&state) {
                                 sink.emit(&state);
                                 terminated = true;
@@ -602,8 +732,9 @@ async fn run_active(
     service.stop();
     // Drop the shared service so any terminal command racing in after teardown
     // finds an empty slot and refuses — defence in depth beside the service's own
-    // `NoConsentedSession` fail-closed once stopped (ST-M008-001).
-    *lock_service(&service_slot) = None;
+    // `NoConsentedSession` fail-closed once stopped (ST-M008-001). A newer wait
+    // emptied the slot when it began; what it holds since is not this session's.
+    turn.while_current(&shared, || *lock_service(&service_slot) = None);
     if let Some((task, shutdown_tx)) = ipc_server {
         let _ = shutdown_tx.send(());
         if tokio::time::timeout(SHUTDOWN_GRACE + Duration::from_secs(2), task)
@@ -626,12 +757,16 @@ async fn run_active(
         // A client whose first call is among them still joins the rail.
         let _ = lock_bridge(&bridge).note(&echo.entry);
     }
-    // The endpoint is released with the session (ST-M009-008).
-    lock_bridge(&bridge).closed();
-    emit_bridge(&bridge, sink.as_ref());
-    // The feed's honest end: the queued echoes, then the trailing gap, then
-    // what is still running ended with the session ([`end_of_feed`]).
-    {
+    // The bridge status and the feed are those of this session only while
+    // no newer wait began: a new wait starts both anew, and the end of this
+    // session is then no part of them.
+    turn.while_current(&shared, || {
+        // The endpoint is released with the session (ST-M009-008).
+        lock_bridge(&bridge).closed();
+        emit_bridge(&bridge, sink.as_ref());
+        // The feed's honest end: the queued echoes, then the trailing gap,
+        // then what is still running ended with the session
+        // ([`end_of_feed`]).
         let shed = audit.take_live_shed();
         let changed = end_of_feed(
             &mut lock_activity(&activity),
@@ -642,12 +777,11 @@ async fn run_active(
         for entry in &changed {
             sink.emit_activity(entry);
         }
-    }
-    if !terminated {
+    });
+    if !terminated && let Some(mut state) = turn.lock(&shared) {
         // The active loop ended without a Revoked/Failed fold (driver closed or
         // every intent handle dropped). Drive the model to an honest end rather
         // than leaving a frozen "under control" surface (REQ-S-009).
-        let mut state = lock(&shared);
         if !is_terminal(&state) {
             state.fail("session", "the session ended before a terminal event");
         }
