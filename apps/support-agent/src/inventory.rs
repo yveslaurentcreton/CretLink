@@ -104,12 +104,18 @@ pub enum ResourceKind {
     /// asserts it absent ([`Self::scanned_here`]); the shipped command line
     /// adds it.
     WebviewProfile,
+    /// What a keep of the support program that was interrupted left
+    /// (ST-M009-017): its folder in `Program Files` without a complete
+    /// program. Only the shipped command line knows that folder and adds the
+    /// kind ([`Self::scanned_here`]); `recover --remove` names it with the
+    /// command that removes it, and never removes it itself.
+    UnfinishedKeep,
 }
 
 impl ResourceKind {
     /// Every kind, in inventory order. Iterated so a scan visits all of them and
     /// none is forgotten.
-    pub const ALL: [ResourceKind; 10] = [
+    pub const ALL: [ResourceKind; 11] = [
         ResourceKind::StagedFiles,
         ResourceKind::RebootResumeTicket,
         ResourceKind::NotCretLinks,
@@ -120,6 +126,7 @@ impl ResourceKind {
         ResourceKind::NetworkListener,
         ResourceKind::TemporaryCredential,
         ResourceKind::WebviewProfile,
+        ResourceKind::UnfinishedKeep,
     ];
 
     /// A short, stable, secret-free label for reports.
@@ -136,6 +143,7 @@ impl ResourceKind {
             ResourceKind::NetworkListener => "network listener",
             ResourceKind::TemporaryCredential => "temporary credential",
             ResourceKind::WebviewProfile => "webview profile",
+            ResourceKind::UnfinishedKeep => "unfinished kept support program",
         }
     }
 
@@ -155,15 +163,19 @@ impl ResourceKind {
                 | ResourceKind::NotCretLinks
                 | ResourceKind::EarlierRelease
                 | ResourceKind::WebviewProfile
+                | ResourceKind::UnfinishedKeep
         )
     }
 
     /// Whether [`scan_at`] and [`recover_at`] decide this kind themselves:
-    /// every kind but the webview profile, which the program that runs the
-    /// verb adds ([`crate::recovery::OtherResidue`]).
+    /// every kind but the webview profile and an unfinished keep, which the
+    /// program that runs the verb adds ([`crate::recovery::OtherResidue`]).
     #[must_use]
     pub fn scanned_here(self) -> bool {
-        self != ResourceKind::WebviewProfile
+        !matches!(
+            self,
+            ResourceKind::WebviewProfile | ResourceKind::UnfinishedKeep
+        )
     }
 }
 

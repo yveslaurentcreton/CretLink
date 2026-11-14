@@ -167,15 +167,22 @@ async fn clean_machine_scans_clean_and_asserts_every_kind_empty() {
         );
     }
     assert_eq!(inventory.asserted_empty.len(), scanned.len());
-    // The webview profile is the application's (ST-M009-014): this scan
-    // cannot see its folders, so it says nothing about them rather than
-    // "none". The program that runs the verb adds the kind.
+    // The webview profile is the application's (ST-M009-014), and so is an
+    // unfinished keep of the support program (ST-M009-017): this scan cannot
+    // see their folders, so it says nothing about them rather than "none".
+    // The program that runs the verb adds the kinds.
     assert_eq!(
         ResourceKind::ALL.len() - scanned.len(),
-        1,
-        "only the webview profile is left to the caller"
+        2,
+        "only the webview profile and an unfinished keep are left to the caller"
     );
     assert!(!ResourceKind::WebviewProfile.scanned_here());
+    assert!(!ResourceKind::UnfinishedKeep.scanned_here());
+    assert!(
+        !inventory
+            .asserted_empty
+            .contains(&ResourceKind::UnfinishedKeep)
+    );
     assert!(
         !inventory
             .asserted_empty

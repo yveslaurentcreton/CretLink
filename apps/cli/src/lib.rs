@@ -276,6 +276,8 @@ struct MoreResidue {
 impl cretlink_support_agent::OtherResidue for MoreResidue {
     fn scan(&self, inventory: &mut cretlink_support_agent::Inventory) {
         add_webview_inventory(inventory, &webview_profile::leftovers(&self.webview));
+        let unfinished = self.kept.as_ref().and_then(kept::unfinished_text);
+        add_unfinished_inventory(inventory, unfinished);
     }
 
     fn recover(&self, report: &mut cretlink_support_agent::RecoveryReport) {
@@ -284,6 +286,8 @@ impl cretlink_support_agent::OtherResidue for MoreResidue {
             report,
             &webview_profile::recover(&self.webview, &mut patience),
         );
+        let unfinished = self.kept.as_ref().and_then(kept::unfinished_text);
+        add_unfinished_recovery(report, unfinished);
     }
 
     fn on_purpose(&self) -> Vec<String> {
@@ -293,6 +297,50 @@ impl cretlink_support_agent::OtherResidue for MoreResidue {
             .into_iter()
             .collect()
     }
+}
+
+/// What a keep of the support program that was interrupted left
+/// (ST-M009-017), as a resource of the inventory: named with the command
+/// that removes it.
+fn unfinished_resource(text: String) -> cretlink_support_agent::OwnedResource {
+    cretlink_support_agent::OwnedResource {
+        kind: cretlink_support_agent::ResourceKind::UnfinishedKeep,
+        description: text,
+        session: None,
+    }
+}
+
+/// Adds an unfinished keep to the inventory, so that the computer is never
+/// called clean while it is there.
+fn add_unfinished_inventory(
+    inventory: &mut cretlink_support_agent::Inventory,
+    unfinished: Option<String>,
+) {
+    inventory.found.extend(unfinished.map(unfinished_resource));
+}
+
+/// Adds an unfinished keep to the recovery report: found, and kept with the
+/// command that removes it. The recovery does not remove it itself: what
+/// keeping added is removed by `uninstall`, from its record and its layout.
+fn add_unfinished_recovery(
+    report: &mut cretlink_support_agent::RecoveryReport,
+    unfinished: Option<String>,
+) {
+    let Some(text) = unfinished else {
+        return;
+    };
+    report.found.push(unfinished_resource(text.clone()));
+    report.failed.push(cretlink_support_agent::RecoveryFailure {
+        kind: cretlink_support_agent::ResourceKind::UnfinishedKeep,
+        description: text,
+        reason: "a keep of the support program did not finish; recover does not remove it"
+            .to_owned(),
+        remediation: format!(
+            "run '{} uninstall' as an administrator, or use Installed apps in the settings of \
+             Windows",
+            kept::PROGRAM_FILE
+        ),
+    });
 }
 
 /// A webview folder that was left, as a resource of the inventory.
@@ -961,6 +1009,48 @@ mod tests {
             "! Could not read webview profile (the temporary folder /tmp could not be \
                  listed (denied))"
         ));
+    }
+
+    /// A keep that was interrupted is named, with the command that removes
+    /// it, and the computer is never called clean then (ST-M009-017).
+    #[test]
+    fn an_unfinished_keep_is_named_and_the_computer_is_not_clean() {
+        use cretlink_support_agent::recovery::{inventory_text, recovery_report_text};
+        use cretlink_support_agent::{Inventory, RecoveryReport, ResourceKind};
+
+        let layout = kept::Layout::new(
+            std::path::PathBuf::from("/x/CretLink Support"),
+            std::path::Path::new("/x/Start Menu"),
+            std::path::Path::new("/x/Desktop"),
+        );
+        // Nothing of a kept program is there: nothing is added.
+        assert_eq!(kept::unfinished_text(&layout), None);
+        let mut inventory = Inventory::default();
+        add_unfinished_inventory(&mut inventory, None);
+        assert_eq!(inventory, Inventory::default());
+
+        let unfinished = "C:/Program Files/CretLink Support: keeping CretLink Support on this \
+                          computer did not finish. To remove what it left, run \
+                          'CretLink-Support.exe uninstall' as an administrator"
+            .to_owned();
+        add_unfinished_inventory(&mut inventory, Some(unfinished.clone()));
+        assert!(!inventory.is_clean());
+        assert_eq!(inventory.found[0].kind, ResourceKind::UnfinishedKeep);
+        let text = inventory_text("CretLink-Support.exe", &inventory);
+        assert!(!text.contains("This machine is clean"), "{text}");
+        assert!(text.contains("'CretLink-Support.exe uninstall'"), "{text}");
+
+        let mut report = RecoveryReport::default();
+        add_unfinished_recovery(&mut report, Some(unfinished));
+        assert!(!report.ok(), "an unfinished keep is never a clean result");
+        let text = recovery_report_text(&report);
+        assert!(!text.contains("this machine is clean"), "{text}");
+        assert!(
+            text.contains(
+                "      remediation: run 'CretLink-Support.exe uninstall' as an administrator"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

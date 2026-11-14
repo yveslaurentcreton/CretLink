@@ -28,31 +28,37 @@
     unsafe_code,
     reason = "Localized Windows FFI (CoInitializeEx, CoCreateInstance, IShellLinkW, \
               IPersistFile, RegCreateKeyExW, RegSetValueExW, RegOpenKeyExW, \
-              RegDeleteTreeW, CreateToolhelp32Snapshot, Process32FirstW/NextW, \
-              OpenProcess, QueryFullProcessImageNameW, SHGetKnownFolderPath, \
-              CoTaskMemFree); every pointer handed to Windows borrows a value \
+              RegDeleteTreeW, RegGetValueW, CreateToolhelp32Snapshot, \
+              Process32FirstW/NextW, OpenProcess, QueryFullProcessImageNameW, \
+              SHGetKnownFolderPath, CoTaskMemFree, GetFileInformationByHandle, \
+              IShellLinkW::GetPath, IPersistFile::Load); every pointer handed to Windows borrows a value \
               that outlives the call, and every handle is closed by an owner."
 )]
 
 use std::ffi::{OsString, c_void};
+use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStringExt;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, HANDLE, WIN32_ERROR};
+use windows::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, WIN32_FIND_DATAW,
+};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-    CoTaskMemFree, CoUninitialize, IPersistFile,
+    CoTaskMemFree, CoUninitialize, IPersistFile, STGM_READ,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_DWORD,
-    REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW,
-    RegOpenKeyExW, RegSetValueExW,
+    REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW,
+    RegDeleteTreeW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -191,6 +197,45 @@ pub(crate) fn has_uninstall_entry_in(hive: Hive, key: &str) -> bool {
     }
 }
 
+/// The location that the uninstall entry under `key` of `hive` names
+/// (`InstallLocation`). `None` when there is no entry, or it names none.
+pub(crate) fn uninstall_entry_location_in(hive: Hive, key: &str) -> Option<PathBuf> {
+    let path = HSTRING::from(key);
+    let value = HSTRING::from("InstallLocation");
+    let mut buffer = vec![0u16; 32_768];
+    let mut len = u32::try_from(buffer.len() * 2).ok()?;
+    // SAFETY: `path` and `value` outlive the call; `buffer` is writable and
+    // holds `len` bytes, and the call writes the length it used into `len`.
+    let status = unsafe {
+        RegGetValueW(
+            hive.root(),
+            &path,
+            &value,
+            RRF_RT_REG_SZ,
+            None,
+            Some(buffer.as_mut_ptr().cast::<c_void>()),
+            Some(&mut len),
+        )
+    };
+    check(status).ok()?;
+    // The length is in bytes and counts the terminating NUL.
+    buffer.truncate(usize::try_from(len).ok()? / 2);
+    while buffer.last() == Some(&0) {
+        buffer.pop();
+    }
+    (!buffer.is_empty()).then(|| PathBuf::from(OsString::from_wide(&buffer)))
+}
+
+/// How many names (hard links) the open `file` has.
+pub(crate) fn number_of_links(file: &File) -> io::Result<u32> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle belongs to `file`, which outlives the call; `info`
+    // is a valid place for the answer.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+        .map_err(io::Error::from)?;
+    Ok(info.nNumberOfLinks)
+}
+
 pub(super) fn remove_uninstall_entry() -> io::Result<bool> {
     remove_uninstall_entry_in(Hive::CurrentUser, UNINSTALL_KEY)
 }
@@ -267,6 +312,51 @@ fn write_shortcut(shortcut: &Shortcut) -> io::Result<()> {
     // interface of this thread has been released.
     unsafe { CoUninitialize() };
     result.map_err(io::Error::from)
+}
+
+/// The program that the shortcut at `path` starts, as written in it: read by
+/// the shell's own `ShellLink` object on a thread of its own, without
+/// resolving the shortcut and without expanding anything in it.
+pub(crate) fn shortcut_target(path: &Path) -> io::Result<PathBuf> {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || read_shortcut(&path))
+        .join()
+        .map_err(|_| io::Error::other("the shortcut could not be read"))?
+}
+
+/// Reads the target of the `.lnk` on the calling thread, which must be a
+/// fresh one.
+fn read_shortcut(path: &Path) -> io::Result<PathBuf> {
+    /// `SLGP_RAWPATH`: the path as it was written, nothing expanded.
+    const SLGP_RAWPATH: u32 = 0x4;
+    // SAFETY: a fresh thread, initialised once and uninitialised below.
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+        .ok()
+        .map_err(io::Error::from)?;
+    let result = (|| -> windows::core::Result<Vec<u16>> {
+        let path = HSTRING::from(path.as_os_str());
+        let mut target = vec![0u16; 32_768];
+        let mut found = WIN32_FIND_DATAW::default();
+        // SAFETY: COM is initialised on this thread; `path` outlives the
+        // call it is passed to; `target` and `found` are writable and
+        // outlive the call; the interfaces are released on drop.
+        unsafe {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            let file: IPersistFile = link.cast()?;
+            file.Load(&path, STGM_READ)?;
+            link.GetPath(&mut target, &raw mut found, SLGP_RAWPATH)?;
+        }
+        Ok(target)
+    })();
+    // SAFETY: balances the successful CoInitializeEx above, after every
+    // interface of this thread has been released.
+    unsafe { CoUninitialize() };
+    let target = result.map_err(io::Error::from)?;
+    let len = target
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(target.len());
+    Ok(PathBuf::from(OsString::from_wide(&target[..len])))
 }
 
 /// The full image path of a process, when this user may query it.

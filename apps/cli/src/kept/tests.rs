@@ -70,8 +70,9 @@ impl System for FakeSystem {
     }
 
     fn create_shortcut(&self, shortcut: &Shortcut) -> io::Result<()> {
-        // Stands in for the .lnk file, so that removing can remove it.
-        fs::write(&shortcut.path, b"lnk")?;
+        // Stands in for the .lnk file, so that removing can remove it: it
+        // holds the target, as a shortcut does.
+        fs::write(&shortcut.path, shortcut.target.to_string_lossy().as_bytes())?;
         self.shortcuts.borrow_mut().push(shortcut.clone());
         Ok(())
     }
@@ -85,6 +86,17 @@ impl System for FakeSystem {
 
     fn has_uninstall_entry(&self, key: &str) -> bool {
         self.entries.borrow().contains_key(key)
+    }
+
+    fn uninstall_entry_location(&self, key: &str) -> Option<PathBuf> {
+        self.entries
+            .borrow()
+            .get(key)
+            .map(|entry| PathBuf::from(&entry.install_location))
+    }
+
+    fn shortcut_target(&self, path: &Path) -> io::Result<PathBuf> {
+        Ok(PathBuf::from(fs::read_to_string(path)?))
     }
 
     fn remove_uninstall_entry(&self, key: &str) -> io::Result<bool> {
@@ -680,7 +692,7 @@ fn what_was_written_is_read_back_against_the_program_that_runs() {
     let machine = Machine::new("read-back");
     let target = machine.root.join("written");
     let source = File::open(machine.copy()).unwrap();
-    write_program(&source, &target).unwrap();
+    write_program(&mut &source, &target).unwrap();
     assert_eq!(
         fs::read(&target).unwrap(),
         b"the support program, version 1"
@@ -1316,6 +1328,21 @@ fn off_windows_nothing_is_kept() {
     );
 }
 
+/// No option skips the question before a removal: `--yes` is refused with
+/// the usage exit code before anything is looked at, also in a console build
+/// that was given the name of a copy for getting help.
+#[test]
+fn no_option_skips_the_question_before_a_removal() {
+    assert_eq!(
+        uninstall_command("CretLink-Support", true, false),
+        ExitCode::from(USAGE_EXIT)
+    );
+    assert_eq!(
+        uninstall_command("CretLink-Support-console", true, false),
+        ExitCode::from(USAGE_EXIT)
+    );
+}
+
 /// The real system, in a sandbox: the folder is made with its permissions,
 /// the program that runs is held and written, the shortcuts are real, and
 /// the entry lies in the registry under a key of this test. Everything that
@@ -1356,6 +1383,20 @@ fn on_windows_the_real_system_keeps_and_removes_in_a_sandbox() {
         ])
     );
     assert!(system.has_uninstall_entry(&layout.uninstall_key));
+    // What a removal without a record looks at: where the shortcuts lead,
+    // and the location that the entry names.
+    for shortcut in [&layout.start_menu, &layout.desktop] {
+        let target = system.shortcut_target(shortcut).unwrap();
+        assert!(same_path(&target, &layout.exe), "{}", target.display());
+    }
+    let location = system
+        .uninstall_entry_location(&layout.uninstall_key)
+        .unwrap();
+    assert!(
+        same_path(&location, &layout.folder),
+        "{}",
+        location.display()
+    );
     assert_eq!(
         status(&layout, &this, "9.9.9"),
         Status {
@@ -1371,4 +1412,289 @@ fn on_windows_the_real_system_keeps_and_removes_in_a_sandbox() {
     assert!(report.complete(), "{report:?}");
     assert_eq!(machine.everything(), before);
     assert!(!system.has_uninstall_entry(&layout.uninstall_key));
+}
+
+// --- Added with the review of 2026-11-14 (REQ-S-024) ---
+
+/// A source that gives other bytes the second time it is read from its
+/// start, as a program file that changed between the copy and the check
+/// would.
+struct Shifting {
+    passes: usize,
+    at: usize,
+}
+
+impl Shifting {
+    fn content(&self) -> &'static [u8] {
+        if self.passes <= 1 {
+            b"the program that runs"
+        } else {
+            b"the program that runs, changed"
+        }
+    }
+}
+
+impl Read for Shifting {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let content = self.content();
+        let rest = &content[self.at.min(content.len())..];
+        let read = rest.len().min(buffer.len());
+        buffer[..read].copy_from_slice(&rest[..read]);
+        self.at += read;
+        Ok(read)
+    }
+}
+
+impl Seek for Shifting {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        assert_eq!(to, SeekFrom::Start(0), "read from its start only");
+        self.passes += 1;
+        self.at = 0;
+        Ok(0)
+    }
+}
+
+/// The comparison in `write_program` itself: a source whose bytes differ
+/// when they are read back never gives its name to what was written.
+#[test]
+fn a_program_that_reads_back_otherwise_is_not_written() {
+    let machine = Machine::new("shifting");
+    let target = machine.root.join("CretLink-Support.exe");
+    let mut source = Shifting { passes: 0, at: 0 };
+    let error = write_program(&mut source, &target).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(source.passes, 2, "written once and read back once");
+    assert!(!target.exists());
+    assert!(!temporary_name(&target).exists(), "nothing is left of it");
+
+    // A program that was kept before stays as it was.
+    fs::write(&target, b"kept before").unwrap();
+    let mut source = Shifting { passes: 0, at: 0 };
+    assert!(write_program(&mut source, &target).is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"kept before");
+}
+
+/// A keep that was interrupted after the record and before the program
+/// file took its name is named, is no program kept on purpose, and is
+/// removed or finished like any other (M2).
+#[test]
+fn an_interrupted_keep_is_named_and_not_taken_for_a_kept_program() {
+    let machine = Machine::new("interrupted");
+    let layout = &machine.layout;
+    assert!(!unfinished(layout));
+    assert_eq!(unfinished_text(layout), None);
+
+    // The folder alone, then the record, then the program under its
+    // temporary name: each is a keep that did not finish.
+    fs::create_dir(&layout.folder).unwrap();
+    assert!(unfinished(layout));
+    let record = Record {
+        schema: RECORD_SCHEMA,
+        version: "1.0.0".to_owned(),
+        files: vec![PROGRAM_FILE.to_owned(), RECORD_FILE.to_owned()],
+        start_menu: Some(layout.start_menu.clone()),
+        desktop: None,
+        uninstall_entry: Some(format!(r"HKLM\{}", layout.uninstall_key)),
+    };
+    write_record(layout, &record).unwrap();
+    fs::write(temporary_name(&layout.exe), b"half").unwrap();
+    assert!(unfinished(layout));
+    assert_eq!(kept(layout), None);
+    assert_eq!(on_purpose(layout), None, "not there on purpose");
+    let text = unfinished_text(layout).unwrap();
+    assert!(text.contains("did not finish"), "{text}");
+    assert!(text.contains("'CretLink-Support.exe uninstall'"), "{text}");
+    assert_eq!(
+        machine.status(&machine.copy(), "1.0.0").relation,
+        Relation::NotKept
+    );
+
+    // Keeping again finishes it.
+    machine.keep("1.0.0", false).unwrap();
+    assert!(!unfinished(layout));
+    assert!(kept(layout).is_some());
+
+    // An update that was interrupted: the program file of the older version
+    // and a file under a temporary name beside it. The record already names
+    // the newer version, so no version is believed.
+    fs::write(temporary_name(&layout.exe), b"half of version 2").unwrap();
+    assert!(unfinished(layout));
+    assert_eq!(kept(layout), None);
+    let status = machine.status(&machine.copy(), "2.0.0");
+    assert_eq!(status.kept_version, None);
+    assert_eq!(status.relation, Relation::Unknown, "it is not replaced");
+    // Removing takes all of it.
+    let report = machine.remove(&machine.copy());
+    assert!(report.complete(), "{report:?}");
+    assert!(!layout.folder.exists());
+    assert!(!unfinished(layout));
+}
+
+/// Keeping looks again at what is kept once the folder is prepared, and
+/// refuses when that is no longer what the plan showed: an older plan never
+/// replaces a newer program that was kept since (M3).
+#[test]
+fn keeping_refuses_when_what_is_kept_changed_since_the_plan() {
+    let machine = Machine::new("changed");
+    let layout = &machine.layout;
+    // Shown: nothing kept. Meanwhile version 3 was kept.
+    machine.download(b"the support program, version 2");
+    let older = machine.plan("2.0.0").unwrap();
+    assert_eq!(older.replaces, None);
+    machine.download(b"the support program, version 3");
+    machine.keep("3.0.0", false).unwrap();
+    machine.download(b"the support program, version 2");
+    let refused = keep(layout, &machine.system, &older, false).unwrap_err();
+    assert!(
+        matches!(
+            &refused,
+            KeptError::Changed { shown: None, now: Some(now) } if now == "3.0.0"
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(refused.stage(), "keep_changed");
+    assert_eq!(
+        fs::read(&layout.exe).unwrap(),
+        b"the support program, version 3"
+    );
+    assert_eq!(read_record(layout).unwrap().unwrap().version, "3.0.0");
+
+    // Shown: version 3 kept, to be replaced by 4. Meanwhile 5 was kept.
+    machine.download(b"the support program, version 4");
+    let plan = machine.plan("4.0.0").unwrap();
+    assert_eq!(plan.replaces.as_deref(), Some("3.0.0"));
+    machine.download(b"the support program, version 5");
+    machine.keep("5.0.0", false).unwrap();
+    machine.download(b"the support program, version 4");
+    assert!(matches!(
+        keep(layout, &machine.system, &plan, false).unwrap_err(),
+        KeptError::Changed { .. }
+    ));
+    assert_eq!(read_record(layout).unwrap().unwrap().version, "5.0.0");
+
+    // Shown: version 5 kept. Meanwhile it was removed.
+    machine.download(b"the support program, version 6");
+    let plan = machine.plan("6.0.0").unwrap();
+    machine.remove(&machine.copy());
+    assert!(matches!(
+        keep(layout, &machine.system, &plan, false).unwrap_err(),
+        KeptError::Changed {
+            shown: Some(_),
+            now: None
+        }
+    ));
+    assert!(!layout.exe.exists());
+}
+
+/// Relay settings or a certificate file with a second name are not read:
+/// the second name could have been given to a file that the account cannot
+/// read itself (L1).
+#[test]
+fn relay_settings_with_a_second_name_are_not_read() {
+    let machine = Machine::new("hard-link");
+    let elsewhere = machine.root.join("elsewhere.toml");
+    fs::write(
+        &elsewhere,
+        "[relay]\naddress = \"192.0.2.1:9970\"\nkey = \"key-of-ann\"\nname = \"relay.example.org\"\n",
+    )
+    .unwrap();
+    fs::hard_link(&elsewhere, machine.downloads.join(PROFILE_FILE)).unwrap();
+    let plan = machine.plan("1.0.0").unwrap();
+    assert!(plan.relay.is_none());
+    let problem = plan.relay_problem.unwrap().to_string();
+    assert!(!problem.contains("key-of-ann"), "{problem}");
+
+    // The same for the certificate file that the settings name.
+    fs::remove_file(machine.downloads.join(PROFILE_FILE)).unwrap();
+    machine.relay_file(
+        "[relay]\naddress = \"192.0.2.1:9970\"\nkey = \"key-of-ann\"\nname = \
+         \"relay.example.org\"\nca = \"authority.pem\"\n",
+    );
+    let pem = machine.root.join("authority.pem");
+    fs::write(&pem, PEM).unwrap();
+    fs::hard_link(&pem, machine.downloads.join("authority.pem")).unwrap();
+    let plan = machine.plan("1.0.0").unwrap();
+    assert!(plan.relay.is_none());
+    assert!(plan.relay_problem.is_some());
+    // With one name it is read.
+    fs::remove_file(&pem).unwrap();
+    assert!(machine.plan("1.0.0").unwrap().relay.is_some());
+}
+
+/// Without a record that can be read, a removal takes only a shortcut that
+/// starts the kept program and an entry in Installed apps whose location is
+/// the folder of the kept program (L2).
+#[test]
+fn without_a_record_only_what_points_at_the_kept_program_is_removed() {
+    let machine = Machine::new("no-record-foreign");
+    let layout = &machine.layout;
+    machine.keep("1.0.0", true).unwrap();
+    fs::remove_file(&layout.record).unwrap();
+    // The desktop shortcut now starts another program, and the entry names
+    // another location.
+    let other = machine.root.join("other.exe");
+    fs::write(&layout.desktop, other.to_string_lossy().as_bytes()).unwrap();
+    machine.system.entries.borrow_mut().insert(
+        layout.uninstall_key.clone(),
+        UninstallEntry {
+            display_name: "Something else".to_owned(),
+            display_version: "1".to_owned(),
+            publisher: "Somebody".to_owned(),
+            install_location: machine.root.join("Other").to_string_lossy().into_owned(),
+            uninstall_string: String::new(),
+            display_icon: String::new(),
+        },
+    );
+
+    let plan = machine.remove_plan(&machine.copy());
+    assert_eq!(plan.shortcuts, vec![layout.start_menu.clone()]);
+    assert_eq!(plan.uninstall_entry, None);
+    assert!(
+        plan.left.contains(&format!(
+            "The shortcut {}, which does not start the kept program",
+            layout.desktop.display()
+        )),
+        "{:?}",
+        plan.left
+    );
+    assert!(
+        plan.left
+            .iter()
+            .any(|line| line.contains("whose location is not the folder of the kept program")),
+        "{:?}",
+        plan.left
+    );
+    let report = remove(layout, &machine.system, &plan).unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert!(!layout.start_menu.exists());
+    assert!(layout.desktop.exists(), "the other shortcut stays");
+    assert!(machine.system.has_uninstall_entry(&layout.uninstall_key));
+
+    // With a record the entry under its own key is CretLink's.
+    let machine = Machine::new("no-record-own");
+    machine.keep("1.0.0", false).unwrap();
+    fs::remove_file(&machine.layout.record).unwrap();
+    let plan = machine.remove_plan(&machine.copy());
+    assert_eq!(plan.uninstall_entry.as_deref(), Some(UNINSTALL_KEY));
+    assert_eq!(plan.shortcuts, vec![machine.layout.start_menu.clone()]);
+}
+
+/// A desktop shortcut that is no longer wanted goes only when it starts the
+/// kept program; one that starts something else stays.
+#[test]
+fn a_desktop_shortcut_that_is_no_longer_wanted_goes_only_when_it_starts_the_kept_program() {
+    let machine = Machine::new("desktop-foreign");
+    let layout = &machine.layout;
+    machine.keep("1.0.0", true).unwrap();
+    let other = machine.root.join("other.exe");
+    fs::write(&layout.desktop, other.to_string_lossy().as_bytes()).unwrap();
+
+    machine.download(b"the support program, version 2");
+    machine.keep("2.0.0", false).unwrap();
+    assert_eq!(
+        fs::read_to_string(&layout.desktop).unwrap(),
+        other.to_string_lossy(),
+        "a shortcut that starts something else stays"
+    );
+    assert_eq!(read_record(layout).unwrap().unwrap().desktop, None);
 }

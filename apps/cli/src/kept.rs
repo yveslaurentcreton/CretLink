@@ -39,16 +39,32 @@
 //!   program that is running is never replaced.
 //! - **The relay settings are somebody else's input.** The file next to the
 //!   running program is read without following a link, up to a bound, with
-//!   the reader of relay profiles; a profile that cannot be used is not kept
+//!   the reader of relay profiles, and refused when the file has more than
+//!   one name (a hard link could make it a file the account cannot read); a profile that cannot be used is not kept
 //!   and is said. What is kept is written anew from what was read: the
 //!   settings of the profile, and the certificates of its certificate file
 //!   and nothing else that stood in that file. The same value that the
 //!   customer was shown is the one that is written ([`KeepPlan`]).
+//! - **What is kept is looked at again when it is written.** After the folder
+//!   is prepared, what is kept and in which version is looked at once more;
+//!   when that is no longer what the customer was shown, nothing is written
+//!   ([`KeptError::Changed`]): an older plan never replaces a newer program.
+//! - **A keep that was interrupted is named.** The record and files under a
+//!   temporary name are written before the program file has its name. A
+//!   folder with any of them and no program file, or with a file under a
+//!   temporary name, is a kept program that is not complete ([`unfinished`]):
+//!   `recover` names it with the command that removes it, and never calls the
+//!   computer clean then.
 //! - **Removing removes what the record names**, as far as it lies in the
 //!   layout: a file directly in the folder of the kept program, a shortcut
 //!   in its own place, the entry under its own key. Nothing is followed
 //!   through a link, and a record that names anything else changes nothing
-//!   about it.
+//!   about it. Without a record that can be read, a shortcut goes only when
+//!   it starts the kept program, and the entry in Installed apps only when
+//!   its location is the folder of the kept program. A desktop shortcut that
+//!   is no longer wanted goes only when it starts the kept program.
+//! - **Removing always asks.** No option skips the question
+//!   ([`uninstall_command`] refuses `--yes`).
 //! - **Nobody keeps the program but the customer.** There is no command-line
 //!   option, no environment variable and no remote operation for it:
 //!   [`keep`] is called from the customer's own window only.
@@ -93,6 +109,9 @@ pub const SHORTCUT_FILE: &str = "CretLink Support.lnk";
 /// The key of the entry in Installed apps, under `HKEY_LOCAL_MACHINE`.
 pub const UNINSTALL_KEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CretLink Support";
+
+/// The exit code of a command line that is refused as it was given.
+const USAGE_EXIT: u8 = 2;
 
 /// The largest record that is read (bounded input).
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
@@ -261,6 +280,17 @@ pub trait System {
     /// Whether the entry under `key` exists.
     fn has_uninstall_entry(&self, key: &str) -> bool;
 
+    /// The location that the entry under `key` names (`InstallLocation`).
+    /// `None` when there is no entry or it names none.
+    fn uninstall_entry_location(&self, key: &str) -> Option<PathBuf>;
+
+    /// The program that the shortcut at `path` starts, as written in it.
+    ///
+    /// # Errors
+    ///
+    /// When the shortcut cannot be read.
+    fn shortcut_target(&self, path: &Path) -> io::Result<PathBuf>;
+
     /// Removes the entry under `key`; `Ok(false)` when there was none.
     ///
     /// # Errors
@@ -319,6 +349,14 @@ impl System for OsSystem {
         false
     }
 
+    fn uninstall_entry_location(&self, _key: &str) -> Option<PathBuf> {
+        None
+    }
+
+    fn shortcut_target(&self, _path: &Path) -> io::Result<PathBuf> {
+        windows_only()
+    }
+
     fn remove_uninstall_entry(&self, _key: &str) -> io::Result<bool> {
         windows_only()
     }
@@ -335,8 +373,10 @@ impl System for OsSystem {
 ///
 /// The file may lie in a folder that a program without rights can write. So
 /// only a file is read: a link under the name is refused, also one that
-/// takes the file's place between the look and the opening, and a file that
-/// is larger than the bound is refused before it is read whole.
+/// takes the file's place between the look and the opening; a file with more
+/// than one name is refused, because a second name can be given in such a
+/// folder to a file that the account itself cannot read; and a file that is
+/// larger than the bound is refused before it is read whole.
 fn read_untrusted(path: &Path, limit: u64) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
     let not_a_file = || io::Error::new(io::ErrorKind::InvalidInput, "it is not a file");
     let looked = match fs::symlink_metadata(path) {
@@ -363,6 +403,12 @@ fn read_untrusted(path: &Path, limit: u64) -> io::Result<Option<Zeroizing<Vec<u8
     if !opened.file_type().is_file() || !same_entry(&looked, &opened) {
         return Err(not_a_file());
     }
+    if number_of_names(&file, &opened)? != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the file has more than one name",
+        ));
+    }
     if opened.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -379,6 +425,26 @@ fn read_untrusted(path: &Path, limit: u64) -> io::Result<Option<Zeroizing<Vec<u8
         ));
     }
     Ok(Some(bytes))
+}
+
+/// How many names (hard links) the open file has.
+fn number_of_names(file: &File, opened: &fs::Metadata) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = file;
+        Ok(opened.nlink())
+    }
+    #[cfg(windows)]
+    {
+        let _ = opened;
+        crate::install::win::number_of_links(file).map(u64::from)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, opened);
+        Ok(1)
+    }
 }
 
 /// Whether the entry that was looked at by its name and the one that was
@@ -454,18 +520,19 @@ fn write_bytes(target: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Writes the held program `source` as `target`, and reads what was written
 /// back against it before it takes its name.
-fn write_program(source: &File, target: &Path) -> io::Result<()> {
+fn write_program<S: Read + Seek>(source: &mut S, target: &Path) -> io::Result<()> {
+    let source = std::cell::RefCell::new(source);
     write_new(
         target,
         &mut |file| {
-            let mut source = source;
+            let mut source = source.borrow_mut();
             source.seek(SeekFrom::Start(0))?;
-            io::copy(&mut source, file).map(drop)
+            io::copy(&mut **source, file).map(drop)
         },
         &mut |written| {
-            let mut source = source;
+            let mut source = source.borrow_mut();
             source.seek(SeekFrom::Start(0))?;
-            if same_bytes(&mut source, written)? {
+            if same_bytes(&mut **source, written)? {
                 Ok(())
             } else {
                 Err(io::Error::new(
@@ -664,6 +731,35 @@ pub struct Status {
     pub kept_version: Option<String>,
 }
 
+/// Whether a keep that was interrupted left something of a kept program
+/// that is not complete: the folder, the record or a file under a temporary
+/// name without the program file, or a file under a temporary name beside
+/// it. Keeping writes the record and every file under a temporary name
+/// before the program file takes its name.
+#[must_use]
+pub fn unfinished(layout: &Layout) -> bool {
+    if Standing::of_dir(&layout.folder) == Standing::Absent {
+        return false;
+    }
+    let half_written = Layout::own_names()
+        .iter()
+        .any(|name| fs::symlink_metadata(temporary_name(&layout.folder.join(name))).is_ok());
+    half_written || Standing::of_file(&layout.exe) != Standing::Ours
+}
+
+/// The version of the kept program as its record says it, when the program
+/// is complete; `None` when its record cannot be read or a keep was
+/// interrupted, since the record is written first.
+fn kept_version(layout: &Layout) -> Option<String> {
+    if unfinished(layout) {
+        return None;
+    }
+    read_record(layout)
+        .ok()
+        .flatten()
+        .map(|record| record.version)
+}
+
 /// Looks at what is kept. It changes nothing and needs no administrator
 /// rights.
 #[must_use]
@@ -674,10 +770,7 @@ pub fn status(layout: &Layout, this_exe: &Path, this_version: &str) -> Status {
             kept_version: None,
         };
     }
-    let kept_version = read_record(layout)
-        .ok()
-        .flatten()
-        .map(|record| record.version);
+    let kept_version = kept_version(layout);
     let relation = if layout.is_kept_exe(this_exe) {
         Relation::ThisIsIt
     } else {
@@ -698,17 +791,29 @@ pub fn status(layout: &Layout, this_exe: &Path, this_version: &str) -> Status {
 }
 
 /// The program that is kept on this computer: its folder, and its version
-/// when its record says one. `None` when nothing is kept.
+/// when its record says one. `None` when nothing is kept, and when a keep
+/// was interrupted ([`unfinished`]): that is no program kept on purpose.
 #[must_use]
 pub fn kept(layout: &Layout) -> Option<(PathBuf, Option<String>)> {
-    if Standing::of_file(&layout.exe) != Standing::Ours {
+    if Standing::of_file(&layout.exe) != Standing::Ours || unfinished(layout) {
         return None;
     }
-    let version = read_record(layout)
-        .ok()
-        .flatten()
-        .map(|record| record.version);
-    Some((layout.folder.clone(), version))
+    Some((layout.folder.clone(), kept_version(layout)))
+}
+
+/// What a report says about a keep that was interrupted ([`unfinished`]):
+/// where it lies and the command that removes it. `None` when there is
+/// none.
+#[must_use]
+pub fn unfinished_text(layout: &Layout) -> Option<String> {
+    unfinished(layout).then(|| {
+        format!(
+            "{}: keeping CretLink Support on this computer did not finish. To remove what \
+             it left, run '{PROGRAM_FILE} uninstall' as an administrator (any copy of \
+             CretLink Support does), or use Installed apps in the settings of Windows",
+            layout.folder.display()
+        )
+    })
 }
 
 /// What a report says about a program that is kept on this computer, so that
@@ -752,6 +857,13 @@ pub enum KeptError {
     Running(PathBuf),
     /// No program is kept, and nothing of one is there.
     NotKept(PathBuf),
+    /// What is kept changed since the plan was shown: nothing was kept.
+    Changed {
+        /// The version that was kept when the plan was shown, if any.
+        shown: Option<String>,
+        /// The version that is kept now, if any can be read.
+        now: Option<String>,
+    },
     /// The file of the program that runs could not be held unchanged, or is
     /// not the image this process runs from: nothing is kept from a file
     /// that could be another one.
@@ -785,6 +897,7 @@ impl KeptError {
             Self::NotNewer { .. } => "keep_older",
             Self::Running(_) => "keep_running",
             Self::NotKept(_) => "keep_absent",
+            Self::Changed { .. } => "keep_changed",
             Self::Program(_) => "keep_program",
             Self::Io { .. } => "keep_failed",
         }
@@ -827,6 +940,20 @@ impl std::fmt::Display for KeptError {
                 "CretLink Support is not kept on this computer (nothing of it in {})",
                 folder.display()
             ),
+            Self::Changed { shown, now } => {
+                let said = |version: &Option<String>| {
+                    version
+                        .as_deref()
+                        .map_or_else(|| "none".to_owned(), |version| format!("version {version}"))
+                };
+                write!(
+                    f,
+                    "what is kept on this computer changed since it was shown (then {}, now \
+                     {}); nothing was kept. Look again at what keeping adds, then choose",
+                    said(shown),
+                    said(now)
+                )
+            }
             Self::Program(source) => write!(
                 f,
                 "the file of the program that runs could not be held as it is ({source}); \
@@ -961,6 +1088,26 @@ pub fn keep(
     system
         .prepare_folder(&layout.folder)
         .map_err(|err| KeptError::io("make the folder of the kept program", &layout.folder, err))?;
+    // Looked at again, now that the folder is ready: what is kept, and in
+    // which version, must still be what the plan showed. An older plan never
+    // replaces a newer program that was kept since.
+    let now = if Standing::of_file(&layout.exe) == Standing::Ours {
+        Some(kept_version(layout))
+    } else {
+        None
+    };
+    let shown = plan.replaces.clone();
+    let unchanged = match (&shown, &now) {
+        (None, None) => true,
+        (Some(shown), Some(Some(now))) => shown == now,
+        _ => false,
+    };
+    if !unchanged {
+        return Err(KeptError::Changed {
+            shown,
+            now: now.flatten(),
+        });
+    }
 
     // The record first, with everything this run is going to add: whatever
     // then exists is named by a record, also when the run is interrupted.
@@ -989,7 +1136,7 @@ pub fn keep(
     write_record(layout, &record)?;
 
     // Read through the held file, never by a path.
-    write_program(&source, &layout.exe)
+    write_program(&mut &source, &layout.exe)
         .map_err(|err| KeptError::io("write the program", &layout.exe, err))?;
     drop(source);
 
@@ -1022,8 +1169,11 @@ pub fn keep(
             &shortcut(&layout.desktop),
             "add the desktop shortcut",
         )?;
-    } else if previous.is_some_and(|record| record.desktop.is_some()) {
-        // Not wanted any more: the one an earlier run added goes.
+    } else if previous.is_some_and(|record| record.desktop.is_some())
+        && starts_the_kept_program(system, layout, &layout.desktop)
+    {
+        // Not wanted any more: the one an earlier run added goes, and only
+        // when it is still a shortcut to the kept program.
         remove_own_file(&layout.desktop)
             .map_err(|err| KeptError::io("remove the desktop shortcut", &layout.desktop, err))?;
     }
@@ -1066,6 +1216,15 @@ fn write_record(layout: &Layout, record: &Record) -> Result<(), KeptError> {
     let failed = |err| KeptError::io("write the record", &layout.record, err);
     let text = serde_json::to_string_pretty(record).map_err(|err| failed(io::Error::other(err)))?;
     write_bytes(&layout.record, text.as_bytes()).map_err(failed)
+}
+
+/// Whether the shortcut at `path` is a file, and no link, that starts the
+/// kept program.
+fn starts_the_kept_program(system: &dyn System, layout: &Layout, path: &Path) -> bool {
+    Standing::of_file(path) == Standing::Ours
+        && system
+            .shortcut_target(path)
+            .is_ok_and(|target| same_path(&target, &layout.exe))
 }
 
 /// Adds a shortcut where nothing but a file of that name may stand: a link
@@ -1241,12 +1400,14 @@ pub fn remove_plan(
     }
 
     // The shortcuts: only in their own places. The record says which were
-    // added; without one, both places are looked at.
+    // added; without one, both places are looked at, and a shortcut there
+    // goes only when it starts the kept program.
     let recorded = |named: Option<&PathBuf>, own: &PathBuf| match &record {
         Some(_) => named.is_some_and(|named| named == own),
         None => true,
     };
     let mut shortcuts = Vec::new();
+    let ours = |own: &PathBuf| record.is_some() || starts_the_kept_program(system, layout, own);
     for (named, own) in [
         (
             record.as_ref().and_then(|r| r.start_menu.as_ref()),
@@ -1258,15 +1419,36 @@ pub fn remove_plan(
         ),
     ] {
         if recorded(named, own) && fs::symlink_metadata(own).is_ok() {
-            shortcuts.push(own.clone());
+            if ours(own) {
+                shortcuts.push(own.clone());
+            } else {
+                left.push(format!(
+                    "The shortcut {}, which does not start the kept program",
+                    own.display()
+                ));
+            }
         } else if named.is_some_and(|named| named != own) {
             left.push("A shortcut that the record names outside its own place".to_owned());
         }
     }
 
-    let uninstall_entry = system
+    // The entry: without a record, only when its location is the folder of
+    // the kept program.
+    let mut uninstall_entry = system
         .has_uninstall_entry(&layout.uninstall_key)
         .then(|| layout.uninstall_key.clone());
+    if record.is_none()
+        && uninstall_entry.is_some()
+        && !system
+            .uninstall_entry_location(&layout.uninstall_key)
+            .is_some_and(|location| same_path(&location, &layout.folder))
+    {
+        uninstall_entry = None;
+        left.push(format!(
+            r"The entry in Installed apps (HKLM\{}), whose location is not the folder of the kept program",
+            layout.uninstall_key
+        ));
+    }
     if files.is_empty() && shortcuts.is_empty() && uninstall_entry.is_none() {
         return Err(KeptError::NotKept(layout.folder.clone()));
     }
@@ -1445,6 +1627,10 @@ fn remove_report_text(report: &RemoveReport) -> String {
 /// through the elevation prompt of Windows and does nothing else; the
 /// elevated one shows the list and asks. `in_box` tells that there is no
 /// terminal to ask in: a program without a console asks in a message box.
+///
+/// No option skips the question: `yes` (`--yes`) is refused with the usage
+/// exit code, also in a console build that was given the name of a copy for
+/// getting help, and nothing is looked at or removed then.
 pub fn uninstall_command(program: &str, yes: bool, in_box: bool) -> ExitCode {
     let title = "Remove CretLink Support";
     let tell = |text: &str, failed: bool| {
@@ -1460,6 +1646,14 @@ pub fn uninstall_command(program: &str, yes: bool, in_box: bool) -> ExitCode {
             println!("{}", text.trim_end());
         }
     };
+    if yes {
+        tell(
+            "--yes is not accepted here: removing CretLink Support always shows what it \
+             removes and asks first. Nothing was removed.",
+            true,
+        );
+        return ExitCode::from(USAGE_EXIT);
+    }
     let Some(layout) = Layout::current() else {
         tell(
             "The support program is kept only on a Windows computer; nothing to do.",
@@ -1491,10 +1685,7 @@ pub fn uninstall_command(program: &str, yes: bool, in_box: bool) -> ExitCode {
     };
     if system.require_administrator().is_err() {
         // Windows asks; the elevated program shows the list and asks itself.
-        let mut args = vec!["uninstall".to_owned()];
-        if yes {
-            args.push("--yes".to_owned());
-        }
+        let args = vec!["uninstall".to_owned()];
         return match process::relaunch_elevated(&exe, &args) {
             Ok(process::Elevation::Started) => ExitCode::SUCCESS,
             Ok(process::Elevation::Declined) => {
@@ -1517,12 +1708,7 @@ pub fn uninstall_command(program: &str, yes: bool, in_box: bool) -> ExitCode {
         };
     }
     let text = remove_plan_text(&plan);
-    let confirmed = if yes {
-        if !in_box {
-            print!("{text}");
-        }
-        true
-    } else if in_box {
+    let confirmed = if in_box {
         process::confirm(title, &format!("{text}\nRemove now?"))
     } else {
         print!("{text}Remove now? [y/N] ");

@@ -54,6 +54,14 @@ impl System for OsSystem {
         win::has_uninstall_entry_in(Hive::LocalMachine, key)
     }
 
+    fn uninstall_entry_location(&self, key: &str) -> Option<PathBuf> {
+        win::uninstall_entry_location_in(Hive::LocalMachine, key)
+    }
+
+    fn shortcut_target(&self, path: &Path) -> io::Result<PathBuf> {
+        win::shortcut_target(path)
+    }
+
     fn remove_uninstall_entry(&self, key: &str) -> io::Result<bool> {
         win::remove_uninstall_entry_in(Hive::LocalMachine, key)
     }
