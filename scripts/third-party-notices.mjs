@@ -1,35 +1,46 @@
-// Writes the third-party notices of one program (ST-M007-015, ST-M006-019,
-// REQ-N-016): the packages of other authors that are linked into it, their
-// licences, the licence texts those packages ship, and where their source is.
+// Writes the third-party notices of one program, or of the programs of one
+// release archive (ST-M007-015, ST-M006-019, REQ-N-016): the packages of other
+// authors that are linked into them, their licences, the licence texts those
+// packages ship, and where their source is.
 //
 // A released program carries the code of its dependencies, so it carries
 // their notices too. The list is what a build of the program links in:
 // `cargo tree --edges normal --locked` resolves features the way the build
 // does, so what only tests or build scripts need is left out, and so is
 // everything below a procedural macro, which runs in the compiler and is not
-// part of the program.
+// part of the program. The application also carries its frontend, so the npm
+// packages that the frontend is bundled from are listed with it.
 //
-// Usage: node scripts/third-party-notices.mjs --package <name>
-//          [--manifest-path <Cargo.toml>] [--target <triple>] [--output <file>]
+// Usage: node scripts/third-party-notices.mjs --package <name>...
+//          [--manifest-path <Cargo.toml>]... [--npm <folder>]...
+//          [--target <triple>] [--output <file>]
 //
-//   --package <name>        the workspace package whose program this is about
-//   --manifest-path <path>  the Cargo.toml to resolve from (default: the
-//                           workspace of the current directory)
+//   --package <name>        a package whose program this is about; once per
+//                           program of an archive
+//   --manifest-path <path>  a Cargo.toml to resolve from (default: the
+//                           workspace of the current directory); once per
+//                           workspace. A package is resolved from the
+//                           workspace it is a member of, which is the
+//                           lockfile its program is built with
+//   --npm <folder>          an npm package whose installed production
+//                           dependencies are part of a program; they must be
+//                           installed as its lockfile says (`npm ci`)
 //   --target <triple>       only the dependencies of this target platform
 //   --output <file>         write there instead of to standard output
 //
-// Exit status: 0 when written, 1 when the package is unknown or a licence
-// file cannot be read, 2 after a usage error or when cargo cannot be run.
+// Exit status: 0 when written, 1 when a package is unknown, a licence file
+// cannot be read or the npm packages are not installed as locked, 2 after a
+// usage error or when cargo cannot be run.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
 const USAGE =
-  "Usage: node scripts/third-party-notices.mjs --package <name> [--manifest-path <Cargo.toml>] [--target <triple>] [--output <file>]";
+  "Usage: node scripts/third-party-notices.mjs --package <name>... [--manifest-path <Cargo.toml>]... [--npm <folder>]... [--target <triple>] [--output <file>]";
 
 /** Files of a package that hold a licence text or a notice. */
 const NOTICE_FILE = /^(licen[cs]e|copying|notice|unlicense|copyright)([-._].*)?$/i;
@@ -50,7 +61,7 @@ export function linkedFromTree(tree) {
   const linked = new Set();
   // While inside the subtree of a procedural macro: the depth of that macro.
   let macroDepth = null;
-  for (const line of tree.split("\n")) {
+  for (const line of tree.split(/\r?\n/)) {
     const match = /^(\d+)(\S+) v(\S+)(.*)$/.exec(line);
     if (!match) continue;
     const depth = Number(match[1]);
@@ -68,13 +79,15 @@ export function linkedFromTree(tree) {
 /**
  * The packages of other authors among `linked` (the keys of
  * [`linkedFromTree`]), with what `cargo metadata` knows about them. The
- * packages of the workspace itself are left out: the program's own licence
- * covers them.
+ * packages of this repository are left out, because the program's own licence
+ * covers them: the members of the workspace, and the packages that come from
+ * a path and not from a registry, as the application reaches the crates of
+ * the workspace.
  */
 export function linkedPackages(metadata, linked) {
   const members = new Set(metadata.workspace_members);
   const selected = metadata.packages.filter(
-    (pkg) => linked.has(`${pkg.name} ${pkg.version}`) && !members.has(pkg.id),
+    (pkg) => linked.has(`${pkg.name} ${pkg.version}`) && !members.has(pkg.id) && pkg.source,
   );
   const known = new Set(metadata.packages.map((pkg) => `${pkg.name} ${pkg.version}`));
   const unknown = [...linked].filter((key) => !known.has(key));
@@ -82,6 +95,69 @@ export function linkedPackages(metadata, linked) {
     throw new Error(`cargo metadata does not know: ${unknown.join(", ")}`);
   }
   return selected.sort(
+    (a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version),
+  );
+}
+
+/**
+ * The names of the programs that the workspace member `name` builds: its
+ * binaries, or its own name when it has none. `null` when the workspace has
+ * no such member.
+ */
+export function programsOf(metadata, name) {
+  const members = new Set(metadata.workspace_members);
+  const pkg = metadata.packages.find((candidate) => candidate.name === name && members.has(candidate.id));
+  if (!pkg) return null;
+  const binaries = (pkg.targets ?? []).filter((target) => target.kind.includes("bin"));
+  return binaries.length > 0 ? binaries.map((target) => target.name) : [name];
+}
+
+/**
+ * The production dependencies of the npm package in `folder`, as its
+ * `package-lock.json` (`lock`) pins them, in the shape of the packages of
+ * `cargo metadata`. Each one must be installed in the locked version, because
+ * its licence files are read from there; what only builds or tests the
+ * package is left out, and so is an optional package that is not installed
+ * on this platform.
+ */
+export function npmPackages(folder, lock) {
+  const packages = [];
+  for (const [path, entry] of Object.entries(lock.packages ?? {})) {
+    if (path === "" || entry.dev || entry.devOptional || entry.link) continue;
+    const manifestPath = join(folder, path, "package.json");
+    if (!existsSync(manifestPath)) {
+      if (entry.optional) continue;
+      throw new Error(`${join(folder, path)} is not installed; run \`npm ci\` in ${folder} first`);
+    }
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (manifest.version !== entry.version) {
+      throw new Error(
+        `${join(folder, path)} is version ${manifest.version}, the lockfile says ${entry.version}; run \`npm ci\` in ${folder} first`,
+      );
+    }
+    packages.push({
+      name: manifest.name,
+      version: manifest.version,
+      license: typeof manifest.license === "string" ? manifest.license : entry.license,
+      repository: typeof manifest.repository === "string" ? manifest.repository : manifest.repository?.url,
+      source: "npm",
+      manifest_path: manifestPath,
+    });
+  }
+  return packages;
+}
+
+/**
+ * One list of several lists of packages: a package that two programs share
+ * appears once, and the list is sorted by name and version.
+ */
+export function mergePackages(lists) {
+  const merged = new Map();
+  for (const pkg of lists.flat()) {
+    const key = `${pkg.source === "npm" ? "npm" : "cargo"} ${pkg.name} ${pkg.version}`;
+    if (!merged.has(key)) merged.set(key, pkg);
+  }
+  return [...merged.values()].sort(
     (a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version),
   );
 }
@@ -136,25 +212,44 @@ export function groupTexts(collected) {
 
 /** Where the source of a package is found. */
 function sourceOf(pkg) {
-  const registry = pkg.source?.startsWith("registry+")
-    ? `https://crates.io/crates/${pkg.name}/${pkg.version}`
-    : (pkg.source ?? "this repository");
+  let registry = pkg.source ?? "this repository";
+  if (pkg.source === "npm") registry = `https://www.npmjs.com/package/${pkg.name}/v/${pkg.version}`;
+  else if (pkg.source?.startsWith("registry+")) registry = `https://crates.io/crates/${pkg.name}/${pkg.version}`;
   return pkg.repository ? `${registry} (${pkg.repository})` : registry;
 }
 
-/** The whole notices file as text. */
+/**
+ * The whole notices file as text, for one program (its name) or for the
+ * programs of one archive (their names).
+ */
 export function renderNotices(program, collected) {
+  const programs = [program].flat();
   const lines = [];
   const rule = "=".repeat(78);
+  lines.push("THIRD-PARTY NOTICES", "");
+  if (programs.length === 1) {
+    lines.push(
+      `${programs[0]} contains the packages listed below, which other authors wrote and`,
+      "published under their own licences. This file lists every such package with",
+      "its licence, repeats the licence texts and notices that the packages ship,",
+      "and says where the source of each package is found.",
+      "",
+      `${programs[0]} itself is published under the MIT licence; see the file LICENSE.`,
+    );
+  } else {
+    lines.push(
+      `The programs ${programs.slice(0, -1).join(", ")} and ${programs.at(-1)} contain the packages listed`,
+      "below, which other authors wrote and published under their own licences. A",
+      "package is part of at least one of the programs, not always of each. This",
+      "file lists every such package with its licence, repeats the licence texts",
+      "and notices that the packages ship, and says where the source of each",
+      "package is found.",
+      "",
+      "The programs themselves are published under the MIT licence; see the file",
+      "LICENSE.",
+    );
+  }
   lines.push(
-    "THIRD-PARTY NOTICES",
-    "",
-    `${program} contains the packages listed below, which other authors wrote and`,
-    "published under their own licences. This file lists every such package with",
-    "its licence, repeats the licence texts and notices that the packages ship,",
-    "and says where the source of each package is found.",
-    "",
-    `${program} itself is published under the MIT licence; see the file LICENSE.`,
     "",
     rule,
     `PACKAGES (${collected.length})`,
@@ -242,8 +337,9 @@ function main() {
   try {
     options = parseArgs({
       options: {
-        package: { type: "string" },
-        "manifest-path": { type: "string" },
+        package: { type: "string", multiple: true },
+        "manifest-path": { type: "string", multiple: true },
+        npm: { type: "string", multiple: true },
         target: { type: "string" },
         output: { type: "string" },
       },
@@ -257,24 +353,51 @@ function main() {
     return 2;
   }
 
-  let metadata;
-  let tree;
+  // Each workspace with what cargo knows about its locked graph.
+  let workspaces;
   try {
-    tree = cargoTree(options.package, options["manifest-path"], options.target);
-    metadata = cargoMetadata(options["manifest-path"]);
+    workspaces = (options["manifest-path"] ?? [undefined]).map((manifestPath) => ({
+      manifestPath,
+      metadata: cargoMetadata(manifestPath),
+    }));
   } catch (error) {
     console.error(`third-party-notices: cargo could not be run: ${error.message}`);
     return 2;
   }
 
+  const programs = [];
+  const lists = [];
   try {
-    const collected = collectNotices(linkedPackages(metadata, linkedFromTree(tree)));
-    const text = renderNotices(options.package, collected);
+    for (const name of options.package) {
+      const owners = workspaces.filter(({ metadata }) => programsOf(metadata, name) !== null);
+      if (owners.length !== 1) {
+        throw new Error(`${name} is a member of ${owners.length} of the workspaces, not of one`);
+      }
+      const [{ manifestPath, metadata }] = owners;
+      let tree;
+      try {
+        tree = cargoTree(name, manifestPath, options.target);
+      } catch (error) {
+        console.error(`third-party-notices: cargo could not be run: ${error.message}`);
+        return 2;
+      }
+      const linked = linkedFromTree(tree);
+      // The tree starts with the package itself; without it, nothing was read.
+      if (linked.size === 0) throw new Error(`cargo tree lists no package for ${name}`);
+      programs.push(...programsOf(metadata, name));
+      lists.push(linkedPackages(metadata, linked));
+    }
+    for (const folder of options.npm ?? []) {
+      lists.push(npmPackages(folder, JSON.parse(readFileSync(join(folder, "package-lock.json"), "utf8"))));
+    }
+
+    const collected = collectNotices(mergePackages(lists));
+    const text = renderNotices(programs, collected);
     if (options.output) writeFileSync(options.output, text);
     else process.stdout.write(text);
     const shipped = collected.filter(({ files }) => files.length > 0).length;
     console.error(
-      `third-party-notices: ${collected.length} packages in ${options.package}, ${shipped} with a licence file`,
+      `third-party-notices: ${collected.length} packages in ${programs.join(", ")}, ${shipped} with a licence file`,
     );
     return 0;
   } catch (error) {

@@ -114,8 +114,9 @@ jobs:
           CRETLINK_SIGN_PFX_PASSWORD: ${{ secrets.CRETLINK_SIGN_PFX_PASSWORD }}
           CRETLINK_SIGN_TIMESTAMP_URL: ${{ secrets.CRETLINK_SIGN_TIMESTAMP_URL }}
         run: pwsh -File scripts/sign-windows.ps1
-      # Checksums, the per-OS archive, the dependency inventory and the SBOMs,
-      # over the (possibly signed) staged binaries (ST-M009-004).
+      # Checksums, the per-OS archive with the third-party notices of its
+      # programs (ST-M006-019), the dependency inventory and the SBOMs, over
+      # the (possibly signed) staged binaries (ST-M009-004).
       - name: Pack the archive and its metadata
         shell: bash
         env:

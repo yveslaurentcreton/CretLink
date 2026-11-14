@@ -7,7 +7,9 @@ Every CretLink GitHub release attaches:
   `cretlink-<version>-linux-x86_64.tar.gz`. Each holds one folder with the
   application `cretlink` (Give help, and on Windows Get help, the program the
   customer runs) and its console build `cretlink-cli`, plus `README.txt`,
-  `LICENSE` and the target's `CHECKSUMS-<target>.txt`;
+  `LICENSE`, `THIRD-PARTY-NOTICES.txt` (the licenses and notices of the
+  packages the programs are built from) and the target's
+  `CHECKSUMS-<target>.txt`;
 - `SHA256SUMS.txt` — SHA-256 over the archives;
 - `cretlink-relay-server-<target>[.exe]` — the relay server, operator-hosted
   infrastructure on neither endpoint, so not in the archives;

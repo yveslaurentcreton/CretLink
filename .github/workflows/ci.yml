@@ -164,7 +164,6 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm test
-      - run: npm audit --omit=dev
       - run: cargo fmt --check
         working-directory: apps/app/src-tauri
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -214,19 +213,45 @@ jobs:
       # action sets; `+1.95` makes this job compile on the MSRV itself.
       - run: cargo +1.95 check --workspace --locked
 
+  # Every locked dependency is checked (ST-M006-019): the Cargo workspace; the
+  # application package, which is detached and has a lockfile and a
+  # configuration of its own (apps/app/src-tauri/deny.toml); the npm packages
+  # of the application's frontend and of the release tooling. The npm packages
+  # of the documentation site are audited in its own job below.
   deny:
     name: Dependency licenses, advisories, and sources
     needs: changes
     if: needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - name: Check the workspace (cargo deny)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check licenses advisories bans sources
+      - name: Check the application package (cargo deny)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: apps/app/src-tauri/Cargo.toml
+          arguments: --all-features --config apps/app/src-tauri/deny.toml
+          command: check licenses advisories bans sources
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      # `npm audit` reads the lockfile and asks the registry; nothing is
+      # installed. For the frontend any advisory fails, also in what only
+      # builds and tests it.
+      - name: Audit the application's frontend (npm)
+        working-directory: apps/app
+        run: npm audit
+      # The release tooling packs a package manager with dependencies that no
+      # lockfile here can move, so its check fails on an advisory of high or
+      # critical severity that has a fix (scripts/check-npm-audit.mjs).
+      - name: Audit the release tooling (npm)
+        run: node scripts/check-npm-audit.mjs
 
   # The documentation site (ST-M011-001): its build, the tests of its check,
   # and the check of every link and picture of the built pages. pages.yml

@@ -37,7 +37,8 @@ crates/
 docs/               Threat model, release policy, artifact verification, relay
                     operation, MCP clients, manual tests, release sign-off
 scripts/            Release artifact generation, Windows signing helpers, the
-                    third-party notices and the private-data check
+                    third-party notices, the audit of the release tooling and
+                    the private-data check
 website/            The documentation site (Astro with Starlight), published
                     through GitHub Pages
 ```
@@ -175,23 +176,82 @@ Follow [`docs/releasing.md`](docs/releasing.md):
 ## Dependency and license policy
 
 CretLink is MIT-licensed (REQ-N-016). Dependencies must carry MIT-compatible
-licenses; the allowlist and policy checks live in [`deny.toml`](deny.toml) and
-run in CI via `cargo deny`:
+licenses; the allowlist and the policy checks live in the `cargo deny`
+configurations named below and run in CI:
 
 - Allowed: `MIT`, `MIT-0`, `Apache-2.0`, `Apache-2.0 WITH LLVM-exception`,
   `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, `Zlib`, `Unicode-3.0`.
 - Any other license, including `MPL-2.0`, needs an explicit, commented
-  exception in `deny.toml` recording the review outcome. GPL/AGPL/LGPL and other
-  strong-copyleft licenses and source-unavailable licenses are not accepted
-  without an explicit maintainer decision.
+  exception recording the review outcome, for the crates that carry it and for
+  no other. GPL/AGPL/LGPL and other strong-copyleft licenses and
+  source-unavailable licenses are not accepted without an explicit maintainer
+  decision.
 - Security-relevant dependencies (crypto, transport, elevation) prefer widely
   used, actively maintained, audited crates (REQ-S-005). Do not add a crypto
   crate without an accepted ADR.
 
-Retain third-party license notices. Never commit credentials, tokens, signing
-keys, or customer data (REQ-N-017); `.gitignore` excludes common local state,
-and every pull request runs a secret scan and the private-data check described
-below.
+Never commit credentials, tokens, signing keys, or customer data (REQ-N-017);
+`.gitignore` excludes common local state, and every pull request runs a secret
+scan and the private-data check described below.
+
+### Dependency checks
+
+CI checks every lockfile of the repository (ST-M006-019), in the job
+"Dependency licenses, advisories, and sources" of `ci.yml` and, for the
+documentation site, in the job of the site. Run the check of a lockfile from
+the root of the repository before you change it or its manifest:
+
+| Lockfile | Check | Fails on |
+|---|---|---|
+| `Cargo.lock`, the workspace | `cargo deny check licenses advisories bans sources` | a license outside the list, a known advisory, a yanked crate, a dependency without a version, a source other than crates.io |
+| `apps/app/src-tauri/Cargo.lock`, the application with Tauri's tree | `cargo deny --manifest-path apps/app/src-tauri/Cargo.toml --config apps/app/src-tauri/deny.toml check licenses advisories bans sources` | the same |
+| `apps/app/package-lock.json`, the application's frontend | `npm audit` in `apps/app` | any known advisory |
+| `website/package-lock.json`, the documentation site | `npm audit` in `website` | any known advisory |
+| `package-lock.json`, the release tooling | `node scripts/check-npm-audit.mjs` | an advisory of high or critical severity that has a fix |
+
+[`deny.toml`](deny.toml) configures the check of the workspace. The
+application is a detached package, so it has a configuration of its own,
+[`apps/app/src-tauri/deny.toml`](apps/app/src-tauri/deny.toml): the same list
+of licenses, and what Tauri's dependency tree needs beyond it:
+
+- `MPL-2.0` for the five crates that only Tauri's dependencies bring, and for
+  no other crate;
+- the advisories without a fix inside the dependency lines of the locked
+  Tauri, each by its identifier;
+- path dependencies on the crates of this repository, which name no version.
+
+Each of these entries stands next to the reason it was accepted for and to
+what would make it worth another look. Add one only in the same way: for one
+crate or one advisory, never by widening a list or lowering a level until a
+check passes. Where a fix exists, update the lockfile instead.
+
+The release tooling is semantic-release, which brings the package manager npm
+with npm's own dependencies packed inside it. No lockfile here can move those,
+so `npm audit` alone would fail on advisories that nobody can act on.
+`scripts/check-npm-audit.mjs` reads the report of `npm audit` and fails on an
+advisory of high or critical severity that has a fix: an update of the
+lockfile (`npm audit fix`) or a newer version of a pinned tool. It prints how
+many others there are.
+
+### Third-party notices
+
+Retain third-party license notices. A released program carries the code of
+its dependencies, so it carries their license texts and notices too
+(REQ-N-016):
+
+- every release archive holds `THIRD-PARTY-NOTICES.txt` for its two programs,
+  `cretlink` and `cretlink-cli`, with the npm packages of the frontend that
+  the application carries;
+- the container image of the relay server holds `/THIRD-PARTY-NOTICES.txt` for
+  its program.
+
+`scripts/third-party-notices.mjs` writes the file when the archive or the
+image is built, from the locked dependencies for that platform: every package
+of another author that is linked into a program, with its license and the
+place of its source, the license texts and notices that the packages ship,
+and where the source of the files under `MPL-2.0` is found. Nothing in it is
+written by hand, so a new dependency needs no notice of its own, and a
+generated notices file is never committed.
 
 ## Sample data
 
