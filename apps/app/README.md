@@ -356,6 +356,7 @@ the rules in `cretlink_cli::webview_profile`):
 | Process | Profile folder | Removed |
 | --- | --- | --- |
 | Not installed (the start screen, a technician that runs once, a `CretLink-Support*` copy), and every customer process | a new `CretLink-webview-<random>` in the temporary folder | by the process itself, after its last window has closed |
+| Any process with administrator rights | a new `CretLink-webview-<random>` in `webview` in `%ProgramFiles%\CretLink Data`, created private (`Base::Private`) | by the process itself, after its last window has closed |
 | The installed technician copy | `%LOCALAPPDATA%\CretLink\webview`, `~/.local/share/CretLink/webview`, next to the audit trail | by `cretlink uninstall`; from the installed copy's own window, once that window has closed |
 | Any process on macOS | none: WebKit keeps its data itself | not by CretLink (a known gap) |
 
@@ -382,6 +383,17 @@ the rules in `cretlink_cli::webview_profile`):
   releases up to 0.24.1 left for this user; `recover --remove` removes them,
   with the exit codes it has. `cretlink uninstall` lists and removes the
   installed copy's profile and that earlier folder. The audit trail stays.
+- **With administrator rights** (REQ-S-024) the process takes nothing from
+  its environment for its profile: `Base::current` and `Places::current`
+  give the private folder `webview` in `CretLink Data`
+  (`cretlink_exec::OwnFolder::webview_for_this_process`), which `prepare`
+  creates with its owner and its permissions in one step, and never ask for
+  the temporary folder or the local application data. Sweep and `recover`
+  look only there; an elevated `recover` says that the account's folders are
+  not covered and names the command to run without administrator rights.
+  `run_screen` drops every `WEBVIEW2_*` variable from the process's
+  environment before WebView2 is asked anything
+  (`webview_profile::forget_webview_overrides`).
 
 ## Keeping the support program (ST-M009-017)
 
@@ -419,11 +431,13 @@ commands of the customer role are in `src-tauri/src/customer/keep.rs`:
 - **What was shown is what is kept.** The relay settings next to the copy
   are read once, for the plan, without following a link; the screen names
   the relay, where the copy would connect and what vouches for the name, and
-  that value is written.
+  that value is written. `keep_program` looks again, once the folder is
+  prepared, at what is kept and in which version, and refuses with
+  `keep_changed` when that is no longer what the plan showed.
 - **The kept program** shows that it is installed, with its version, says
   so in its footer and in the explanation of the Windows prompt in place of
-  "nothing is installed", and keeps its webview profile in a temporary
-  folder like every customer process (ST-M009-014).
+  "nothing is installed", and keeps its webview profile like every customer
+  process: with administrator rights in its private folder (ST-M009-014).
 - **Reports.** The end report carries `keptProgram` and says that the
   program is installed because the customer chose that; `recover` names it
   as kept on purpose and never removes it.

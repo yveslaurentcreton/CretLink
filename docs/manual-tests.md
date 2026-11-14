@@ -526,25 +526,45 @@ was doing.
    `Get-ChildItem -Recurse | Where-Object LastWriteTime -gt <start>`).
    - Expected: no session record or report exists, and `Documents\CretLink`
      does not exist (REQ-F-027, REQ-F-001).
-   - Expected while the Get help window is open (ST-M009-014): `%TEMP%` holds
-     one folder `CretLink-webview-<32 digits>` for it, with `cretlink.lock`
-     and the webview's data in it, and no `dev.cretlink.app` folder exists in
-     `%LOCALAPPDATA%`. The folder of the elevated window is in the `%TEMP%`
-     of the account that answered the UAC prompt. (A `dev.cretlink.app`
+   - Expected while the Get help window is open (ST-M009-014): the elevated
+     window's profile is one folder `CretLink-webview-<32 digits>` in
+     `C:\Program Files\CretLink Data\webview` (look as an administrator),
+     with `cretlink.lock` and the webview's data in it; `icacls` on it shows
+     the administrators and the system and nobody else. No
+     `CretLink-webview-*` folder of the elevated window is in `%TEMP%`, and
+     no `dev.cretlink.app` folder exists in `%LOCALAPPDATA%`. While the
+     unelevated window that explains the UAC prompt is open, its own folder
+     is in `%TEMP%` of the account that started it. (A `dev.cretlink.app`
      folder that a release up to 0.24.1 left is listed by `cretlink recover`
-     and removed by `cretlink recover --remove`; remove it before this step.)
+     without administrator rights and removed by `cretlink recover --remove`;
+     remove it before this step.)
+   - Before starting Get help, set `WEBVIEW2_USER_DATA_FOLDER` to a folder of
+     the standard account in a PowerShell of that account and start the copy
+     from there. Expected: the elevated window's profile is still in
+     `C:\Program Files\CretLink Data\webview`, and nothing is written into
+     the folder that the variable names.
    - Close CretLink — once outside a session, once with **Stop and close**,
      once with **Close CretLink** on the end screen — and look again ten
      seconds later. Expected each time: no `CretLink-webview-*` folder is left
-     in `%TEMP%`, also not of the unelevated window that explained the UAC
-     prompt, no `dev.cretlink.app` in `%LOCALAPPDATA%`, and no CretLink
-     process in Task Manager.
-   - Start Get help again and end its process in Task Manager. Expected: its
-     `CretLink-webview-*` folder stays, and `recover` (as the notice of
-     MT-12 step 10 writes the command) lists it as a webview profile left by
-     a copy that no longer runs. Start Get help once more. Expected: that
-     folder is gone, and only the folder of the window now open is in
-     `%TEMP%`.
+     in `C:\Program Files\CretLink Data\webview` or in `%TEMP%`, also not of
+     the unelevated window that explained the UAC prompt, no
+     `dev.cretlink.app` in `%LOCALAPPDATA%`, and no CretLink process in Task
+     Manager.
+   - Start Get help again and end its elevated process in Task Manager.
+     Expected: its `CretLink-webview-*` folder stays in
+     `C:\Program Files\CretLink Data\webview`, and `recover` in an
+     administrator PowerShell (as the notice of MT-12 step 10 writes the
+     command) lists it as a webview profile left by a copy that no longer
+     runs, and ends with the note that the folders of the account are not
+     covered, naming `recover` and `recover --remove` to run without
+     administrator rights. Start Get help once more. Expected: that folder is
+     gone, and only the folder of the window now open is there.
+   - With a folder `CretLink-webview-<32 digits>` planted in `%TEMP%` of the
+     standard account (with an empty `cretlink.lock`), run
+     `recover --remove` in the administrator PowerShell. Expected: the
+     planted folder is not listed and stays. Run the same command in a
+     PowerShell of the standard account. Expected: it is listed and
+     removed.
 3. Choose **Save a copy**, then cancel the dialog.
    - Expected: the dialog opened on `Documents\CretLink\` with
      `YYYY-MM-DD <hostname>.html`; after cancelling, no file and no
@@ -1429,9 +1449,10 @@ menu of all users and of the public desktop.
    nothing about keeping or removing while the session exists, and an end
    report that says that CretLink Support is installed because it was kept,
    and lists it under nothing that was left behind. While it is open, its
-   webview profile is a folder `CretLink-webview-…` in `%TEMP%` of the account
-   that answered the prompt, and nothing is written into
-   `C:\Program Files\CretLink Support` (ST-M009-014). `recover` (as MT-12
+   webview profile is a folder `CretLink-webview-…` in
+   `C:\Program Files\CretLink Data\webview`, and nothing is written into
+   `C:\Program Files\CretLink Support` or into `%TEMP%` of the account that
+   answered the prompt (ST-M009-014). `recover` (as MT-12
    step 10 runs it) names the kept program as there on purpose and still
    calls the computer clean.
 5. **The program that runs is what is kept.** Remove the kept program (step
@@ -1461,11 +1482,29 @@ menu of all users and of the public desktop.
    `C:\Program Files\CretLink Support` (from the kept program itself: once
    its window has closed), no shortcut, no entry in Installed apps, and no
    CretLink process. A report saved with **Save a copy** is still in
-   `Documents\CretLink`.
+   `Documents\CretLink`. `uninstall --yes` is refused with exit code 2 and
+   removes nothing, also with `cretlink-cli.exe` renamed to
+   `CretLink-Support-console.exe`. From the kept program, while its
+   removal waits for it to close, the helper that removes the folder is
+   `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` (Process
+   Explorer, *Properties → Environment*): its environment holds `SystemRoot`,
+   `windir`, `Path` and `PSModulePath`, each a folder of Windows, and nothing
+   else.
 8. **Keyboard and Narrator.** Walk the keep and the remove screen with `Tab`,
    `Space`, `Enter` and `Escape` only, then with Narrator. Expected: every
    control is reached and named, the state band and the heading are read
    when a screen opens, and the desktop wish is read with its state.
+9. **An interrupted keep, and what points elsewhere.** As an administrator,
+   create the folder `C:\Program Files\CretLink Support` and put an empty
+   `install.json` into it. Run `recover`. Expected: it lists an unfinished
+   kept support program with the command `CretLink-Support.exe uninstall`,
+   and does not say that the computer is clean; `recover --remove` exits
+   with an error and names the same command. Run that command from a copy in
+   `Downloads`. Expected: the folder is gone. Keep the program again with a
+   desktop shortcut, delete `install.json`, and change the target of the
+   desktop shortcut to `notepad.exe`. Remove it. Expected: the list says that
+   the desktop shortcut stays because it does not start the kept program,
+   and afterwards it is still there.
 
 ## Run log
 

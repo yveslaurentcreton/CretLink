@@ -108,9 +108,18 @@ storage, no session secret) in a folder:
 - The installed copy keeps its profile next to the audit trail
   (`%LOCALAPPDATA%\CretLink\webview`, `~/.local/share/CretLink/webview`).
   Uninstall removes it.
+- A window with administrator rights (Get help after the Windows prompt)
+  makes that folder in `webview` in `%ProgramFiles%\CretLink Data`, where
+  only administrators can write, and looks for leftovers only there: it
+  removes nothing in the temporary folder or the local application data that
+  its environment names. Before its window opens it drops the `WEBVIEW2_*`
+  variables from its environment.
 - Releases up to 0.24.1 kept the profile of both roles in `dev.cretlink.app`
   in the per-user data folder (`%LOCALAPPDATA%`, `~/.local/share`) and left it
-  there. Uninstall and `cretlink recover --remove` remove that folder.
+  there. Uninstall and `cretlink recover --remove` remove that folder. Run
+  with administrator rights, `recover` does not look at the account's own
+  folders and says so: run `recover` there again without administrator
+  rights.
 
 Known gap: on macOS the webview is WebKit, which keeps this data in its own
 folders under `~/Library`, where CretLink can neither direct nor remove it. It
@@ -151,13 +160,16 @@ approval code is compared and full control is allowed, each time.
   its entry in Installed apps, and `CretLink-Support.exe uninstall`. Each
   shows what it removes, asks, and asks Windows for administrator rights when
   it has none. The program, its folder, the shortcuts and the entry go. A
-  session report that the customer saved stays where it was saved.
+  session report that the customer saved stays where it was saved. Removing
+  always asks: `uninstall --yes` is refused.
 - **No other way.** No command-line option, no environment variable and no
   remote operation keeps the program: only the customer's click does.
 
 `cretlink recover` names a kept program as kept on purpose and never removes
 it, and the end report of a session says that it is installed because the
-customer chose that.
+customer chose that. A keep that was interrupted is no kept program:
+`recover` names what it left, with the command that removes it
+(`CretLink-Support.exe uninstall`), and does not call the computer clean.
 
 ## Platforms
 
