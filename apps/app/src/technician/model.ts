@@ -116,6 +116,9 @@ export interface RelayDraft {
   test?: { state: "running" } | { state: "done"; result: RelayTest };
   // "Remove the relay?" is being asked.
   removing?: boolean;
+  // The text for the file next to the program, after a save that could not
+  // write there because its folder cannot be written. It holds no key.
+  byHand?: string;
   // Counts what was saved or removed: a new number draws the form anew, so
   // that no typed key stays in a field.
   round: number;
@@ -785,9 +788,8 @@ export type RelayOffer =
   // when the installed copy takes its relay from there and not from
   // Settings.
   | { state: "ready"; relay: RelayView; fromFile?: string }
-  // No relay. `runOnce`: this copy keeps no settings, so a relay goes into
-  // the file next to the program.
-  | { state: "none"; runOnce: boolean }
+  // No relay: Settings, under Relay, is where one is set up.
+  | { state: "none" }
   // A profile that cannot be used: what is wrong, and the file.
   | { state: "problem"; message: string; file: string };
 
@@ -796,11 +798,14 @@ export type RelayOffer =
  * relay from it (ST-M007-011). Settings is where the technician of an
  * installed copy sets the relay up; a file next to the program wins over it,
  * and whoever can write there chose the relay. The waiting screen says so. A
- * copy that runs once has no other place for a relay: there is nothing to
+ * copy that runs once keeps its relay in that very file: there is nothing to
  * say.
  */
 export function relayFromFile(settings: RelaySettings | null): string | undefined {
-  return settings?.editable && settings.source === "file" && settings.file.relay
+  return settings?.keptIn === "settings" &&
+    settings.editable &&
+    settings.source === "file" &&
+    settings.file.relay
     ? settings.file.path
     : undefined;
 }
@@ -817,7 +822,7 @@ export function relayOffer(settings: RelaySettings | null): RelayOffer {
   if (place?.problem) {
     return { state: "problem", message: place.problem.message, file: place.problem.file };
   }
-  return { state: "none", runOnce: settings !== null && !settings.editable };
+  return { state: "none" };
 }
 
 /** The stage of a relay that could not be used: `relay_unreachable`, … */
@@ -941,9 +946,11 @@ export function isRelaySettings(value: unknown): value is RelaySettings {
   const settings = value as Record<string, unknown>;
   return (
     typeof settings.editable === "boolean" &&
+    (settings.keptIn === "settings" || settings.keptIn === "program_folder") &&
     (settings.source === "file" || settings.source === "settings" || settings.source === "none") &&
     isRelayPlace(settings.file) &&
-    (settings.stored === undefined || isRelayPlace(settings.stored))
+    (settings.stored === undefined || isRelayPlace(settings.stored)) &&
+    (settings.caPath === undefined || isText(settings.caPath))
   );
 }
 

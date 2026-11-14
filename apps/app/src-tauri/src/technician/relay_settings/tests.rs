@@ -1,6 +1,6 @@
 //! Tests of Settings → Relay over a home of its own (ST-M007-011): what is
-//! kept, what a copy that runs once refuses, what wins, and that the key
-//! never comes back to the window.
+//! kept, what wins, and that the key never comes back to the window. A copy
+//! that runs once is tested in `run_once`.
 
 use std::time::Duration;
 
@@ -84,8 +84,10 @@ fn saving_keeps_the_relay_and_the_key_never_comes_back() {
         serde_json::to_value(&view).unwrap(),
         json!({
             "editable": true,
+            "keptIn": "settings",
             "source": "settings",
             "file": { "path": view.file.path },
+            "caPath": home.layout.relay_ca.display().to_string(),
             "stored": {
                 "path": home.layout.settings.display().to_string(),
                 "relay": {
@@ -446,36 +448,6 @@ fn a_form_that_cannot_be_used_names_its_setting_and_changes_nothing() {
 }
 
 #[test]
-fn a_copy_that_runs_once_keeps_no_settings_and_says_where_its_relay_goes() {
-    let home = Home::new("settings-run-once");
-    let copy = home.run_once();
-    let pending = PendingCa::default();
-    let view = RelaySettingsView::of(&copy);
-    assert!(!view.editable);
-    assert_eq!(view.stored, None);
-    assert!(serde_json::to_value(&view).unwrap().get("stored").is_none());
-
-    for refused in [
-        save(
-            &copy,
-            &with_key(form("relay.example.org:443"), KEY),
-            &pending,
-        ),
-        remove(&copy, &pending),
-    ] {
-        let error = refused.unwrap_err();
-        assert_eq!(error.stage, "relay_run_once");
-        assert!(error.message.contains("cretlink.toml next to the program"));
-    }
-    assert!(
-        relay_to_test(&copy, Some(&form("relay.example.org:443")), &pending)
-            .is_err_and(|error| error.stage == "relay_run_once")
-    );
-    // Nothing was written anywhere.
-    assert!(home.folder.snapshot().is_empty());
-}
-
-#[test]
 fn a_chosen_certificate_file_is_kept_next_to_the_settings() {
     let home = Home::new("settings-ca");
     let copy = home.installed();
@@ -655,7 +627,8 @@ fn a_file_next_to_the_program_wins_and_the_view_says_so() {
     let tested = relay_to_test(&copy, None, &pending).unwrap();
     assert_eq!(tested.host(), "host-01.example.org");
 
-    // A copy that runs once shows its file too, and nothing of the settings.
+    // A copy that runs once shows its file too, as the place it keeps its
+    // relay in, and nothing of the settings.
     let run_once = home.run_once();
     home.folder.write(
         relay_profile::path_next_to(&run_once.exe)
@@ -666,8 +639,9 @@ fn a_file_next_to_the_program_wins_and_the_view_says_so() {
     );
     let view = RelaySettingsView::of(&run_once);
     assert_eq!(view.source, "file");
-    assert_eq!(view.file.relay.unwrap().address, "192.0.2.1:443");
-    assert_eq!(view.stored, None);
+    assert_eq!(view.file.relay.as_ref().unwrap().address, "192.0.2.1:443");
+    assert_eq!(view.stored, Some(view.file.clone()));
+    assert_eq!(view.kept_in, "program_folder");
 }
 
 #[test]
@@ -733,11 +707,13 @@ fn a_session_goes_through_the_relay_this_copy_uses_or_says_where_one_is_set_up()
         none.message,
         "This copy has no relay. Set one up in Settings, under Relay."
     );
-    // A copy that runs once keeps no settings: the file next to it.
+    // A copy that runs once is given its relay in Settings as well.
     let none = relay_of_copy(&home.run_once()).unwrap_err();
     assert_eq!(none.stage, "relay_none");
-    assert!(none.message.contains("cretlink.toml"), "{}", none.message);
-    assert!(!none.message.contains("  "), "{:?}", none.message);
+    assert_eq!(
+        none.message,
+        "This copy has no relay. Set one up in Settings, under Relay."
+    );
 
     // The relay of the settings, with its key, which no word of it shows.
     save(
@@ -877,3 +853,5 @@ fn a_form_from_the_window_is_read_strictly_and_its_key_is_not_printed() {
 /// written in two parts so that no scanner takes this file for one that
 /// holds a key.
 const KEY_MARKER: &str = concat!("-----BEGIN PRIVATE", " KEY-----\n");
+
+mod run_once;

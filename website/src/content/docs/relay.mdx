@@ -85,6 +85,7 @@ You need a server with Docker that the internet can reach, a name for it such as
 />
 
 - **Your installed copy:** open **Settings** and enter the relay's address and your own key under **Relay**. **Test** says in words whether the relay lets this copy in.
+- **A copy that runs once** has the same **Settings → Relay**. It keeps no settings, so **Save** writes the relay to a file `cretlink.toml` next to the program, with your key in readable form, and the screen says so before it does. **Remove** deletes that file again. When the folder cannot be written, the screen shows the text for the file instead.
 - **Your customer's copy** reads the relay from a file `cretlink.toml` next to the program. You do not write it by hand: [CretLink makes the customer's copy](/CretLink/get-started/#a-copy-for-a-customer-on-another-network), with a key of that customer's own.
 - **A certificate from an authority of your own** works too: give your copy that authority's certificate file. A copy never talks to a relay without TLS.
 

@@ -554,13 +554,14 @@ describe("a session through the relay (ST-M007-013)", () => {
       relay: RELAY_PRIVATE,
       fromFile: RELAY_FILE.file.path,
     });
-    // A copy that runs once has no other place for a relay than the file:
-    // there is nothing to say about where it comes from.
+    // A copy that runs once keeps its relay in the file: there is nothing to
+    // say about where it comes from.
     expect(relayOffer(RELAY_RUN_ONCE_FILE)).toEqual({ state: "ready", relay: RELAY });
-    expect(relayOffer(RELAY_NONE)).toEqual({ state: "none", runOnce: false });
-    expect(relayOffer(RELAY_RUN_ONCE)).toEqual({ state: "none", runOnce: true });
-    // Until the backend has said: no relay, and nothing claimed about the copy.
-    expect(relayOffer(null)).toEqual({ state: "none", runOnce: false });
+    // Without a relay, every copy sets one up in Settings.
+    expect(relayOffer(RELAY_NONE)).toEqual({ state: "none" });
+    expect(relayOffer(RELAY_RUN_ONCE)).toEqual({ state: "none" });
+    // Until the backend has said: no relay.
+    expect(relayOffer(null)).toEqual({ state: "none" });
     const problem = relayOffer(RELAY_FILE_PROBLEM);
     expect(problem.state).toBe("problem");
     if (problem.state === "problem") {
@@ -570,6 +571,7 @@ describe("a session through the relay (ST-M007-013)", () => {
     // Settings that cannot be read, with no file next to the program.
     const unreadable = relayOffer({
       editable: true,
+      keptIn: "settings",
       source: "settings",
       file: { path: "cretlink.toml" },
       stored: { path: "settings.toml", problem: { file: "settings.toml", message: "Line 2." } },
@@ -585,7 +587,7 @@ describe("a session through the relay (ST-M007-013)", () => {
     expect(relayFromFile(null)).toBeUndefined();
     // A file that cannot be used gives no relay: its problem is said instead.
     expect(relayFromFile(RELAY_FILE_PROBLEM)).toBeUndefined();
-    // A copy that runs once keeps no settings to prefer.
+    // A copy that runs once keeps its relay in that file: nothing to prefer.
     expect(relayFromFile(RELAY_RUN_ONCE_FILE)).toBeUndefined();
     expect(relayFromFile(RELAY_RUN_ONCE)).toBeUndefined();
   });

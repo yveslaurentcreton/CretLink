@@ -21,6 +21,7 @@ import {
   RELAY_NONE,
   RELAY_PRIVATE,
   RELAY_RUN_ONCE,
+  RELAY_RUN_ONCE_FILE,
   RELAY_STORED,
   SESSIONS,
   SESSION_ID,
@@ -1128,11 +1129,59 @@ describe("Settings → Relay (ST-M007-011)", () => {
     expect((document.activeElement as HTMLElement | null)?.dataset.action).toBe("relay-test");
   });
 
-  it("keeps nothing in a copy that runs once", async () => {
-    await settings(RELAY_RUN_ONCE);
-    expect(app().textContent).toContain("This copy runs once and keeps no settings.");
-    expect(app().querySelector('[data-action="relay-save"]')).toBeNull();
+  it("saves the relay of a copy that runs once next to the program, and only on Save", async () => {
+    await settings(RELAY_RUN_ONCE, { save_relay: () => RELAY_RUN_ONCE_FILE });
+    // Opening Settings wrote nothing.
     expect(asked("save_relay")).toBe(0);
+    type("relay-address", "relay.example.org:443");
+    type("relay-key", KEY);
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(sent("save_relay")).toEqual({
+      form: { address: "relay.example.org:443", keyMode: "set", key: KEY, caMode: "none" },
+    });
+    expect(announced()).toBe("The relay relay.example.org was saved next to the program.");
+    // The form is filled from the file; the key field is empty again.
+    expect(input("relay-address").value).toBe("relay.example.org:443");
+    expect(input("relay-key").value).toBe("");
+    expect(app().textContent).not.toContain(KEY);
+  });
+
+  it("shows the text for the file when the folder of the program cannot be written", async () => {
+    await settings(RELAY_RUN_ONCE, {
+      save_relay: () => {
+        throw {
+          stage: "relay_folder",
+          message:
+            "The relay could not be saved: the folder of the program cannot be written (Permission denied). Nothing was changed.",
+          fileText: '[relay]\naddress = "relay.example.org:443"\nkey = "the key of this copy"\n',
+        };
+      },
+    });
+    type("relay-address", "relay.example.org:443");
+    type("relay-key", KEY);
+    click('[data-action="relay-save"]');
+    await flush();
+    expect(alert()).toContain("The relay was not saved");
+    expect(alert()).toContain("the folder of the program cannot be written");
+    const byHand = app().querySelector("#relay-by-hand");
+    expect(byHand?.querySelector(".relay-example")?.textContent).toContain(
+      'key = "the key of this copy"',
+    );
+    expect(app().textContent).not.toContain(KEY);
+    expect(document.activeElement?.id).toBe("relay-by-hand");
+  });
+
+  it("removes the relay file of a copy that runs once after asking", async () => {
+    await settings(RELAY_RUN_ONCE_FILE, { remove_relay: () => RELAY_RUN_ONCE });
+    click('[data-action="relay-remove"]');
+    await flush();
+    expect(app().textContent).toContain("from the folder of the program?");
+    click('[data-action="relay-remove-confirm"]');
+    await flush();
+    expect(asked("remove_relay")).toBe(1);
+    expect(announced()).toBe("The relay file next to the program was removed.");
+    expect(input("relay-address").value).toBe("");
   });
 
   it("shows what the backend has to say in the alert, with its next step", async () => {

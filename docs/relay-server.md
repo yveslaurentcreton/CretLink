@@ -324,7 +324,9 @@ technician chooses it: see
 
 Both roles read a file named `cretlink.toml` next to the program. This is how
 a copy that runs once, and every copy you hand to a customer
-(`CretLink-Support.exe`), learn your relay:
+(`CretLink-Support.exe`), learn your relay. A copy that runs once writes this
+file for you from **Settings → Relay**
+([below](#settings-in-a-copy-that-runs-once)); you can also write it by hand:
 
 ```toml
 # cretlink.toml, in the same folder as the program
@@ -396,7 +398,42 @@ settings:
 
 **A file next to the program wins over Settings**, and the screen says so: it
 then shows the relay of the file, and what Settings holds as the relay that is
-not used. A copy that runs once keeps no settings; its relay goes in the file.
+not used.
+
+### Settings, in a copy that runs once
+
+A copy that runs once keeps no settings, but it has the same **Settings →
+Relay**. Its relay is the `cretlink.toml` next to the program: the form is
+filled from that file when there is one, and
+
+- **Save** writes the relay to that file, and the certificate file you chose
+  beside it as `relay-ca.pem`. The screen names both files before you save,
+  and says that **the key stands in that file in readable form**: whoever can
+  read the folder of the program can read the key, and a copy of the folder
+  carries it. On macOS and Linux the files are made readable by your account
+  only (mode `0600`); on Windows they take the access rules of the folder.
+- It is the one thing besides the audit trail that such a copy writes, and
+  only when you press Save: nothing is written when the screen opens, not
+  even to find out whether the folder can be written.
+- The same rules hold as in the installed copy: the key is never shown
+  again, a kept key stays with its relay, the two files change together, and
+  `relay-ca.pem` holds the certificates of the chosen file and nothing else.
+  A certificate file that a hand-written profile names under another name is
+  read for a Save, and written anew as `relay-ca.pem`.
+- Save keeps what you wrote around the relay: comments in the file stay, and
+  only the settings of `[relay]` are replaced. A file that cannot be read as
+  a profile is not overwritten; the screen says what is wrong, and Remove
+  deletes it.
+- **Remove** deletes `cretlink.toml` and `relay-ca.pem` next to the program,
+  after asking. A certificate file of another name stays.
+- **Test** works as in the installed copy.
+- **When the folder of the program cannot be written** (a read-only share, a
+  protected folder), the screen says so and shows the text for the file, with
+  a line in place of the key: write it there yourself, or move the program to
+  a folder of your own.
+- Neither file is written or removed through a symbolic link, a junction or
+  a folder of that name: the screen says what is in the way.
+- A copy for a customer writes nothing; it has no such screen.
 
 The installed copy keeps one more thing in the same file: the network it
 waits on when your computer is on several (ST-M009-016).

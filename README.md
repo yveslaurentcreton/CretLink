@@ -70,7 +70,9 @@ The technician side is one program, `cretlink`, that runs from wherever it was
 unpacked. Its start screen offers, under **Give help**:
 
 - **Run once without installing.** The copy writes nothing but its audit trail
-  (in the per-user data folder). Its window keeps its webview profile in a
+  (in the per-user data folder) and, only when you save a relay in **Settings
+  → Relay**, the relay file `cretlink.toml` next to the program (with its
+  admission key in readable form). Its window keeps its webview profile in a
   temporary folder, which it removes when it closes (see below). AI clients
   you connect from it point at this copy and break when it is moved or
   deleted; the AI assistants screen says so.
@@ -213,8 +215,9 @@ CretLink is under active development. Versions are `0.x` pre-releases;
 - **In progress:** sessions over the internet, through a relay that you host
   yourself and that forwards only end-to-end encrypted traffic. The relay
   server is released and [documented](docs/relay-server.md). A copy of
-  CretLink is told which relay to use in a file `cretlink.toml` next to the
-  program or in **Settings → Relay** of the installed copy, and can test it
+  CretLink is told which relay to use in **Settings → Relay**, which a copy
+  that runs once keeps in a file `cretlink.toml` next to the program, and can
+  test it
   ([how](docs/relay-server.md#3-tell-a-copy-of-cretlink-which-relay-to-use)).
   For a customer, **Settings → Relay → Make a customer copy…** writes one
   folder to hand over: the support program and a `cretlink.toml` with your

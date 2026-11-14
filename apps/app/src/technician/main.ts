@@ -411,19 +411,39 @@ function relayChanged(relay: RelaySettings, notice: string, focus: string): void
 async function saveRelay(): Promise<void> {
   const form = readRelayForm();
   if (!form || snap.busy !== undefined) return;
-  set({ busy: "relay-save", error: undefined });
+  set({ busy: "relay-save", error: undefined, relayDraft: { ...snap.relayDraft, byHand: undefined } });
   try {
     const relay = await api.saveRelay(form);
     if (!isRelaySettings(relay)) throw new Error("The settings could not be read back.");
     const host = relay.stored?.relay?.host;
+    const where = relay.keptIn === "program_folder" ? " next to the program" : "";
     relayChanged(
       relay,
-      host ? `The relay ${host} was saved.` : "The relay was saved.",
+      host ? `The relay ${host} was saved${where}.` : `The relay was saved${where}.`,
       // Where the technician was: on Save.
       '[data-action="relay-save"]',
     );
   } catch (error) {
     // The backend's sentence says whether anything was changed.
+    if (
+      isCommandError(error) &&
+      error.stage === "relay_folder" &&
+      typeof error.fileText === "string"
+    ) {
+      // The folder of the program cannot be written: the text for the file,
+      // to write there by hand. It holds no key.
+      focusNext = "#relay-by-hand";
+      set({
+        busy: undefined,
+        relayDraft: { ...snap.relayDraft, byHand: error.fileText },
+        error: {
+          title: "The relay was not saved",
+          message: error.message,
+          next: "Write the file by hand, as shown under the form.",
+        },
+      });
+      return;
+    }
     relayRefused(error, "The relay was not saved", "Try again.");
   }
 }
@@ -436,7 +456,9 @@ async function removeRelay(): Promise<void> {
     if (!isRelaySettings(relay)) throw new Error("The settings could not be read back.");
     relayChanged(
       relay,
-      "The relay was removed from the settings.",
+      relay.keptIn === "program_folder"
+        ? "The relay file next to the program was removed."
+        : "The relay was removed from the settings.",
       // The question is gone: on to the empty form, or to the relay of the
       // file that is in use.
       '#relay-address, [data-action="relay-test"]',

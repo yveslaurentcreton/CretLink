@@ -11,8 +11,9 @@
 //! [`cretlink_discovery::first_choice`]. A choice of the technician holds for
 //! the later sessions ([`NetworkChoice`]). The installed copy keeps it in its
 //! settings, so that it holds after the program is closed (ST-M007-011); a
-//! copy that runs once keeps it in memory only and writes nothing but its
-//! audit trail.
+//! copy that runs once keeps it in memory only: besides its audit trail it
+//! writes only the relay file next to its program, and only when the
+//! technician saves a relay.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};

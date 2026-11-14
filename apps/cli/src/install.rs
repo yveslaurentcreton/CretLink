@@ -2,7 +2,8 @@
 //! REQ-F-024, ADR-0018).
 //!
 //! `cretlink` runs from wherever it was unpacked: that is a *run-once* copy,
-//! which writes nothing but the audit trail. *Install* copies the program to a
+//! which writes nothing but the audit trail, and the relay file next to the
+//! program when the technician saves a relay (ST-M007-011). *Install* copies the program to a
 //! location that is fixed per operating system, so the AI-client registrations
 //! made against it keep working after an update in place:
 //!

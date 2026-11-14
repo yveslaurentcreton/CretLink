@@ -53,6 +53,7 @@
 //! an [`AdmissionToken`]: erased when dropped, and redacted in `Debug`.
 
 pub(crate) mod document;
+pub mod program_file;
 
 use std::fmt;
 use std::fs;
@@ -593,7 +594,15 @@ pub(crate) fn read_bounded(
     };
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // A folder on the way that is a file holds no file either.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(error) => return Err(unreadable(&error)),
     };
     if !meta.is_file() {

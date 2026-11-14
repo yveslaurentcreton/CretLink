@@ -483,15 +483,22 @@ export interface RelayPlace {
 
 // `get_relay_settings`, and the answer of `save_relay` and `remove_relay`.
 export interface RelaySettings {
-  // Whether this copy keeps settings: only the installed copy does. A copy
-  // that runs once takes its relay from the file next to the program.
+  // Whether Save and Remove keep a relay for this copy: the installed copy
+  // and a technician copy that runs once do.
   editable: boolean;
-  // Which profile this copy uses. A file next to the program wins over the
-  // settings, also when that file cannot be used.
+  // Where Save keeps the relay: the settings of the installed copy, or the
+  // file next to the program of a copy that runs once (ST-M007-011), which
+  // is then `file` and `stored` alike.
+  keptIn: "settings" | "program_folder";
+  // Which profile this copy uses. In the installed copy a file next to the
+  // program wins over the settings, also when that file cannot be used.
   source: "file" | "settings" | "none";
   file: RelayPlace;
-  // What the settings hold; absent in a copy that keeps none.
+  // What the place that Save writes holds; absent in a copy that keeps
+  // nothing.
   stored?: RelayPlace;
+  // Where Save puts the certificate authority file of the relay.
+  caPath?: string;
 }
 
 // The relay as the form of Settings → Relay gives it (`save_relay`,

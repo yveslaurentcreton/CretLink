@@ -179,13 +179,8 @@ function relayOfferCard(s: TechnicianSnapshot): HTMLElement {
       action = settings;
       break;
     default:
-      text = offer.runOnce
-        ? [
-            "This copy has no relay. To help someone on another network, put a file ",
-            h("span", { class: "mono" }, "cretlink.toml"),
-            " for your relay next to the program; Settings, under Relay, shows how.",
-          ]
-        : "This copy has no relay. To help someone on another network, set up your relay in Settings, under Relay.";
+      text =
+        "This copy has no relay. To help someone on another network, set up your relay in Settings, under Relay.";
       action = settings;
   }
   return h(

@@ -57,7 +57,7 @@ export function settingsView(s: TechnicianSnapshot): HTMLElement {
       ? h(
           "p",
           { class: "muted" },
-          "This copy writes nothing but the audit trail, so there is nothing to uninstall. Delete the file when you no longer need it.",
+          "This copy writes nothing but the audit trail, and the relay file next to the program when you save a relay, so there is nothing to uninstall. Delete the program, and that file, when you no longer need them.",
         )
       : null,
   );
