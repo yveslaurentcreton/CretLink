@@ -126,6 +126,17 @@ fn recover(sandbox: &Sandbox, args: &[&str]) -> Output {
         .expect("run cretlink-cli recover")
 }
 
+/// Whether the program under test runs as an elevated program on Windows, as
+/// its own report tells.
+fn elevated_on_windows(inspection: &str) -> bool {
+    let says = |label: &str, value: &str| {
+        inspection
+            .lines()
+            .any(|line| line.trim_start().starts_with(label) && line.trim_end().ends_with(value))
+    };
+    says("windows:", "true") && says("elevated:", "true")
+}
+
 /// Whether the program under test keeps to the sandbox, as its own report
 /// tells: everywhere except as an elevated program on Windows, and except
 /// where it names files of a program with administrator rights that it
@@ -277,6 +288,21 @@ fn webview_folders_that_were_left_are_listed_and_removed() {
 
     assert_eq!(inspect.status.code(), Some(0));
     let text = stdout(&inspect);
+    // A program with administrator rights looks at nothing that its
+    // environment names (REQ-S-024): the folders of the account are left to
+    // a run without those rights, and the report says so.
+    if elevated_on_windows(&text) {
+        assert!(!text.contains(&stale.display().to_string()), "{text}");
+        assert!(
+            text.contains("the webview folders in the temporary"),
+            "the report says what it does not cover: {text}"
+        );
+        assert!(
+            stale.join("Cache").exists(),
+            "nothing of the account is touched"
+        );
+        return;
+    }
     assert!(
         text.contains(&format!(
             "  - webview profile: {} (left by a copy that no longer runs)",
