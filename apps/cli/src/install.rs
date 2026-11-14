@@ -53,7 +53,7 @@ use crate::setup::{self, Action, Client, RegistrationState, Runner};
 use crate::webview_profile;
 
 #[cfg(windows)]
-mod win;
+pub(crate) mod win;
 
 /// The record's file name.
 pub const RECORD_FILE: &str = "install.json";
@@ -399,7 +399,7 @@ pub fn is_customer_copy(exe: &Path) -> bool {
 
 /// Whether two paths name the same file: compared after resolving links when
 /// both exist, and without case on Windows.
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let (a, b) = (resolve(a), resolve(b));
     if cfg!(windows) {

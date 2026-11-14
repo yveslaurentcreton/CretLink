@@ -14,18 +14,26 @@
 //!   administrator rights are needed.
 //! - The process list (`CreateToolhelp32Snapshot` and
 //!   `QueryFullProcessImageNameW`) tells whether the installed copy runs.
+//!
+//! The support program that a customer keeps (ST-M009-017, `crate::kept`)
+//! uses the same calls for the whole computer: its entry is a key under
+//! `HKEY_LOCAL_MACHINE` ([`Hive::LocalMachine`]), its shortcuts lie in the
+//! Start menu and on the desktop of all users, which the system names
+//! ([`common_programs`], [`public_desktop`]), and the helper that removes its
+//! folder is started from the Windows folder that the system names, never
+//! from one that the environment names ([`remove_after_exit_from`]).
 
 #![allow(
     unsafe_code,
     reason = "Localized Windows FFI (CoInitializeEx, CoCreateInstance, IShellLinkW, \
               IPersistFile, RegCreateKeyExW, RegSetValueExW, RegOpenKeyExW, \
               RegDeleteTreeW, CreateToolhelp32Snapshot, Process32FirstW/NextW, \
-              OpenProcess, QueryFullProcessImageNameW); every pointer handed to \
-              Windows borrows a value that outlives the call, and every handle is \
-              closed by an owner."
+              OpenProcess, QueryFullProcessImageNameW, SHGetKnownFolderPath, \
+              CoTaskMemFree); every pointer handed to Windows borrows a value \
+              that outlives the call, and every handle is closed by an owner."
 )]
 
-use std::ffi::OsString;
+use std::ffi::{OsString, c_void};
 use std::io;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::process::CommandExt;
@@ -35,20 +43,24 @@ use std::process::{Command, Stdio};
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, HANDLE, WIN32_ERROR};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-    CoUninitialize, IPersistFile,
+    CoTaskMemFree, CoUninitialize, IPersistFile,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
-    REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_DWORD,
+    REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW,
+    RegOpenKeyExW, RegSetValueExW,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
-use windows::core::{HSTRING, Interface, PCWSTR, PWSTR};
+use windows::Win32::UI::Shell::{
+    FOLDERID_CommonPrograms, FOLDERID_PublicDesktop, IShellLinkW, KF_FLAG_DEFAULT,
+    SHGetKnownFolderPath, ShellLink,
+};
+use windows::core::{GUID, HSTRING, Interface, PCWSTR, PWSTR};
 
 use super::{Shortcut, UNINSTALL_KEY, UninstallEntry};
 
@@ -95,14 +107,43 @@ fn set_string(key: &Key, name: &str, value: &str) -> io::Result<()> {
     set_value(key, name, REG_SZ, &data)
 }
 
+/// The part of the registry an uninstall entry lies in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hive {
+    /// For this user: the technician's install, which needs no administrator
+    /// rights.
+    CurrentUser,
+    /// For the whole computer: the support program that a customer keeps,
+    /// which only administrators can change.
+    LocalMachine,
+}
+
+impl Hive {
+    fn root(self) -> HKEY {
+        match self {
+            Self::CurrentUser => HKEY_CURRENT_USER,
+            Self::LocalMachine => HKEY_LOCAL_MACHINE,
+        }
+    }
+}
+
 pub(super) fn write_uninstall_entry(entry: &UninstallEntry) -> io::Result<()> {
-    let path = HSTRING::from(UNINSTALL_KEY);
+    write_uninstall_entry_in(Hive::CurrentUser, UNINSTALL_KEY, entry)
+}
+
+/// Writes the uninstall entry under `key` of `hive`.
+pub(crate) fn write_uninstall_entry_in(
+    hive: Hive,
+    key: &str,
+    entry: &UninstallEntry,
+) -> io::Result<()> {
+    let path = HSTRING::from(key);
     let mut key = HKEY::default();
     // SAFETY: `path` outlives the call and `key` receives the opened key, which
     // `Key` closes.
     check(unsafe {
         RegCreateKeyExW(
-            HKEY_CURRENT_USER,
+            hive.root(),
             &path,
             None,
             PCWSTR::null(),
@@ -132,10 +173,15 @@ pub(super) fn write_uninstall_entry(entry: &UninstallEntry) -> io::Result<()> {
 }
 
 pub(super) fn has_uninstall_entry() -> bool {
-    let path = HSTRING::from(UNINSTALL_KEY);
+    has_uninstall_entry_in(Hive::CurrentUser, UNINSTALL_KEY)
+}
+
+/// Whether the uninstall entry under `key` of `hive` exists.
+pub(crate) fn has_uninstall_entry_in(hive: Hive, key: &str) -> bool {
+    let path = HSTRING::from(key);
     let mut key = HKEY::default();
-    // SAFETY: as in `write_uninstall_entry`; read access only.
-    let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, &path, None, KEY_READ, &mut key) };
+    // SAFETY: as in `write_uninstall_entry_in`; read access only.
+    let status = unsafe { RegOpenKeyExW(hive.root(), &path, None, KEY_READ, &mut key) };
     if status.is_ok() {
         drop(Key(key));
         true
@@ -145,16 +191,46 @@ pub(super) fn has_uninstall_entry() -> bool {
 }
 
 pub(super) fn remove_uninstall_entry() -> io::Result<bool> {
-    let path = HSTRING::from(UNINSTALL_KEY);
+    remove_uninstall_entry_in(Hive::CurrentUser, UNINSTALL_KEY)
+}
+
+/// Removes the uninstall entry under `key` of `hive`; `Ok(false)` when there
+/// was none.
+pub(crate) fn remove_uninstall_entry_in(hive: Hive, key: &str) -> io::Result<bool> {
+    let path = HSTRING::from(key);
     // SAFETY: `path` outlives the call.
-    let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &path) };
+    let status = unsafe { RegDeleteTreeW(hive.root(), &path) };
     if status == ERROR_FILE_NOT_FOUND {
         return Ok(false);
     }
     check(status).map(|()| true)
 }
 
-pub(super) fn create_shortcut(shortcut: &Shortcut) -> io::Result<()> {
+/// The Start-menu folder of all users, as the system names it.
+pub(crate) fn common_programs() -> Option<PathBuf> {
+    known_folder(&FOLDERID_CommonPrograms)
+}
+
+/// The desktop folder of all users, as the system names it.
+pub(crate) fn public_desktop() -> Option<PathBuf> {
+    known_folder(&FOLDERID_PublicDesktop)
+}
+
+/// A folder that the system knows by `id`. `None` when it does not name one.
+fn known_folder(id: &GUID) -> Option<PathBuf> {
+    // SAFETY: `id` outlives the call; without a token the folder of the
+    // calling account is asked, which for a folder of all users is the same.
+    let path = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }.ok()?;
+    // SAFETY: on success `path` is a NUL-terminated wide string that stays
+    // valid until it is freed below.
+    let folder = PathBuf::from(OsString::from_wide(unsafe { path.as_wide() }));
+    // SAFETY: the string was allocated by the system for the caller to free
+    // with `CoTaskMemFree`, and is not used afterwards.
+    unsafe { CoTaskMemFree(Some(path.0.cast_const().cast::<c_void>())) };
+    Some(folder)
+}
+
+pub(crate) fn create_shortcut(shortcut: &Shortcut) -> io::Result<()> {
     if let Some(parent) = shortcut.path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -214,7 +290,7 @@ fn image_path(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(OsString::from_wide(&buffer)))
 }
 
-pub(super) fn running_elsewhere(exe: &Path) -> io::Result<bool> {
+pub(crate) fn running_elsewhere(exe: &Path) -> io::Result<bool> {
     let me = std::process::id();
     let Some(wanted) = exe
         .file_name()
@@ -266,6 +342,16 @@ pub(super) fn remove_after_exit(files: &[PathBuf], dir: &Path) -> io::Result<()>
     let system_root = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    remove_after_exit_from(&system_root, files, dir)
+}
+
+/// [`remove_after_exit`] with the Windows folder given: an elevated program
+/// takes it from the system, never from its environment (ST-M009-017).
+pub(crate) fn remove_after_exit_from(
+    system_root: &Path,
+    files: &[PathBuf],
+    dir: &Path,
+) -> io::Result<()> {
     let powershell = system_root
         .join("System32")
         .join("WindowsPowerShell")
@@ -275,7 +361,7 @@ pub(super) fn remove_after_exit(files: &[PathBuf], dir: &Path) -> io::Result<()>
     Command::new(powershell)
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         // Not inside the folder it removes.
-        .current_dir(&system_root)
+        .current_dir(system_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

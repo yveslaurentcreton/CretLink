@@ -21,13 +21,18 @@
 //!   replaces in the product ([`cretlink_support_agent::recovery`]), with the
 //!   webview profile folders that the application's window left added to it
 //!   (ST-M009-014, [`webview_profile`]). A `CretLink-Support*` copy of the
-//!   application accepts this command only.
+//!   application accepts this command and the next one only.
+//! - `CretLink-Support.exe uninstall` removes the support program that a
+//!   customer kept on the computer (ST-M009-017, [`kept`]): the same verb, in
+//!   a copy for getting help. Nothing on the command line keeps a program:
+//!   that is a choice in the customer's own window.
 //!
 //! None of the subcommands opens a session, a listener or a window. The
 //! dispatch is a library so the one CretLink application (ST-M009-005) can run
 //! the same subcommands before it opens its window.
 
 pub mod install;
+pub mod kept;
 pub mod process;
 pub mod relay_profile;
 pub mod settings;
@@ -383,6 +388,12 @@ fn uninstall_command(program: &str, yes: bool, console: process::ConsoleAttach) 
             return ExitCode::FAILURE;
         }
     };
+    // A copy for getting help has no install of the technician role: its
+    // `uninstall` removes the support program that a customer kept on this
+    // computer (ST-M009-017).
+    if install::is_customer_copy(&exe) {
+        return kept::uninstall_command(program, yes, in_box);
+    }
     let Some(layout) = install::Layout::current() else {
         tell(
             "CretLink",
@@ -470,7 +481,7 @@ fn uninstall_command(program: &str, yes: bool, console: process::ConsoleAttach) 
 
 /// Reads one answer line: only `y` or `yes` (any case) confirms; end of
 /// input or anything else does not.
-fn confirmed(input: &mut dyn std::io::BufRead) -> bool {
+pub(crate) fn confirmed(input: &mut dyn std::io::BufRead) -> bool {
     let mut line = String::new();
     match input.read_line(&mut line) {
         Ok(0) | Err(_) => false,
@@ -682,6 +693,25 @@ mod tests {
         // Install is a choice of the application's start screen, not a
         // subcommand.
         assert!(parse(args(&["install"])).is_err());
+    }
+
+    /// Nothing on a command line keeps the support program on a computer
+    /// (ST-M009-017): that is a choice in the customer's own window, and the
+    /// shared command line has no word for it.
+    #[test]
+    fn no_command_keeps_a_program() {
+        for words in [
+            args(&["keep"]),
+            args(&["--keep"]),
+            args(&["install"]),
+            args(&["install", "--yes"]),
+            args(&["update"]),
+            args(&["uninstall", "--keep"]),
+            args(&["recover", "--keep"]),
+            args(&["version", "--keep"]),
+        ] {
+            assert!(parse(words.clone()).is_err(), "{words:?}");
+        }
     }
 
     #[test]
