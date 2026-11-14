@@ -1054,6 +1054,12 @@ fn outcome_to_audit(outcome: JobOutcome) -> Outcome {
 
 /// Fails every outstanding console request with a fresh error, so a torn-down
 /// session never leaves a caller awaiting a reply that cannot come (fail closed).
+///
+/// Every caller first takes control away from the session
+/// (`set_control_active(false)`): a caller whose request fails here may ask
+/// again at once, before the teardown has run, and that request must be
+/// refused as "not active", never sent into a session that is ending and
+/// then lost with it.
 fn fail_pending(
     pending: &mut HashMap<RequestId, oneshot::Sender<Result<OpResult, SessionError>>>,
     make: impl Fn() -> SessionError,
@@ -2127,6 +2133,7 @@ async fn host_active<T: AsyncRead + AsyncWrite + Unpin>(
             biased;
             cmd = revoke_rx.recv() => {
                 let reason = cmd.unwrap_or(RevokeReason::TechnicianRequested);
+                shared.set_control_active(false);
                 fail_pending(&mut pending, || SessionError::RevokedLocally);
                 finish_running_unknown(&running, tx);
                 return finish_local_revoke(channel, session, reason, shared, tx, audit, Actor::Console).await;
@@ -2178,6 +2185,7 @@ async fn host_active<T: AsyncRead + AsyncWrite + Unpin>(
                     }
                     Err(_) => {
                         let _ = command.reply.send(Err(SessionError::Disconnected));
+                        shared.set_control_active(false);
                         fail_pending(&mut pending, || SessionError::Disconnected);
                         finish_running_unknown(&running, tx);
                         return finish(channel, shared, tx, audit, Actor::Console, Ending::ActiveDisconnect);
@@ -2235,12 +2243,14 @@ async fn host_active<T: AsyncRead + AsyncWrite + Unpin>(
                 Frame::Message(Message::Control { control: ControlMessage::Heartbeat { seq }, .. }) => {
                     shared.record_heartbeat();
                     if send_control(&mut channel, session, ControlMessage::Heartbeat { seq }).await.is_err() {
+                        shared.set_control_active(false);
                         fail_pending(&mut pending, || SessionError::Disconnected);
                         finish_running_unknown(&running, tx);
                         return finish(channel, shared, tx, audit, Actor::Console, Ending::ActiveDisconnect);
                     }
                 }
                 Frame::Message(Message::Control { control: ControlMessage::Revoke { reason }, .. }) => {
+                    shared.set_control_active(false);
                     fail_pending(&mut pending, || SessionError::RevokedByPeer);
                     finish_running_unknown(&running, tx);
                     return finish(channel, shared, tx, audit, Actor::Agent, Ending::PeerRevoke(reason));
@@ -2286,16 +2296,19 @@ async fn host_active<T: AsyncRead + AsyncWrite + Unpin>(
                 // Any other message (a stray Request, consent control, Hello) is a
                 // protocol violation on the console side and fails closed.
                 Frame::Message(_) => {
+                    shared.set_control_active(false);
                     fail_pending(&mut pending, || SessionError::Protocol("active".to_string()));
                     finish_running_unknown(&running, tx);
                     return finish(channel, shared, tx, audit, Actor::Console, Ending::Protocol("active"));
                 }
                 Frame::Disconnected => {
+                    shared.set_control_active(false);
                     fail_pending(&mut pending, || SessionError::Disconnected);
                     finish_running_unknown(&running, tx);
                     return finish(channel, shared, tx, audit, Actor::Console, Ending::ActiveDisconnect);
                 }
                 Frame::ChannelFault => {
+                    shared.set_control_active(false);
                     fail_pending(&mut pending, || SessionError::Disconnected);
                     finish_running_unknown(&running, tx);
                     return finish(channel, shared, tx, audit, Actor::Console, Ending::ChannelFault("active"));
