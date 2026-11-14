@@ -2,7 +2,8 @@
 //! (ST-M006-020, REQ-S-024).
 //!
 //! The customer-side program keeps a staging area and a store of reboot
-//! tickets. When it runs with administrator rights it acts with those rights
+//! tickets, and its window keeps the profile of its webview
+//! ([`OwnFolder::webview_for_this_process`], ST-M009-014). When it runs with administrator rights it acts with those rights
 //! on what lies there: a cleanup removes the files a manifest names, and a
 //! staged tool is run. A program of an account without rights must therefore
 //! never have been able to put anything there or to open anything there.
@@ -111,6 +112,10 @@ const STAGING_FOLDER: &str = "staging";
 /// The store of reboot tickets inside the data folder.
 const TICKETS_FOLDER: &str = "reboot-resume";
 
+/// The webview profiles of an elevated program, inside its private data
+/// folder (ST-M009-014).
+const WEBVIEW_FOLDER: &str = "webview";
+
 /// The private folders this process has already prepared, so that an
 /// operation that needs one does not open and check it again every time.
 static PREPARED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
@@ -183,6 +188,17 @@ impl OwnFolder {
     #[must_use]
     pub fn tickets_for_this_process() -> Self {
         Self::of_this_process(TICKETS_FOLDER)
+    }
+
+    /// The folder in which an elevated program keeps the profiles of its
+    /// webview (ST-M009-014): `webview` in `CretLink Data`, private like the
+    /// staging area. `None` for a process without administrator rights,
+    /// whose profiles lie in the temporary folder of its account, and off
+    /// Windows.
+    #[must_use]
+    pub fn webview_for_this_process() -> Option<Self> {
+        let folder = Self::of_this_process(WEBVIEW_FOLDER);
+        folder.private.then_some(folder)
     }
 
     fn of_this_process(name: &str) -> Self {

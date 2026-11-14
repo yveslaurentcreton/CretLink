@@ -553,6 +553,9 @@ fn off_windows_there_is_one_place_and_no_earlier_release() {
     assert_eq!(administrators_folder(), None);
     assert!(!OwnFolder::staging_for_this_process().is_private());
     assert!(!OwnFolder::tickets_for_this_process().is_private());
+    // No program is elevated: the webview keeps its profile where the
+    // account's own programs do.
+    assert_eq!(OwnFolder::webview_for_this_process(), None);
     // A lock in a folder is never taken for the lock of an earlier release.
     let sb = Sandbox::new();
     let staging = sb.root.join("staging");
@@ -896,7 +899,13 @@ mod windows {
             assert_eq!(staging.path(), data.join("staging"));
             assert_eq!(tickets.path(), data.join("reboot-resume"));
             assert_eq!(staging.chain(), vec![data.clone(), data.join("staging")]);
+            // The webview of an elevated window keeps its profiles there too.
+            let webview = OwnFolder::webview_for_this_process().expect("a private place");
+            assert!(webview.is_private());
+            assert_eq!(webview.path(), data.join("webview"));
+            assert_eq!(webview.outermost(), data);
         } else {
+            assert_eq!(OwnFolder::webview_for_this_process(), None);
             let local = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA");
             let data = Path::new(&local).join("CretLink");
             assert_eq!(staging.path(), data.join("staging"));

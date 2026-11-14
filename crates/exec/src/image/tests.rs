@@ -9,6 +9,58 @@
 
 use super::hold_running_program;
 
+use super::hold_checked;
+
+/// A file that is held for a test, and says when it was given back.
+struct Held<'a>(&'a std::cell::Cell<bool>);
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.0.set(true);
+    }
+}
+
+/// The image was moved between the two looks: what was held under the first
+/// name is given back, and the caller is told.
+#[test]
+fn a_program_that_moved_between_the_two_looks_is_not_held() {
+    let given_back = std::cell::Cell::new(false);
+    let mut names = ["first", "second"].into_iter();
+    let held = hold_checked(
+        || Ok(names.next().unwrap_or("none")),
+        |name| {
+            assert_eq!(*name, "first", "the file under the first name is held");
+            Ok(Held(&given_back))
+        },
+        |_| Ok(true),
+    );
+    let error = held.err().expect("nothing is held");
+    assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
+    assert!(given_back.get(), "what was held is given back");
+}
+
+/// The image lay under the same name before and after: what was held is the
+/// image, and it stays held.
+#[test]
+fn a_program_that_stayed_where_it_lies_is_held() {
+    let given_back = std::cell::Cell::new(false);
+    let held =
+        hold_checked(|| Ok("same"), |_| Ok(Held(&given_back)), |_| Ok(true)).expect("it is held");
+    assert!(!given_back.get());
+    drop(held);
+    assert!(given_back.get());
+}
+
+/// What stands under the name is no file: nothing is held.
+#[test]
+fn what_is_no_file_is_not_held() {
+    let given_back = std::cell::Cell::new(false);
+    let held = hold_checked(|| Ok("same"), |_| Ok(Held(&given_back)), |_| Ok(false));
+    let error = held.err().expect("nothing is held");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(given_back.get());
+}
+
 #[cfg(not(windows))]
 #[test]
 fn off_windows_no_program_is_held() {
@@ -66,6 +118,34 @@ mod windows {
         );
         assert!(done.status.success(), "{said}");
         assert!(said.contains("1 passed"), "the copy ran this test: {said}");
+    }
+
+    /// While another handle may change the program file (here: rename or
+    /// remove it), the program is not held: the open that shares reading
+    /// only is refused. Once that handle is closed, it is held. A handle that
+    /// may only read attributes would take no part in this, so the other
+    /// handle asks for the right to remove the file.
+    #[test]
+    fn the_program_is_not_held_while_another_handle_may_change_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        /// `DELETE`: the right to rename or remove the file.
+        const DELETE: u32 = 0x0001_0000;
+        /// Reading, writing and removing shared: this handle stands in the
+        /// way of nobody but a holder that shares only reading.
+        const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+
+        let program = std::env::current_exe().expect("this program");
+        let other = std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(SHARE_ALL)
+            .open(&program)
+            .expect("another handle that may change the file");
+        assert!(
+            hold_running_program().is_err(),
+            "not held while another handle may change it"
+        );
+        drop(other);
+        drop(hold_running_program().expect("held once the other handle is closed"));
     }
 
     /// What the copy does with its own file.

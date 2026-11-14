@@ -54,6 +54,41 @@ pub fn hold_running_program() -> io::Result<File> {
     sys::hold()
 }
 
+/// The steps of [`hold_running_program`], with the questions to the system
+/// given: `image_name` says where the image lies now, `open` holds what
+/// stands under a name, and `is_file` says whether what was held is a file.
+/// What was held is given back, closed, unless the image lay under the same
+/// name before and after it was held.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only Windows holds its program; the steps are tested everywhere"
+    )
+)]
+fn hold_checked<N: PartialEq, H>(
+    mut image_name: impl FnMut() -> io::Result<N>,
+    open: impl FnOnce(&N) -> io::Result<H>,
+    is_file: impl FnOnce(&H) -> io::Result<bool>,
+) -> io::Result<H> {
+    let name = image_name()?;
+    let held = open(&name)?;
+    if !is_file(&held)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "what stands where the program lies is not a file",
+        ));
+    }
+    // Asked again while the file is held: see the module documentation.
+    if image_name()? != name {
+        return Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            "the program file was moved while it was opened",
+        ));
+    }
+    Ok(held)
+}
+
 #[cfg(not(windows))]
 mod sys {
     use std::fs::File;
@@ -100,22 +135,11 @@ mod sys {
     const MAX_NAME_UNITS: usize = 32_768;
 
     pub(super) fn hold() -> io::Result<File> {
-        let name = image_name()?;
-        let held = open_held(&name)?;
-        if !held.metadata()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "what stands where the program lies is not a file",
-            ));
-        }
-        // Asked again while the file is held: see the module documentation.
-        if image_name()? != name {
-            return Err(io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                "the program file was moved while it was opened",
-            ));
-        }
-        Ok(held)
+        super::hold_checked(
+            image_name,
+            |name| open_held(name),
+            |held| Ok(held.metadata()?.is_file()),
+        )
     }
 
     /// Where the image that this process is mapped from lies now, as the

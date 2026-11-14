@@ -95,7 +95,7 @@ pub use own::{
     earlier_release_in_use, kept_program_folder, prepare_program_folder, remove_whole,
     require_administrator,
 };
-pub use system::{job_folder, leave_the_starters_folder, windows_folder};
+pub use system::{job_folder, leave_the_starters_folder, system_folder, windows_folder};
 
 // Reuse the wire vocabulary so the session layer forwards broker output without
 // lossy conversions.
