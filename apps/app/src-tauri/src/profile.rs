@@ -12,6 +12,13 @@
 //!   technician copy uses the folder in the application's data folder; on
 //!   macOS the webview takes no folder. The same start removes, off the
 //!   window's thread, the temporary folders of copies that no longer run.
+//! - A process with administrator rights makes its folder in its private
+//!   folder in `CretLink Data` and looks for leftovers only there
+//!   ([`Base::Private`]): nothing of the temporary folder or the local
+//!   application data that its environment names is looked at or removed
+//!   (REQ-S-024). It drops the variables that WebView2 obeys from its
+//!   environment before any window opens
+//!   ([`webview_profile::forget_webview_overrides`], called by the caller).
 //! - Every window is built with that folder: the main window through
 //!   [`open_main_window`] — `tauri.conf.json` describes it but does not create
 //!   it, because the folder is only known at run time — and the customer's
@@ -34,7 +41,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use cretlink_cli::install::{Layout, Platform};
-use cretlink_cli::webview_profile::{self, Home, Patience, TempProfile};
+use cretlink_cli::webview_profile::{self, Base, Home, Patience, TempProfile};
 use tauri::{AppHandle, ExitRequestApi, Manager, WebviewWindow, WebviewWindowBuilder};
 
 /// The main window's label, as in `tauri.conf.json`.
@@ -73,25 +80,32 @@ impl Profile {
     }
 
     /// Decides and prepares the profile of this process, before its window
-    /// opens; `customer` is whether it shows the customer role. Then removes,
-    /// on a thread of its own, the temporary folders that other copies left.
+    /// opens; `customer` is whether it shows the customer role, and `base`
+    /// is where its temporary folder is made ([`Base::current`]). Then
+    /// removes, on a thread of its own, the temporary folders that other
+    /// copies left in `base`.
     ///
     /// # Errors
     ///
     /// Returns an error when the temporary folder of this process could not
     /// be created. No window opens then: the webview would fall back to the
     /// folder that stays.
-    pub(crate) fn open(customer: bool) -> io::Result<Self> {
-        let exe = std::env::current_exe().ok();
+    pub(crate) fn open(customer: bool, base: &Base) -> io::Result<Self> {
         // The profile of the installed copy, only for a process that runs
-        // from the install location.
-        let installed = Layout::current()
-            .filter(|layout| {
-                exe.as_deref()
-                    .is_some_and(|exe| layout.is_installed_exe(exe))
-            })
-            .and_then(|layout| layout.webview);
-        let temp_dir = std::env::temp_dir();
+        // from the install location, and never for a process with
+        // administrator rights: the account's folders, which its environment
+        // names, are not its own.
+        let installed = if base.is_private() {
+            None
+        } else {
+            let exe = std::env::current_exe().ok();
+            Layout::current()
+                .filter(|layout| {
+                    exe.as_deref()
+                        .is_some_and(|exe| layout.is_installed_exe(exe))
+                })
+                .and_then(|layout| layout.webview)
+        };
         let profile = match Home::choose(Platform::current(), installed.as_deref(), customer) {
             Home::Unmanaged => return Ok(Self::new(None, None, false)),
             // An installed copy whose data folder cannot be written runs
@@ -100,10 +114,15 @@ impl Profile {
                 Self::new(Some(dir), None, true)
             }
             Home::Installed(_) | Home::Temporary => {
-                let temp = TempProfile::create_in(&temp_dir)?;
+                // The private folder is made with its owner and its
+                // permissions in one step; the profile made in it takes
+                // them when it is created.
+                base.prepare()?;
+                let temp = TempProfile::create_in(base.dir())?;
                 Self::new(Some(temp.path().to_path_buf()), Some(temp), false)
             }
         };
+        let swept = base.dir().to_path_buf();
         // A folder that cannot be removed, or whose lock cannot be told, is
         // left alone, and is not an error for this session: a later start
         // tries again, and `recover` names it.
@@ -112,7 +131,7 @@ impl Profile {
             .as_ref()
             .map(|temp| temp.path().to_path_buf());
         std::thread::spawn(move || {
-            let _ = webview_profile::sweep(&temp_dir, own.as_deref(), &mut Patience::none());
+            let _ = webview_profile::sweep(&swept, own.as_deref(), &mut Patience::none());
         });
         Ok(profile)
     }

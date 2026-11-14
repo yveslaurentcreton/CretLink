@@ -10,6 +10,7 @@
 //! | Process | Profile folder | Removed |
 //! |---|---|---|
 //! | Not installed (the start screen, a technician that runs once, a `CretLink-Support*` copy) and every customer process | `CretLink-webview-<random>` in the temporary folder ([`TempProfile`]) | by the process, after its last window closed |
+//! | Any process with administrator rights | `CretLink-webview-<random>` in `webview` in `CretLink Data`, the private folder of an elevated program ([`Base::Private`]) | by the process, after its last window closed |
 //! | The installed technician copy | `webview` in the application's data folder, next to the audit trail ([`installed_dir`]) | by uninstall |
 //! | Any process on macOS | none: WebKit keeps its data where a program cannot direct it | not by CretLink |
 //!
@@ -42,6 +43,27 @@
 //!   when the lock file is still missing after the content was seen: content
 //!   comes after the lock, so nobody is creating it.
 //!
+//! # With administrator rights (REQ-S-024)
+//!
+//! The account that approves the elevation owns the environment that an
+//! elevated program starts with, its temporary folder and its local
+//! application data: a program of that account without administrator rights
+//! can write there, and can lead a path there elsewhere. So a process with
+//! administrator rights takes nothing of those places ([`Base::current`],
+//! [`Places::current`]): its profile is a new folder in `webview` in
+//! `CretLink Data`, the private folder of an elevated program
+//! (`cretlink_exec::OwnFolder::webview_for_this_process`), which is created
+//! with its owner and its permissions in one step or found to be such a
+//! folder already, and every profile folder made in it takes those
+//! permissions when it is created. No program without administrator rights
+//! can write into it while the window runs. Leftovers are looked for and
+//! removed only there. What lies in the account's own folders (the temporary
+//! profiles of a window without administrator rights, the folder of earlier
+//! versions) is removed by a start or a recovery without administrator
+//! rights, and a recovery with them says so. Before the webview is created,
+//! such a process drops the variables of its environment that WebView2 obeys
+//! ([`forget_webview_overrides`]).
+//!
 //! # Links are never followed
 //!
 //! The temporary folder is one that other programs of the same account can
@@ -58,7 +80,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cretlink_exec::{Standing, remove_whole};
+use cretlink_exec::{OwnFolder, Standing, remove_whole};
 
 use crate::install::{BaseDirs, Platform};
 
@@ -193,6 +215,117 @@ impl Home {
         match installed {
             Some(dir) if !customer => Self::Installed(dir.to_path_buf()),
             _ => Self::Temporary,
+        }
+    }
+}
+
+// --- Where a process makes its profile and looks for leftovers ---
+
+/// The folder in which this process makes its temporary profile, and looks
+/// for the ones that other copies left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Base {
+    /// The temporary folder of the account: a process without administrator
+    /// rights.
+    Account(PathBuf),
+    /// `webview` in `CretLink Data`, the private folder of a process with
+    /// administrator rights (REQ-S-024). Nothing of the account's folders is
+    /// looked at.
+    Private(OwnFolder),
+}
+
+impl Base {
+    /// The folder of this process: the private one when it has administrator
+    /// rights, otherwise its temporary folder.
+    #[must_use]
+    pub fn current() -> Self {
+        Self::choose(OwnFolder::webview_for_this_process(), std::env::temp_dir)
+    }
+
+    /// The private folder when there is one; `temp` is asked only otherwise,
+    /// so that a process with administrator rights never looks at the
+    /// temporary folder its environment names.
+    #[must_use]
+    pub fn choose(private: Option<OwnFolder>, temp: impl FnOnce() -> PathBuf) -> Self {
+        match private {
+            Some(private) => Self::Private(private),
+            None => Self::Account(temp()),
+        }
+    }
+
+    /// The folder.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        match self {
+            Self::Account(temp) => temp,
+            Self::Private(private) => private.path(),
+        }
+    }
+
+    /// Whether this is the private folder of a process with administrator
+    /// rights.
+    #[must_use]
+    pub fn is_private(&self) -> bool {
+        matches!(self, Self::Private(_))
+    }
+
+    /// Makes the folder ready for a new profile. The private one is created
+    /// with its owner and its permissions in one step, with `CretLink Data`
+    /// above it, or found to be such a folder already; a profile folder made
+    /// in it takes those permissions when it is created. The temporary
+    /// folder of the account is taken as it is.
+    ///
+    /// # Errors
+    ///
+    /// When the private folder cannot be made or is not such a folder: no
+    /// profile is made then.
+    pub fn prepare(&self) -> io::Result<()> {
+        match self {
+            Self::Account(_) => Ok(()),
+            Self::Private(private) => private.prepare(),
+        }
+    }
+}
+
+/// Whether `name` is a variable of the environment that WebView2 obeys
+/// (`WEBVIEW2_USER_DATA_FOLDER`, `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`,
+/// `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` and the others of that prefix).
+/// Windows does not tell names of variables apart by case.
+#[must_use]
+pub fn is_webview_override(name: &OsStr) -> bool {
+    const PREFIX: &str = "WEBVIEW2_";
+    name.to_str().is_some_and(|name| {
+        name.get(..PREFIX.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(PREFIX))
+    })
+}
+
+/// Drops from the environment of this process every variable that WebView2
+/// obeys ([`is_webview_override`]): where the profile lies, which browser
+/// runs the window and with which arguments. For a process with
+/// administrator rights, before its first webview is created: the account
+/// that approved the elevation owns the environment it was started with
+/// (REQ-S-024). Off Windows there is no WebView2, and nothing changes.
+pub fn forget_webview_overrides() {
+    #[cfg(windows)]
+    {
+        let names: Vec<std::ffi::OsString> = std::env::vars_os()
+            .map(|(name, _)| name)
+            .filter(|name| is_webview_override(name))
+            .collect();
+        for name in names {
+            #[allow(
+                unsafe_code,
+                reason = "The standard library documents removing a variable as \
+                          always safe on Windows, also with other threads: the \
+                          environment is changed and read through calls of the \
+                          system that take its lock."
+            )]
+            // SAFETY: on Windows `remove_var` is safe in a program with
+            // several threads (see the reason above).
+            unsafe {
+                std::env::remove_var(&name);
+            }
         }
     }
 }
@@ -679,10 +812,16 @@ impl Leftover {
 /// The places `recover` looks for webview folders in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Places {
-    /// The temporary folder of this process.
+    /// The folder the temporary profiles lie in: the temporary folder of a
+    /// process without administrator rights, or the private folder of one
+    /// with them.
     pub temp: PathBuf,
     /// Where earlier versions kept the profile of this user ([`legacy_dir`]).
+    /// Never for a process with administrator rights.
     pub legacy: Option<PathBuf>,
+    /// The private folder of a process with administrator rights, which
+    /// `temp` names: what stands there is looked at before it is listed.
+    pub private: Option<OwnFolder>,
 }
 
 impl Places {
@@ -693,17 +832,65 @@ impl Places {
         Self {
             temp,
             legacy: dirs.and_then(|dirs| legacy_dir(platform, dirs)),
+            private: None,
         }
     }
 
-    /// The places of this computer and user.
+    /// The places of a process with administrator rights: its private
+    /// folder alone. The account's folders are not looked at.
+    #[must_use]
+    pub fn private(folder: OwnFolder) -> Self {
+        Self {
+            temp: folder.path().to_path_buf(),
+            legacy: None,
+            private: Some(folder),
+        }
+    }
+
+    /// The places of this process: with administrator rights its private
+    /// folder alone; without them its temporary folder and the folder of
+    /// earlier versions of this user.
     #[must_use]
     pub fn current() -> Self {
-        Self::new(
-            Platform::current(),
-            BaseDirs::from_env().as_ref(),
-            std::env::temp_dir(),
-        )
+        Self::choose(OwnFolder::webview_for_this_process(), || {
+            Self::new(
+                Platform::current(),
+                BaseDirs::from_env().as_ref(),
+                std::env::temp_dir(),
+            )
+        })
+    }
+
+    /// The private places when there is a private folder; `account` is asked
+    /// only otherwise, so that a process with administrator rights never
+    /// looks at the folders its environment names.
+    #[must_use]
+    pub fn choose(private: Option<OwnFolder>, account: impl FnOnce() -> Self) -> Self {
+        match private {
+            Some(private) => Self::private(private),
+            None => account(),
+        }
+    }
+
+    /// Whether these are the places of a process with administrator rights,
+    /// which leave the account's own folders out.
+    #[must_use]
+    pub fn leaves_the_account_out(&self) -> bool {
+        self.private.is_some()
+    }
+
+    /// The temporary profiles that were left, as [`look`] finds them; for
+    /// the private folder only when a folder and no link stands there.
+    fn look(&self) -> io::Result<Found> {
+        if let Some(private) = &self.private
+            && private.standing() == Standing::Foreign
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "something that is not a folder of CretLink stands under its name",
+            ));
+        }
+        look(&self.temp, None)
     }
 
     /// The folder of an earlier version, when something stands under its
@@ -734,7 +921,7 @@ pub struct Leftovers {
 #[must_use]
 pub fn leftovers(places: &Places) -> Leftovers {
     let mut leftovers = Leftovers::default();
-    match look(&places.temp, None) {
+    match places.look() {
         Ok(found) => {
             leftovers
                 .found
@@ -770,7 +957,7 @@ pub struct Recovery {
 #[must_use]
 pub fn recover(places: &Places, patience: &mut Patience) -> Recovery {
     let mut recovery = Recovery::default();
-    match look(&places.temp, None) {
+    match places.look() {
         Ok(found) => {
             recovery.unknown = found.unknown;
             for (path, lock) in found.left {
@@ -806,7 +993,7 @@ pub fn recover(places: &Places, patience: &mut Patience) -> Recovery {
 
 fn unreadable(temp: &Path, err: &io::Error) -> String {
     format!(
-        "the temporary folder {} could not be listed ({})",
+        "the folder of the temporary profiles {} could not be listed ({})",
         temp.display(),
         err.kind()
     )

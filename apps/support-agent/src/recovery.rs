@@ -119,6 +119,7 @@ pub async fn run_recover_with(
     RecoverRun {
         text: with_scope_note(
             with_what_is_there_on_purpose(run.text, &on_purpose),
+            program,
             with_administrator_rights,
         ),
         success: run.success,
@@ -134,20 +135,32 @@ fn with_what_is_there_on_purpose(mut text: String, on_purpose: &[String]) -> Str
     text
 }
 
-/// What the report of a run with administrator rights does not cover. (A run
-/// without them that cannot see the administrators' folder says so itself,
-/// as something it could not read.)
-const OTHER_KEEPER_NOTE: &str = concat!(
-    "  Note: this covers what CretLink keeps when it runs with administrator rights.\n",
-    "  What it kept while it ran without them lies in the folder of that account;\n",
-    "  run this command there without administrator rights to see or remove it.\n",
-);
+/// What the report of a run with administrator rights does not cover, with
+/// the command that covers it. (A run without them that cannot see the
+/// administrators' folder says so itself, as something it could not read.)
+///
+/// A run with administrator rights removes nothing in a folder that the
+/// environment names (REQ-S-024): the account that approved the rights owns
+/// that environment. So what lies in the account's own folders, also the
+/// webview folders of a window without administrator rights in its
+/// temporary folder and its local application data (ST-M009-014), is left
+/// to a run without them.
+fn other_keeper_note(program: &str) -> String {
+    format!(
+        "  Note: this covers what CretLink keeps when it runs with administrator rights.\n\
+         \x20 What it kept while it ran without them, and the webview folders in the temporary\n\
+         \x20 folder and the local application data of an account, lie in the folders of that\n\
+         \x20 account and are not looked at here. To see or remove them, run in that account\n\
+         \x20 without administrator rights:  {program} recover  or  {}\n",
+        recover_command(program)
+    )
+}
 
 /// A report, with what a run with administrator rights does not cover said
 /// after it.
-fn with_scope_note(mut text: String, with_administrator_rights: bool) -> String {
+fn with_scope_note(mut text: String, program: &str, with_administrator_rights: bool) -> String {
     if with_administrator_rights {
-        text.push_str(OTHER_KEEPER_NOTE);
+        text.push_str(&other_keeper_note(program));
     }
     text
 }
@@ -1280,17 +1293,26 @@ mod tests {
     #[test]
     fn a_run_with_administrator_rights_says_what_it_does_not_cover() {
         let report = recovery_report_text(&RecoveryReport::default());
-        let with_rights = with_scope_note(report.clone(), true);
+        let with_rights = with_scope_note(report.clone(), "CretLink-Support.exe", true);
         assert!(with_rights.starts_with(&report));
         assert!(
             with_rights.ends_with(
-                "  run this command there without administrator rights to see or remove it.\n"
+                "  without administrator rights:  CretLink-Support.exe recover  or  \
+                 CretLink-Support.exe recover --remove\n"
             ),
             "{with_rights}"
         );
         assert!(with_rights.contains("  Note: this covers what CretLink keeps when it runs"));
+        // The webview folders of the account are named as not covered.
+        assert!(
+            with_rights.contains("the webview folders in the temporary\n  folder"),
+            "{with_rights}"
+        );
         // A run without them covers the folder of its account, and says what
         // it cannot see as something it could not read.
-        assert_eq!(with_scope_note(report.clone(), false), report);
+        assert_eq!(
+            with_scope_note(report.clone(), "CretLink-Support.exe", false),
+            report
+        );
     }
 }

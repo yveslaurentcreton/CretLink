@@ -499,6 +499,7 @@ fn places(temp: &Temp) -> Places {
     Places {
         temp: temp.path().to_path_buf(),
         legacy: Some(temp.path().join("data").join(LEGACY_DIR)),
+        private: None,
     }
 }
 
@@ -642,6 +643,7 @@ fn a_temporary_folder_that_cannot_be_listed_is_unknown_not_empty() {
     let places = Places {
         temp: temp.path().join("closed"),
         legacy: None,
+        private: None,
     };
     fs::create_dir(&places.temp).unwrap();
     fs::set_permissions(&places.temp, fs::Permissions::from_mode(0o000)).unwrap();
@@ -654,11 +656,145 @@ fn a_temporary_folder_that_cannot_be_listed_is_unknown_not_empty() {
         assert_eq!(
             reason,
             format!(
-                "the temporary folder {} could not be listed (permission denied)",
+                "the folder of the temporary profiles {} could not be listed (permission \
+                 denied)",
                 places.temp.display()
             )
         );
         assert!(recovery.unreadable.is_some());
         assert!(recovery.found.is_empty());
+    }
+}
+
+// --- With administrator rights (REQ-S-024) ---
+
+/// The private folder of the test: `webview` in a folder that stands for
+/// `CretLink Data`.
+fn private(temp: &Temp) -> OwnFolder {
+    let data = temp.path().join("CretLink Data");
+    OwnFolder::administrators_only(data.clone(), data.join("webview"))
+}
+
+/// A process with administrator rights takes the private folder, and never
+/// asks for the temporary folder or the account's folders its environment
+/// names.
+#[test]
+fn an_elevated_start_does_not_look_at_the_folders_of_the_account() {
+    let temp = Temp::new("elevated-start");
+    let folder = private(&temp);
+
+    let base = Base::choose(Some(folder.clone()), || {
+        panic!("the temporary folder was asked")
+    });
+    assert!(base.is_private());
+    assert_eq!(base.dir(), folder.path());
+
+    let elevated = Places::choose(Some(folder.clone()), || {
+        panic!("the folders of the account were asked")
+    });
+    assert_eq!(elevated.temp, folder.path());
+    assert_eq!(elevated.legacy, None, "no folder of earlier versions");
+    assert!(elevated.leaves_the_account_out());
+
+    // Without administrator rights the account's folders are the places.
+    let base = Base::choose(None, || temp.path().to_path_buf());
+    assert_eq!(base, Base::Account(temp.path().to_path_buf()));
+    assert!(!base.is_private());
+    let account = Places::choose(None, || places(&temp));
+    assert!(!account.leaves_the_account_out());
+    assert!(account.legacy.is_some());
+}
+
+/// The private folder is made, with the folder above it, before the profile
+/// is made in it; a profile there is removed like one in the temporary
+/// folder.
+#[test]
+fn an_elevated_profile_is_made_in_the_private_folder() {
+    let temp = Temp::new("elevated-profile");
+    let base = Base::Private(private(&temp));
+    base.prepare().unwrap();
+    let profile = TempProfile::create_in(base.dir()).unwrap();
+    assert_eq!(profile.path().parent(), Some(base.dir()));
+    let dir = profile.path().to_path_buf();
+    fill(&dir);
+    profile.remove(&mut Patience::none()).unwrap();
+    assert!(is_gone(&dir));
+    // The account's temporary folder is a base that needs nothing.
+    Base::Account(temp.path().join("absent")).prepare().unwrap();
+}
+
+/// A recovery with administrator rights looks for leftovers in the private
+/// folder alone: what lies in the account's folders stays for a recovery
+/// without them.
+#[test]
+fn an_elevated_recovery_removes_only_in_the_private_folder() {
+    let temp = Temp::new("elevated-recover");
+    let folder = private(&temp);
+    // Nothing is there yet: nothing was left, and nothing is made.
+    let places = Places::private(folder.clone());
+    assert_eq!(leftovers(&places), Leftovers::default());
+    assert!(is_gone(folder.path()));
+
+    fs::create_dir_all(folder.path()).unwrap();
+    let in_private = folder.path().join(profile_name(1));
+    fs::create_dir(&in_private).unwrap();
+    fs::write(in_private.join(LOCK_FILE), b"").unwrap();
+    // What lies in the account's folders: a temporary profile and the folder
+    // of earlier versions.
+    let in_account = temp.stale(2);
+    let earlier = temp.path().join("data").join(LEGACY_DIR);
+    fs::create_dir_all(&earlier).unwrap();
+
+    let listed = leftovers(&places);
+    assert_eq!(listed.found.len(), 1);
+    assert_eq!(listed.found[0].path, in_private);
+    let recovery = recover(&places, &mut Patience::none());
+    assert_eq!(recovery.removed.len(), 1);
+    assert!(is_gone(&in_private));
+    assert!(!is_gone(&in_account), "the account's folder is not touched");
+    assert!(
+        !is_gone(&earlier),
+        "the earlier version's folder is not touched"
+    );
+}
+
+/// A link where the private folder belongs is not looked through: the
+/// folders are unknown, and nothing is removed.
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_place_of_the_private_folder_is_not_followed() {
+    let temp = Temp::new("elevated-link");
+    let folder = private(&temp);
+    let elsewhere = temp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let stale = elsewhere.join(profile_name(3));
+    fs::create_dir(&stale).unwrap();
+    fs::create_dir_all(folder.path().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, folder.path()).unwrap();
+
+    let places = Places::private(folder);
+    let listed = leftovers(&places);
+    assert!(listed.found.is_empty());
+    assert!(listed.unreadable.is_some());
+    let recovery = recover(&places, &mut Patience::none());
+    assert!(recovery.removed.is_empty());
+    assert!(recovery.unreadable.is_some());
+    assert!(!is_gone(&stale), "nothing behind the link is removed");
+}
+
+/// The variables WebView2 obeys are known by their prefix, in any case.
+#[test]
+fn the_variables_webview2_obeys_are_known_by_their_prefix() {
+    for name in [
+        "WEBVIEW2_USER_DATA_FOLDER",
+        "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "WEBVIEW2_RELEASE_CHANNEL_PREFERENCE",
+        "webview2_user_data_folder",
+    ] {
+        assert!(is_webview_override(OsStr::new(name)), "{name}");
+    }
+    for name in ["PATH", "WEBVIEW2", "WEBVIEW", "MY_WEBVIEW2_X", ""] {
+        assert!(!is_webview_override(OsStr::new(name)), "{name}");
     }
 }

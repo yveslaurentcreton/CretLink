@@ -96,6 +96,15 @@ pub fn run_customer(entry: Entry) -> ExitCode {
 const RUNTIME_STOP_WAIT: Duration = Duration::from_secs(1);
 
 fn run_screen(screen: Screen, entry: Entry) -> ExitCode {
+    // Where the webview of this process keeps its profile: with
+    // administrator rights in its private folder, and the variables that
+    // WebView2 obeys are dropped from its environment before WebView2 is asked
+    // anything (ST-M009-014, REQ-S-024).
+    let base = cretlink_cli::webview_profile::Base::current();
+    if base.is_private() {
+        cretlink_cli::webview_profile::forget_webview_overrides();
+    }
+
     if let Err(err) = tauri::webview_version() {
         cretlink_cli::process::alert(
             "CretLink cannot open its window",
@@ -125,7 +134,7 @@ fn run_screen(screen: Screen, entry: Entry) -> ExitCode {
 
     // Where the webview of this process keeps its profile, decided before any
     // window opens (ST-M009-014).
-    let profile = match Profile::open(screen == Screen::Role(Role::Customer)) {
+    let profile = match Profile::open(screen == Screen::Role(Role::Customer), &base) {
         Ok(profile) => profile,
         Err(err) => {
             cretlink_cli::process::alert(
@@ -133,7 +142,7 @@ fn run_screen(screen: Screen, entry: Entry) -> ExitCode {
                 &format!(
                     "CretLink could not create the temporary folder for its window in {}. \
                      Nothing was started and nothing was changed.\n\n({err})",
-                    std::env::temp_dir().display()
+                    base.dir().display()
                 ),
             );
             return ExitCode::FAILURE;
