@@ -53,13 +53,19 @@ export function band(b: Band, since?: Child): HTMLElement {
   );
 }
 
-/** The footer of the screens before a session. */
-export function nothingInstalled(): HTMLElement {
+/**
+ * The footer of the screens before a session: what is on this computer, in
+ * `words`. Nothing is installed unless the customer chose to keep the
+ * support program (ST-M009-017).
+ */
+export function nothingInstalled(
+  words = "Nothing is installed · closing CretLink ends everything",
+): HTMLElement {
   return h(
     "div",
     { class: "cfoot" },
     icon("check", "sm"),
-    h("span", { class: "muted" }, "Nothing is installed · closing CretLink ends everything"),
+    h("span", { class: "muted", id: "installed-words" }, words),
   );
 }
 

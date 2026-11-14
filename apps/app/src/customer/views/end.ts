@@ -9,8 +9,18 @@ import type { CleanupNote, CleanupResult, CustomerReport, EndedBy } from "../../
 import { h } from "../../shared/dom";
 import { plural } from "../../shared/feed";
 import { icon } from "../../shared/icons";
-import { type CustomerSnapshot, capName, liveCounts, technicianName } from "../model";
+import { viaRelay } from "../../shared/relay";
+import {
+  type CustomerSnapshot,
+  capName,
+  liveCounts,
+  relayLostWords,
+  relayNamed,
+  sessionRelay,
+  technicianName,
+} from "../model";
 import { button } from "./common";
+import { keepCardView } from "./keep";
 
 export function endHeading(endedBy: EndedBy | undefined, name: string): string {
   switch (endedBy) {
@@ -147,6 +157,49 @@ function record(s: CustomerSnapshot, report: CustomerReport | null): HTMLElement
   );
 }
 
+/**
+ * A session through a relay whose connection was lost says so with the
+ * relay, and that nothing connects again by itself (ST-M007-013).
+ */
+function relayLost(s: CustomerSnapshot): HTMLElement | null {
+  const relay = relayNamed(s);
+  const phase = s.view?.status.phase;
+  const lost =
+    s.report?.endedBy === "connection_lost" ||
+    (phase?.phase === "stopped" && phase.reason === "disconnected");
+  if (!relay || !lost) return null;
+  const words = relayLostWords(relay);
+  return h(
+    "p",
+    { class: "note relay-lost", role: "note", "data-key": "relay-lost" },
+    icon("alert"),
+    h("span", null, h("b", null, `${words.message} `), words.next),
+  );
+}
+
+/**
+ * A support program that the customer kept is on this computer on purpose:
+ * the report says so beside the cleanup, so that it is not taken for
+ * something this session left behind (ST-M009-017, REQ-F-019).
+ */
+function keptOnPurpose(report: CustomerReport | null): HTMLElement | null {
+  const kept = report?.keptProgram;
+  if (!kept) return null;
+  return h(
+    "p",
+    { class: "note info kept-on-purpose", role: "note", "data-key": "kept-on-purpose" },
+    icon("check"),
+    h(
+      "span",
+      null,
+      h("b", null, "CretLink Support is installed on this computer because you chose to keep it. "),
+      "It was not left behind by this session. It lies in ",
+      h("code", { class: "path" }, kept.location),
+      kept.version ? `, in version ${kept.version}.` : ".",
+    ),
+  );
+}
+
 export function endView(s: CustomerSnapshot): HTMLElement[] {
   const report = s.report;
   const name = technicianName(s);
@@ -163,10 +216,16 @@ export function endView(s: CustomerSnapshot): HTMLElement[] {
           { class: "lead" },
           `${capName(name)} can no longer reach this computer. A new session needs a new code and your permission again.`,
         ),
+        viaRelay(sessionRelay(s)),
       ),
+      relayLost(s),
       stats(s, report),
       cleanup(report),
+      keptOnPurpose(report),
       record(s, report),
+      // Offered again once the session is over, never during it
+      // (ST-M009-017).
+      keepCardView(s),
     ),
     h(
       "div",

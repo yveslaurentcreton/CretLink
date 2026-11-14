@@ -94,6 +94,20 @@ body {
 .net-list li + li { border-top: 1px solid var(--line-2); }
 .net-list .net-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .net-list .muted { font-size: 12px; }
+/* Not on the same network? (ST-M007-013) */
+.relay-offer { align-items: center; gap: 14px; padding: 14px 18px; margin-top: 14px; }
+.relay-offer > .ic { color: var(--muted); flex: none; }
+.relay-offer-text { flex: 1; min-width: 0; }
+.relay-offer-text b { font-size: 14px; }
+.relay-offer-text .muted { font-size: 12.5px; overflow-wrap: anywhere; }
+.relay-offer .btn { flex: none; }
+.relay-offer-text .relay-trust, .relay-offer-text .relay-source { display: block; margin-top: 4px; }
+/* Waiting on the relay. */
+.relay-wait .relay-state { margin: 14px 0 0; font-weight: 600; }
+.relay-wait .relay-note { margin: 6px 0 0; font-size: 12.5px; max-width: 460px; }
+.relay-wait .relay-facts { margin: 6px 0 0; font-size: 12.5px; max-width: 460px; overflow-wrap: anywhere; }
+.relay-wait .relay-facts > span { display: block; }
+.sess-id .via-relay-line { margin-top: 2px; }
 .center-col { align-items: center; justify-content: center; text-align: center; flex: 1; }
 .center-col h2 { margin-top: 4px; }
 .compare .reports { margin: 16px 0 4px; }
@@ -146,7 +160,181 @@ body {
 .sh-badge.warn { color: #fde68a; background: rgba(255, 180, 60, 0.13); }
 .sh-badge.bad { color: #fca5a5; background: rgba(255, 80, 80, 0.14); }
 
-/* Files and audit */
+/* Files: the explorer (ST-M010-002). The toolbar, the grid and the status
+ * line fill the tab; the transfers of the session lie under them. A row is
+ * 28 pixels high and a column of the List view 260 wide: `explorer.ts` draws
+ * only the rows in view from those two numbers. */
+.panel-files { overflow: hidden; }
+.xp { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #fff; position: relative; }
+.xp-bar {
+  display: flex; align-items: center; gap: 2px; padding: 8px 12px; flex: none;
+  border-bottom: 1px solid var(--line);
+}
+.xp-tool { padding: 6px; }
+.xp-path {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 2px; margin: 0 8px;
+  border: 1px solid var(--line); border-radius: var(--r); background: var(--bg); padding: 2px;
+}
+.xp-path ol {
+  list-style: none; margin: 0; padding: 0; flex: 1; min-width: 0; display: flex; align-items: center;
+  overflow-x: auto; scrollbar-width: none; white-space: nowrap;
+}
+.xp-path ol::-webkit-scrollbar { display: none; }
+.xp-path li { display: flex; align-items: center; flex: none; }
+.xp-crumb {
+  display: inline-flex; align-items: center; gap: 6px; border: 0; background: none; padding: 4px 7px;
+  border-radius: var(--r-sm); font-size: 13px; color: var(--ink-2); max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.xp-crumb:hover { background: var(--line-2); }
+.xp-crumb[aria-current] { color: var(--ink); font-weight: 600; }
+.xp-sep { color: var(--faint); }
+.xp-path.edit { gap: 6px; }
+.xp-path.edit:focus-within { border-color: var(--tech); box-shadow: 0 0 0 2px var(--tech-line); }
+.xp-input {
+  flex: 1; min-width: 0; border: 0; background: transparent; padding: 5px 8px; font-size: 13px; color: var(--ink);
+}
+.xp-input:focus { outline: none; }
+.xp .seg {
+  display: inline-flex; border: 1px solid var(--line); border-radius: var(--r); padding: 2px;
+  background: var(--bg); gap: 2px; flex: none;
+}
+.xp .seg button {
+  border: 0; background: transparent; padding: 5px 12px; font-size: 13px; border-radius: 7px; color: var(--muted);
+}
+.xp .seg button.on { background: #fff; color: var(--ink); font-weight: 600; box-shadow: var(--shadow); }
+.xp > .alert { margin: 8px 12px; flex: none; }
+.xp > .alert .alert-body { flex: 1; }
+.xp > .alert .next { margin-top: 4px; font-weight: 600; }
+/* A second message below the end of the session. */
+.xp > .alert b.also { margin-top: 10px; }
+
+.xp-body { flex: 1; min-height: 0; display: flex; position: relative; }
+.xp-grid { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; font-size: 13px; }
+.xp-grid:focus { outline: none; }
+.xp-grid:focus-visible { outline: 2.5px solid var(--tech); outline-offset: -2.5px; }
+.xp-scroll { flex: 1; min-height: 0; overflow: auto; position: relative; }
+.xp-head,
+.xp-grid.details .xp-row {
+  display: grid; grid-template-columns: minmax(180px, 1fr) 150px 130px 100px; align-items: center;
+}
+.xp-head {
+  position: sticky; top: 0; z-index: 2; height: 30px; background: var(--bg);
+  border-bottom: 1px solid var(--line); font-size: 11.5px; font-weight: 700; color: var(--muted);
+}
+.xp-rows { position: relative; }
+.xp-row { position: absolute; left: 0; right: 0; height: 28px; cursor: default; user-select: none; }
+.xp-grid.list .xp-row { right: auto; width: 260px; display: flex; align-items: center; }
+.xp-cell { padding: 0 10px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.xp-cell.num { text-align: right; font-variant-numeric: tabular-nums; }
+.xp-cell.name { display: flex; align-items: center; gap: 8px; }
+.xp-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.xp-icon { display: inline-flex; flex: none; color: var(--muted); }
+.xp-icon.dir, .xp-icon.drive { color: var(--tech); }
+.xp-row:hover { background: var(--line-2); }
+/* A selected row is marked by a bar as well as by its colour. */
+.xp-row.sel { background: var(--tech-soft); box-shadow: inset 3px 0 0 var(--tech); }
+.xp-grid:focus .xp-row.focus { outline: 1.5px solid var(--tech); outline-offset: -1.5px; }
+.xp-sort {
+  display: inline-flex; align-items: center; gap: 5px; width: 100%; border: 0; background: none;
+  padding: 0; font: inherit; color: inherit; text-align: left;
+}
+.xp-cell.num .xp-sort { justify-content: flex-end; }
+.xp-sort.on { color: var(--ink); }
+.xp-arrow { font-size: 9px; }
+/* What stands in the place of the rows when there are none. */
+.xp-state {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 12px; padding: 24px; text-align: center; pointer-events: none;
+}
+.xp-state p { margin: 0; max-width: 440px; color: var(--muted); }
+.xp-state .btn { pointer-events: auto; }
+.xp-note { margin: 8px 12px 0; flex: none; align-items: center; }
+.xp-note p { flex: 1; }
+.xp-status {
+  flex: none; min-height: 27px; padding: 5px 14px; font-size: 12px; color: var(--muted);
+  border-top: 1px solid var(--line-2);
+}
+.xp-menu {
+  position: fixed; z-index: 50; list-style: none; margin: 0; padding: 4px; min-width: 190px;
+  background: #fff; border: 1px solid var(--line); border-radius: var(--r);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
+}
+.xp-menu button {
+  display: flex; align-items: center; justify-content: space-between; gap: 24px; width: 100%;
+  border: 0; background: none; padding: 7px 10px; border-radius: var(--r-sm); font-size: 13px; text-align: left;
+}
+.xp-menu button:hover:not(:disabled),
+.xp-menu button:focus-visible { background: var(--tech-soft); }
+.xp-menu button:disabled { color: var(--faint); cursor: default; }
+.xp-menu kbd { font: 600 11px var(--mono); color: var(--muted); }
+.xp-transfers {
+  flex: none; max-height: 32%; overflow: auto; padding: 10px 14px; border-top: 1px solid var(--line);
+  background: var(--bg);
+}
+.xp-h {
+  margin: 0 0 6px; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+  font-weight: 700;
+}
+.xp-transfers p { margin: 0; font-size: 12.5px; }
+
+/* What the explorer changes (ST-M010-002): the buttons, the rename field, the
+ * queue, the questions, and where a drop goes. */
+.xp-actions {
+  display: flex; align-items: center; gap: 6px; padding: 6px 12px; flex: none; flex-wrap: wrap;
+  border-bottom: 1px solid var(--line); background: var(--bg);
+}
+.xp-actions .btn { display: inline-flex; align-items: center; gap: 6px; }
+.xp-actions .btn.danger-quiet:not(:disabled) { color: var(--bad-deep); }
+.xp-actions .btn.danger-quiet:not(:disabled):hover { background: var(--bad-soft); border-color: var(--bad-line); }
+.xp-rename {
+  flex: 1; min-width: 0; height: 22px; padding: 0 6px; font-size: 13px; color: var(--ink);
+  border: 1px solid var(--tech); border-radius: var(--r-sm); background: #fff;
+}
+.xp-rename:focus { outline: none; box-shadow: 0 0 0 2px var(--tech-line); }
+.xp-details { margin: 6px 0 0; padding: 0 0 0 18px; font-size: 12.5px; max-height: 140px; overflow: auto; }
+.xp-details code { overflow-wrap: anywhere; }
+.xp-details .more { list-style: none; margin-left: -18px; color: var(--muted); }
+.xp-menu li.sep { border-top: 1px solid var(--line-2); margin-top: 4px; padding-top: 4px; }
+.xp-drop {
+  position: absolute; inset: 6px; z-index: 5; display: grid; place-items: center; pointer-events: none;
+  border: 2px dashed var(--tech); border-radius: var(--r-md); background: rgba(238, 242, 255, 0.92);
+  color: var(--tech-deep); font-weight: 600; text-align: center; padding: 24px;
+}
+.xp-drop.no { border-color: var(--warn); background: rgba(255, 251, 235, 0.94); color: var(--warn); }
+.xp-drop p { margin: 0; max-width: 460px; }
+.xp-transfers-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.xp-transfers-head .xp-h { margin: 0; }
+.xp-queue-words { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); }
+.xp-transfers.queued { max-height: 42%; min-height: 132px; }
+.list.files.queue .it { padding: 6px 0; align-items: center; }
+.list.files.queue .it .file-text { flex: 1; }
+.q-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.q-line b { min-width: 0; overflow-wrap: anywhere; }
+.list.files.queue .it.failed .k,
+.list.files.queue .it.left_out .k,
+.list.files.queue .it.stopped .k { background: var(--bad-soft); border-color: var(--bad-line); color: var(--bad); }
+.list.files.queue .it.more { color: var(--muted); font-size: 12px; padding: 6px 0 6px 40px; }
+.list.files.queue .why { margin: 4px 0 0; font-size: 12.5px; color: var(--bad-deep); overflow-wrap: anywhere; }
+.list.files.queue .it.cancelled .why { color: var(--warn); }
+.list.files.queue code.path {
+  display: block; margin-top: 4px; font: 11.5px/1.45 var(--mono); color: var(--muted); overflow-wrap: anywhere;
+}
+.res.wait { color: var(--muted); }
+.xp-progress { display: block; width: 100%; max-width: 360px; height: 6px; margin-top: 6px; accent-color: var(--tech); }
+.xp-scrim {
+  position: absolute; inset: 0; z-index: 40; display: grid; place-items: center; padding: 24px;
+  background: rgba(15, 23, 42, 0.45);
+}
+.xp-dialog { max-width: 520px; width: 100%; max-height: 100%; overflow: auto; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35); }
+.xp-dialog h3 { margin: 0 0 10px; font-size: 17px; overflow-wrap: anywhere; }
+.xp-question-text p { margin: 0 0 8px; font-size: 13.5px; overflow-wrap: anywhere; }
+.xp-all { display: inline-flex; align-items: center; gap: 6px; margin: 4px 0 0; }
+.xp-all.on { background: var(--tech-soft); border-color: var(--tech-line); color: var(--tech-deep); font-weight: 600; }
+.xp-dialog .row.end { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.xp-dialog .row.end .btn { padding: 8px 14px; }
+
+/* Transfers and audit */
 .list.files .it { align-items: flex-start; }
 .list.files .k {
   width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center; flex: none;
@@ -214,6 +402,37 @@ table.audit tr.gap td { color: var(--warn); font-weight: 600; }
 .settings .card { display: flex; flex-direction: column; gap: 10px; }
 .settings .card p { margin: 0; }
 .settings .card .btn { align-self: flex-start; }
+
+/* Settings → Relay (ST-M007-011) */
+.relay-form { display: flex; flex-direction: column; gap: 14px; }
+.field { display: flex; flex-direction: column; gap: 5px; max-width: 560px; }
+.field > label, .field-label { font-weight: 600; font-size: 13.5px; }
+.field-input {
+  border: 1px solid #cbd5e1; border-radius: var(--r); padding: 8px 11px; font: 14px var(--mono);
+  color: var(--ink); background: #fff; min-width: 0;
+}
+.field-input::placeholder { color: var(--faint); }
+.field-input:focus-visible { outline: 2.5px solid var(--role); outline-offset: 1px; }
+.field .check { display: flex; gap: 8px; align-items: center; font-weight: 500; font-size: 13px; }
+.relay-ca { font-size: 13.5px; overflow-wrap: anywhere; }
+.relay-test:empty { display: none; }
+.relay-result { border: 1px solid var(--line); border-radius: var(--r-md); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.relay-result.bad { border-color: var(--bad-line); background: var(--bad-soft); }
+.relay-result .next { font-weight: 600; }
+.relay-unused { border-top: 1px solid var(--line); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.relay-example { margin: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); font: 12.5px var(--mono); overflow: auto; }
+/* Make a customer copy (ST-M007-016). */
+.copy-offer { border-top: 1px solid var(--line); padding-top: 12px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.copy-offer p { margin: 0; }
+.copy-step { border-top: 1px solid var(--line); padding-top: 12px; display: flex; flex-direction: column; gap: 14px; }
+.copy-step:focus { outline: none; }
+.copy-step h5 { margin: 0; font-size: 14px; }
+.copy-step p { margin: 0; }
+.copy-key-entry .field-input { flex: 1; min-width: 180px; }
+.copy-key-line { display: flex; flex-direction: column; gap: 6px; }
+.copy-key-line p { max-width: 560px; }
+.key-line { padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); font-size: 12.5px; overflow-wrap: anywhere; user-select: all; }
+.relay-where { overflow-wrap: anywhere; font-size: 12.5px; }
 
 /* ---------- Narrow windows ---------- */
 @media (max-width: 1000px) {

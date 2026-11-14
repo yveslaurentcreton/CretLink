@@ -309,6 +309,13 @@ pub async fn pump(
                     break;
                 };
                 session.set_technician_name(technician);
+                // A session through a relay whose connection was lost before
+                // full control says so, with the relay (ST-M007-013).
+                let event = crate::relay::name_lost_connection(
+                    event,
+                    handle.ended_by(),
+                    session.relay_named().as_deref(),
+                );
                 if is_terminal(&session) {
                     // A local emergency stop or decline already ended the model.
                     // Do not fold further wire events (a late `Active` could flip

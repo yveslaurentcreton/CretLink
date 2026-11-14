@@ -7,6 +7,16 @@
 /// Maximum encoded size of one wire frame (JSON payload), in bytes.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Maximum encoded size of one message that crosses a session, in bytes.
+///
+/// The secure channel sends a message in one Noise record: 65535 bytes, of
+/// which 16 are the authentication tag. Nothing splits a longer message, so a
+/// message whose encoding is longer cannot be sent at all. For everything that
+/// crosses a session this is the bound that holds, far below
+/// [`MAX_FRAME_BYTES`]. `cretlink-transport` asserts that it is the capacity
+/// of its record, so the two cannot drift apart.
+pub const MAX_RECORD_BYTES: usize = 65_519;
+
 /// Maximum byte length of an `Exec` command string.
 pub const MAX_COMMAND_BYTES: usize = 32 * 1024;
 
@@ -107,7 +117,9 @@ pub const MAX_NAME_BYTES: usize = 768;
 /// force an unbounded component walk.
 pub const MAX_PATH_DEPTH: usize = 64;
 
-/// Maximum number of directory entries returned in one `FsList` page.
+/// Maximum number of directory entries returned in one `FsList` page. A page
+/// of long names ends earlier: before the entry that would make its answer
+/// larger than [`MAX_RECORD_BYTES`] ([`crate::DirPage`], ST-M010-005).
 pub const MAX_DIR_PAGE: usize = 256;
 
 /// Maximum number of file-transfer operations the console keeps in flight at
@@ -138,6 +150,71 @@ pub const MAX_LABEL_BYTES: usize = 512;
 
 /// Length in bytes of a SHA-256 digest ([`crate::DigestAlgo::Sha256`]).
 pub const DIGEST_LEN: usize = 32;
+
+// --- Drives and folder removal (ADR-0012, ST-M010-001, minor 12) ---
+//
+// Every answer of the agent travels in one record of the secure channel
+// (about 64 KiB), so the two results below are bounded in number and in the
+// size of each text, and a full one stays well inside a record.
+
+/// Maximum number of drives in one [`crate::OpResult::Drives`]. A Windows
+/// target has at most 26 drive letters.
+pub const MAX_DRIVES: usize = 32;
+
+/// Maximum byte length of a drive's root path ([`crate::DriveEntry::root`]),
+/// such as `C:\`.
+pub const MAX_DRIVE_ROOT_BYTES: usize = 256;
+
+/// Maximum byte length of a drive's label ([`crate::DriveEntry::label`]). A
+/// volume label is at most 32 UTF-16 code units, which encode to at most 96
+/// UTF-8 bytes.
+pub const MAX_DRIVE_LABEL_BYTES: usize = 128;
+
+/// The most entries one [`crate::Operation::RemoveTree`] step meets: every
+/// entry it removes, every one it cannot remove, every one that is gone by
+/// the time it reaches for it, and every folder it enters. A step that
+/// reaches this bound answers and the caller asks for the next one, so one
+/// request never holds the agent for the whole of a large folder: between two
+/// steps the agent serves a stop from the customer, a revocation and every
+/// other request (REQ-S-004, REQ-N-006).
+pub const MAX_TREE_STEP_ENTRIES: u64 = 4096;
+
+/// How long one [`crate::Operation::RemoveTree`] step works before it answers,
+/// in milliseconds, once it has met an entry — whether or not it has removed
+/// anything. With [`MAX_TREE_STEP_ENTRIES`] this bounds how long a folder
+/// removal delays a stop or a cancellation by what it does itself, however
+/// many entries a program makes in the folder meanwhile. It is looked at
+/// between two entries and does not end a single request that the operating
+/// system keeps waiting.
+pub const MAX_TREE_STEP_MS: u64 = 1000;
+
+/// The deepest level below the folder being removed that
+/// [`crate::Operation::RemoveTree`] walks. A folder nested deeper is reported
+/// as not removed, never walked without bound.
+pub const MAX_TREE_DEPTH: usize = 256;
+
+// A step enters at most `MAX_TREE_DEPTH` folders on its way down, and each of
+// them counts as an entry it met. With room for more entries than that, a step
+// in a folder where nothing is in its way always removes something before its
+// entries run out, so a removal that is not hindered always gets further.
+const _: () = assert!(MAX_TREE_STEP_ENTRIES > MAX_TREE_DEPTH as u64);
+
+/// Maximum number of entries one [`crate::OpResult::TreeRemoval`] names as not
+/// removed: the first ones, each with its reason. The rest are counted in
+/// `failed_more`.
+pub const MAX_TREE_FAILURES: usize = 16;
+
+/// Maximum byte length of the path of one [`crate::TreeFailure`]. A longer
+/// path is cut on a character boundary and ends in `…`, so it is never taken
+/// for a whole one.
+pub const MAX_TREE_FAILURE_PATH_BYTES: usize = 1024;
+
+/// Maximum byte length of a `folder_id`: what identifies the folder being
+/// removed between two steps of one removal
+/// ([`crate::OpResult::TreeRemoval`], [`crate::Operation::RemoveTree`]). The
+/// agent chooses the bytes; the longest it has today is a volume serial number
+/// with a 128-bit file identifier.
+pub const MAX_FOLDER_ID_BYTES: usize = 32;
 
 // --- Interactive terminal (ADR-0013, ST-M003-009) ---
 

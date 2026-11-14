@@ -59,7 +59,8 @@ fn main() -> ExitCode {
 
 /// Runs a subcommand without a window, exactly as `cretlink-cli` does.
 /// `program` names the command in its texts: `cretlink`, or the file name of a
-/// `CretLink-Support*` copy, whose only subcommand is `recover` (ST-M009-010).
+/// `CretLink-Support*` copy, whose only subcommands are `recover` (ST-M009-010)
+/// and its own `uninstall` (ST-M009-017).
 fn subcommand(program: &str, args: Vec<String>) -> ExitCode {
     // Route panics to stderr only — never stdout, which may be the JSON-RPC
     // stream of `cretlink mcp`.

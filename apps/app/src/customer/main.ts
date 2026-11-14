@@ -140,6 +140,8 @@ function adoptView(next: ConsentView): void {
   const ended = after === "stopped" || after === "failed";
   const wasEnded = before === "stopped" || before === "failed";
   if (before !== undefined && ended && !wasEnded && !snap.hadControl) void browse();
+  // Once a session is over, keeping the program is offered again.
+  if (before !== undefined && ended && !wasEnded) void loadKeep();
 }
 
 // The end report is built once the session task's cleanup is in (bounded on
@@ -176,6 +178,16 @@ async function loadActivity(): Promise<void> {
   }
 }
 
+// What is kept on this computer, and what this window offers about it
+// (ST-M009-017). A backend that has no answer offers nothing.
+async function loadKeep(): Promise<void> {
+  try {
+    set({ keep: await api.getKeep() });
+  } catch {
+    set({ keep: null });
+  }
+}
+
 async function loadLaunch(): Promise<void> {
   try {
     set({ launch: await api.getLaunch() });
@@ -204,7 +216,9 @@ async function browse(): Promise<void> {
 async function viewCommand(
   busy: string,
   call: () => Promise<ConsentView>,
-  failure: Omit<UiError, "message">,
+  // What to say around the backend's message, or how to choose that from the
+  // refusal itself.
+  failure: Omit<UiError, "message"> | ((error: unknown) => Omit<UiError, "message">),
 ): Promise<void> {
   const startGen = pushGeneration;
   set({ busy, error: undefined });
@@ -213,7 +227,8 @@ async function viewCommand(
     if (pushGeneration === startGen) adoptView(next);
     set({ busy: undefined });
   } catch (error) {
-    set({ busy: undefined, error: { ...failure, message: describe(error) } });
+    const around = typeof failure === "function" ? failure(error) : failure;
+    set({ busy: undefined, error: { ...around, message: describe(error) } });
   }
 }
 
@@ -247,10 +262,34 @@ function connectCode(): void {
     });
     return;
   }
-  void viewCommand("connect", () => api.startLiveSession(code), {
-    title: "That code did not work",
-    next: "Check the code with your technician and type it again.",
-  });
+  void viewCommand("connect", () => api.startLiveSession(code), relayCodeFailure);
+}
+
+/**
+ * What to say around the backend's message when a typed code was not taken.
+ * A relay code is not a mistyped code: typing it again would not help
+ * (ST-M007-012). Why this copy cannot use it decides the next step
+ * (ST-M007-011).
+ */
+export function relayCodeFailure(error: unknown): Omit<UiError, "message"> {
+  const stage = isCommandError(error) ? error.stage : "";
+  switch (stage) {
+    case "relay":
+      return {
+        title: "This copy cannot use a relay code",
+        next: "Ask your technician for a copy of CretLink that is set up for their relay, or connect while you are on the same network.",
+      };
+    case "relay_profile":
+      return {
+        title: "The relay settings of this copy cannot be used",
+        next: "Tell your technician what this says and ask for a new copy of CretLink. You can still connect while you are on the same network.",
+      };
+    default:
+      return {
+        title: "That code did not work",
+        next: "Check the code with your technician and type it again.",
+      };
+  }
 }
 
 async function relaunch(): Promise<void> {
@@ -317,6 +356,99 @@ async function save(): Promise<void> {
         next: "Try again, or choose another folder.",
       },
     });
+  }
+}
+
+// --- Keeping the support program for next time (ST-M009-017) ---
+
+/** A refusal of the backend around keeping, in plain words with a next step. */
+function keepFailure(title: string, error: unknown, next: string): void {
+  set({ busy: undefined, error: { title, message: capitalise(describe(error)), next } });
+}
+
+/** **Keep CretLink Support on this computer**: shows what it adds first. */
+async function openKeep(): Promise<void> {
+  if (canStop(snap) || snap.busy !== undefined) return;
+  set({ busy: "keep-open", error: undefined });
+  try {
+    const plan = await api.keepPlan();
+    set({ busy: undefined, panel: { kind: "keep", plan }, keptNow: false });
+  } catch (error) {
+    keepFailure("CretLink Support cannot be kept from here", error, "Nothing was changed on this computer.");
+    void loadKeep();
+  }
+}
+
+/** Keeps the program as the plan on screen says, with the wish for a desktop shortcut. */
+async function confirmKeep(): Promise<void> {
+  if (snap.panel.kind !== "keep" || snap.busy !== undefined) return;
+  const desktop = live?.querySelector<HTMLInputElement>("#keep-desktop")?.checked === true;
+  const update = snap.panel.plan.replaces !== undefined;
+  set({ busy: "keep", error: undefined });
+  try {
+    const keep = await api.keepProgram(desktop);
+    set({
+      busy: undefined,
+      keep,
+      keptNow: true,
+      panel: { kind: "none" },
+      notice: update
+        ? "CretLink Support was updated on this computer."
+        : "CretLink Support is now kept on this computer. Next time, start it from the Start menu.",
+    });
+  } catch (error) {
+    // The plan was used up: the screen closes, and what is kept is asked again.
+    set({ panel: { kind: "none" } });
+    keepFailure(
+      "CretLink Support was not kept",
+      error,
+      "Look at what is on this computer below, then try again.",
+    );
+    void loadKeep();
+  }
+}
+
+/** **Remove from this computer**: shows what goes first. */
+async function openRemove(): Promise<void> {
+  if (canStop(snap) || snap.busy !== undefined) return;
+  set({ busy: "remove-open", error: undefined });
+  try {
+    const plan = await api.removePlan();
+    set({ busy: undefined, panel: { kind: "remove", plan } });
+  } catch (error) {
+    keepFailure("CretLink Support cannot be removed from here", error, "Nothing was changed on this computer.");
+    void loadKeep();
+  }
+}
+
+async function confirmRemove(): Promise<void> {
+  if (snap.panel.kind !== "remove" || snap.busy !== undefined) return;
+  set({ busy: "remove", error: undefined });
+  try {
+    const outcome = await api.removeProgram();
+    if (outcome.state === "elevating") {
+      // Windows asks; this window is closing.
+      set({ notice: "Windows asks for administrator rights. This window closes." });
+      return;
+    }
+    set({ busy: undefined, panel: { kind: "removed", outcome }, keptNow: false });
+    void loadKeep();
+  } catch (error) {
+    keepFailure(
+      "CretLink Support was not removed",
+      error,
+      "Close every CretLink window, then try again, or remove it in Installed apps of Windows.",
+    );
+    void loadKeep();
+  }
+}
+
+/** **Back**, and Escape: leaves the screen without changing anything. */
+function closePanel(): void {
+  if (snap.busy !== undefined) return;
+  if (snap.panel.kind === "keep" || snap.panel.kind === "remove") {
+    focusNext = '[data-key="keep-card"] button';
+    set({ panel: { kind: "none" }, error: undefined });
   }
 }
 
@@ -404,6 +536,21 @@ function onAction(event: ActionEvent): void {
     case "dismiss-error":
       set({ error: undefined });
       break;
+    case "keep-open":
+      void openKeep();
+      break;
+    case "keep-confirm":
+      void confirmKeep();
+      break;
+    case "remove-open":
+      void openRemove();
+      break;
+    case "remove-confirm":
+      void confirmRemove();
+      break;
+    case "panel-back":
+      closePanel();
+      break;
     default:
       break;
   }
@@ -420,6 +567,11 @@ function onKeydown(event: KeyboardEvent): void {
       stop();
     } else if (snap.confirmClose && !snap.closing) {
       set({ confirmClose: false });
+    } else if (snap.panel.kind === "keep" || snap.panel.kind === "remove") {
+      // Without a session, Escape leaves the keep or remove screen and
+      // changes nothing (ST-M009-017).
+      event.preventDefault();
+      closePanel();
     }
     return;
   }
@@ -488,6 +640,7 @@ export async function start(options: StartOptions = {}): Promise<void> {
     });
   }
   await loadLaunch();
+  if (snap.window === "main") await loadKeep();
   try {
     adoptView(await api.getView());
   } catch (error) {

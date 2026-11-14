@@ -66,6 +66,12 @@ pub(crate) const NOISE_MAX_MESSAGE_LEN: usize = 65535;
 /// Maximum plaintext a single Noise record can carry (message max minus tag).
 pub(crate) const NOISE_MAX_PLAINTEXT_LEN: usize = NOISE_MAX_MESSAGE_LEN - NOISE_TAG_LEN;
 
+// What builds an answer to fit one record (a folder page, ST-M010-005) cannot
+// see this crate, so it measures against the protocol's bound. The two are the
+// same number, or such an answer would be built for a record that is not this
+// one.
+const _: () = assert!(NOISE_MAX_PLAINTEXT_LEN == limits::MAX_RECORD_BYTES);
+
 /// Ciphertext-length ceiling enforced on a received frame before allocation: a
 /// full [`limits::MAX_FRAME_BYTES`] plaintext plus the Noise tag.
 pub const MAX_CIPHERTEXT_LEN: usize = limits::MAX_FRAME_BYTES + NOISE_TAG_LEN;

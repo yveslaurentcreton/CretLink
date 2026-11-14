@@ -964,6 +964,185 @@ async fn simulator_refuses_to_overwrite_a_committed_artifact() {
     }
 }
 
+// --- simulated drives and folder removal (ST-M010-001, ADR-0012) -----------
+
+/// Sends `op` on `framed` and returns the code of the error it is answered
+/// with, panicking on a response.
+async fn op_err(
+    framed: &mut Framed<DuplexStream>,
+    id: u64,
+    session: SessionId,
+    op: Operation,
+) -> ErrorCode {
+    framed
+        .send(&Message::Request {
+            origin: Origin::Console,
+            purpose: None,
+            id: RequestId(id),
+            session,
+            op,
+        })
+        .await
+        .unwrap();
+    match framed.recv().await.unwrap() {
+        Message::Error {
+            id: got,
+            code,
+            stage,
+            ..
+        } => {
+            assert_eq!(got, Some(RequestId(id)), "the error correlates");
+            assert_eq!(stage, ErrorStage::Execution);
+            code
+        }
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+/// Creates the folder `name` in the simulated staging area over the wire and
+/// returns where it really lies, so a test can put content in it.
+async fn staged_folder(
+    framed: &mut Framed<DuplexStream>,
+    session: SessionId,
+    name: &str,
+) -> std::path::PathBuf {
+    let created = op_ok(
+        framed,
+        1,
+        session,
+        Operation::CreateDir {
+            path: staging(name),
+        },
+    )
+    .await;
+    assert_eq!(created, OpResult::Ack {});
+    super::vfs_root(session)
+        .join(session.to_string())
+        .join(name)
+}
+
+#[tokio::test]
+async fn simulator_lists_the_drives_of_its_host() {
+    let (mut framed, session) = connect().await;
+    match op_ok(&mut framed, 1, session, Operation::FsDrives {}).await {
+        OpResult::Drives { drives } => {
+            assert!(!drives.is_empty(), "a computer has at least one drive");
+            // Off Windows the one drive is the root file system.
+            #[cfg(unix)]
+            assert_eq!(
+                drives.iter().map(|d| d.root.as_str()).collect::<Vec<_>>(),
+                ["/"]
+            );
+        }
+        other => panic!("expected drives, got {other:?}"),
+    }
+}
+
+/// The simulated target removes a folder with the real engine: everything in
+/// it goes, the folder goes, and the answer counts both.
+#[tokio::test]
+async fn simulator_removes_a_folder_with_its_content() {
+    use cretlink_protocol::TreeState;
+
+    let (mut framed, session) = connect().await;
+    let folder = staged_folder(&mut framed, session, "unpacked").await;
+    std::fs::create_dir(folder.join("drivers")).unwrap();
+    std::fs::write(folder.join("setup.exe"), b"setup").unwrap();
+    std::fs::write(folder.join("drivers").join("net.inf"), b"[Version]").unwrap();
+
+    let removed = op_ok(
+        &mut framed,
+        2,
+        session,
+        Operation::RemoveTree {
+            path: staging("unpacked"),
+            stop: false,
+            folder_id: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        removed,
+        OpResult::TreeRemoval {
+            state: TreeState::Removed,
+            removed_files: 2,
+            removed_dirs: 2,
+            failed: Vec::new(),
+            failed_more: 0,
+            folder_id: None,
+        }
+    );
+    assert!(!folder.exists(), "the folder is gone");
+
+    // What is not there cannot be removed, and the answer says so.
+    let code = op_err(
+        &mut framed,
+        3,
+        session,
+        Operation::RemoveTree {
+            path: staging("unpacked"),
+            stop: false,
+            folder_id: None,
+        },
+    )
+    .await;
+    assert_eq!(code, ErrorCode::PathNotFound);
+}
+
+/// A request that only ends a removal is answered as stopped and removes
+/// nothing; a file is not removed as a folder.
+#[tokio::test]
+async fn simulator_stops_a_removal_and_refuses_a_file() {
+    use cretlink_protocol::TreeState;
+
+    let (mut framed, session) = connect().await;
+    let folder = staged_folder(&mut framed, session, "kept").await;
+    std::fs::write(folder.join("a.txt"), b"a").unwrap();
+
+    let stopped = op_ok(
+        &mut framed,
+        2,
+        session,
+        Operation::RemoveTree {
+            path: staging("kept"),
+            stop: true,
+            folder_id: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        stopped,
+        OpResult::TreeRemoval {
+            state: TreeState::Stopped,
+            removed_files: 0,
+            removed_dirs: 0,
+            ..
+        }
+    ));
+    assert!(folder.join("a.txt").exists(), "nothing was removed");
+
+    stage(
+        &mut framed,
+        session,
+        "tool.zip",
+        b"not-a-folder",
+        CleanupPolicy::OnSessionEnd,
+    )
+    .await;
+    let code = op_err(
+        &mut framed,
+        3,
+        session,
+        Operation::RemoveTree {
+            path: staging("tool.zip"),
+            stop: false,
+            folder_id: None,
+        },
+    )
+    .await;
+    assert_eq!(code, ErrorCode::WrongPathKind);
+}
+
 // --- Interactive terminal grammar (ADR-0013, ST-M003-009) ---
 
 /// A `Request` carrying a terminal `op`, stamped with the technician-terminal

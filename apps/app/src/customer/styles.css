@@ -56,6 +56,13 @@ body {
 .note.dev { align-items: center; flex-wrap: wrap; }
 .note.dev > span { flex: 1 1 240px; }
 .note.info { border-color: var(--cust-line); background: var(--cust-soft); color: var(--cust-deep); }
+/* A session through the relay (ST-M007-013). */
+.cbody .relay-host { overflow-wrap: anywhere; }
+.cbody .relay-explained { max-width: 420px; margin: 0; }
+.cbody p.relay-trust { max-width: 420px; margin: 0; font-size: 12.5px; }
+.cbody .via-relay { margin: 0; }
+.cbody.center .via-relay { margin-top: 6px; }
+.note.relay-lost > span { flex: 1; }
 .spinner.lg { width: 28px; height: 28px; border-width: 3px; }
 .provenance { margin: -4px 0 0; font-size: 12px; }
 
@@ -228,3 +235,15 @@ html.mini-window body { background: transparent; overflow: hidden; }
 .mininow code { font: 12px var(--mono); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1 1 0; min-width: 0; }
 .mininow > .spacer { flex: 0 0 0; }
 .mininow .linkbtn { font-size: 12px; white-space: nowrap; }
+
+/* Keeping the support program for next time (ST-M009-017). */
+.keep-card { display: flex; flex-direction: column; gap: 8px; }
+.keep-card .row { align-items: flex-start; gap: 10px; }
+.keep-card .row.end { justify-content: flex-end; }
+.keep-card .btn { white-space: normal; text-align: left; }
+.keep-adds { display: flex; flex-direction: column; gap: 10px; }
+.keep-adds .adds, .plain-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.plain-list li { font-size: 13px; overflow-wrap: anywhere; }
+.keep-adds code.path, .kept-on-purpose code.path { overflow-wrap: anywhere; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 13.5px; cursor: pointer; }
+.check input { width: 16px; height: 16px; margin: 0; }

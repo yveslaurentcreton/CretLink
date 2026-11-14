@@ -13,9 +13,31 @@ import type {
   AppInfo,
   AuditEntryView,
   BridgeStatus,
+  ChosenCa,
+  ChosenFolder,
   ClientId,
+  ConflictChoice,
+  DeleteReport,
+  ExplorerDrive,
+  ExplorerEntryKind,
+  ExplorerListing,
   ListenNetwork,
+  RelayForm,
+  ChosenForCopy,
+  CustomerCopyForm,
+  CustomerCopyMade,
+  CustomerCopyOptions,
+  GeneratedKey,
+  RelaySettings,
+  RelayTest,
+  RelayTrust,
+  UninstallPlan,
   SessionSummary,
+  TransferCheck,
+  TransferEntry,
+  TransferKind,
+  TransferQueued,
+  UploadOffer,
 } from "../shared/contract";
 
 export type DiscoverySource = "discovered" | "manual" | "simulated";
@@ -70,13 +92,37 @@ export type SessionPhase =
   | { phase: "full_control" }
   | { phase: "stopping" }
   | { phase: "stopped"; reason: StopReason }
-  | { phase: "failed"; stage: string; message: string };
+  // `next` is what to do about the failure, when the failure has a next step
+  // of its own (ST-M007-013): a relay that cannot be reached is put right in
+  // another way than a key the relay refuses.
+  | { phase: "failed"; stage: string; message: string; next?: string };
+
+// The relay a session waits on or runs through (ST-M007-013, ADR-0016). A
+// label for the screens: the relay only passes the encrypted session on. In
+// the `listening` phase with a relay, `code` is the relay code the technician
+// reads aloud and `address` is where the relay is reached; `admitted` says
+// whether the relay holds that code yet.
+//
+// `host` is the name the relay's certificate carries, `address` is where
+// this copy connects, and `trust` is what vouches for the name. A screen
+// shows the address beside the name when its host is another one, and says
+// when the certificate is checked against a file of the profile
+// (`shared/relay.ts`).
+export interface RelayRoute {
+  host: string;
+  address: string;
+  trust: RelayTrust;
+  admitted: boolean;
+}
 
 export interface ConsoleState {
   technician: TechnicianHost;
   targets: DiscoveredTarget[];
   selected?: string;
   session?: string;
+  // Absent for a session on one network. It stays after the session has
+  // ended, until the console waits again.
+  relay?: RelayRoute;
   phase: SessionPhase;
 }
 
@@ -106,6 +152,21 @@ export interface TerminalFrame {
 export interface CommandError {
   stage: string;
   message: string;
+}
+
+// A selected entry of the open folder, for a copy to this computer: its
+// name, and what the listing showed it as. The backend finds out what it is
+// from a listing of its own.
+export interface TransferName {
+  name: string;
+  kind: TransferKind;
+}
+
+// A selected entry of the open folder, for a delete: its name and the kind
+// the listing gave, which chooses how it is removed.
+export interface DeleteItem {
+  name: string;
+  kind: ExplorerEntryKind;
 }
 
 export function isCommandError(value: unknown): value is CommandError {
@@ -139,6 +200,13 @@ export const api = {
   listenNetworks: () => invoke<ListenNetwork[]>("get_listen_networks"),
   switchListenNetwork: (address: string) =>
     invoke<ConsoleState>("switch_listen_network", { address }),
+  // **Use relay** on the waiting screen (ST-M007-013): stops waiting on the
+  // network and waits for the customer on the relay of this copy, with a new
+  // relay code. Answers the new waiting state; that the relay holds the code,
+  // or why it cannot be used, then arrives as `console-state`. Rejects with
+  // the stage `relay_none` or `relay_profile` when this copy has no relay
+  // that can be used.
+  useRelay: () => invoke<ConsoleState>("use_relay"),
   // Interactive terminal panel (ST-M008-001). All four fail closed with
   // `no_consented_session` when no session is under full control — the panel
   // never fabricates a shell. `open_terminal` streams output on the
@@ -152,6 +220,51 @@ export const api = {
   termResize: (term: number, cols: number, rows: number) =>
     invoke<void>("term_resize", { term, cols, rows }),
   termClose: (term: number) => invoke<void>("term_close", { term }),
+  // The file explorer of the live session (ST-M010-002). Both fail closed
+  // with `no_consented_session` outside full control. `explorer_open` takes
+  // a path on the customer computer and a number for this listing; the folder
+  // arrives on the `"console-explorer"` event, and the answer says how the
+  // listing ended. A place that is refused rejects, and nothing arrives.
+  explorerDrives: () => invoke<ExplorerDrive[]>("explorer_drives"),
+  explorerOpen: (path: string, listing: number) =>
+    invoke<ExplorerListing>("explorer_open", { path, listing }),
+  // What the explorer sends, copies, renames and deletes (ST-M010-002). All
+  // fail closed with `no_consented_session` outside full control, except the
+  // four that only look at what the backend holds: the queue, a cancel, and
+  // the folder of a copy. A folder is a path on the customer computer; no
+  // command takes a path of this computer: files to send are named by the
+  // number of an offer, and a folder to copy to by the number it was chosen
+  // under.
+  explorerPickUpload: (kind: "files" | "folder") =>
+    invoke<UploadOffer | null>("explorer_pick_upload", { kind }),
+  explorerSendCheck: (offer: number, folder: string) =>
+    invoke<TransferCheck>("explorer_send_check", { offer, folder }),
+  explorerSend: (offer: number, folder: string, choices: Record<string, ConflictChoice>) =>
+    invoke<TransferQueued>("explorer_send", { offer, folder, choices }),
+  explorerChooseFolder: () => invoke<ChosenFolder | null>("explorer_choose_folder"),
+  explorerDownloadCheck: (names: TransferName[], to?: number) =>
+    invoke<TransferCheck>("explorer_download_check", to === undefined ? { names } : { names, to }),
+  explorerDownload: (
+    folder: string,
+    names: TransferName[],
+    to: number | undefined,
+    choices: Record<string, ConflictChoice>,
+  ) =>
+    invoke<TransferQueued>(
+      "explorer_download",
+      to === undefined ? { folder, names, choices } : { folder, names, to, choices },
+    ),
+  explorerTransfers: () => invoke<TransferEntry[]>("explorer_transfers"),
+  explorerCancelTransfer: (transfer: number) =>
+    invoke<void>("explorer_cancel_transfer", { transfer }),
+  explorerCancelTransfers: () => invoke<void>("explorer_cancel_transfers"),
+  explorerShowFolder: (transfer: number) => invoke<void>("explorer_show_folder", { transfer }),
+  explorerRename: (folder: string, name: string, to: string) =>
+    invoke<void>("explorer_rename", { folder, name, to }),
+  explorerDelete: (folder: string, items: DeleteItem[], removal: number) =>
+    invoke<DeleteReport>("explorer_delete", { folder, items, removal }),
+  explorerCancelDelete: (removal: number) =>
+    invoke<void>("explorer_cancel_delete", { removal }),
 
   // The interfaces of ST-M009-008, ST-M009-006 and ST-M009-012. A command
   // the backend does not offer yet rejects; the controller then shows the
@@ -173,8 +286,33 @@ export const api = {
   // Without a session: opens the audit folder; with one: that session's file.
   openAudit: (session?: string) =>
     invoke<void>("open_audit", session === undefined ? {} : { session }),
-  uninstallPlan: () => invoke<string[]>("uninstall_plan"),
+  uninstallPlan: () => invoke<UninstallPlan>("uninstall_plan"),
   uninstallApp: () => invoke<void>("uninstall_app"),
+  // Settings → Relay (ST-M007-011). Only the installed copy keeps a relay;
+  // `save_relay` and `remove_relay` refuse in a copy that runs once. The
+  // certificate authority file is chosen in the system's dialog, opened by
+  // the backend. `test_relay` reaches the relay of the form as it stands,
+  // or without a form the one this copy uses, and saves nothing.
+  relaySettings: () => invoke<RelaySettings>("get_relay_settings"),
+  chooseRelayCa: () => invoke<ChosenCa | null>("choose_relay_ca"),
+  saveRelay: (form: RelayForm) => invoke<RelaySettings>("save_relay", { form }),
+  testRelay: (form?: RelayForm) =>
+    invoke<RelayTest>("test_relay", form === undefined ? {} : { form }),
+  removeRelay: () => invoke<RelaySettings>("remove_relay"),
+
+  // Make a customer copy (ST-M007-016), from Settings → Relay: a folder with
+  // the support program and the `cretlink.toml` of this copy's relay with the
+  // customer's key. The program and the place are chosen in dialogs of the
+  // system, opened by the backend, and named here by a number. A generated
+  // key comes back once, to show the line for the relay's key file. Nothing
+  // is sent anywhere: the folder is written and can be shown.
+  customerCopyOptions: () => invoke<CustomerCopyOptions>("customer_copy_options"),
+  chooseCustomerProgram: () => invoke<ChosenForCopy | null>("choose_customer_program"),
+  chooseCustomerPlace: () => invoke<ChosenForCopy | null>("choose_customer_place"),
+  generateCustomerKey: () => invoke<GeneratedKey>("generate_customer_key"),
+  makeCustomerCopy: (form: CustomerCopyForm) =>
+    invoke<CustomerCopyMade>("make_customer_copy", { form }),
+  showCustomerCopy: (copy: number) => invoke<void>("show_customer_copy", { copy }),
 };
 
 // The Tauri event name the backend emits a whole `ConsoleState` on during a
@@ -190,6 +328,25 @@ export const CONSOLE_ACTIVITY_EVENT = "console-activity";
 // The local MCP bridge's status for the rail (ST-M009-008): one
 // `BridgeStatus` of the shared contract per change.
 export const CONSOLE_BRIDGE_EVENT = "console-bridge";
+
+// The pages of a folder the file explorer opened (ST-M010-002): one
+// `ExplorerEvent` of the shared contract per step of a listing.
+export const CONSOLE_EXPLORER_EVENT = "console-explorer";
+
+// What the technician dropped on the window (ST-M010-002): one `UploadOffer`
+// of the shared contract. The paths stay in the backend.
+export const CONSOLE_EXPLORER_DROP_EVENT = "console-explorer-drop";
+
+// The transfer queue's changes (ST-M010-002): one `TransfersEvent` each.
+export const CONSOLE_TRANSFERS_EVENT = "console-transfers";
+
+// Where a delete stands (ST-M010-002): one `RemovalProgress` each.
+export const CONSOLE_REMOVAL_EVENT = "console-removal";
+
+// Something the technician should know that is not the failure of a command
+// (ST-M007-011): one `ConsoleNotice` of the shared contract, shown in the
+// window's alert.
+export const CONSOLE_NOTICE_EVENT = "console-notice";
 
 // The raw terminal frame channel (ST-M008-001). Distinct again so high-frequency
 // VT output never re-renders state or the activity feed; the terminal panel

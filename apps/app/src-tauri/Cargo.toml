@@ -56,6 +56,10 @@ cretlink-protocol = { path = "../../../crates/protocol" }
 # (ST-M002-009).
 cretlink-session = { path = "../../../crates/session" }
 cretlink-discovery = { path = "../../../crates/discovery" }
+# The reasons a relay gives when it refuses a connection, which each get words
+# of their own (ST-M007-011). The application reaches a relay only through
+# the dialers of `cretlink-session`.
+cretlink-relay = { path = "../../../crates/relay" }
 # The same-user local IPC endpoint the MCP bridge dials. The technician role
 # binds `IpcEndpoint::user_default()`, so the application is the single
 # consented session the bridge and the technician terminal route through
@@ -68,8 +72,9 @@ tauri = { version = "2", features = [] }
 # The pumps run on Tauri's own runtime (`tauri::async_runtime`) and `select!`
 # the live handle against the intent channels; `time` bounds the teardown of the
 # audit service and IPC server (ST-M004-007); `rt-multi-thread` runs the
-# subcommands before any window exists.
-tokio = { version = "1", features = ["macros", "sync", "time", "rt-multi-thread"] }
+# subcommands before any window exists; `net` finds the addresses of a relay's
+# host name (ST-M007-011).
+tokio = { version = "1", features = ["macros", "net", "sync", "time", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 # The native save dialog of the customer's "Save a copy" (ST-M009-012), called
 # from Rust only, so the frontend gets no dialog permission. MIT; the same
@@ -81,6 +86,24 @@ rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
 [dev-dependencies]
 # The contract shape of the ST-M009-006 commands is checked as JSON.
 serde_json = "1"
+# A relay with TLS inside the test process (ST-M007-011, ST-M007-013): the
+# real relay server over a loopback port, with a certificate that is minted
+# for the run (`test-cert`; no key material is committed, REQ-N-017) and
+# written as the PEM file a relay profile names.
+cretlink-relay-server = { path = "../../relay-server" }
+cretlink-wss = { path = "../../../crates/wss", features = ["test-cert"] }
+base64 = "0.23"
+
+# A real WebView2 in a test, with the profile folder the elevated customer
+# window chooses (ST-M009-014, `src/profile/webview2.rs`): the bindings that
+# the webview library uses already, in the versions locked for it.
+[target.'cfg(windows)'.dev-dependencies]
+webview2-com = "0.38"
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [lints.rust]
 unsafe_code = "deny"

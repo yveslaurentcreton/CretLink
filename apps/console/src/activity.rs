@@ -9,18 +9,37 @@
 //! - [`Actor::Mcp`]: every AI tool call, including read-only ones, with the AI
 //!   client's label ([`client_label`]) and its stated purpose;
 //! - [`Actor::Terminal`]: the technician terminal opening and closing;
-//! - [`Actor::Console`]: manual console commands and cancellations.
+//! - [`Actor::Console`]: manual console commands and cancellations, and the
+//!   technician's own file actions — the drive list, the listing of a folder,
+//!   the removal of a folder with its content, a file sent into a folder, a
+//!   file copied to the technician computer, and the changes to one entry
+//!   (ST-M010-001, ST-M010-002).
 //!
 //! A call's `_start` record opens a running item and its completion record
-//! (sharing the `call_id`, or the `job_id` for a manual command) updates the
-//! same item in place with the honest state and the duration. Session
+//! (sharing the `call_id`, the `job_id` for a manual command, or the
+//! `action_id` for a file action of the technician) updates the same item in
+//! place with the honest state and the duration. Session
 //! lifecycle records (pairing, consent, cleanup) and purely local registry
 //! records (a terminal consumer attaching) are not actions on the customer
 //! computer and produce no item.
+//!
+//! # The technician's looks are one item (ST-M010-002)
+//!
+//! The drive list and the listing of a folder are how the technician looks
+//! through the customer computer's files in the explorer. Here, as on the
+//! customer's side, they are one item that follows along
+//! ([`ActivityFeed::look`]), not one for each folder: a look that the
+//! customer computer answered moves that item on to the folder it listed.
+//! Its start record shows nothing yet. A look the technician left for another
+//! place shows nothing either, since the next one is shown. A look that
+//! failed, or whose session was lost, is a failed item of its own, as on the
+//! customer's side, and is never replaced by a later look (REQ-N-008).
 
 use std::collections::HashMap;
 
-use cretlink_session::activity::{SESSION_ENDED, UNKNOWN_RESULT, describe};
+use cretlink_session::activity::{
+    LOOK_AT_DRIVES, SESSION_ENDED, UNKNOWN_RESULT, describe, look_at_folder,
+};
 use cretlink_session::{ActivityEntry, ActivityFeed, ActivityItem, ActivityKind, ActivitySource};
 use cretlink_session::{ActivityState, MAX_ACTION_DESCRIPTION_CHARS};
 use cretlink_shared::{Actor, AuditArgs, AuditRecord, AuditValue, Outcome, format_rfc3339_millis};
@@ -135,6 +154,26 @@ impl TechnicianActivity {
         // A start record that already failed (a manual command the runtime
         // refused to start) is a one-shot completion: nothing is running.
         let is_start = is_start && entry.outcome == Outcome::Ok;
+        // A look of the technician through the explorer: one item that
+        // follows along (see the module documentation).
+        if entry.actor == Actor::Console && matches!(base, "console_fs_drives" | "console_fs_list")
+        {
+            if is_start {
+                return None;
+            }
+            match entry.outcome {
+                Outcome::Ok => {
+                    let path = (base == "console_fs_list")
+                        .then(|| arg_text(entry, "path").map(|path| path_text(&path)))
+                        .flatten();
+                    return self.feed.look(action.operation, path, now_unix_millis);
+                }
+                // Left for another place, which is the look that is shown.
+                Outcome::Cancelled => return None,
+                // Failed or not known: an item of its own, below.
+                Outcome::Failed | Outcome::Timeout | Outcome::Unknown => {}
+            }
+        }
         let id = self.id_for(entry, base, is_start)?;
         let purpose = (action.source == ActivitySource::Ai)
             .then(|| arg_text(entry, "purpose"))
@@ -228,12 +267,20 @@ impl TechnicianActivity {
     }
 
     /// The item id of one record: the console-minted `call_id` of a routed
-    /// call, the `job_id` of a manual command, or a fresh local id for a
-    /// one-shot completion record. A start record without a correlation id
-    /// cannot be paired with its completion and produces no item.
+    /// call, the `action_id` of a file action of the technician, the `job_id`
+    /// of a manual command, or a fresh local id for a one-shot completion
+    /// record. A start record without a correlation id cannot be paired with
+    /// its completion and produces no item.
     fn id_for(&mut self, entry: &RecordView<'_>, base: &str, is_start: bool) -> Option<String> {
         if let Some(call) = arg_u64(entry, "call_id") {
             return Some(format!("call-{call}"));
+        }
+        // A technician action is numbered apart from the routed calls, so the
+        // two never share an item (ST-M010-001).
+        if entry.actor == Actor::Console
+            && let Some(action) = arg_u64(entry, "action_id")
+        {
+            return Some(format!("action-{action}"));
         }
         // A manual command's start and finish share its job id.
         if entry.actor == Actor::Console
@@ -296,6 +343,59 @@ fn action_of(entry: &RecordView<'_>, base: &str) -> Option<Action> {
                 "console_cancel" => (
                     ActivityKind::JobControl,
                     format!("stop job {}", arg(entry, "job_id")),
+                ),
+                // The technician's file explorer (ST-M010-001), in the words
+                // the customer's own feed uses for the same actions.
+                "console_fs_drives" => (ActivityKind::FileOperation, LOOK_AT_DRIVES.to_owned()),
+                // A folder listed for the explorer (ST-M010-002).
+                "console_fs_list" => (
+                    ActivityKind::FileOperation,
+                    look_at_folder(&path_text(&arg(entry, "path"))),
+                ),
+                "console_remove_tree" => (
+                    ActivityKind::FileOperation,
+                    format!(
+                        "delete the folder {} and everything in it",
+                        path_text(&arg(entry, "path"))
+                    ),
+                ),
+                "console_send" => (
+                    ActivityKind::FileReceived,
+                    format!(
+                        "copy a file to the customer computer at {}",
+                        path_text(&arg(entry, "path"))
+                    ),
+                ),
+                // What the explorer does besides (ST-M010-002): a copy to the
+                // technician computer in the words of the AI's download, and
+                // each change to one entry in the words the customer's own
+                // feed has for it.
+                "console_download" => (
+                    ActivityKind::FileSent,
+                    format!(
+                        "copy the file {} from the customer computer",
+                        path_text(&arg(entry, "path"))
+                    ),
+                ),
+                "console_fs_stat" => (
+                    ActivityKind::FileOperation,
+                    format!("look up {}", path_text(&arg(entry, "path"))),
+                ),
+                "console_make_dir" => (
+                    ActivityKind::FileOperation,
+                    format!("create the folder {}", path_text(&arg(entry, "path"))),
+                ),
+                "console_move" => (
+                    ActivityKind::FileOperation,
+                    format!(
+                        "move {} to {}",
+                        path_text(&arg(entry, "path")),
+                        path_text(&arg(entry, "to"))
+                    ),
+                ),
+                "console_delete" => (
+                    ActivityKind::FileOperation,
+                    format!("delete the file {}", path_text(&arg(entry, "path"))),
                 ),
                 // Lifecycle records (pairing, compare, consent, revoke) are
                 // session events, not actions on the customer computer.

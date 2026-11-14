@@ -1,15 +1,16 @@
 // The live session (`#t-live`, ST-M009-008): an always-visible full-control
 // band, the target identity, Stop (Escape), the Overview / Terminal / Files /
 // Audit tabs and a rail with the AI clients and the activity feed
-// (REQ-F-006, REQ-F-016, REQ-F-017, REQ-F-018).
+// (REQ-F-006, REQ-F-016, REQ-F-017, REQ-F-018). The Files tab is the file
+// explorer (`./explorer`, ST-M010-002).
 //
 // All four tab panels are always rendered and the inactive ones hidden, so the
 // embedded terminal (owned by the controller inside `data-keep` slots) lives
 // across tab switches, and the feed keeps its scroll position.
 
-import type { ActivityEntry } from "../../shared/contract";
 import { h } from "../../shared/dom";
 import { type IconName, icon } from "../../shared/icons";
+import { relayLabel, trustFact } from "../../shared/relay";
 import { selectedIsSimulated } from "../api";
 import {
   type LiveTab,
@@ -18,7 +19,6 @@ import {
   auditActorWords,
   auditOutcomeWords,
   currentTarget,
-  formatBytes,
   formatClock,
   formatTime,
   plural,
@@ -27,7 +27,8 @@ import {
   targetName,
   technicianName,
 } from "../model";
-import { button, feedList, kv, pill, resultBadge, whoChip } from "./common";
+import { button, feedList, kv, pill } from "./common";
+import { explorerPanel } from "./explorer";
 
 const TABS: ReadonlyArray<{ tab: LiveTab; label: string; icon: IconName }> = [
   { tab: "overview", label: "Overview", icon: "gauge" },
@@ -62,6 +63,17 @@ export function liveView(s: TechnicianSnapshot): HTMLElement {
         { class: "sess-id" },
         h("h2", { class: "host" }, host),
         h("div", { class: "meta" }, identityLine(s)),
+        // Which way the session goes, when it is not on one network
+        // (ST-M007-013).
+        s.console.relay
+          ? h(
+              "div",
+              { class: "meta via-relay-line", id: "session-relay" },
+              "Through the relay ",
+              relayLabel(s.console.relay),
+              " · it only passes encrypted traffic on",
+            )
+          : null,
       ),
       target?.simulated || simulated ? pill("wait", "Simulated target") : null,
       h("span", { class: "spacer" }),
@@ -110,7 +122,7 @@ export function liveView(s: TechnicianSnapshot): HTMLElement {
         ),
         panel("overview", s, overviewPanel(s)),
         panel("terminal", s, terminalPanel(s)),
-        panel("files", s, filesPanel(s)),
+        panel("files", s, explorerPanel(s)),
         panel("audit", s, auditPanel(s)),
         statusBar(s),
       ),
@@ -195,6 +207,12 @@ function overviewPanel(s: TechnicianSnapshot): HTMLElement {
             ["Agent", target.agent_version],
             ["Session", shortId(id)],
             ["Since", formatTime(s.last?.since)],
+            s.console.relay
+              ? ["Connection", ["Through the relay ", relayLabel(s.console.relay)]]
+              : ["Connection", "On this network"],
+            // What vouches for the relay's name, when it is not the
+            // system's authorities (ST-M007-011).
+            s.console.relay ? trustFact(s.console.relay) : null,
           ])
         : h("p", { class: "muted" }, "The customer computer has not reported its identity."),
     ),
@@ -230,53 +248,6 @@ function terminalPanel(s: TechnicianSnapshot): HTMLElement {
       "Keystrokes run on the customer computer. Press Esc to stop the session.",
     ),
   );
-}
-
-function fileEntries(s: TechnicianSnapshot): ActivityEntry[] {
-  return s.activity.filter(
-    (e) => e.entry === "item" && (e.item.kind === "file_sent" || e.item.kind === "file_received"),
-  );
-}
-
-function filesPanel(s: TechnicianSnapshot): HTMLElement {
-  const files = fileEntries(s);
-  if (files.length === 0) {
-    return h(
-      "div",
-      { class: "pane-body" },
-      h("p", { class: "muted" }, "No files were sent or received in this session."),
-    );
-  }
-  const rows = h("ul", { class: "list files" });
-  for (let i = files.length - 1; i >= 0; i -= 1) {
-    const entry = files[i];
-    if (!entry || entry.entry !== "item") continue;
-    const item = entry.item;
-    const sent = item.kind === "file_sent";
-    rows.append(
-      h(
-        "li",
-        { class: sent ? "it out" : "it", "data-key": `f-${item.id}` },
-        h("span", { class: sent ? "k out" : "k" }, icon(sent ? "out" : "in")),
-        h(
-          "div",
-          { class: "file-text" },
-          h("b", { class: "mono" }, item.path ?? item.operation),
-          h(
-            "div",
-            { class: "m" },
-            sent
-              ? h("span", { class: "flag" }, "Sent · left the customer computer")
-              : h("span", { class: "who sys" }, "Received · arrived on the customer computer"),
-            item.bytes !== undefined ? h("span", null, formatBytes(item.bytes)) : null,
-            whoChip(item),
-            resultBadge(item, s.now),
-          ),
-        ),
-      ),
-    );
-  }
-  return h("div", { class: "pane-body" }, rows);
 }
 
 // This session's audit records (ST-M009-008): every record of its audit log,

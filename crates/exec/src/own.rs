@@ -2,7 +2,8 @@
 //! (ST-M006-020, REQ-S-024).
 //!
 //! The customer-side program keeps a staging area and a store of reboot
-//! tickets. When it runs with administrator rights it acts with those rights
+//! tickets, and its window keeps the profile of its webview
+//! ([`OwnFolder::webview_for_this_process`], ST-M009-014). When it runs with administrator rights it acts with those rights
 //! on what lies there: a cleanup removes the files a manifest names, and a
 //! staged tool is run. A program of an account without rights must therefore
 //! never have been able to put anything there or to open anything there.
@@ -62,6 +63,19 @@
 //! ([`administrators_own`]): every account can make that folder again and
 //! move into it what it may move but not remove.
 //!
+//! # The support program that a customer keeps (ST-M009-017)
+//!
+//! A customer can keep the support program on the computer. It asks for
+//! administrator rights every time it is started, so it must lie where a
+//! program without those rights cannot replace it: `CretLink Support` in the
+//! same `Program Files` ([`kept_program_folder`]). Its folder is made like
+//! the private ones, with its owner and its permissions in one step, or found
+//! to be such a folder already, and never made so afterwards
+//! ([`prepare_program_folder`]). Its permissions differ in one point: every
+//! account may read the folder and start the program in it, because the
+//! program is started without administrator rights and asks for them itself.
+//! Nobody but the administrators and the system can change anything there.
+//!
 //! Off Windows the agent is a development and test tool that is never elevated
 //! on a customer computer: every place is the account's own.
 
@@ -80,6 +94,14 @@ use std::sync::{Mutex, PoisonError};
 )]
 const PRIVATE_DATA_FOLDER: &str = "CretLink Data";
 
+/// The folder of the support program that a customer keeps, in
+/// `Program Files` (ST-M009-017).
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only a Windows computer has a place of this kind")
+)]
+const KEPT_PROGRAM_FOLDER: &str = "CretLink Support";
+
 /// The folder of an unelevated program's own files, in the account's local
 /// application data, and the folder that releases up to 0.24.0 used.
 const DATA_FOLDER: &str = "CretLink";
@@ -89,6 +111,10 @@ const STAGING_FOLDER: &str = "staging";
 
 /// The store of reboot tickets inside the data folder.
 const TICKETS_FOLDER: &str = "reboot-resume";
+
+/// The webview profiles of an elevated program, inside its private data
+/// folder (ST-M009-014).
+const WEBVIEW_FOLDER: &str = "webview";
 
 /// The private folders this process has already prepared, so that an
 /// operation that needs one does not open and check it again every time.
@@ -164,6 +190,17 @@ impl OwnFolder {
         Self::of_this_process(TICKETS_FOLDER)
     }
 
+    /// The folder in which an elevated program keeps the profiles of its
+    /// webview (ST-M009-014): `webview` in `CretLink Data`, private like the
+    /// staging area. `None` for a process without administrator rights,
+    /// whose profiles lie in the temporary folder of its account, and off
+    /// Windows.
+    #[must_use]
+    pub fn webview_for_this_process() -> Option<Self> {
+        let folder = Self::of_this_process(WEBVIEW_FOLDER);
+        folder.private.then_some(folder)
+    }
+
     fn of_this_process(name: &str) -> Self {
         let (root, private) = sys::data_root();
         Self {
@@ -217,6 +254,13 @@ impl OwnFolder {
     #[must_use]
     pub fn is_private(&self) -> bool {
         self.private
+    }
+
+    /// The outermost folder that is CretLink's own: this folder, or the
+    /// folder above it from which everything is private.
+    #[must_use]
+    pub fn outermost(&self) -> &Path {
+        self.root.as_deref().unwrap_or(&self.path)
     }
 
     /// Whether anything stands where the outermost folder of this one
@@ -372,6 +416,51 @@ pub fn administrators_folder() -> Option<PathBuf> {
     sys::administrators_folder()
 }
 
+/// The folder of the support program that a customer chose to keep
+/// (ST-M009-017): `CretLink Support` in `Program Files` on the drive of the
+/// Windows folder, which the system names. `None` off Windows, and when
+/// `Program Files` is not one of the system's own folders: then no program is
+/// kept.
+#[must_use]
+pub fn kept_program_folder() -> Option<PathBuf> {
+    sys::kept_program_folder()
+}
+
+/// Makes `folder` a folder that only administrators can change and from
+/// which every account can read and start a program (ST-M009-017): the folder
+/// of a program that asks for administrator rights when it is started.
+///
+/// The folder is created with its owner and these permissions in one step.
+/// A folder that is already there is opened without following a link, and
+/// through that one handle its kind, its owner and its permissions are read:
+/// it must be such a folder of the administrators already. Nothing is put
+/// right afterwards, for the reason the module documentation gives. The
+/// folder that holds `folder` must be one that only administrators can
+/// write.
+///
+/// Blocking: it works on the file system.
+///
+/// # Errors
+///
+/// When this process is not an administrator; when a link, a file, a folder
+/// of another owner or a folder with other permissions stands under the
+/// name; or when the folder cannot be created or opened. Nothing may be put
+/// into the folder then.
+pub fn prepare_program_folder(folder: &Path) -> io::Result<()> {
+    sys::require_administrator()?;
+    sys::make_program_folder(folder)
+}
+
+/// Fails unless this process acts as a member of the administrators. Off
+/// Windows, where the agent is a development and test tool, it never fails.
+///
+/// # Errors
+///
+/// When this process is not an administrator, or that cannot be told.
+pub fn require_administrator() -> io::Result<()> {
+    sys::require_administrator()
+}
+
 /// The folder in which releases up to 0.24.0 kept the staging area and the
 /// reboot tickets: `CretLink` under the machine's application data, where
 /// every account could create files and folders. `None` off Windows, and for
@@ -425,6 +514,79 @@ pub(crate) fn this_process_is_elevated() -> bool {
     sys::elevated()
 }
 
+/// Opens the profile folder of an elevated window's webview at `dir` to the
+/// account whose desktop the window is shown on (ST-M009-014, REQ-S-024).
+///
+/// WebView2 does not run its browser with administrator rights: when the
+/// program that hosts it is elevated, it starts its browser through the
+/// desktop's shell (Explorer), with the unelevated token of the account that
+/// is signed in at the desktop. In that token the administrators are a group
+/// that refuses and never grants, so the browser cannot enter a private
+/// folder, which admits only the administrators and the system: Microsoft
+/// Edge WebView2 then says it "can't read and write to its data directory",
+/// and the window stays empty. After a consent elevation that account is the
+/// one the program runs as; after an elevation with another administrator's
+/// password it is the standard account at the keyboard.
+///
+/// So the folder, made private in `webview` in `CretLink Data` with the lock
+/// of its process already in it, gets permissions of its own
+/// (`webview_profile_descriptor`): the administrators and the system keep
+/// full control, and the account of the desktop may read the folder and make
+/// files and folders in it, with full control over what is made there. It may
+/// not remove or rename the folder, nor change its permissions or its owner,
+/// and it can put nothing into `webview` itself: the path of the folder stays
+/// one that only administrators can change, so an elevated program that
+/// removes the folder later removes this folder and what is in it, never
+/// another place (the removal does not follow a link inside it,
+/// [`remove_whole`]).
+///
+/// The folder must already hold the lock file: a folder that is not empty
+/// cannot be made a link. Off Windows nothing is changed.
+///
+/// # Errors
+///
+/// When the account of the desktop cannot be told, when what stands at `dir`
+/// is not a folder of the administrators, or when its permissions cannot be
+/// set. The window then does not open.
+pub fn open_webview_profile(dir: &Path) -> io::Result<()> {
+    sys::open_webview_profile(dir)
+}
+
+/// The owner and the permissions of the profile folder of an elevated
+/// window's webview once it is opened to `user`, the account of the desktop
+/// as the system writes its identifier ([`open_webview_profile`]). `None`
+/// when `user` is not such an identifier.
+///
+/// - The administrators own it, and they and the system keep full control
+///   over the folder and everything in it (`OICI`), as in a private folder.
+/// - The account may read the folder, make files and folders in it and
+///   change their attributes (`0x1201bf`: reading, writing and starting,
+///   without removing it, without removing what others made in it, and
+///   without changing its permissions or its owner), for the folder itself
+///   only.
+/// - What is made in the folder gives the account full control (`OICIIO`):
+///   the profile that the browser writes is its own.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows adapter sets permissions; the rule is tested everywhere"
+    )
+)]
+fn webview_profile_descriptor(user: &str) -> Option<String> {
+    let digits = user.strip_prefix("S-1-")?;
+    let well_formed = !digits.is_empty()
+        && user.len() <= 184
+        && digits
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    well_formed.then(|| {
+        format!(
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1201bf;;;{user})(A;OICIIO;FA;;;{user})"
+        )
+    })
+}
+
 /// Removes what stands at `path` whole, without reading it and without
 /// following a link: a link is removed as a link, a folder with everything in
 /// it. For what CretLink no longer uses or did not make, where nothing in it
@@ -450,6 +612,93 @@ pub fn remove_whole(path: &Path) -> io::Result<()> {
     }
 }
 
+/// The two spellings the system has for full control over a file.
+const FULL_CONTROL: [&str; 2] = ["FA", "0x1f01ff"];
+
+/// The spellings the system has for reading a folder and starting a program
+/// in it, and nothing more.
+const READ_AND_START: [&str; 3] = ["0x1200a9", "FRFX", "FXFR"];
+
+/// Who the permissions of one of CretLink's own folders name, each with the
+/// rights it has, when the descriptor in `text` has the form that CretLink
+/// gives a folder it creates: owned by the administrators or the system; a
+/// list of its own that refuses what the folder above would hand down; and
+/// nothing but plain grants, each handed down to the files and the folders
+/// made in the folder later, at most one for each name. `None` for a
+/// descriptor of any other form.
+///
+/// The text is what the system writes for a descriptor read back from a
+/// folder, for example `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows adapter reads permissions; the rule is tested everywhere"
+    )
+)]
+fn own_grants(text: &str) -> Option<Vec<(&str, &str)>> {
+    /// Who may own one of CretLink's own folders.
+    const OWNERS: [&str; 2] = ["SY", "BA"];
+
+    let rest = text.strip_prefix("O:")?;
+    let (owner_and_group, access) = rest.split_once("D:")?;
+    // The owner is followed by the group when the system writes one.
+    let owner = owner_and_group.split("G:").next().unwrap_or_default();
+    if !OWNERS.contains(&owner) {
+        return None;
+    }
+    // A list for auditing, if the system writes one, is not part of this rule.
+    let access = access.split("S:").next().unwrap_or_default();
+    let (flags, entries) = match access.find('(') {
+        Some(at) => access.split_at(at),
+        None => (access, ""),
+    };
+    // `P`: protected, so nothing is inherited from the folder above.
+    if !flags.contains('P') {
+        return None;
+    }
+    let mut grants: Vec<(&str, &str)> = Vec::new();
+    for entry in entries.split_inclusive(')') {
+        let fields = entry.strip_prefix('(')?.strip_suffix(')')?;
+        let fields: Vec<&str> = fields.split(';').collect();
+        let [kind, handed_down, rights, object, inherited_object, who] = fields[..] else {
+            return None;
+        };
+        // `OICI`: handed down to the files and the folders made in it.
+        if kind != "A"
+            || handed_down != "OICI"
+            || !object.is_empty()
+            || !inherited_object.is_empty()
+            || grants.iter().any(|(named, _)| *named == who)
+        {
+            return None;
+        }
+        grants.push((who, rights));
+    }
+    Some(grants)
+}
+
+/// Whether `grants` are exactly `wanted`: each name once, with rights in one
+/// of the spellings given for it, and nobody else.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows adapter reads permissions; the rule is tested everywhere"
+    )
+)]
+fn grants_are(grants: &[(&str, &str)], wanted: &[(&str, &[&str])]) -> bool {
+    grants.len() == wanted.len()
+        && wanted.iter().all(|(who, spellings)| {
+            grants.iter().any(|(named, rights)| {
+                named == who
+                    && spellings
+                        .iter()
+                        .any(|spelling| rights.eq_ignore_ascii_case(spelling))
+            })
+        })
+}
+
 /// Whether the owner and the permissions of a folder, in the text form of a
 /// security descriptor, are the private ones: owned by the administrators or
 /// the system; a list of its own that refuses what the folder above would
@@ -466,63 +715,36 @@ pub fn remove_whole(path: &Path) -> io::Result<()> {
     )
 )]
 fn is_private_text(text: &str) -> bool {
-    /// The two spellings the system has for full control over a file.
-    const FULL_CONTROL: [&str; 2] = ["FA", "0x1f01ff"];
-    /// Who has full control over a private folder.
-    const WHO: [&str; 2] = ["SY", "BA"];
+    own_grants(text)
+        .is_some_and(|grants| grants_are(&grants, &[("SY", &FULL_CONTROL), ("BA", &FULL_CONTROL)]))
+}
 
-    let Some(rest) = text.strip_prefix("O:") else {
-        return false;
-    };
-    let Some((owner_and_group, access)) = rest.split_once("D:") else {
-        return false;
-    };
-    // The owner is followed by the group when the system writes one.
-    let owner = owner_and_group.split("G:").next().unwrap_or_default();
-    if !WHO.contains(&owner) {
-        return false;
-    }
-    // A list for auditing, if the system writes one, is not part of this rule.
-    let access = access.split("S:").next().unwrap_or_default();
-    let (flags, entries) = match access.find('(') {
-        Some(at) => access.split_at(at),
-        None => (access, ""),
-    };
-    // `P`: protected, so nothing is inherited from the folder above.
-    if !flags.contains('P') {
-        return false;
-    }
-    let mut seen = [false; WHO.len()];
-    for entry in entries.split_inclusive(')') {
-        let Some(fields) = entry
-            .strip_prefix('(')
-            .and_then(|entry| entry.strip_suffix(')'))
-        else {
-            return false;
-        };
-        let fields: Vec<&str> = fields.split(';').collect();
-        let [kind, handed_down, rights, object, inherited_object, who] = fields[..] else {
-            return false;
-        };
-        let Some(index) = WHO.iter().position(|known| *known == who) else {
-            return false;
-        };
-        let full = FULL_CONTROL
-            .iter()
-            .any(|spelling| rights.eq_ignore_ascii_case(spelling));
-        // `OICI`: handed down to the files and the folders made in it.
-        if kind != "A"
-            || handed_down != "OICI"
-            || !full
-            || !object.is_empty()
-            || !inherited_object.is_empty()
-            || seen[index]
-        {
-            return false;
-        }
-        seen[index] = true;
-    }
-    seen.iter().all(|seen| *seen)
+/// Whether the owner and the permissions of a folder, in the text form of a
+/// security descriptor, are those of the folder of a kept program
+/// (ST-M009-017): as the private ones, and beside them every account may
+/// read the folder and start a program in it, and nothing more. Nobody but
+/// the administrators and the system can change anything.
+///
+/// The text is what the system writes for such a folder, for example
+/// `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows adapter reads permissions; the rule is tested everywhere"
+    )
+)]
+fn is_program_folder_text(text: &str) -> bool {
+    own_grants(text).is_some_and(|grants| {
+        grants_are(
+            &grants,
+            &[
+                ("SY", &FULL_CONTROL),
+                ("BA", &FULL_CONTROL),
+                ("BU", &READ_AND_START),
+            ],
+        )
+    })
 }
 
 #[cfg(not(windows))]
@@ -547,6 +769,18 @@ mod sys {
         None
     }
 
+    /// Off Windows the customer role does not exist: no program is kept.
+    pub(super) fn kept_program_folder() -> Option<PathBuf> {
+        None
+    }
+
+    /// Makes `dir` exist. Off Windows there are no such permissions to set;
+    /// something that is not a folder under the name is an error all the
+    /// same.
+    pub(super) fn make_program_folder(dir: &Path) -> io::Result<()> {
+        make_private(dir)
+    }
+
     /// Off Windows the earlier releases kept their files where this one does.
     pub(super) fn earlier_release_folder() -> Option<PathBuf> {
         None
@@ -566,6 +800,15 @@ mod sys {
     /// Off Windows no program is elevated.
     pub(super) fn elevated() -> bool {
         false
+    }
+
+    /// Off Windows there is no WebView2, and no elevated window.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the Windows adapter of the same name can fail"
+    )]
+    pub(super) fn open_webview_profile(_dir: &Path) -> io::Result<()> {
+        Ok(())
     }
 
     /// Off Windows there is no administrator to be: see the module
@@ -621,22 +864,31 @@ mod sys {
     use windows::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
         ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-        SE_FILE_OBJECT,
+        SE_FILE_OBJECT, SetSecurityInfo,
     };
     use windows::Win32::Security::{
-        CheckTokenMembership, CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetTokenInformation,
-        IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+        ACL, ACL_REVISION, CheckTokenMembership, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
+        GetSecurityDescriptorDacl, GetTokenInformation, InitializeAcl, IsWellKnownSid,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+        TokenElevation, TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION,
         WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+        WRITE_DAC,
     };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
     use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
 
-    use super::{DATA_FOLDER, PRIVATE_DATA_FOLDER, is_private_text};
+    use super::{
+        DATA_FOLDER, KEPT_PROGRAM_FOLDER, PRIVATE_DATA_FOLDER, is_private_text,
+        is_program_folder_text, webview_profile_descriptor,
+    };
 
     /// The private permissions of a folder with their owner, in the text form
     /// of a security descriptor: owned by the administrators (`O:BA`); a list
@@ -644,6 +896,12 @@ mod sys {
     /// full control for the system and for the administrators, for the folder
     /// and everything made in it later (`OICI`).
     const PRIVATE: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+    /// The permissions of the folder of a kept program with their owner
+    /// (ST-M009-017): as [`PRIVATE`], and every account (`BU`, the users of
+    /// this computer) may read the folder and what is made in it and start a
+    /// program there (`0x1200a9`), and nothing more.
+    const PROGRAM_FOLDER: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 
     /// The service that owns the files of Windows itself, as the system
     /// writes its identifier. It owns `Program Files`.
@@ -692,6 +950,12 @@ mod sys {
     /// `Program Files`.
     pub(super) fn administrators_folder() -> Option<PathBuf> {
         system_folder(ADMINISTRATORS_FOLDER).map(|folder| folder.join(PRIVATE_DATA_FOLDER))
+    }
+
+    /// Where the support program lies that a customer keeps: `CretLink
+    /// Support` in `Program Files`.
+    pub(super) fn kept_program_folder() -> Option<PathBuf> {
+        system_folder(ADMINISTRATORS_FOLDER).map(|folder| folder.join(KEPT_PROGRAM_FOLDER))
     }
 
     /// Where releases up to 0.24.0 kept their files: `CretLink` in the
@@ -850,7 +1114,21 @@ mod sys {
     /// below it is used: CretLink did not make it, and an administrator has
     /// to remove it.
     pub(super) fn make_private(dir: &Path) -> io::Result<()> {
-        create(dir)?;
+        make(dir, PRIVATE, is_private_text)
+    }
+
+    /// Makes `dir` the folder of a kept program, or finds it to be one: as
+    /// [`make_private`], with the permissions of such a folder
+    /// ([`PROGRAM_FOLDER`]).
+    pub(super) fn make_program_folder(dir: &Path) -> io::Result<()> {
+        make(dir, PROGRAM_FOLDER, is_program_folder_text)
+    }
+
+    /// Creates `dir` with the owner and the permissions of `descriptor` in
+    /// one step, or finds it to be a folder of the administrators whose
+    /// permissions `fits` accepts already.
+    fn make(dir: &Path, descriptor: &str, fits: fn(&str) -> bool) -> io::Result<()> {
+        create_with(dir, descriptor)?;
         let folder = open(dir, READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0)?;
         if !is_plain_folder(&folder)? {
             return Err(io::Error::new(
@@ -864,7 +1142,7 @@ mod sys {
                 "the folder does not belong to the administrators",
             ));
         }
-        if is_private_text(&permissions_text(&folder)?) {
+        if fits(&permissions_text(&folder)?) {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -879,9 +1157,18 @@ mod sys {
     /// the folder never exists without them. A name that is taken is not an
     /// error: what stands there is looked at by the caller, and is left as it
     /// is.
+    #[cfg(test)]
     pub(super) fn create(dir: &Path) -> io::Result<()> {
+        create_with(dir, PRIVATE)
+    }
+
+    /// Creates `dir` with the owner and the permissions that the text
+    /// `descriptor` describes, in one step: the folder never exists without
+    /// them. A name that is taken is not an error: what stands there is
+    /// looked at by the caller, and is left as it is.
+    fn create_with(dir: &Path, descriptor: &str) -> io::Result<()> {
         let path = HSTRING::from(dir.as_os_str());
-        let descriptor = Descriptor::from_text(PRIVATE)?;
+        let descriptor = Descriptor::from_text(descriptor)?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of_u32::<SECURITY_ATTRIBUTES>(),
             lpSecurityDescriptor: descriptor.0.0,
@@ -894,6 +1181,167 @@ mod sys {
             Err(error) if error.code() == ERROR_ALREADY_EXISTS.to_hresult() => Ok(()),
             Err(error) => Err(os_error(&error)),
         }
+    }
+
+    /// Replaces the permissions of an opened entry by the ones that the
+    /// folder it lies in hands down, as if the entry had been made there. The
+    /// entry must be open with the rights to read and to change its
+    /// permissions: nothing is looked up by name.
+    pub(super) fn inherit_permissions_of(entry: &File) -> io::Result<()> {
+        let mut none = ACL::default();
+        // SAFETY: `none` is a valid place for a list of exactly its own size.
+        unsafe { InitializeAcl(&raw mut none, size_of_u32::<ACL>(), ACL_REVISION) }
+            .map_err(io::Error::from)?;
+        // SAFETY: the handle is open with the right to change permissions for
+        // as long as `entry` lives, and `none` is an initialised list that
+        // outlives the call. An empty list that is not protected leaves the
+        // entry with what its folder hands down.
+        let status = unsafe {
+            SetSecurityInfo(
+                HANDLE(entry.as_raw_handle()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&raw const none),
+                None,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status.0.cast_signed()));
+        }
+        Ok(())
+    }
+
+    /// Gives the profile folder at `dir` the permissions that open it to the
+    /// account of the desktop (see `open_webview_profile` in the module
+    /// above). The folder is opened once, without following a link, and its
+    /// kind, its owner and its new permissions go through that one handle.
+    pub(super) fn open_webview_profile(dir: &Path) -> io::Result<()> {
+        let user = desktop_user().or_else(own_user).ok_or_else(|| {
+            io::Error::other("the account that is signed in at the desktop cannot be told")
+        })?;
+        let text = webview_profile_descriptor(&user).ok_or_else(|| {
+            io::Error::other("the account of the desktop has an identifier of another form")
+        })?;
+        let descriptor = Descriptor::from_text(&text)?;
+        let folder = open(dir, READ_CONTROL.0 | WRITE_DAC.0 | FILE_READ_ATTRIBUTES.0)?;
+        if !is_plain_folder(&folder)? || !Owner::of(&folder)?.is_trusted() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the profile folder is not a folder of the administrators",
+            ));
+        }
+        let mut present = BOOL::default();
+        let mut defaulted = BOOL::default();
+        let mut list: *mut ACL = std::ptr::null_mut();
+        // SAFETY: `descriptor` owns a valid descriptor for as long as it
+        // lives; the three places are valid for the results. `list` points
+        // into that descriptor.
+        unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut list, &mut defaulted) }
+            .map_err(|error| os_error(&error))?;
+        if !present.as_bool() || list.is_null() {
+            return Err(io::Error::other(
+                "the permissions of the profile were not made",
+            ));
+        }
+        // SAFETY: the handle is open with the right to change permissions for
+        // as long as `folder` lives, and `list` points into `descriptor`,
+        // which outlives the call. `PROTECTED` keeps what `webview` hands
+        // down out of the folder.
+        let status = unsafe {
+            SetSecurityInfo(
+                HANDLE(folder.as_raw_handle()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(list.cast_const()),
+                None,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status.0.cast_signed()));
+        }
+        Ok(())
+    }
+
+    /// The account that is signed in at the desktop of this session, as the
+    /// system writes its identifier: the user of the token of the shell
+    /// (Explorer), through which WebView2 starts its browser when its host is
+    /// elevated. `None` without a shell, or when its token cannot be read.
+    fn desktop_user() -> Option<String> {
+        // SAFETY: no argument; the answer is a window handle or null.
+        let shell = unsafe { GetShellWindow() };
+        if shell.is_invalid() {
+            return None;
+        }
+        let mut id = 0u32;
+        // SAFETY: `shell` is a window handle, which may have gone since; then
+        // the answer is 0. `id` is a valid place for the process identifier.
+        unsafe { GetWindowThreadProcessId(shell, Some(&raw mut id)) };
+        if id == 0 {
+            return None;
+        }
+        // SAFETY: a process identifier and a right to ask; the handle that
+        // comes back is closed below.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, id) }.ok()?;
+        let user = user_of_process(process);
+        // SAFETY: `process` was opened above and is closed once.
+        let _ = unsafe { CloseHandle(process) };
+        user
+    }
+
+    /// The account this process runs as: when no shell can be asked, the
+    /// account of the desktop is taken to be this one, as after a consent
+    /// elevation.
+    fn own_user() -> Option<String> {
+        // SAFETY: `GetCurrentProcess` returns a pseudo-handle that is always
+        // valid and is not closed.
+        user_of_process(unsafe { GetCurrentProcess() })
+    }
+
+    /// The user of the token of `process`, as the system writes its
+    /// identifier.
+    fn user_of_process(process: HANDLE) -> Option<String> {
+        let mut token = HANDLE::default();
+        // SAFETY: `process` is a valid process handle for the duration of the
+        // call; `token` is a valid place for the result.
+        unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.ok()?;
+        // Words, not bytes, so that the structure and the SID after it are
+        // aligned; large enough for the largest SID.
+        let mut buffer = [0usize; 64];
+        let mut returned = 0u32;
+        // SAFETY: `token` was just opened for querying; the buffer is
+        // writable for the size passed, and `returned` is a valid place for
+        // the length.
+        let read = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buffer.as_mut_ptr().cast::<c_void>()),
+                u32::try_from(size_of_val(&buffer)).unwrap_or(0),
+                &mut returned,
+            )
+        };
+        // SAFETY: `token` is the handle opened above and is closed once.
+        let _ = unsafe { CloseHandle(token) };
+        read.ok()?;
+        // SAFETY: on success the buffer starts with a `TOKEN_USER`, aligned
+        // as a word, whose SID points into the same buffer.
+        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut text = PWSTR::null();
+        // SAFETY: `sid` points to a valid SID inside `buffer`, which lives
+        // until after the call; `text` is a valid place for the string the
+        // system allocates.
+        unsafe { ConvertSidToStringSidW(sid, &mut text) }.ok()?;
+        // SAFETY: on success `text` is a NUL-terminated wide string that stays
+        // valid until it is freed below.
+        let user = String::from_utf16_lossy(unsafe { text.as_wide() });
+        // SAFETY: the string was allocated by the system for the caller to
+        // free with `LocalFree`, and is not used afterwards.
+        let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast::<c_void>()))) };
+        Some(user)
     }
 
     /// The owner and the permissions of the entry at `path`, for the tests.
@@ -1097,6 +1545,35 @@ pub(crate) fn tests_can_name_the_administrators() -> bool {
     }
     eprintln!("skipped: this process is not an administrator");
     false
+}
+
+/// Gives an opened entry, which was moved out of a private folder, the
+/// permissions that the folder it lies in now hands down, as if it had been
+/// made there. A move keeps the permissions of an entry, and those of a
+/// private folder admit only the administrators. The entry must be open with
+/// the rights to read and to change its permissions: nothing is looked up by
+/// name, so the permissions that change are those of the entry that was
+/// moved, whatever happens to its path meanwhile.
+///
+/// # Errors
+///
+/// When the permissions cannot be replaced.
+#[cfg(windows)]
+pub(crate) fn inherit_permissions_of(entry: &std::fs::File) -> io::Result<()> {
+    sys::inherit_permissions_of(entry)
+}
+
+/// The entries of the permissions of `path`, each in the text form of a
+/// security descriptor, for tests outside this module.
+#[cfg(all(test, windows))]
+pub(crate) fn tests_permission_entries(path: &Path) -> Vec<String> {
+    let text = sys::permissions_of(path).unwrap_or_default();
+    let list = text.split_once("D:").map_or("", |(_, list)| list);
+    list.split('(')
+        .skip(1)
+        .filter_map(|entry| entry.split_once(')'))
+        .map(|(entry, _)| entry.to_string())
+        .collect()
 }
 
 /// Whether the folder at `path` has the private permissions, for tests

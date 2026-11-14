@@ -35,6 +35,9 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 rustls-native-certs = { workspace = true, optional = true }
+# Writes certificates back as the text of a PEM file (`certs_to_pem`). The
+# protocol and MCP crates link the same version already.
+base64.workspace = true
 
 # test-cert feature only — pure-Rust cert minting, no committed secrets.
 x509-cert = { workspace = true, optional = true }

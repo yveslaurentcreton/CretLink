@@ -1,11 +1,13 @@
 // Settings (ST-M009-008): the version, the install path or the folder this
-// copy runs from, the audit folder (Open), and Uninstall when installed
-// (ST-M009-006). Uninstall first shows what it will remove.
+// copy runs from, the audit folder (Open), the relay of this copy
+// (ST-M007-011, `./relay`), and Uninstall when installed (ST-M009-006).
+// Uninstall first shows what it will remove.
 
 import { h } from "../../shared/dom";
 import { icon } from "../../shared/icons";
 import type { TechnicianSnapshot } from "../model";
 import { button, card, kv } from "./common";
+import { relayCard } from "./relay";
 
 export function settingsView(s: TechnicianSnapshot): HTMLElement {
   const app = s.app;
@@ -49,6 +51,7 @@ export function settingsView(s: TechnicianSnapshot): HTMLElement {
         ],
       ]),
     ),
+    relayCard(s),
     app?.install === "installed" ? uninstallCard(s) : null,
     app?.install === "run_once"
       ? h(
@@ -78,7 +81,7 @@ function uninstallCard(s: TechnicianSnapshot): HTMLElement {
       h(
         "p",
         null,
-        "Removes this installed copy, its shortcut, its uninstall entry and the AI assistant registrations that point at it.",
+        "Removes this installed copy, its settings with the relay and its key, its shortcut, its uninstall entry and the AI assistant registrations that point at it.",
       ),
       button("Uninstall…", "uninstall-plan", { disabled: s.busy === "uninstall-plan" }),
     );
@@ -105,6 +108,19 @@ function uninstallCard(s: TechnicianSnapshot): HTMLElement {
           { class: "plan" },
           step.plan.map((line) => h("li", { class: "mono" }, line)),
         )
+      : null,
+    // What uninstall leaves in place: a relay profile next to the program
+    // with whether it holds a key, a registration that points elsewhere now
+    // (ST-M007-011). Said before anything is removed, like what goes.
+    step.stays && step.stays.length > 0
+      ? [
+          h("p", { id: "uninstall-stays-h" }, "This stays:"),
+          h(
+            "ul",
+            { class: "plan stays", "aria-labelledby": "uninstall-stays-h" },
+            step.stays.map((line) => h("li", null, line)),
+          ),
+        ]
       : null,
     h(
       "div",

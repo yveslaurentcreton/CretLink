@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generate verifiable release artifacts for CretLink (ST-M006-004, ST-M006-014,
-# ST-M009-004, ST-M009-010).
+# ST-M006-019, ST-M009-004, ST-M009-010).
 #
 # Portable across the release matrix (windows / macos / ubuntu runners, all of
 # which provide a bash shell) and runnable locally in any bash (Linux, macOS, or
@@ -12,8 +12,8 @@
 # Without an option it does both phases. The release workflow runs `--stage`
 # (build and stage the binaries), then signs the staged Windows binaries in a
 # separate step that alone holds the signing secrets (scripts/sign-windows.ps1),
-# then runs `--pack` (checksums, archive, inventory and SBOMs over the signed
-# bytes).
+# then runs `--pack` (checksums, third-party notices, archive, inventory and
+# SBOMs over the signed bytes).
 #
 # VERSION (argument, or the VERSION or CRETLINK_VERSION environment variable)
 # is the release version the workflow computed with scripts/next-version.mjs;
@@ -24,8 +24,10 @@
 # Under dist/ it writes, for the host target triple:
 #   - cretlink-<version>-<os>-<arch>.zip (Windows) or .tar.gz (macOS, Linux):
 #     one folder with the application `cretlink` and its console build
-#     `cretlink-cli`, plus README.txt, LICENSE and the checksum file
-#     (REQ-N-021);
+#     `cretlink-cli`, plus README.txt, LICENSE, the checksum file (REQ-N-021)
+#     and THIRD-PARTY-NOTICES.txt: the licence texts and notices of the
+#     packages that the two programs are built from, and where their source
+#     is found, from the locked dependencies (ST-M006-019, REQ-N-016);
 #   - cretlink-relay-server-<target>[.exe]: the relay server, which runs on
 #     neither endpoint and so is not in the technician archive;
 #   - CHECKSUMS-<target>.txt   SHA-256 over every binary for this target;
@@ -194,6 +196,9 @@ done
   echo "      SHA-256 checksums of the programs built for this platform."
   echo "  LICENSE"
   echo "      The MIT license."
+  echo "  THIRD-PARTY-NOTICES.txt"
+  echo "      The licenses and notices of the packages by other authors that"
+  echo "      the programs are built from, and where their source is found."
   if [[ "$os" == linux ]]; then
     echo
     echo "Requirements"
@@ -220,6 +225,24 @@ done
 } >"$stage/README.txt"
 cp "$repo_root/LICENSE" "$stage/LICENSE"
 cp "$checksums" "$stage/$checksum_name"
+
+# The licence texts and notices of every package that is linked into a program
+# of the archive, and where its source is found (ST-M006-019, REQ-N-016). They
+# come from the locked dependencies for this target: each program from the
+# lockfile it is built with, and the frontend that the application carries
+# from the npm packages that `--stage` installed. An archive is never packed
+# without them: a failure here stops the script.
+echo "== writing the third-party notices =="
+notice_args=()
+for entry in "${staged_bins[@]}"; do
+  if [[ "$(field "$entry" 4)" == bundle ]]; then
+    notice_args+=("--package" "$(field "$entry" 2)")
+  fi
+done
+node scripts/third-party-notices.mjs "${notice_args[@]}" \
+  --manifest-path "$app_dir/src-tauri/Cargo.toml" --manifest-path Cargo.toml \
+  --npm "$app_dir" --target "$target" \
+  --output "target/bundle/$bundle_name/THIRD-PARTY-NOTICES.txt"
 
 echo "== packing $bundle_name =="
 (

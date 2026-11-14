@@ -19,9 +19,10 @@ use cretlink_cli::install::{self, InstallError, Layout, OsSystem, System as _};
 use cretlink_cli::setup::{self, Action, Client, ClientStatus, RegistrationState, SystemRunner};
 use cretlink_console::AuditServiceConfig;
 use serde::Serialize;
-use tauri::AppHandle;
+use tauri::{AppHandle, State};
 
 use super::CommandError;
+use crate::profile::Profile;
 
 /// Whether this copy runs from the install location (`AppInfo.install`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -200,7 +201,7 @@ fn install_error(err: &InstallError) -> CommandError {
 
 /// Runs blocking work (client command lines, file copies) off the window's
 /// thread.
-async fn blocking<T: Send + 'static>(
+pub(super) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, CommandError> + Send + 'static,
 ) -> Result<T, CommandError> {
     tauri::async_runtime::spawn_blocking(work)
@@ -308,32 +309,72 @@ pub(crate) async fn ai_client_uninstall(
     blocking(move || change_client(&client, Action::Uninstall)).await
 }
 
-fn plan(layout: &Layout, exe: &std::path::Path) -> Result<install::UninstallPlan, CommandError> {
-    install::uninstall_plan(
+/// The uninstall plan. `own_profile` is whether this window's webview holds
+/// the installed copy's profile: it then goes once the window has closed,
+/// and the plan says so (ST-M009-014).
+fn plan(
+    layout: &Layout,
+    exe: &std::path::Path,
+    own_profile: bool,
+) -> Result<install::UninstallPlan, CommandError> {
+    let plan = install::uninstall_plan(
         layout,
         &OsSystem,
         &setup::Context::from_env(exe.to_path_buf()),
         exe,
     )
-    .map_err(|err| install_error(&err))
+    .map_err(|err| install_error(&err))?;
+    Ok(if own_profile {
+        plan.from_its_window()
+    } else {
+        plan
+    })
 }
 
-/// What uninstall would remove, one line each, before anything changes.
+/// What uninstall would do, before anything changes (`UninstallPlan` of the
+/// contract).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UninstallPlanView {
+    /// What it removes, one line each.
+    pub removes: Vec<String>,
+    /// What it leaves in place, one line each: a registration that points
+    /// elsewhere now, and a relay profile next to the installed program with
+    /// whether it holds an admission key (ST-M007-011). The audit trail
+    /// stays too; the screen says that itself.
+    pub stays: Vec<String>,
+}
+
+impl UninstallPlanView {
+    fn of(plan: install::UninstallPlan) -> Self {
+        Self {
+            removes: plan.lines(),
+            stays: plan.kept,
+        }
+    }
+}
+
+/// What uninstall would remove and what it would leave, before anything
+/// changes.
 #[tauri::command]
-pub(crate) async fn uninstall_plan() -> Result<Vec<String>, CommandError> {
+pub(crate) async fn uninstall_plan(
+    profile: State<'_, Profile>,
+) -> Result<UninstallPlanView, CommandError> {
     let exe = current_exe()?;
-    blocking(move || Ok(plan(&layout()?, &exe)?.lines())).await
+    let own_profile = profile.is_installed();
+    blocking(move || Ok(UninstallPlanView::of(plan(&layout()?, &exe, own_profile)?))).await
 }
 
-/// Uninstalls this copy. On Windows the folder goes once this window closes.
+/// Uninstalls this copy. On Windows the folder goes once this window closes;
+/// so does, everywhere, the webview profile this window holds (ST-M009-014).
 /// A partial uninstall is an error that lists what is left.
 #[tauri::command]
-pub(crate) async fn uninstall_app() -> Result<(), CommandError> {
+pub(crate) async fn uninstall_app(profile: State<'_, Profile>) -> Result<(), CommandError> {
     let exe = current_exe()?;
-    blocking(move || {
+    let own_profile = profile.is_installed();
+    let report = blocking(move || {
         let layout = layout()?;
-        let plan = plan(&layout, &exe)?;
-        let report = install::uninstall(
+        let plan = plan(&layout, &exe, own_profile)?;
+        install::uninstall(
             &layout,
             &OsSystem,
             &SystemRunner,
@@ -341,17 +382,21 @@ pub(crate) async fn uninstall_app() -> Result<(), CommandError> {
             &plan,
             &exe,
         )
-        .map_err(|err| install_error(&err))?;
-        if report.complete() {
-            Ok(())
-        } else {
-            Err(CommandError::new(
-                "uninstall_incomplete",
-                format!("These could not be removed: {}.", report.failed.join("; ")),
-            ))
-        }
+        .map_err(|err| install_error(&err))
     })
-    .await
+    .await?;
+    if own_profile {
+        // The uninstall ran: this process removes its profile at its end.
+        profile.remove_when_closed();
+    }
+    if report.complete() {
+        Ok(())
+    } else {
+        Err(CommandError::new(
+            "uninstall_incomplete",
+            format!("These could not be removed: {}.", report.failed.join("; ")),
+        ))
+    }
 }
 
 /// What the install screen shows: the location, the menu entry, and each
@@ -458,6 +503,49 @@ mod tests {
     use super::*;
     use cretlink_cli::setup::{PlannedCommand, Registration};
     use serde_json::json;
+
+    #[test]
+    fn the_uninstall_plan_says_what_goes_and_what_stays() {
+        use std::path::PathBuf;
+
+        let stays = "The relay profile /home/sam/.local/bin/cretlink.toml, which CretLink did not \
+                     write and does not remove. It holds the admission key of a relay in readable \
+                     form: remove the file yourself when nobody else should be able to read that \
+                     key";
+        let plan = install::UninstallPlan {
+            location: PathBuf::from("/home/sam/.local/bin"),
+            files: vec![PathBuf::from("/home/sam/.local/bin/cretlink")],
+            settings: vec![PathBuf::from(
+                "/home/sam/.local/share/CretLink/settings.toml",
+            )],
+            after_exit: false,
+            entry: None,
+            uninstall_entry: false,
+            registrations: vec![],
+            kept: vec![stays.to_owned()],
+            webview: Some(PathBuf::from("/home/sam/.local/share/CretLink/webview")),
+            webview_after_close: true,
+            legacy_webview: None,
+            audit_dir: PathBuf::from("/home/sam/.local/share/CretLink/audit"),
+        };
+        // A relay profile next to the program is among what stays, never
+        // among what is removed (ST-M007-011).
+        assert_eq!(
+            serde_json::to_value(UninstallPlanView::of(plan)).unwrap(),
+            json!({
+                "removes": [
+                    "/home/sam/.local/bin/cretlink",
+                    "Your settings (the relay with its key, the network to wait on): \
+                     /home/sam/.local/share/CretLink/settings.toml",
+                    // The profile of the window that runs the uninstall goes
+                    // when that window has closed (ST-M009-014).
+                    "The webview profile /home/sam/.local/share/CretLink/webview (removed once \
+                     CretLink has closed)",
+                ],
+                "stays": [stays],
+            })
+        );
+    }
 
     fn status(registration: RegistrationState) -> ClientStatus {
         ClientStatus {

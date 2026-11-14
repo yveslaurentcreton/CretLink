@@ -27,7 +27,9 @@ works, how to get started, and what it promises about security.
    on several, such as a VPN next to the local network, can choose another.
 2. **The customer** starts the same program, chooses **Get help** and answers
    the Windows administrator prompt. A copy named `CretLink-Support.exe` opens
-   Get help straight away, for example from a USB stick. Nothing is installed.
+   Get help straight away, for example from a USB stick. Nothing is installed,
+   unless the customer chooses to [keep the support program](#a-customer-keeps-the-support-program)
+   for next time.
 3. The customer picks the technician from the computers found on the network,
    or types the connection code the technician gives them.
 4. Both windows show the same six digits. The technician reads them aloud;
@@ -68,8 +70,10 @@ The technician side is one program, `cretlink`, that runs from wherever it was
 unpacked. Its start screen offers, under **Give help**:
 
 - **Run once without installing.** The copy writes nothing but its audit trail
-  (in the per-user data folder). AI clients you connect from it point at this
-  copy and break when it is moved or deleted; the AI assistants screen says so.
+  (in the per-user data folder). Its window keeps its webview profile in a
+  temporary folder, which it removes when it closes (see below). AI clients
+  you connect from it point at this copy and break when it is moved or
+  deleted; the AI assistants screen says so.
 - **Install for me.** Copies `cretlink` (and `cretlink-cli`) to a fixed
   per-user location — `%LOCALAPPDATA%\Programs\CretLink\` on Windows,
   `~/Applications/CretLink.app` on macOS, `~/.local/bin/` on Linux — adds a
@@ -81,12 +85,91 @@ unpacked. Its start screen offers, under **Give help**:
 
 `cretlink uninstall` (or **Uninstall** in Settings, or the Windows *Installed
 apps* entry) shows what it will remove and asks first, then removes the
-installed files, the shortcut or desktop entry, the uninstall entry and the AI
-client registrations the install made, but only while they still point at the
-installed copy. The audit trail stays. On macOS and Linux an installed copy
+installed files, the settings of the installed copy (its relay with its key,
+and the network it waits on), the shortcut or desktop entry, the uninstall
+entry, the installed copy's webview profile and the AI client registrations
+the install made, but only while they still point at the installed copy. The
+audit trail stays. On macOS and Linux an installed copy
 opens Give help directly; a copy that is not installed shows the start screen
 so it can still be installed. A `CretLink-Support*` copy, for customers, never
-installs or uninstalls; the one command it accepts is `recover [--remove]`.
+installs or uninstalls the technician side; the commands it accepts are
+`recover [--remove]` and its own `uninstall` (see the next section).
+
+The window of `cretlink` is a webview, which keeps a profile (cache and local
+storage, no session secret) in a folder:
+
+- A copy that is not installed, and Get help wherever it is started from,
+  uses a new folder of its own, `CretLink-webview-<random>`, in the temporary
+  folder, and removes it when its last window has closed. If the program is
+  killed, or the webview still holds files a few seconds after closing, the
+  folder stays until the next start of a CretLink window, which removes the
+  folders of copies that no longer run. `cretlink recover` lists them and
+  `cretlink recover --remove` removes them.
+- The installed copy keeps its profile next to the audit trail
+  (`%LOCALAPPDATA%\CretLink\webview`, `~/.local/share/CretLink/webview`).
+  Uninstall removes it.
+- A window with administrator rights (Get help after the Windows prompt)
+  makes that folder in `webview` in `%ProgramFiles%\CretLink Data`, where
+  only administrators can write, and looks for leftovers only there: it
+  removes nothing in the temporary folder or the local application data that
+  its environment names. Before its window opens it drops the `WEBVIEW2_*`
+  variables from its environment.
+- Releases up to 0.24.1 kept the profile of both roles in `dev.cretlink.app`
+  in the per-user data folder (`%LOCALAPPDATA%`, `~/.local/share`) and left it
+  there. Uninstall and `cretlink recover --remove` remove that folder. Run
+  with administrator rights, `recover` does not look at the account's own
+  folders and says so: run `recover` there again without administrator
+  rights.
+
+Known gap: on macOS the webview is WebKit, which keeps this data in its own
+folders under `~/Library`, where CretLink can neither direct nor remove it. It
+stays after a copy that runs once has closed and after an uninstall. Only the
+technician role exists on macOS.
+
+## A customer keeps the support program
+
+A customer who gets help more than once can keep the support program on the
+computer, and start it from the Start menu next time. It is the customer's
+own choice, made in the Get help window: **Keep CretLink Support on this
+computer** is offered before a session and on the end report, never during a
+session, and only in a window that Windows gave administrator rights. The
+screen says what is added before anything is added:
+
+- the program, in `%ProgramFiles%\CretLink Support\CretLink-Support.exe`,
+  where only an administrator can change it;
+- a Start-menu entry **CretLink Support** for everyone who uses the computer,
+  and a shortcut on the desktop when the customer asks for one;
+- an entry in Installed apps, with the version;
+- the relay settings of the copy that was kept (`cretlink.toml`, and the
+  certificates of its certificate file), when it had any. The screen names
+  that relay first. On the computer the settings can then be read by every
+  account, with the admission key of the relay in them.
+
+Nothing else is added: no service, no scheduled task, nothing that starts
+with Windows, no listener and no stored permission. Between sessions no
+CretLink process runs. A session from the kept program takes every step of a
+session from a downloaded copy: the customer starts it, Windows asks for
+administrator rights, the technician is chosen or the code typed, the
+approval code is compared and full control is allowed, each time.
+
+- **Update.** The kept program does not update itself and contacts nobody by
+  itself. A newer copy that the customer starts offers to update it and names
+  both versions; an older copy never replaces a newer one. Relay settings
+  next to the newer copy replace the kept ones, and the screen says so.
+- **Remove.** The kept program offers **Remove from this computer**; so does
+  its entry in Installed apps, and `CretLink-Support.exe uninstall`. Each
+  shows what it removes, asks, and asks Windows for administrator rights when
+  it has none. The program, its folder, the shortcuts and the entry go. A
+  session report that the customer saved stays where it was saved. Removing
+  always asks: `uninstall --yes` is refused.
+- **No other way.** No command-line option, no environment variable and no
+  remote operation keeps the program: only the customer's click does.
+
+`cretlink recover` names a kept program as kept on purpose and never removes
+it, and the end report of a session says that it is installed because the
+customer chose that. A keep that was interrupted is no kept program:
+`recover` names what it left, with the command that removes it
+(`CretLink-Support.exe uninstall`), and does not call the computer clean.
 
 ## Platforms
 
@@ -127,12 +210,27 @@ CretLink is under active development. Versions are `0.x` pre-releases;
   [release sign-off](docs/release-signoff.md) on the official files.
 - **Experimental:** the screenshot, input and clipboard tools, and the
   technician's interactive terminal.
-- **In progress:** sessions over the internet. The relay server, which forwards
-  only end-to-end encrypted traffic, is released and
-  [documented](docs/relay-server.md), but the application cannot use a relay
-  yet. Attended reboot-resume has its building blocks (a customer-armed,
-  single-use, expiring ticket that never restores control without fresh
-  consent) but is not wired into an actual reboot.
+- **In progress:** sessions over the internet, through a relay that you host
+  yourself and that forwards only end-to-end encrypted traffic. The relay
+  server is released and [documented](docs/relay-server.md). A copy of
+  CretLink is told which relay to use in a file `cretlink.toml` next to the
+  program or in **Settings → Relay** of the installed copy, and can test it
+  ([how](docs/relay-server.md#3-tell-a-copy-of-cretlink-which-relay-to-use)).
+  For a customer, **Settings → Relay → Make a customer copy…** writes one
+  folder to hand over: the support program and a `cretlink.toml` with your
+  relay and a key of that customer's own
+  ([how](docs/relay-server.md#make-a-customer-copy)).
+  With that, the technician chooses **Use relay** on the waiting screen and
+  reads out a relay code, the customer types it, and from there the session
+  is the one of one network: the same approval code on both screens, the
+  customer's permission, and a stop on either side
+  ([how](docs/relay-server.md#a-session-through-the-relay)). This is covered
+  by automated tests against a relay inside the test; it has not been run
+  between real computers on two networks yet
+  ([MT-15](docs/manual-tests.md)). Attended reboot-resume has
+  its building blocks (a customer-armed, single-use, expiring ticket that
+  never restores control without fresh consent) but is not wired into an
+  actual reboot.
 
 Official releases are built by the release workflow and ship with SHA-256
 checksums, a dependency inventory, and CycloneDX SBOMs.

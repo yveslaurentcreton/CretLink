@@ -27,7 +27,7 @@ does, and the role then stays fixed for the life of the process:
 | `cretlink` on Windows | start screen: Get help or Give help |
 | the installed `cretlink` on macOS or Linux | Give help |
 | any other `cretlink` on macOS or Linux | start screen with Give help only: install or run once |
-| `CretLink-Support*.exe` | Get help; refuses subcommands (`install`, `uninstall` included) and Give help, except `recover [--remove]` |
+| `CretLink-Support*.exe` | Get help; refuses Give help and every subcommand except `recover [--remove]` and `uninstall`, which removes the support program that a customer kept (ST-M009-017) |
 | `cretlink --role technician` / `--role customer` | that role, never relaunching (Give help from the start screen, the elevated customer after the UAC prompt) |
 | `cretlink --role customer --from-start` | Get help from the start screen: unelevated, explains the UAC prompt first; Back returns to the start screen |
 
@@ -105,14 +105,348 @@ The start-screen process registers, besides `get_role` and `choose_role`, only
 (`technician/setup.rs`). The technician process registers `get_app_info`,
 `ai_clients`, `ai_client_install`, `ai_client_uninstall`, `uninstall_plan` and
 `uninstall_app` for the AI assistants and Settings screens. Settings offers
-**Uninstall** only in the installed copy; it shows the plan first, and on
-Windows the folder is removed once the window closes.
+**Uninstall** only in the installed copy; it shows the plan first
+(`UninstallPlan`: what is removed, and what stays in place, such as a relay
+profile next to the program with whether it holds a key), and on Windows the
+folder is removed once the window closes.
 
 | | Windows | macOS | Linux |
 | --- | --- | --- | --- |
 | Program | `%LOCALAPPDATA%\Programs\CretLink\cretlink.exe` | `~/Applications/CretLink.app/Contents/MacOS/cretlink` | `~/.local/bin/cretlink` |
 | Record | `…\CretLink\install.json` | `…/Contents/Resources/install.json` | `~/.local/share/CretLink/install.json` |
+| Settings | `settings.toml` and `relay-ca.pem` next to the record (ST-M007-011) | the same | the same |
 | Entry | Start-menu `CretLink.lnk`, HKCU uninstall entry | the bundle | `~/.local/share/applications/cretlink.desktop` |
+
+## The relay of this copy (ST-M007-011)
+
+When the two computers are not on one network, their copies meet on a relay
+that the technician hosts. A **relay profile** tells a copy which one: the
+relay's `address`, an optional admission `key`, an optional certificate
+authority file `ca` and an optional `name` in the certificate
+([`docs/relay-server.md`](../../docs/relay-server.md), section 3).
+
+| Read from | By | Rules |
+| --- | --- | --- |
+| `cretlink.toml` next to the program | both roles | the one place the customer role reads; nothing is written there. Next to the installed program it is left in place by `cretlink uninstall`, which says that it stays and whether it holds a key |
+| `settings.toml` next to the install record | the installed technician copy | written by **Settings → Relay**; removed by `cretlink uninstall` |
+
+- **The lookup** is `relay::TechnicianRelays::active` for Give help and
+  `relay::next_to_program` for Get help (`src-tauri/src/relay.rs`). A file
+  next to the program wins over the settings, also when that file cannot be
+  used: a profile that is wrong is explained and never passed over for
+  another relay. A copy that runs once reads no settings. Without a profile
+  nothing about a relay is offered or dialled (REQ-N-003).
+- **The file is input that somebody else may have written**
+  (`cretlink_cli::relay_profile`): a small form of TOML, read up to 16 KiB,
+  with every unknown section and setting refused. A problem names the line and
+  the setting in plain words and never repeats text from the file.
+- **The key never comes back.** It is held as an admission token
+  (`cretlink_relay::AdmissionToken`: erased when dropped, redacted in
+  `Debug`). No view sent to the window holds it — `RelayView.keySet` says
+  only whether there is one — and a form that leaves the key alone says
+  `keep`. It is not logged and is no argument of any audit record. `keep` is
+  honoured only while the host of the address, the name for the certificate
+  and the certificate authority are all what the key was saved for: a form
+  that changes one of them must bring the key again or none, so a kept key
+  is never presented to a server the technician did not give it to, in a
+  save or in a test.
+- **A save lands whole or not at all**
+  (`cretlink_cli::settings::write_with_relay_ca`). The settings and the
+  certificate file change together: the new certificate file is written
+  under another name, the settings are written, and only then the
+  certificate file takes its place. When a step fails, both are as they
+  were. `relay-ca.pem` holds the certificates of the chosen file and nothing
+  else, written anew; a private key in that file is neither kept nor held in
+  memory.
+- **Always TLS** (`relay::EndpointDial`). A relay is reached over `wss` only,
+  with its certificate checked against the system's authorities or the
+  profile's `ca` file, for the profile's `name` or else the host of its
+  address. A check that fails ends the dial before anything is sent; nothing
+  falls back to a connection without TLS.
+- **Addressing only** (ADR-0016 §2, §4). A profile grants nothing. Saving one
+  opens no connection.
+
+| Command (Give help) | What it does |
+| --- | --- |
+| `get_relay_settings` | which relay this copy uses and where it comes from (`RelaySettings` in `src/shared/contract.ts`): the file next to the program and, in the installed copy, the settings; a profile that cannot be used with its file, setting and what is wrong |
+| `choose_relay_ca` | the system's dialog for the certificate authority file, opened from Rust; the file is read, checked and kept under a number (`ChosenCa`), so the window names no path of this computer |
+| `save_relay` `{ form }` | keeps the relay of the form (`RelayForm`) in the settings, and a copy of a chosen certificate file next to them; refuses in a copy that runs once |
+| `test_relay` `{ form? }` | reaches the relay once and answers in words (`RelayTest`): the relay of the form as it stands, or without a form the one this copy uses. It presents a ticket of its own, meets nobody and saves nothing |
+| `remove_relay` | removes the relay from the settings, with its key and its certificate file |
+
+**Settings → Relay** (`src/technician/views/relay.ts`) shows the form in the
+installed copy, the relay of the file when a file wins (with what the settings
+hold as the relay that is not used), and in a copy that runs once where its
+relay goes. The key field is always empty; after **Save** the form is drawn
+anew so that no typed key stays in a field, and the keyboard focus is put back
+where it was. **Remove** asks first. A refusal names the setting it is about
+and moves the focus there.
+
+On the customer's side a relay code typed into a copy whose profile cannot be
+used is answered with the file and what is wrong with it, before anything is
+dialled (`customer::typed_target`, stage `relay_profile`).
+
+The settings file is created for this user only where the system has file
+modes (`0600` on macOS and Linux); on Windows it has the access rules of the
+user's `%LOCALAPPDATA%` folder.
+
+To try the screen without a backend, run `npx vite` and open
+`/dev/relay.html` (`?copy=installed|kept|file|file-problem|run-once`,
+`?relay=admit|key|down`): the real controller against a copy and a relay held
+in memory.
+
+## Make a customer copy (ST-M007-016)
+
+With a relay that can be used, **Settings → Relay** offers **Make a customer
+copy…** (`src/technician/views/customer-copy.ts`): one folder
+`CretLink-Support-<label>` for one customer, with `CretLink-Support.exe`, a
+`cretlink.toml` that names the relay of this copy with that customer's key,
+the relay's certificate file when the profile names one, and `README.txt`.
+The rules live in `src-tauri/src/technician/customer_copy.rs`.
+
+| Command (Give help) | What it does |
+| --- | --- |
+| `customer_copy_options` | what a copy would hold (`CustomerCopyOptions`): the relay of this copy without any key, and where the program comes from: `this_program` on Windows, `choose` elsewhere. Rejects with `relay_none` or `relay_profile` without a relay that can be used |
+| `choose_customer_program` | the system's dialog for `cretlink.exe` from the Windows archive of a release (macOS, Linux); a file that is no Windows program is refused, and the file is kept under a number (`ChosenForCopy`) |
+| `choose_customer_place` | the system's dialog for the folder the copy is made in, kept under a number |
+| `generate_customer_key` | a new admission key from the system's random source (`GeneratedKey`). The window shows it once, with the label, as the line `label:key` of the relay's key file; the backend keeps nothing |
+| `make_customer_copy` `{ form }` | writes the folder (`CustomerCopyForm` → `CustomerCopyMade`). Rejects with the stage of the field it is about (`copy_label`, `copy_key`, `copy_program`, `copy_place`), with `copy_exists` when a folder of that name is there and `replace` was not said, with `copy_relay` when the relay cannot go into a copy, and with `copy_write` when writing failed |
+| `show_customer_copy` `{ copy }` | shows the folder that was written in the file manager, by the number of the copy; no other folder can be shown |
+
+- **The technician's own key is never written.** The backend builds the
+  copy's profile from the address, the name and the certificate file of the
+  relay in use and from the key of the form; it does not read the key of the
+  technician's profile, and `keyMode` is `set` or `none`. A relay that asks
+  for no key gets a copy without one.
+- **Names.** The label is letters, digits and hyphens, at most 40. The
+  label, the folder and the name of the certificate file are each checked as
+  one plain name that Windows takes, before anything is written; the window
+  names the program, the place and the copy by a number and sends no path.
+- **The program is copied byte for byte.** On Windows it is the running
+  program itself (`std::env::current_exe`).
+- **No half copy.** The folder is written as
+  `CretLink-Support-<label>.cretlink-new` beside its place, read back with
+  `relay::next_to_program`, the reader of the customer role, and renamed
+  only then. A failure removes it; `copy_write` says when it could not be
+  removed and where it lies. A folder that is replaced is set aside under
+  the same name with `.cretlink-old` first, and comes back when the new one
+  cannot take its place.
+- **The step** asks for the label, the key (typed, **Generate**, or none)
+  and the place, and elsewhere than on Windows for the program. It says that
+  the key stands in the file in readable form, only admits to the relay and
+  can be withdrawn. A generated key fixes the label it was generated for and
+  is shown with **Copy**; it is forgotten when the step is closed or the
+  page is left. A refusal moves the focus to the field it is about, and
+  "a folder of that name is there already" is a question, with the focus on
+  the answer that keeps it.
+
+The dev page `/dev/relay.html` drives the step too (`?os=windows` for the copy
+that is this program itself; the labels `exists` and `fail` for a folder that
+is there and a copy that cannot be written).
+
+## A session through the relay (ST-M007-013)
+
+With a profile in both copies the technician helps someone who is not on
+their network. The relay only lets the two copies find each other; pairing,
+the approval code, consent, the stop and the cleanup are those of a session
+on one network (ADR-0016, REQ-F-022).
+
+**Give help.** The waiting screen (`#t-wait`) has a card **Not on the same
+network?** under the connection code. With a relay it offers **Use relay…**
+and names the relay's host; without one it names Settings, and a profile that
+cannot be used is said with its file (`relayOffer` in
+`src/technician/model.ts`).
+
+| Command (Give help) | What it does |
+| --- | --- |
+| `use_relay` | only while waiting on a network: stops the listener, waits until it is gone, draws a new relay code and waits on the relay of this copy. Answers the waiting state; rejects with the stage `relay_none` or `relay_profile` when this copy has no relay that can be used |
+
+- The waiting state is the `listening` phase with `ConsoleState.relay`
+  (`RelayRoute { host, address, trust, admitted }`): `code` is the relay code
+  to read out, `address` where the relay is reached, and `admitted` whether
+  the relay holds the code yet. The screen shows the relay's host name, the
+  code in four outlined groups with **Copy**, and the state in words;
+  **Cancel** (`Escape`) ends it. The relay code is named a relay code and
+  drawn unlike the connection code and the approval code.
+- **A relay is named with where it is reached and what vouches for its
+  name** (`src/shared/relay.ts` for both windows, `relay::named` for the
+  backend's sentences). A profile can give the relay a name that differs
+  from the host it connects to, with a certificate file of its own; whoever
+  can write the profile could give a server of their own the name of another
+  relay. So every screen and every sentence that names a relay shows the
+  address beside the name when its host is another one, and says when the
+  certificate is checked against a file of the profile (`trust:
+  "profile_file"`) and not against the system's authorities. The waiting
+  screen of the installed copy also says when the relay comes from the file
+  next to the program and not from Settings (`relayFromFile`).
+- The wait runs in the session's own task
+  (`src-tauri/src/technician/session_task.rs`), because a session handle
+  exists only once the customer is heard: `WaitingDial` keeps the rendezvous
+  open for as long as the screen is, and **Cancel** drops it, so the code
+  leads to no session any more. No listener is open during a wait on a
+  relay, and `switch_listen_network` is refused.
+- **Every wait has a turn of its own on the console's state**
+  (`session_driver::Waits`, `Turn`). A change of wait stops the old task and
+  waits a bounded moment for it (`use_relay`, `switch_listen_network`); a
+  task that does not let go in time lives on beside the new one. It then
+  finds its turn over: it ends the session it holds and writes nothing more,
+  neither to the state nor to the slots that the commands read (the
+  session's service, its audit sink, the activity feed, the bridge status).
+  A late connection to an old listener therefore never shows as a customer
+  of the wait that is on screen. The customer role has the same rule
+  (`customer::session_driver::lock_current`).
+- `ConsoleState.relay` stays through the session and after its end, until
+  the console waits again: a new wait clears it when it begins, so a wait
+  that then fails to start names no relay. Compare, consent, the live session and the end
+  report each say **Through the relay** with the host name. No transition of
+  the console state reads it. The audit gets a record `session_route` with
+  the relay's host name, the address the copy connected to and the kind of
+  trust, right after the line that opens the log and before the records of
+  pairing and consent; `SessionSummary.relay`, `relayAddress` and
+  `relayTrust` carry them into the history.
+
+**Get help.** The code field (`#c-find`) takes a connection code, an address
+and a relay code and tells them apart (`customer::typed_target`). In a copy
+with a profile that can be used, a line under the field names the relay a
+relay code would connect through (`ConsentView.relay_of_copy`:
+`RelayUseView { host, address, trust }`), so the customer sees its host
+name, where the copy would connect and what vouches for the name before
+connecting. A relay
+code joins the rendezvous on the relay of the profile next to the program
+(`JoiningDial`), which gives the technician ten seconds to be heard. The
+connecting screen then reads **Connecting through the relay** with the
+relay's host name and says that the relay only passes encrypted traffic on;
+`ConsentView.relay` names the relay on every later screen.
+
+**Failures** have words of their own and a next step, and none reads as a
+session that was lost for no known reason (REQ-N-008, REQ-N-015). Nothing
+connects again by itself.
+
+| Stage | Where | What it says |
+| --- | --- | --- |
+| `relay_unreachable`, `relay_name_not_found`, `relay_untrusted`, `relay_no_answer`, `relay_key_required`, `relay_key_refused`, `relay_rate_limited`, `relay_busy`, `relay_unavailable`, `relay_version`, `relay_settings` | both | the relay could not be used: the words of `relay::failure_words` for the technician or for the customer. The technician's next step is `next` of the failed phase, with the place where the relay of this copy is set; the customer's is `ConsentView.failure_next` |
+| `rendezvous` | Get help | nobody waits on the code: it is mistyped or used, or the technician stopped waiting |
+| `relay_lost` | both | the connection of a relayed session was lost before full control: the relay may have stopped. Taken from the session's own verdict (`EndedBy::ConnectionLost`), never from a message text |
+| `relay`, `relay_profile` | Get help, as a refusal of the command | this copy has no relay, or its profile cannot be used |
+
+A relayed session that loses its connection under full control ends as any
+session does (`stopped`, `disconnected`); the end screens of both roles then
+say that the connection through the relay was lost.
+
+The end-to-end tests (`src-tauri/src/relayed_session_tests.rs`) run both
+roles as the application does, without their windows, over the real relay
+server with TLS inside the test: pairing through a typed code, a command, a
+transfer there and back, a stop from each side, a relay that stops in the
+middle, and each failure above.
+
+To try the screens without a backend, run `npx vite` and open
+`/dev/relay.html` (**Start a session**, then **Use relay…**;
+`?customer=arrives|lost` lets a customer type the code) and
+`/dev/relay-customer.html` (`?copy=relay|none|problem`,
+`?outcome=pair|nobody|unreachable|untrusted|key|lost`).
+
+## The webview's profile folder (ST-M009-014)
+
+The window is a webview, which keeps a profile (cache and local storage, no
+session secret) in a folder. Left to itself that is `dev.cretlink.app` in the
+per-user data folder, which stays after the window has closed. So a process
+decides the folder before its window opens (`src-tauri/src/profile.rs`, with
+the rules in `cretlink_cli::webview_profile`):
+
+| Process | Profile folder | Removed |
+| --- | --- | --- |
+| Not installed (the start screen, a technician that runs once, a `CretLink-Support*` copy), and every customer process | a new `CretLink-webview-<random>` in the temporary folder | by the process itself, after its last window has closed |
+| Any process with administrator rights | a new `CretLink-webview-<random>` in `webview` in `%ProgramFiles%\CretLink Data`, created private (`Base::Private`) | by the process itself, after its last window has closed |
+| The installed technician copy | `%LOCALAPPDATA%\CretLink\webview`, `~/.local/share/CretLink/webview`, next to the audit trail | by `cretlink uninstall`; from the installed copy's own window, once that window has closed |
+| Any process on macOS | none: WebKit keeps its data itself | not by CretLink (a known gap) |
+
+- **One folder per process.** The main window is built in `setup` from its
+  description in `tauri.conf.json` (`"create": false`), with the folder; the
+  customer's compact bar gets the same one. A temporary folder is created new
+  under a name from the system's random source. A name that is taken is never
+  taken over, and when no folder can be created the program says so and opens
+  no window.
+- **The lock.** The process holds a lock on `cretlink.lock` in its folder for
+  as long as it runs. A folder whose lock is free belongs to no running copy:
+  every start of a CretLink window removes those, off the window's thread.
+  A folder whose lock is held is never touched, and one whose lock cannot be
+  told is left alone; `cretlink recover` names it.
+- **The end of the process.** A webview holds its profile for as long as it
+  exists, so an exit that the program asks for itself closes every window
+  first. When the last window is gone, the process stops its async runtime,
+  so that no session task, listener or IPC endpoint runs on without a window,
+  and then removes the folder whole, without following a link, trying again
+  for about five seconds while the closing webview still holds files. What
+  is still there after that goes at the next start.
+- **Recover and uninstall.** `cretlink recover` lists the temporary folders
+  of copies that no longer run and the `dev.cretlink.app` folder that
+  releases up to 0.24.1 left for this user; `recover --remove` removes them,
+  with the exit codes it has. `cretlink uninstall` lists and removes the
+  installed copy's profile and that earlier folder. The audit trail stays.
+- **With administrator rights** (REQ-S-024) the process takes nothing from
+  its environment for its profile: `Base::current` and `Places::current`
+  give the private folder `webview` in `CretLink Data`
+  (`cretlink_exec::OwnFolder::webview_for_this_process`), which `prepare`
+  creates with its owner and its permissions in one step, and never ask for
+  the temporary folder or the local application data. Sweep and `recover`
+  look only there; an elevated `recover` says that the account's folders are
+  not covered and names the command to run without administrator rights.
+  `run_screen` drops every `WEBVIEW2_*` variable from the process's
+  environment before WebView2 is asked anything
+  (`webview_profile::forget_webview_overrides`).
+
+## Keeping the support program (ST-M009-017)
+
+A customer who gets help more than once can keep the support program on the
+computer: `%ProgramFiles%\CretLink Support\CretLink-Support.exe`, a
+Start-menu entry for all users, a desktop shortcut on request, an entry in
+Installed apps, and the relay settings of the copy. Nothing that runs by
+itself is added, and a session from the kept program takes every step of a
+session from a downloaded copy. What is written, how the running program is
+verified and how it all goes again is in `cretlink_cli::kept` and
+`cretlink_exec` (`hold_running_program`, `prepare_program_folder`); the
+commands of the customer role are in `src-tauri/src/customer/keep.rs`:
+
+| Command | What it does |
+| --- | --- |
+| `get_keep` | `KeepView`: how this copy relates to what is kept (`not_kept`, `this`, `same`, `newer`, `older`, `unknown`), both versions, and whether this window offers to keep or to remove |
+| `keep_plan` | `KeepPlanView`: what keeping would add, with the relay that the copy's settings name; changes nothing |
+| `keep_program` `{ desktop }` | keeps the program that runs, as the plan that `keep_plan` showed says and no other; returns the new `KeepView` |
+| `remove_plan` | `RemovePlanView`: what removing would remove and what stays; changes nothing |
+| `remove_program` | removes the kept program; without administrator rights it starts `uninstall` through the elevation prompt and closes this window |
+
+- **The customer's click, and nothing else.** The commands exist in the
+  customer role only. No command-line option, environment variable or remote
+  operation keeps a program, and `launch.rs` refuses every argument of a
+  `CretLink-Support*` copy but `recover` and `uninstall`.
+- **Never during a session.** Every command refuses while a session exists
+  and before the permission step. The window offers keeping on `#c-find`
+  and on the end report (`views/keep.ts`), with one card: **Keep CretLink
+  Support on this computer**, an update that names both versions, what is
+  kept, or in the kept program **Remove from this computer**. A session that
+  starts closes the keep or remove screen.
+- **With administrator rights.** Keeping is offered only by a window that
+  has them (`keep::offer`). The kept program offers to remove itself with or
+  without them.
+- **What was shown is what is kept.** The relay settings next to the copy
+  are read once, for the plan, without following a link; the screen names
+  the relay, where the copy would connect and what vouches for the name, and
+  that value is written. `keep_program` looks again, once the folder is
+  prepared, at what is kept and in which version, and refuses with
+  `keep_changed` when that is no longer what the plan showed.
+- **The kept program** shows that it is installed, with its version, says
+  so in its footer and in the explanation of the Windows prompt in place of
+  "nothing is installed", and keeps its webview profile like every customer
+  process: with administrator rights in its private folder (ST-M009-014).
+- **Reports.** The end report carries `keptProgram` and says that the
+  program is installed because the customer chose that; `recover` names it
+  as kept on purpose and never removes it.
+- **Off Windows** there is no layout: `get_keep` answers that nothing is
+  offered, and the screens show nothing about keeping.
+
+`/dev/keep.html` drives the real controller and views against a computer
+held in memory (`?copy=portable|update|same|older|kept|unelevated|kept-unelevated`,
+`?relay=none|plain|renamed|problem`, `?fail=plan|keep|remove|declined`).
 
 ## Live by default
 
@@ -140,14 +474,17 @@ waiting screen (`#t-wait`) names its adapter.
 | --- | --- |
 | `get_listen_networks` | this computer's private addresses that are up, each with the name of its network adapter (`ListenNetwork` in `src/shared/contract.ts`), in the order of `cretlink_discovery::listen_candidates` |
 | `start_live_session` | waits on the adapter chosen earlier in this run while it still has an address, otherwise on the first choice of `cretlink_discovery::first_choice`: the address of the default route unless that adapter is a point-to-point link |
-| `switch_listen_network` `{ address }` | only while waiting: stops the listener, waits until it is gone, and starts one on `address` with a new connection code; `address` must be one that `get_listen_networks` lists |
+| `switch_listen_network` `{ address }` | only while waiting on a network: stops the listener, waits until it is gone, and starts one on `address` with a new connection code; `address` must be one that `get_listen_networks` lists |
 
 - With more than one network the waiting screen offers the others under
   **Wait on another network**. While the listener moves it shows no code. The
   first Escape closes the open list; Escape then cancels as always.
-- The choice is kept for the later sessions of the same run, by adapter name
-  and in memory only (`src-tauri/src/technician/network.rs`): nothing is
-  written to disk.
+- The choice is kept for the later sessions, by adapter name
+  (`src-tauri/src/technician/network.rs`). The installed copy writes it to its
+  settings, next to the relay, so that it holds after the program is closed
+  (ST-M007-011); when that cannot be written the window says so (the
+  `console-notice` event). A copy that runs once keeps it in memory only and
+  writes nothing to disk.
 - Discovery announces the bound address alone, on its adapter alone
   (`cretlink_discovery::Advertiser`), so the customer's list never holds an
   address that nobody listens on.
@@ -175,6 +512,15 @@ name, else the user name) is in `ConsoleState.technician.display_name`; the
 customer view carries it as `technician`, labelled as what the technician's
 computer says.
 
+The technician looking through files in the explorer (ST-M010-002) is one
+item on both sides, "Looked through files and folders", which names the
+folder that is being looked at and follows along
+(`cretlink_session::ActivityFeed::look`). It goes on only while it is the
+newest entry: a change, a transfer, a command, an action of the AI or a gap
+is an entry of its own, and the next look starts a new item after it. A look
+that was refused is a failed item of its own and is never replaced. A look of
+the AI keeps its stated purpose and stays an item of its own.
+
 The rail of the live session (`#t-live`, **ST-M009-008**) asks
 `get_bridge_status` and follows the `console-bridge` event for the local MCP
 bridge (`BridgeStatus` in the contract): whether its IPC endpoint is `ready`
@@ -196,6 +542,196 @@ the record — an action as the feed words it, any other record from its
 arguments with the audit's own rendering (`[REDACTED]`, digests) — never a
 payload or a chain field. The frontend asks again, at most once a second,
 when the feed or the phase changes, and when the tab opens.
+
+## The file explorer (ST-M010-002)
+
+The **Files** tab of the live session is a file explorer for the customer
+computer: the drives, folders in a **Details** and a **List** view, a path bar,
+back, forward, up and refresh. From it the technician sends files and folders
+to the open folder, copies the selection to this computer, renames and
+deletes. The transfers of the session are under it, as its queue.
+
+Browsing:
+
+| Command | What it does |
+| --- | --- |
+| `explorer_drives` | the drives of the customer computer (`ExplorerDrive` in `src/shared/contract.ts`): root, kind, label, total and free space; a value the customer computer could not read is absent, never zero |
+| `explorer_open` `{ path, listing }` | opens the place `path` names and lists it. The folder arrives on the `console-explorer` event while the command runs (`ExplorerEvent`): `opened` once, with the folder as the customer computer names it and the first page, then a `page` for each further page. The answer says how the listing ended (`ExplorerListing`): `complete`, `cancelled` (left for another place) or `limit` |
+
+- **No authority of its own.** Every command of the explorer exists in a
+  technician process only. Those that ask something of the customer computer,
+  or prepare to, work only while a session is under full control: without
+  one, or without its open audit trail, they refuse with
+  `no_consented_session` before anything is asked, opened or kept
+  (`src-tauri/src/technician/explorer.rs`, `explorer/commands.rs`). Nothing
+  is asked of the customer computer before the technician opens the tab. A
+  stop or a revocation ends a listing, every transfer and every removal with
+  the session, and what was listed and queued is dropped with the session:
+  the next one starts with an empty explorer and an empty queue.
+- **Every look is the technician's, and recorded.** The commands go through
+  `cretlink_console::TechnicianFiles`: requests carry the origin `console`,
+  and each look is a pair of audit records, `console_fs_drives` or
+  `console_fs_list`, one pair for one folder however many pages it takes.
+- **The real location.** `path` is a path on the customer computer, never one
+  on this computer. A text that is no rooted path on a drive is refused before
+  anything is asked. What is shown and sent afterwards is the place as the
+  customer computer names it, built from its own answers: the root as the
+  drive list gives it, each further name as a listing of the folder above it
+  gives it (`cretlink_console::explorer`). A path typed in another letter case
+  therefore shows its real names. A name the folder above does not list, a
+  short name such as `PROGRA~1` included, is not found; a link is shown and
+  not followed; a path to a file opens the folder that holds it, with the file
+  selected. A name is looked for among at most 100 000 entries of a folder.
+  Spelled as the folder lists it, it is asked for at its place in the folder's
+  order and normally found with one request; in another letter case the
+  folder is read from its start. When the search stops at that bound, the
+  refusal says so, never that the name does not exist.
+- **Stays where it was.** A place that is refused is shown as that refusal in
+  the explorer, the folder that was open stays on screen, and a typed path
+  comes back into its field to be corrected.
+- **Thousands of entries.** A page is as long as the customer computer makes
+  it (ST-M010-005); the first page is on screen at once and the rest fills in
+  while the technician works. Only the rows in view are drawn, each at its
+  place in a box as tall as the whole list (`src/technician/explorer.ts`,
+  `views/explorer.ts`). Pages are sorted into what is listed — folders first,
+  names without regard to case and digits by their value, or by date, type or
+  size — while the selection stays on its entries and the row in focus, or
+  else the first row in view, stays where it is. A listing stops at 100 000
+  entries and says that the folder holds more.
+- **Honest states.** Opening, loading, an empty folder, a list that is not the
+  whole folder (with why), a place that was refused and a session that ended
+  each have their own words. Nothing reads as an empty folder that is not one.
+- **Selection and keys.** Click, `Ctrl` and `Shift` click, `Ctrl+A`; the arrow
+  keys, `Home`, `End`, `Page Up` and `Page Down`, with `Shift` to extend and
+  `Ctrl` to move without selecting; letters go to the row that starts with
+  them. `Enter` or a double click opens a folder or a drive, `Backspace` or
+  `Alt+Up` goes up, `Alt+Left` and `Alt+Right` go back and forward, `F5`
+  refreshes, `Ctrl+L` opens the path field, `F2` renames and `Delete`
+  deletes. The context menu (right click, `Shift+F10` or the menu key) and
+  the buttons above the list are one list of actions (`actionsFor` in
+  `explorer.ts`): **Open**, **Download**, **Download to…**, **Rename**,
+  **Delete**, **Upload files…**, **Upload a folder…** and **Refresh**. An
+  action of the menu is for the rows the menu opened on, a button and a key
+  for the selection.
+- **Escape.** An open question, the context menu, a name that is being typed
+  or the path field takes the first `Escape`; `Escape` then stops the
+  session, as always.
+- **A grid for a screen reader.** The list is a `grid` with rows and cells,
+  the number of all rows and the place of each, the column that sorts
+  (`aria-sort`), the selected rows and the row the keyboard is on
+  (`aria-activedescendant`). The grid itself takes the keyboard; changes of
+  place are announced politely, a refusal assertively.
+
+Sending, copying, renaming and deleting (`explorer/commands.rs`):
+
+| Command | What it does |
+| --- | --- |
+| `explorer_pick_upload` `{ kind }` | the system's dialog for `"files"` or for one `"folder"`; what was picked is kept as an offer (`UploadOffer`: a number, the count and the first names), or `null` when the dialog was closed |
+| `explorer_send_check` `{ offer, folder }` | lists `folder` on the customer computer and answers which names of the offer are taken there (`TransferCheck`) |
+| `explorer_send` `{ offer, folder, choices }` | queues the offer for `folder`; `choices` holds `replace`, `keep_both` or `skip` for each name that is taken; answers how many were queued, left out and skipped (`TransferQueued`) |
+| `explorer_choose_folder` | the system's dialog for a folder of this computer to copy to; the folder is kept under a number (`ChosenFolder`) |
+| `explorer_download_check` `{ names, to? }` | which of the selected names are taken in the folder a copy would go to; nothing is asked of the customer computer and no folder is made |
+| `explorer_download` `{ folder, names, to?, choices }` | queues the entries `names` of `folder` for a copy to this computer |
+| `explorer_transfers` | the queue as it is (`TransferEntry[]`) |
+| `explorer_cancel_transfer` `{ transfer }`, `explorer_cancel_transfers` | cancels one transfer, or all that wait or run |
+| `explorer_show_folder` `{ transfer }` | shows the folder of a copy that arrived in this computer's file manager |
+| `explorer_rename` `{ folder, name, to }` | gives one entry of `folder` another name in that folder |
+| `explorer_delete` `{ folder, items, removal }`, `explorer_cancel_delete` `{ removal }` | deletes the selection and answers what was removed and what could not be (`DeleteReport`); cancels that delete |
+
+| Event | Payload |
+| --- | --- |
+| `console-explorer-drop` | an `UploadOffer`: files and folders were dropped on the window |
+| `console-transfers` | `TransfersEvent`: the entries of the queue that changed, each replaced by its number |
+| `console-removal` | `RemovalProgress`: the item a delete is at, and the files and folders removed so far |
+
+- **The window names no path of this computer.** Files to send come from a
+  drop on the window or from the system's dialog, opened from Rust (`rfd`;
+  the frontend has no dialog permission). The backend keeps the paths and
+  tells the window the number of the offer and the names; a send names the
+  offer. A copy goes to `Downloads\CretLink\<target>`, which is made when the
+  first file goes there, or to a folder chosen in the system's dialog and
+  named by its number. **Show in folder** shows the folder a copy of the
+  queue went to, with the opener started by its full path: `explorer.exe`
+  in the Windows folder the system names, `/usr/bin/open`, or `xdg-open` from
+  `/usr/bin`, `/bin` or `/usr/local/bin` (`opener::show_folder`).
+- **A name from the customer computer is untrusted.** Every name of a listing
+  must be one plain name before a copy is written under it: no separator, no
+  colon, not `.` or `..`, no reserved device name, no trailing dot or space
+  (`explorer/local.rs`). Anything else is left out with a row that says why,
+  and nothing is written outside the folder that was chosen. What a selected
+  name is — a file, a folder, a link — comes from a listing the backend asks
+  for itself, not from what the window says. The folder for `<target>` is
+  the host name with everything but letters, digits, `-`, `_` and `.`
+  replaced.
+- **A name that is taken.** A look at the folder comes before anything is
+  queued, and the window asks once for each name that is taken: **Replace**,
+  **Keep both** (the new one becomes `name (2).ext`) or **Skip**, with a
+  button to do the same for the names that follow. A file replaces a file;
+  a folder goes into a folder, where its files replace those of the same
+  name and everything else stays. **Replace** is not offered where the kinds
+  differ, and is refused when it is asked for all the same. Nothing is
+  replaced without the request: a name that turns out to be taken after the
+  look fails its transfer and leaves what is there.
+- **Folders go file by file.** A dropped folder is walked on this computer,
+  a folder of the customer computer through its listings; each file is a
+  transfer of its own, and the folders are made on the way, empty ones too.
+  A link is never followed and has a row that says so. One send or one copy
+  queues at most 10 000 files and folders, 32 folders deep; a folder that
+  holds more, or that could not be listed to its end, has a row that says it
+  is not complete.
+- **The queue** (`explorer/transfers.rs`) carries one transfer at a time,
+  because the session serves one transfer at a time; the others wait. What
+  did not arrive is shown first, with its reason in the words the activity
+  has for it, then what runs, with its progress, and what waits, then what
+  ended. The panel draws a bounded number of rows of each and counts the
+  rest. A transfer that waits is cancelled at once; a running one ends at its
+  next step and its unfinished part goes with it — the customer computer
+  discards the part of a send, and the row says so when it could not; the
+  part of a copy is removed from this computer.
+- **Honest states** (REQ-N-008). `done` is a transfer whose length and
+  SHA-256 were verified, and only that reads as sent or copied. A failed,
+  cancelled or left-out transfer never does. When the session ends, the
+  running transfer and every waiting one end as stopped; the queue, the
+  explorer's alert and, once the explorer is dropped with the session, the
+  window's own alert say so.
+- **Rename** types the new name in the row (`F2`). `Enter` takes the name,
+  and so does a click elsewhere in the explorer, as in the Windows explorer;
+  `Escape` leaves the name as it was. A click on a row goes on to select
+  that row. A click on a control is not also that control's press when it
+  sent a new name: what the control would act on is being renamed at that
+  moment. A name must be one name. One that cannot be used keeps the field
+  open after `Enter`; after a click the name is left as it was and the
+  window says why. A name that is taken is refused by the customer computer,
+  which never replaces by a move.
+- **Delete** asks once for the whole selection, with the number of items and
+  the sentence that there is no recycle bin on this path; **Cancel** has the
+  focus. A folder is removed with everything in it, a file or a link as that
+  one entry, a link as the link. The answer counts an item as removed only
+  when the customer computer said so and names what could not be removed
+  with its reason; the list is then read again. One delete runs at a time
+  and can be cancelled between two of its steps.
+- **Recorded and shown.** Every transfer and every change goes through
+  `cretlink_console::TechnicianFiles` and is a pair of audit records of the
+  technician: `console_send`, `console_download`, `console_make_dir`,
+  `console_move`, `console_delete`, `console_remove_tree`, and
+  `console_fs_stat` for the look after a cancelled send. In the customer's
+  activity each is an item of its own; the looks stay the one item that
+  follows along. The path of a file on this computer is no argument of a
+  record; it stands only in the reason of a transfer that failed on this
+  computer, which names the file that could not be read or written.
+- **Questions for a screen reader.** A name that is taken is a `dialog` and a
+  delete an `alertdialog`, each with its title and its text, `Tab` going
+  round its buttons and the first `Escape` leaving it. The queue is a list
+  whose rows say their state in words; a running transfer has a progress bar
+  that says its name and its number.
+
+To try the explorer without a customer computer, run `npx vite` and open
+`/dev/explorer.html`: the real controller and views against a customer
+computer held in memory (`src/technician/simulated-computer.ts`), with Tauri
+replaced by its own mocks. It has a folder of five thousand entries and one of
+sixty thousand. A browser cannot hand the page a real drop, so a bar at the
+foot of the page drops prepared files and folders and ends the session. The
+controller's tests drive the same simulated computer.
 
 ## Session history and end reports (ST-M009-012)
 
@@ -266,11 +802,22 @@ apps/app/
     start/         the start screen
     technician/    Give help: api.ts (commands), model.ts (snapshot), views/
                    (one pure function per screen), terminal.ts (xterm),
-                   main.ts (controller), fixtures.ts, *.test.ts
+                   main.ts (controller), fixtures.ts, *.test.ts; the file
+                   explorer in explorer.ts (state), views/explorer.ts,
+                   explorer-control.ts (controller) and simulated-computer.ts
+                   (development and tests only)
     customer/      Get help: api.ts (commands), model.ts (snapshot), views/
                    (one pure function per screen, and the compact bar),
                    main.ts (controller of both windows), fixtures.ts, *.test.ts
   dev/gallery.html every screen of both roles from its fixtures (development only)
+  dev/explorer.html the file explorer against a simulated customer computer
+                    (development only)
+  dev/relay.html   Settings → Relay and a session through the relay against
+                   a simulated copy and relay (development only)
+  dev/relay-customer.html a relay code in the customer's window against a
+                   simulated relay and technician (development only)
+  dev/keep.html    keeping and removing the support program in the customer's
+                   window against a computer held in memory (development only)
   vitest.config.ts frontend tests (jsdom)
   src-tauri/
     Cargo.toml     detached crate; binary `cretlink`
@@ -280,11 +827,25 @@ apps/app/
     src/lib.rs     window per screen, process start and elevated relaunch
     src/start.rs   get_role, choose_role
     src/opener.rs  opens a validated file or folder with the platform opener
-    src/technician/  console state, commands, live-session driver and the
-                     session history (history.rs)
+    src/profile.rs the webview's profile folder of this process, and the end
+                   of the process that removes it
+    src/relay.rs   the relay of this copy, for both roles: where its profile
+                   comes from, the dial over wss, and the words of a failure
+    src/relayed_session_tests.rs  a session through the relay with both
+                   roles' drivers (tests only)
+    src/technician/  console state, commands, live-session driver, the task
+                     of one session that waits on a network or on a relay
+                     (session_task.rs), Settings → Relay
+                     (relay_settings.rs), the
+                     session history (history.rs) and the file explorer
+                     (explorer.rs; in explorer/: commands.rs, the queue in
+                     transfers.rs, rename and delete in changes.rs, the rules
+                     for names and folders of this computer in local.rs, and
+                     the customer computer as they reach it in target.rs)
     src/customer/    agent state, commands, live-session driver, the end
-                     report (report.rs), the admin step (admin.rs), and the
-                     compact bar and closing (windows.rs)
+                     report (report.rs), the admin step (admin.rs), the
+                     compact bar and closing (windows.rs), and keeping the
+                     support program (keep.rs)
 ```
 
 ## Build and run
@@ -360,6 +921,10 @@ one, and the live session starts with its full-control band.
   survives tab switches and the end of the session, and is cleared only when
   the next session starts. Items shed under load show as "N items were not
   shown".
+- The Files tab is the file explorer (ST-M010-002, above). Its state is part
+  of the snapshot for one session's full control; a folder that arrives in
+  pages and a change of the queue redraw the tab alone, and scrolling redraws
+  only the rows.
 - The end report and the history come from `list_sessions` (ST-M009-012).
   Until the sealed audit file is read, the end screen says it is preparing the
   report; unknown cleanup is never shown as success.
@@ -463,12 +1028,49 @@ filter and the end report.
 - Install, update and uninstall on Windows (Start-menu shortcut, uninstall
   entry, folder removal after exit) and macOS (the generated bundle) are manual
   checks of ST-M009-006 (`docs/manual-tests.md`, MT-11).
-- A run-once copy writes nothing of its own but the audit trail, but the
-  webview keeps its profile in the per-user data folder Tauri chooses
-  (`dev.cretlink.app`).
+- On macOS the webview is WebKit, which keeps its data in its own folders
+  under `~/Library`: the program cannot direct or remove it there, so it
+  stays after a copy that runs once has closed and after an uninstall
+  (ST-M009-014). Only the technician role exists on macOS.
+- That WebView2 lets go of the profile folder within the few seconds the
+  process waits at its end is a manual check on Windows
+  (`docs/manual-tests.md`, MT-10 step 2 and MT-11 steps 2 and 6).
 - A manual check on Windows that a customer session leaves no file unless
   **Save a copy** is used, and that the save dialog opens on
   `Documents\CretLink\` (ST-M009-012).
+- Keeping the support program was never run on Windows by hand: the folder
+  in `Program Files` and its permissions, the held program file, the
+  shortcuts, the entry in Installed apps, an update and the three ways to
+  remove are the steps of MT-16 in `docs/manual-tests.md`, with a standard
+  and an administrator account (ST-M009-017). Its screens were tested in
+  jsdom and driven with real mouse and key events in Chromium through
+  `dev/keep.html`, not in the application's own window, and no screen reader
+  has read them yet.
 - A manual walk-through of the technician interface on Windows and macOS, and
   a keyboard and screen-reader pass (Narrator, VoiceOver), are manual checks
   of ST-M009-008.
+- The file explorer has not been run against a customer computer on real
+  hardware, and no screen reader has read its grid, its questions or its
+  queue yet: the steps of scenario MT-14 in `docs/manual-tests.md`
+  (ST-M010-002). Its frontend was tested in jsdom and looked at in Chromium
+  through `dev/explorer.html`, not in the application's own window; a drop
+  from a real file manager and the system's own dialogs were not exercised.
+  Off Windows a customer computer lists its root file system as its one
+  drive, which no path the wire accepts can name, so the explorer shows that
+  drive and a refusal there, and the queue is tested against a customer
+  computer held in memory; the way through a real session runs on Windows.
+- A session through the relay has not been run between real computers on
+  two networks, and no screen reader has read the relay code or the state of
+  the wait yet: the steps of scenario MT-15 in `docs/manual-tests.md`
+  (ST-M007-013). Its backend was tested with both roles against the real
+  relay server with TLS inside the test process, and its screens in jsdom and
+  in Chromium through `dev/relay.html` and `dev/relay-customer.html`, not in
+  the application's own window. The compact bar (`#c-mini`) does not name the
+  relay; the main window does, on every screen.
+- While a file is being sent or copied, the session serves nothing else: a
+  folder that is opened, the terminal and an AI assistant's call wait until
+  that file has ended. Cancelling the transfer frees the session at the
+  transfer's next step.
+- A copy to this computer that is cancelled, or that fails on this computer,
+  stays "in progress" in the customer's activity until the session ends: the
+  customer computer is not told that the copy was given up.

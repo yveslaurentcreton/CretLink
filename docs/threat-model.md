@@ -1350,6 +1350,39 @@ hostile-input tests has landed — see the per-abuse-case evidence below
 maintainer-run hardware half ([`manual-tests.md`](manual-tests.md)) is still
 outstanding.
 
+The operations the technician's file explorer adds (ST-M010-001, REQ-F-028) —
+the list of drives, the removal of a folder with its content, and a file sent
+into a folder on any drive — have landed with automated tests on every CI
+platform. What only Windows has (junctions and other reparse points, a path
+that leads through one, a folder that is held while it is removed, an open
+and a rename inside an opened folder, a file held open by another program, a
+second drive) is covered by tests that run on the Windows CI runner only; the
+run on real hardware is scenario MT-14 in
+[`manual-tests.md`](manual-tests.md), not yet recorded. The technician reaches
+these operations through the console library. The AI tool surface does not
+contain them.
+
+The file explorer in the Files tab of the technician's window (ST-M010-002)
+has landed in both of its parts. It browses — the list of drives and the
+listing of a folder (FT-12) — and it changes: files and folders are sent to
+the open folder, the selection is copied to the technician computer, and an
+entry is renamed or deleted (FT-13). Both have automated tests on every CI
+platform. A folder is found by its path only where the wire accepts such a
+path, so the tests that open a real folder by a typed path, and those that
+send, copy, rename and delete in one, run on the Windows CI runner only. On
+every platform the technician's calls run through a real session in the
+staging area, and the transfer queue and the changes of the window are
+tested against a customer computer held in memory. Its run on real hardware
+is scenario MT-14, not yet recorded.
+
+The four operations that change one entry of a folder — delete a file, remove
+an empty folder, create a folder, move or rename (M003; the AI tools
+`remote_delete`, `remote_remove_dir`, `remote_make_dir` and `remote_move`) —
+take up the folder that holds the entry as a verified folder on Windows
+(ST-M010-004, FT-11). Their tests with junctions and with a folder that is
+swapped run on the Windows CI runner only; the run on real hardware is steps
+15 to 17 of scenario MT-14, not yet recorded.
+
 **Entry points.**
 
 - The MCP bridge file and transfer tools on the technician computer
@@ -1359,6 +1392,27 @@ outstanding.
   output is untrusted input. There is deliberately no file-content read or
   write tool; content crosses only through `remote_upload` and
   `remote_download`.
+- The technician's own file actions in the console library
+  (`TechnicianFiles`, ST-M010-001, ST-M010-002): the list of drives, the
+  listing of a folder, the removal of a folder with everything in it, a file
+  sent into a folder on any drive, a file copied to the technician computer,
+  and the changes to one entry (a new folder, a move or rename, a delete, a
+  look-up). Their requests carry the origin `console`; they are not MCP
+  tools. The drive list and the removal are wire operations of their own
+  (`fs_drives`, `remove_tree`), which an agent serves only when it advertises
+  the capability `fs.v2`; the others use the operations the AI tools use,
+  under the technician's name.
+- The commands of the technician's window that drive those actions
+  (`explorer_*` in `apps/app`, FT-12 and FT-13). They take text from the
+  window — a folder and names on the customer computer — and write files on
+  the technician computer under names that the customer computer gives.
+- The file explorer in the Files tab of the technician's window
+  (ST-M010-002): the commands `explorer_drives` and `explorer_open` of the
+  application's backend, registered in a technician process only. They call
+  `TechnicianFiles` for the list of drives and for the listing of a folder
+  (`fs_list` with the origin `console`). `explorer_open` takes a path as text
+  from the window; the window shows names, labels and paths that the customer
+  computer supplied.
 - The chunked transfer messages carried inside the authenticated encrypted
   session channel.
 - The file and transfer functions of the elevated execution broker on the
@@ -1504,6 +1558,53 @@ adversarial oversized-input tests cover this end to end
 (`crates/protocol/src/tests.rs`) — so an oversized or inconsistent frame is
 rejected rather than buffered (REQ-N-010, ST-M003-007).
 
+The size of one answer is bounded by the channel as well (ST-M010-005). The
+secure channel sends a message in one record of `MAX_RECORD_BYTES` (65519)
+bytes and splits nothing, so an answer whose encoding is longer cannot be
+sent. A folder page was bounded by its number of entries alone
+(`MAX_DIR_PAGE`, 256): a folder of long names — which any program on the
+customer computer can make — gave a page that did not fit, and the agent took
+the failed send for a lost connection and ended the session. Two things
+changed:
+
+- *A folder page fits.* The agent ends a page before the entry that would
+  make its answer larger than one record, and says that more follows; the
+  listing continues after the last name, as it always did. The size is the
+  one the answer has when it is encoded, with the longest request identifier,
+  so a name that the encoding writes longer (a quotation mark or a backslash
+  as two bytes, a control character as six) is counted as it is written. The
+  largest single entry the protocol carries is a small part of a record, so
+  a page that says more follows always holds an entry and a listing always
+  gets further.
+- *An answer that cannot be sent fails its request, not the session.* An
+  answer that is larger than one record, or that breaks a bound of the
+  protocol, is refused before anything of it reaches the wire. The agent
+  then fails that one request with the reason (`oversized_message`, or the
+  category of the bound), in fixed words that hold nothing of the answer
+  (REQ-N-015), and serves the next request. This holds for every kind of
+  answer. Only a channel that is really gone ends the session. The customer
+  sees such a request as failed.
+
+Evidence: `the_counted_size_is_the_size_of_the_real_encoding`,
+`the_real_answer_is_never_longer_than_counted`,
+`a_page_ends_before_the_entry_that_would_not_fit`,
+`the_largest_single_entry_always_fits` and
+`no_character_is_written_longer_than_six_bytes_for_one`
+(`crates/protocol/src/page/tests.rs`);
+`a_folder_of_long_names_is_listed_in_pages_that_fit_one_record`,
+`names_that_the_encoding_writes_longer_are_counted_as_they_are_written` and
+`an_entry_that_fits_no_page_fails_the_listing_instead_of_ending_a_page_empty`
+(`crates/exec/src/fs/tests.rs`);
+`an_answer_larger_than_a_record_fails_its_request_and_the_session_goes_on`,
+`an_answer_that_breaks_a_bound_fails_its_request_and_the_session_goes_on`
+and `a_frame_refused_before_the_wire_is_told_apart_from_a_lost_channel`
+(`crates/session/src/runtime.rs`); and, through a real session,
+`a_folder_of_long_names_is_listed_through_a_session_every_name_exactly_once`
+(600 files; names of 250 characters of three bytes each on Windows, and of 85
+such characters, the longest a name can be, elsewhere) and
+`an_answer_too_large_to_send_fails_its_request_and_the_session_goes_on`
+(`crates/session/tests/e2e.rs`).
+
 *FT-7 — Another program on the customer computer uses CretLink's own
 folders against the elevated program (ST-M006-020).* The staging area is
 where the elevated program acts on its own records: a cleanup removes the
@@ -1600,8 +1701,17 @@ that is already open. Mitigations:
   library and nothing it starts later begins there.
 - *Nothing is moved in.* A move keeps a file as it is, with its permissions
   and with every handle a program opened on it before. An elevated program
-  therefore refuses to move a file from elsewhere into its staging area. A
-  file gets there by an upload, which makes it new.
+  therefore refuses to move a file from elsewhere into its staging area,
+  whether the request names the staging area by a staging name or by its
+  full path: where the file would lie decides. A file gets there by an
+  upload, which makes it new.
+- *What is moved out takes the permissions of where it arrives.* For the same
+  reason a file that an elevated program moves from its staging area to
+  another place would stay closed to everybody but the administrators, the
+  customer included. It is given the permissions that the folder it arrives
+  in hands down, as if it had been made there, also when the request names
+  the staged file by its full path; if that fails, the move is answered as
+  failed and says so.
 - *Said, not passed over.* A session whose cleanup failed, a staging area
   that could not be made private (with the reason), a folder of an earlier
   release that is still there, and a lock that another program holds for
@@ -1622,8 +1732,9 @@ Evidence: `a_planted_manifest_removes_nothing_outside_the_staging_area`,
 `the_temporary_file_of_a_manifest_is_never_written_through_a_link`,
 `a_manifest_larger_than_a_manifest_can_be_is_not_read`,
 `a_session_with_a_damaged_manifest_is_named_and_never_called_clean`,
-`a_sweep_and_a_census_make_nothing_where_nothing_was_kept` and
-`nothing_is_moved_into_a_private_staging_area_from_elsewhere`
+`a_sweep_and_a_census_make_nothing_where_nothing_was_kept`,
+`nothing_is_moved_into_a_private_staging_area_from_elsewhere` and, on Windows,
+`a_file_moved_out_of_a_private_staging_area_takes_the_permissions_of_its_new_folder`
 (`crates/exec/src/fs/tests.rs`); the rule about private permissions, the
 chain of folders, and what happens when something else stands in the place
 of a folder (`crates/exec/src/own/tests.rs`);
@@ -1679,6 +1790,661 @@ administrator rights: that, and the environment of an elevated start, is
 the run on real hardware, scenario MT-4b in
 [`manual-tests.md`](manual-tests.md), not yet recorded.
 
+*FT-8 — Removal of a folder with its content (ST-M010-001).* One operation
+removes a whole folder tree, and what it removes is gone: there is no recycle
+bin. Beyond a wrong path, four things can go wrong. The removal can be led to
+another place: the agent is elevated, the folder may belong to an account that
+is not, and a program of that account can plant a junction or a symbolic link
+in the folder, swap a folder for a link while the removal is on its way to it,
+or swap the folder itself or a folder above it for a junction — before the
+removal begins or between two of its steps — so that the removal reaches the
+system folders or another user's files. The removal can hold the agent: the
+agent serves one request at a time, so a removal that ran to its end inside
+one request, or a step that a program keeps busy by creating and deleting
+entries, would keep a stop by the customer waiting. A removal that left
+something behind, or a folder that was only renamed away, can be reported as
+done. And an answer that names every entry it could not remove can outgrow
+what the channel carries, or carry a file name made to forge a line in the
+activity view or the audit log. Mitigations:
+
+- *Consent, attribution and visibility.* The operation exists only inside an
+  attended session with full-control consent, whose disclosure names reading,
+  modifying and deleting files (REQ-S-001, REQ-S-003). Every request carries
+  its origin, and the customer's activity shows the removal as one item with
+  its kind and its path: in progress from the first step that leaves more to
+  do, then done, cancelled or failed (REQ-F-017).
+- *Audit.* The agent records `fs_remove_tree` with the honest outcome when a
+  removal ends, and `fs_remove_tree_start` when a removal that takes more
+  than one step begins. The console records `console_remove_tree_start`
+  before the first request and `console_remove_tree` after the last, with the
+  path, the number of files and folders removed, the number of entries left
+  behind and the first of them with its reason (REQ-S-017).
+- *The folder is the one that lies at the path.* On Windows a step opens the
+  folder once, without following a link in the last part of its path, reads
+  from the opened handle where the folder really lies, and compares that with
+  the path it was asked, without regard to letter case and with short names
+  written out. A path that reaches the folder through a junction or a
+  symbolic link does not compare equal and is refused as `invalid_path`
+  before anything is removed; so is a path on a drive made with `subst` and
+  one on a network drive, whose real location is not the path that was asked.
+  The step then holds the folder: for as long as it runs, nobody else renames
+  or removes it, nor a folder above it. It asks for the right to remove the
+  folder with that. A folder that another program has open in a way that
+  excludes its removal, its working folder for example, is held with the
+  right to list it instead, and is opened once more at the end and removed
+  only if it is still the folder that was held; a folder that can be held in
+  neither way is not taken up. A link in the place of the folder itself is
+  removed as a link, by the first step of a removal only. The root of a drive
+  is refused, judged from the path and again from where the opened folder
+  lies, and the path of the request passes the same rules as every remote
+  path on both ends (FT-1).
+- *One removal, one folder.* Between two steps the agent holds nothing, and
+  the folder could be swapped for another. An answer that says more remains
+  therefore names the folder by its identity — its volume and its file
+  identifier, at most `MAX_FOLDER_ID_BYTES` (32) bytes — and the console gives
+  that back with the next request. A step that finds a folder with another
+  identity at the path, or a link, refuses with `invalid_path` before it
+  removes anything. Both ends validate the rule: the identity is present
+  exactly when more remains.
+- *Never out of the folder.* An entry that stands for another place — a
+  symbolic link, a junction, a volume mount point — is removed as that entry
+  and never entered; what it points at is not looked at. On Windows nothing is
+  removed by its name alone: every entry is opened without following a link,
+  what it is and where it really lies are read from the opened handle, an
+  entry whose real location is not inside the folder is refused as
+  `invalid_path`, and the removal goes through that same handle. The check and
+  the removal are about one object, so a swap between them changes nothing.
+  The paths of the entries are built from the folder's verified location in a
+  form that Windows does not rewrite, so a name that ends in a dot or a space,
+  or the name of a device such as `nul`, names the entry of that very name.
+  The folder itself is removed through the hold the step has on it, or,
+  where it is held without the right to remove it, through a second open
+  that is compared with the folder that was held.
+- *Bounded steps.* One request meets at most `MAX_TREE_STEP_ENTRIES` (4096)
+  entries — one it removes, one it cannot remove, one that is gone by the time
+  it reaches for it, a folder it enters — and answers after
+  `MAX_TREE_STEP_MS` (one second) once it has met an entry, whether or not it
+  removed anything. A program that keeps creating and deleting entries in the
+  folder therefore cannot keep a step going. The bounds are looked at between
+  two entries: one request that the operating system keeps waiting is not
+  ended by them (see the residual risks). A step that ends at a bound
+  without having removed anything says so (`blocked`) and names what stood in
+  its way. The console asks again while the answer says that more remains, at
+  most a million times; then the removal ends as failed. The agent keeps
+  nothing between two steps, so there is no state to tear down when the
+  session ends. A folder nested deeper than `MAX_TREE_DEPTH` (256) is reported
+  and left. The answer names at most `MAX_TREE_FAILURES` (16) entries, each
+  path cut to `MAX_TREE_FAILURE_PATH_BYTES` and kept on one line, counts the
+  others, and always fits one record of the secure channel (REQ-N-006).
+- *Stop and cancel.* Between two steps the agent serves whatever arrives, so a
+  stop or a revocation from either side takes effect within one step
+  (REQ-S-004, REQ-F-018). A cancellation is the console no longer asking; it
+  tells the agent that the removal ended, so the customer's item ends as
+  cancelled and does not stay in progress.
+- *Honest outcome.* Only a folder that the step itself removed is reported as
+  removed; one that is gone from its path for another reason is reported as
+  not found. A removal that left an entry behind is a failure that names it,
+  a cancelled one says what it had removed, and one cut short by the end of
+  the session is never recorded as done: the agent records its result as
+  unknown. The console treats an answer that contradicts itself — more to do
+  but nothing removed or no folder named, gone but with failures — as an
+  error, never as a result (REQ-N-008).
+- *Capability gate.* An agent that does not advertise `fs.v2` answers
+  `unsupported` before it lists or removes anything (REQ-N-012).
+
+Evidence: `links_in_the_folder_are_removed_and_never_followed`,
+`a_link_in_the_place_of_the_folder_is_removed_as_a_link`,
+`a_continuation_in_another_folder_is_refused_and_removes_nothing`,
+`a_step_that_leaves_more_to_do_names_its_folder_and_no_other_step_does`,
+`a_step_stops_at_its_entry_bound_and_the_next_one_gets_further`,
+`a_step_counts_every_entry_it_meets_and_ends_at_its_bound`,
+`entries_that_are_gone_when_the_walk_reaches_them_count_toward_the_bound`,
+`a_step_ends_at_its_time_bound_although_it_removed_nothing`,
+`a_folder_that_vanishes_during_the_step_is_never_reported_as_removed`,
+`what_cannot_be_removed_is_named_and_the_rest_is_removed` and
+`a_drive_is_not_a_folder` (`crates/exec/src/fs/tree/tests.rs`), with
+`a_folder_reached_through_a_junction_is_refused_and_its_target_keeps_everything`,
+`a_parent_swapped_for_a_junction_between_two_steps_is_refused`,
+`the_folder_cannot_be_renamed_away_while_a_step_holds_it`,
+`a_folder_another_program_holds_is_taken_up_and_reported_in_use`,
+`a_folder_held_without_the_right_to_remove_it_is_not_renamed_away`,
+`a_folder_above_a_held_folder_is_not_renamed_away`,
+`names_that_win32_would_rewrite_are_removed_as_plain_names`,
+`a_junction_in_the_folder_is_removed_and_never_followed`,
+`a_junction_in_the_place_of_the_folder_is_removed_as_a_link` and
+`a_file_held_open_by_another_program_is_named_as_in_use` on Windows;
+`a_folder_reached_through_a_junction_is_refused` and
+`another_spelling_of_the_real_location_is_accepted` on Windows
+(`crates/exec/src/fs/anchor/tests.rs`);
+`every_step_names_the_folder_the_step_before_answered_with` and
+`a_removal_that_never_ends_is_given_up_after_a_bounded_number_of_steps`
+(`crates/session/src/files/tests.rs`);
+`a_folder_swapped_between_two_steps_is_not_removed_in_its_place`,
+`a_cancelled_removal_stops_between_steps_and_says_so_on_both_sides`,
+`a_revoke_during_a_removal_never_reads_as_a_success`,
+`a_removal_that_leaves_something_behind_is_a_failure_with_its_reasons` and
+`without_the_capability_the_explorer_operations_are_unsupported`
+(`crates/session/tests/e2e.rs`);
+`only_a_removal_that_continues_names_its_folder`,
+`a_folder_id_is_bounded_and_never_empty` and
+`the_largest_drives_and_tree_removal_answers_fit_one_secure_record`
+(`crates/protocol/src/tests.rs`); and
+`a_stop_ends_a_removal_and_later_actions_fail_closed`
+(`apps/console/tests/technician_files_e2e.rs`).
+
+*FT-9 — A file sent into any folder (ST-M010-001).* The wire and the agent's
+file store could already commit a file at an absolute path, but nothing that
+is shipped asked for it: the AI's upload tool takes a staging name only. The
+technician's file actions are the first to send a file straight into a
+folder. Such a file is the customer's to keep: it lies outside the staging
+area, in no manifest, and no cleanup removes it. What can go wrong: the
+unfinished part of a transfer that never completes stays in the customer's
+folder; a program of an unprivileged account turns the elevated agent
+elsewhere — it plants a link under the part's name, gives the part a second
+name, or swaps the folder for a junction between two requests of the
+transfer, so that a chunk, the verified file or the cleanup lands in another
+directory; a file that was already there is replaced unasked; a torn or
+unverified file appears under the final name; a full disk or a file in use is
+reported as something else. Mitigations:
+
+- *Verified before it has its name.* The bytes go to a part file beside the
+  destination — on the same drive, so the commit is one rename on any drive,
+  and created in that folder, so on Windows the file inherits the folder's
+  permissions — and the file appears under its name only after its length and
+  SHA-256 are verified (FT-2, FT-3, REQ-N-007).
+- *Replaced only on request.* Without the request to replace, a file of that
+  name fails the transfer with `already_exists` and stays as it is; the
+  rename that publishes the file refuses a taken name in the same step. A
+  file that another program holds open is not replaced either, and the answer
+  says `file_in_use`.
+- *Inside the folder that was opened.* On Windows every request of the
+  transfer — each chunk, the commit, the discard and the cleanup — opens the
+  folder once as a verified folder (FT-8): it must be a real folder that lies
+  where the request says, so a junction or a symbolic link in its place or
+  in a folder above it is refused as `invalid_path`, as is a `subst` drive or
+  a network drive. Everything after that happens inside the opened folder.
+  The part is opened by its one name relative to the folder's handle, where
+  neither a path, nor a junction, nor a link in the object manager's
+  namespace takes part. The commit reads the length and the digest through
+  the handle it then publishes, which only readers share, and publishes with
+  a rename inside the directory the part lies in. Nothing that happens to a
+  path meanwhile changes where the bytes go.
+- *The part is the transfer's own.* The part must be a regular file with
+  exactly one name, and one that this session began. A link under its name, a
+  folder, a second name (a hard link) of a file that lies elsewhere, and a
+  file that lay there before the transfer wrote its first byte are refused:
+  never written to, never published. Whoever put a file there would stay its
+  owner and could change it after it got its name.
+- *The part is cleaned up.* The agent remembers every unfinished part that
+  lies outside the staging area (at most 1024 at a time; one more is refused)
+  and removes them with every cleanup: the one the session runs by itself
+  when it ends by a stop, a revocation or a lost connection, and one the
+  console asks for. On Windows the part is removed through its handle inside
+  the verified folder; a folder that is a link by then is not followed. A
+  part it could not remove is reported like any other cleanup failure and
+  tried again by the next cleanup (REQ-F-019). So is a part whose folder is
+  no longer in its place: a folder that was moved took the part along, and
+  the agent does not call gone what it cannot see. The parts are removed
+  also when the staging area itself cannot be cleaned up. A commit of an
+  empty file that is refused removes the empty part it made, so refused
+  commits leave nothing to remember.
+- *A name is one name.* The technician computer refuses, before anything is
+  sent, a name that is a path and a folder that is not a rooted path on a
+  drive; the wire validation applies the path rules again on both ends (FT-1).
+- *Attributed, visible, recorded.* The transfer carries the origin `console`,
+  the customer's activity shows a received file with its path and size, and
+  the console records `console_send_start` and `console_send` with the path
+  the agent committed — the folder's real location and the file's name — the
+  length and the verified digest, and whether a replacement was asked for
+  (REQ-F-017, REQ-S-017). A full disk is reported as `storage_exhausted`
+  (REQ-N-015).
+
+Evidence: `the_part_lies_beside_the_destination_until_the_verified_commit`,
+`a_file_sent_to_a_folder_is_kept_and_not_staged`,
+`the_part_of_an_unfinished_transfer_to_a_folder_is_removed_by_the_cleanup`,
+`a_part_the_cleanup_cannot_remove_is_reported_and_tried_again`,
+`a_part_whose_folder_is_no_longer_in_its_place_is_named_and_tried_again`,
+`a_cleanup_that_cannot_use_the_staging_area_still_removes_unfinished_parts`,
+`a_file_that_lay_under_the_name_of_a_part_before_the_transfer_is_not_taken_for_it`,
+`a_path_from_a_planted_manifest_fits_the_answer_whatever_it_holds`,
+`a_link_planted_under_the_parts_name_is_never_written_through`,
+`a_folder_under_the_parts_name_is_refused`,
+`a_refused_commit_of_an_empty_file_leaves_no_part_and_no_memory_of_one` and
+`a_full_disk_is_reported_as_exhausted_storage`
+(`crates/exec/src/fs/tests.rs`), with
+`a_junction_in_the_place_of_the_folder_is_refused_by_every_step_of_a_transfer`,
+`a_folder_swapped_for_a_junction_gets_nothing_published_or_removed_in_its_target`,
+`a_junction_under_the_parts_name_is_never_written_through`,
+`a_part_with_a_second_name_is_never_written_to_and_never_published`,
+`a_destination_held_open_by_another_program_is_not_replaced`,
+`a_file_is_committed_into_the_root_of_a_drive` and
+`a_file_is_committed_into_a_folder_spelled_by_a_short_name_or_in_another_letter_case`
+on Windows; `an_open_in_a_folder_stays_in_that_folder_whatever_its_path_leads_to`
+and `a_rename_through_a_handle_stays_in_the_folder_of_the_file` on Windows
+(`crates/exec/src/fs/anchor/tests.rs`); `a_name_that_is_a_path_is_refused`
+(`apps/console/src/service.rs`); and, on Windows only, because the wire
+accepts a path only when it is rooted on a drive,
+`a_file_is_sent_to_a_folder_and_replaced_only_on_request`,
+`a_revoke_during_a_transfer_to_a_folder_leaves_no_part_behind`
+(`crates/session/tests/e2e.rs`),
+`a_file_is_sent_into_a_folder_verified_and_replaced_only_on_request` and
+`a_large_file_arrives_whole_and_a_cancelled_one_leaves_nothing`
+(`apps/console/tests/technician_files_e2e.rs`).
+
+*FT-10 — The list of drives (ST-M010-001).* The list reads facts and changes
+nothing, but it carries text that anyone can choose — the label of a USB
+stick — to the technician computer, and a careless query could open a system
+dialog on the customer's screen or wait on a file server while the agent
+serves nothing else. Mitigations: at most `MAX_DRIVES` (32)
+entries, a root and a label bounded and kept on one line by the agent and
+checked again by the wire validation on both ends; a drive without a medium
+is listed with its kind and no size, and no dialog is shown for it; a drive on
+the network is listed with its kind only, so the list never waits on the
+network; a value the system cannot give is absent, never zero and never
+guessed (REQ-N-006, REQ-N-008). Evidence:
+`a_label_is_bounded_and_kept_on_one_line`,
+`a_drive_without_a_usable_root_is_left_out` (`crates/exec/src/fs/drives.rs`),
+`drive_texts_are_single_lines` and `too_many_drives_rejected`
+(`crates/protocol/src/tests.rs`).
+
+*FT-12 — Looking through the customer computer's files from the technician's
+window (ST-M010-002).* The explorer lets the technician open drives and
+folders of the customer computer and read their names, sizes and dates. It
+reads and changes nothing. What it adds: a command of the application's
+backend that takes a path from the window; text that anyone on the customer
+computer can choose — the name of a file, the label of a drive — shown in the
+technician's window; listings of any length; and many small requests that the
+customer must still be able to follow. Mitigations:
+
+- *No authority of its own.* Both commands exist in a technician process
+  only. Outside a session under full control they refuse with
+  `no_consented_session` before anything is asked, and so they do when the
+  session's audit trail is not open: nothing the technician does through the
+  explorer can miss the trail. Nothing is asked of the customer computer
+  before the technician opens the Files tab. A stop or a revocation ends a
+  listing with the session, between two of its requests, as an error and
+  never as the whole folder; what was listed is dropped from the window when
+  full control ends (REQ-S-023, REQ-S-004, REQ-N-008).
+- *A path from the window.* The path of `explorer_open` is a path on the
+  customer computer. It is never opened, resolved or written on the
+  technician computer. It must be a rooted path on a drive
+  (`validate_remote_absolute_path`: no `..`, no UNC or device namespace, no
+  reserved device name, no alternate data stream, bounded in length and
+  depth); any other text is refused, and recorded as refused, before
+  anything is asked. The wire validation applies the same rules again on both
+  ends (FT-1).
+- *The place that is shown is the real one.* No answer of the agent holds a
+  path, so the explorer names a place by what the customer computer answers:
+  the root of a drive as the drive list gives it, and every further name as a
+  listing of the folder above it gives it. A path that was typed is looked
+  for name by name; in another letter case it is led to the listed spelling,
+  and that is what the window shows, what later requests carry and what the
+  audit record names. A name the folder above does not list is not found —
+  a second spelling such as a short name included — and nothing is opened.
+  The search for a name reads at most as many entries as a listing does; when
+  it stops there, the refusal says so and does not claim that the name is
+  absent (REQ-N-008).
+- *A link is shown, not followed.* A listing describes a link and never
+  follows it. The explorer does not open one, and refuses a typed path that
+  ends in one or leads through one, before anything behind it is asked. So
+  the explorer never stands in a place whose real location differs from the
+  path it shows, which is the path a later change would name (FT-8, FT-11).
+- *Text from the customer computer.* Names, labels and paths are written into
+  the window as text, never as markup, and every string of the backend's
+  events is checked against the contract before it is taken; an event with a
+  malformed entry is dropped whole, so a damaged page cannot make a folder
+  look complete (REQ-S-016, REQ-S-018). The type shown for a file is read
+  from the end of its real name.
+- *A folder of any size.* A page holds at most 256 entries and always fits one
+  record of the secure channel (ST-M010-005). A listing stops at 100 000
+  entries and says that the folder holds more; the window draws only the rows
+  in view. A new listing, or the drive list, leaves the one that is still
+  running, so one window never has two listings in flight. What the session
+  remembers of the places the customer computer confirmed is bounded (the
+  drive roots, 256 folders, 20 000 subfolder names of the folder listed last)
+  and ends with the session (REQ-N-006).
+- *What the customer sees.* Every request carries the origin `console`, so it
+  is shown as the technician's. The requests of one look after another are
+  one item in the customer's activity, *Looked through files and folders*,
+  which names the folder that is looked at now; a change, a transfer, a
+  command and an action of the AI stay items of their own, and a look that
+  the customer computer refused is a failed item of its own that no later
+  look replaces (REQ-F-017). A look of the AI is never folded into it: it
+  keeps the purpose the AI stated (REQ-F-026).
+- *What is recorded.* Each folder that is opened is one pair of audit
+  records, `console_fs_list_start` and `console_fs_list`, with the path as it
+  was asked for, then the folder as the customer computer names it, the
+  number of entries, and an outcome that is `ok` only for a listing that
+  reached the end of the folder or its bound (REQ-S-017).
+
+Evidence: `a_typed_path_is_led_to_the_names_the_target_lists`,
+`a_refused_spelling_reaches_nobody`,
+`a_name_the_folder_does_not_list_is_not_found`,
+`a_link_is_refused_and_nothing_behind_it_is_asked_for`,
+`a_listing_stops_at_its_bound_and_says_that_more_exist`,
+`a_listing_that_fails_on_its_way_is_an_error_with_what_arrived` and
+`a_folder_that_was_forgotten_is_looked_up_again`
+(`apps/console/src/explorer/tests.rs`);
+`a_large_folder_is_listed_in_pages_and_is_one_item_on_both_sides`,
+`looks_follow_along_and_a_change_is_its_own_item_on_both_sides`,
+`a_folder_that_cannot_be_listed_is_refused_and_recorded`,
+`a_stop_ends_a_listing_and_later_looks_fail_closed`,
+`a_path_that_is_no_remote_path_is_refused_before_it_begins` and, on Windows,
+`a_typed_path_opens_the_folder_under_its_real_name`
+(`apps/console/tests/technician_files_e2e.rs`);
+`a_look_that_was_refused_is_a_failed_item_of_its_own` and
+`a_look_of_the_ai_stays_an_item_with_its_stated_purpose`
+(`crates/session/src/activity/tests.rs`);
+`without_a_session_both_commands_fail_closed`,
+`without_an_audit_trail_both_commands_fail_closed`,
+`a_place_that_is_refused_delivers_nothing_and_says_why` and
+`after_a_stop_both_commands_fail_closed`
+(`apps/app/src-tauri/src/technician/explorer/tests.rs`); and the frontend
+tests `explorer.test.ts`, `explorer-views.test.ts` and
+`explorer-controller.test.ts` in `apps/app/src/technician`. The run on real
+hardware is the browsing steps of scenario MT-14 in
+[`manual-tests.md`](manual-tests.md), not yet recorded.
+
+*FT-13 — Sending, copying to the technician computer, renaming and deleting
+from the technician's window (ST-M010-002).* The second part of the explorer
+makes changes everyday actions: a drop on the window sends files, **Download**
+writes files of the customer computer on the technician computer, **Delete**
+removes a folder with everything in it, **Rename** moves an entry. What it
+adds: commands of the application's backend that are driven by text from the
+window; files written on the technician computer under names that the
+customer computer chooses; a destructive action one key away; many requests
+that run without the technician watching each; and transfers that are still
+on their way when the session ends. Abuse: a customer computer — or whoever
+answers in its place — names a file `..\..\Startup\run.bat`, `C:\x`, `NUL`
+or `report.pdf.` so that a copy lands outside the folder the technician
+chose, on a device, or over another file; a listing says that a link is a
+folder so that a copy follows it; the content of the window, should it ever
+be led astray, names a file of the technician computer to send or a place to
+write to; a transfer that failed, was cancelled or was cut off by the end of
+the session is shown as done; a delete removes more than was confirmed, or
+reports as removed what is still there; a rename moves an entry to another
+folder or replaces another file. Mitigations:
+
+- *No authority of its own.* Every command exists in a technician process
+  only. Those that ask something of the customer computer, or that prepare
+  to, refuse with `no_consented_session` outside a session under full
+  control with an open audit trail, before a dialog opens or anything is
+  kept: nothing the technician changes can miss the trail. What a dialog
+  gave is not kept either when the session ended while it was open. The five
+  that only look at or cancel what the backend holds — the queue, the three
+  cancels, the folder of a copy — reach nothing on the customer computer. A
+  stop or a revocation cancels the transfer and the removal that run; the
+  queue then ends the running transfer and every waiting one as stopped,
+  never as done, and a delete says how far it came. The window says so in
+  the queue, in the explorer's alert and, once the explorer is dropped with
+  the session, in its own alert (REQ-S-023, REQ-S-004, REQ-N-008).
+- *The window names no file of the technician computer.* What is sent comes
+  from the system's file dialog, which the backend opens itself, or from a
+  drop on the window, which the backend receives itself. It keeps the paths
+  as an offer and tells the window a number and the names; a send names the
+  number. A copy goes to `Downloads\CretLink\<target>` or to a folder the
+  technician chose in the system's folder dialog, kept under a number. The
+  folder that **Show in folder** opens is the one a copy of the queue went
+  to. So a window that was led astray could send only what the technician
+  dropped or picked, and write only where the technician chose.
+- *A place on the customer computer is text, and checked.* A folder from the
+  window must be a rooted path on a drive (`validate_remote_absolute_path`,
+  FT-12); a name must be one name, without a separator, a colon or a
+  character that no name may hold. Neither is ever opened on the technician
+  computer. The agent has the last word: it takes up the folder of a change
+  or of a transfer as a verified folder and refuses a path through a link
+  (FT-8, FT-9, FT-11).
+- *A name from the customer computer is untrusted.* A copy is written at the
+  chosen folder plus names that listings give. Each such name must be one
+  plain name before anything is written (`explorer/local.rs`): not empty,
+  not `.` or `..`, no `\` or `/`, no colon (a drive or an alternate data
+  stream), no control character, none of `< > " | ? *`, no trailing dot or
+  space (Windows would read it as another name), no reserved device name
+  (`CON`, `NUL`, `COM1`, `LPT1` and the others, with or without an
+  extension), not longer than 255 units, and not the name CretLink gives an
+  unfinished copy. Any other name is refused, never repaired: its entry is
+  left out with a row that says why, and what lies beside it is still
+  copied. The path of every copy is checked once more, when it is about to
+  be written, to lie inside the chosen folder through plain names only. The
+  folder for `<target>` is made from the host name the customer computer
+  reports, with everything but letters, digits, `-`, `_` and `.` replaced,
+  and a fixed name when nothing usable is left.
+- *What a name is comes from the backend's own look.* The window says which
+  entries are selected; whether each is a file, a folder or a link is read
+  from a listing the backend asks for, once for the selection and once for
+  each folder below it. A link is never followed in either direction: one
+  that is selected or lies in a folder that is copied is left out and says
+  so, and a link in a dropped folder is not sent (`symlink_metadata`, never
+  the target). The walks are bounded — 10 000 files and folders for one send
+  or one copy, 32 folders deep, 100 000 transfers in a session's queue — and
+  a folder that holds more, or that could not be listed to its end, has a
+  row that says it is not complete (REQ-N-006, REQ-N-008).
+- *Nothing is replaced without the request.* Before a send the backend lists
+  the folder and the window asks, for each name that is taken, whether to
+  replace it, keep both (`name (2).ext`) or skip; before a copy it looks at
+  the technician computer's folder and asks the same. A file replaces a
+  file and a folder goes into a folder; where the kinds differ, replacing is
+  not offered, and it is refused when it is asked for all the same. A name
+  that is taken and has no choice is left out. A name that turns out to be
+  taken after the look fails its transfer: the agent refuses to publish over
+  a file without the request (FT-9), and a copy whose place is taken is not
+  started.
+- *Done means verified.* A row of the queue reads as sent or copied only for
+  a transfer the engine reported as completed, which is one whose length and
+  SHA-256 were verified (FT-2, FT-3). A failed transfer carries the reason in
+  the words the activity has for its category — in use, access denied, the
+  disk is full — or the local path and reason for a file of the technician
+  computer; a cancelled one says cancelled; one that the end of the session
+  cut off says stopped. A transfer that the session cancelled without the
+  technician asking is the end of the session, not the technician's cancel.
+- *A cancel leaves no part.* The engine asks the agent to discard the part
+  of a cancelled send; the queue then asks whether a part is still there and
+  says so when it is, with what happens to it (the session's cleanup removes
+  it, FT-9). The part of a cancelled or stopped copy is removed from the
+  technician computer, and the row says so when it could not be.
+- *Delete is confirmed once, for exactly what is selected.* The window asks
+  before anything is removed, with the number of items and the sentence that
+  there is no recycle bin, and gives the focus to **Cancel**. Each item is
+  then removed by the operation its listed kind has: `remove_tree` for a
+  folder (FT-8), `fs_delete` for a file or a link, which removes a link as
+  the link (FT-11). The kind only chooses the operation: the agent refuses a
+  folder that is asked to be deleted as a file and a file or a link that is
+  asked to be removed as a folder, so a kind that is out of date removes
+  nothing. The answer counts an item as removed only when the agent said so,
+  names the entries that could not be removed with their reasons — the first
+  twenty, the others as a number — and the folder is listed again. One
+  delete takes at most 10 000 items and can be cancelled between two steps.
+- *Rename stays in its folder.* The new name is one name; a text with a
+  separator would move the entry and is refused before anything is asked.
+  The move never replaces: a name that is taken is refused by the agent in
+  one step with the rename (FT-11).
+- *Text from the customer computer.* Names, paths and reasons are written
+  into the queue, the questions and the alerts as text, never as markup, and
+  every event of the queue is checked against the contract before it is
+  taken; one with a malformed entry is dropped whole (REQ-S-016, REQ-S-018).
+- *The file manager is started by its full path.* **Show in folder** starts
+  `explorer.exe` in the Windows folder the system names, `/usr/bin/open`, or
+  `xdg-open` from one of the system's program folders, with the folder as its
+  only argument and never through a shell; a bare name that a search path
+  resolves is never handed over.
+- *What the customer sees, and what is recorded.* Every request carries the
+  origin `console`. Each file that arrives, each file that leaves, each
+  folder that is made, each rename and each delete is an item of its own in
+  the customer's activity; the looks stay the one item that follows along
+  (FT-12). Each is a pair of audit records of the technician
+  (`console_send`, `console_download`, `console_make_dir`, `console_move`,
+  `console_delete`, `console_remove_tree`, and `console_fs_stat` for the
+  look after a cancelled send), with the path on the customer computer, the
+  length and the digest of a transfer, and an outcome that is `ok` only for
+  what the agent confirmed. The path of a file on the technician computer is
+  no argument of a record. It stands in one place only: the reason of a
+  transfer that failed on the technician computer, which names the file that
+  could not be read or written. That reason stays in the technician's own
+  audit log and is not sent to the customer computer (REQ-F-017, REQ-S-017,
+  REQ-S-018).
+
+Evidence: `a_name_that_could_leave_its_folder_is_refused`,
+`a_name_in_a_folder_stays_in_that_folder`,
+`the_folder_of_a_customer_computer_is_a_plain_name`,
+`a_link_in_a_dropped_folder_is_named_and_not_followed` and
+`a_walk_stops_at_its_bounds_and_says_so`
+(`apps/app/src-tauri/src/technician/explorer/local/tests.rs`);
+`names_that_try_to_leave_the_chosen_folder_are_left_out`,
+`a_copy_whose_place_is_outside_the_chosen_folder_is_refused`,
+`what_a_selected_name_is_comes_from_the_listing_not_from_the_window`,
+`a_selected_folder_is_copied_file_by_file_and_a_link_is_left_out`,
+`a_name_that_is_taken_is_replaced_kept_beside_or_skipped_as_chosen`,
+`a_name_that_is_taken_here_is_replaced_kept_beside_or_skipped_as_chosen`,
+`a_file_never_replaces_a_folder_on_this_computer`,
+`a_file_that_appeared_after_the_look_is_never_replaced`,
+`an_offer_is_queued_only_for_the_folder_it_was_checked_against`,
+`a_cancelled_transfer_never_reads_as_done_and_says_what_it_left`,
+`a_cancelled_or_stopped_copy_leaves_no_part_on_this_computer`,
+`the_end_of_the_session_stops_the_running_and_every_waiting_transfer`,
+`a_transfer_the_session_cancelled_is_stopped_not_cancelled`,
+`a_folder_that_is_not_walked_to_its_end_says_so` and
+`a_new_session_starts_with_an_empty_queue`
+(`apps/app/src-tauri/src/technician/explorer/transfers/tests.rs`);
+`a_new_name_that_is_a_path_is_refused_before_anything_is_asked`,
+`a_rename_onto_a_name_that_is_taken_changes_nothing`,
+`a_delete_removes_each_item_by_what_it_is`,
+`a_kind_that_is_out_of_date_removes_nothing`,
+`what_could_not_be_removed_is_named_with_its_reason` and
+`the_end_of_the_session_stops_a_delete_and_says_so`
+(`apps/app/src-tauri/src/technician/explorer/changes/tests.rs`);
+`without_a_session_every_command_fails_closed`,
+`without_an_audit_trail_every_command_fails_closed`,
+`a_folder_from_the_window_is_a_path_on_a_drive_of_the_customer_computer`,
+`a_copy_goes_to_the_default_folder_or_to_one_the_technician_chose`,
+`a_selection_whose_name_is_a_path_is_refused_whole` and, on Windows,
+`files_are_sent_copied_back_renamed_and_deleted_through_a_session`
+(`apps/app/src-tauri/src/technician/explorer/commands/tests.rs`);
+`the_file_manager_is_named_by_its_full_path` (`apps/app/src-tauri/src/opener.rs`);
+`the_technician_copies_a_file_to_this_computer`,
+`a_cancelled_copy_is_never_done_and_its_part_is_named`,
+`the_technician_changes_one_entry_and_both_sides_say_the_same`,
+`a_stop_ends_a_copy_and_later_changes_fail_closed` and, on Windows,
+`changes_and_a_copy_work_in_a_real_folder_and_refuse_a_link_on_the_way`
+(`apps/console/tests/technician_files_e2e.rs`); and the frontend tests
+`explorer.test.ts`, `explorer-views.test.ts` and
+`explorer-controller.test.ts` in `apps/app/src/technician`. The run on real
+hardware is scenario MT-14 in [`manual-tests.md`](manual-tests.md), not yet
+recorded.
+
+*FT-11 — A change to one entry is led to another place (ST-M010-004).*
+Deleting a file, removing an empty folder, creating a folder and moving or
+renaming an entry each change one entry of a folder. The operations exist
+since M003, the AI reaches them through `remote_delete`, `remote_remove_dir`,
+`remote_make_dir` and `remote_move`, and the explorer makes them everyday
+actions. Up to release 0.24.1 the agent resolved their paths by name. The
+agent is elevated, and the folder may belong to an account that is not. A
+program of that account can make a folder on the way a junction — also one
+that leads into a directory of the object manager, where a symbolic link
+sends one file name to any path — or swap the folder for a junction between
+two requests, or between a check and the change. The delete, the new folder
+or the moved file then lands where the junction leads: with administrator
+rights, in a place the account could not change itself (REQ-S-024).
+Mitigations, on Windows and for an absolute path:
+
+- *The folder that holds the entry is the one that lies at the path.* Each of
+  the four operations takes up that folder once, as a verified folder (FT-8):
+  it is opened without following a link in the last part of its path, where
+  it really lies is read from the opened handle, and that is compared with
+  the path that was asked, without regard to letter case and with short names
+  written out. A path that reaches the folder through a junction or a
+  symbolic link, a folder that is itself a link, and a path on a drive made
+  with `subst` or on a network drive are refused as `invalid_path` before
+  anything changes. So is a folder whose real location the system cannot
+  tell, such as one on a volume without a drive letter. A volume that is
+  mounted in a folder counts as a link here: an entry directly in its top
+  folder cannot be changed by that path.
+- *Delete a file* (`fs_delete`). The entry is opened by its one name relative
+  to the folder's handle, as the entry it is and never as what a link points
+  at. What it is is read from that handle: a folder is refused, a file or a
+  link is removed through that same handle.
+- *Remove an empty folder* (`remove_dir`). The entry is opened the same way.
+  Only a real folder is removed, through its own handle, and only when it is
+  empty.
+- *Create a folder* (`create_dir`). One level, as before: the folder is
+  created relative to the handle of the folder it is created in, never by a
+  path, and gets the permissions that folder hands down. A folder above it
+  that is missing is not created.
+- *Move or rename* (`fs_move`). Both folders are taken up before anything
+  changes. The entry is opened relative to the handle of its folder and
+  renamed through its own handle into the handle of the destination's
+  folder: the system puts the entry into the directory that handle stands
+  for, and no path names the destination. It stays a rename on one volume,
+  never a copy; a name that is taken is refused, in one step with the
+  rename, unless the caller asked to replace it, and a folder under that
+  name is never replaced.
+- *Nothing is resolved by path a second time.* The check of the folder and
+  the change are about the folder that was opened. A folder that is swapped
+  for a junction after it was taken up changes nothing: the operation acts
+  in the folder it opened. A folder that is swapped before the next request
+  is a link when that request takes it up, and the request is refused.
+- *A link as the entry itself keeps its meaning.* Only the way to the entry
+  must be free of links. A delete removes a link — a symbolic link to a file
+  or to a folder, a junction, a link to nothing — as the link, never what it
+  points at. The removal of an empty folder refuses a link. No folder is
+  created under a name that a link has, and none where the link points. A
+  move moves the link, and a move that may replace never reaches what a link
+  under the destination's name points at.
+- *The staging area goes on by path.* An operation on a staging name works
+  by path, as the staging area's own operations do (part, commit, discard,
+  delete, cleanup). Since ST-M006-020 the staging area of an elevated
+  program is a private folder of the administrators, and that of a program
+  without administrator rights lies in the folder of its own account: no
+  other account can change a folder in either (FT-7), so there is no link
+  another account could have put there. A move between a staging name and a
+  path verifies the folder of the path. An elevated program still takes
+  nothing into its staging area by a move, and what it moves out takes the
+  permissions of the folder it arrives in (FT-7). Both are decided from
+  where the two opened folders really lie, so a request that names the
+  staging area by its full path is treated like one that uses a staging
+  name, and the permissions are replaced through the handle that renamed
+  the entry: no path is resolved for it again.
+- *Said to the AI.* The four tools say in their description that a path
+  through a link is refused, that nothing changes then, and that the real
+  location is to be named. Their inputs and their results are unchanged.
+
+Evidence: `a_delete_removes_a_link_and_never_what_it_points_at`,
+`a_link_is_not_removed_as_an_empty_folder`,
+`a_folder_is_not_created_under_the_name_of_a_link`,
+`a_move_moves_a_link_as_the_link`,
+`a_move_that_replaces_never_reaches_what_a_link_points_at`,
+`a_move_into_another_folder_keeps_its_contract`,
+`what_is_not_there_or_not_of_its_kind_is_refused_as_before`,
+`a_delete_of_a_second_name_of_a_file_leaves_the_file_under_its_other_name`
+and `a_file_is_moved_between_the_staging_area_and_a_folder`
+(`crates/exec/src/fs/tests.rs`), which run on every CI platform and pin what
+each operation meant before; the two rules about the private staging area
+with `nothing_is_moved_into_a_private_staging_area_from_elsewhere` and, on
+Windows,
+`a_file_moved_out_of_a_private_staging_area_takes_the_permissions_of_its_new_folder`
+(the same file), each also with the staging area named by its full path;
+with, on Windows,
+`a_delete_through_a_junction_is_refused_and_what_it_leads_to_stays`,
+`a_folder_removal_through_a_junction_is_refused_and_what_it_leads_to_stays`,
+`a_folder_creation_through_a_junction_is_refused_and_nothing_is_created_behind_it`,
+`a_move_through_a_junction_on_either_side_is_refused_and_nothing_moves`,
+`a_folder_swapped_for_a_junction_between_two_deletes_is_not_followed`,
+`a_folder_swapped_for_a_junction_between_two_folder_removals_is_not_followed`,
+`a_folder_swapped_for_a_junction_between_two_folder_creations_is_not_followed`,
+`a_folder_swapped_for_a_junction_between_two_moves_is_not_followed`,
+`a_change_is_made_in_the_folder_that_was_opened_whatever_its_path_leads_to`,
+`a_junction_as_the_entry_keeps_its_meaning_for_every_operation`,
+`a_move_between_the_staging_area_and_a_folder_behind_a_junction_is_refused`,
+`a_folder_spelled_by_a_short_name_or_in_another_letter_case_is_the_same_folder`,
+`a_held_file_is_in_use_and_read_only_entries_are_removed` and
+`the_root_of_a_drive_is_no_entry_to_change` (the same file);
+`a_move_through_handles_lands_in_the_opened_folder_and_replaces_only_when_asked`
+and `a_folder_of_cretlinks_own_is_taken_up_as_it_is` on Windows
+(`crates/exec/src/fs/anchor/tests.rs`); and
+`the_tools_that_change_one_entry_say_that_a_path_through_a_link_is_refused`
+(`crates/mcp/tests/bridge_mock.rs`). The tests that need Windows run on the
+Windows CI runner only; the run on real hardware is steps 15 to 17 of
+scenario MT-14 in [`manual-tests.md`](manual-tests.md), not yet recorded.
+
 **Residual risks.**
 
 - A release up to 0.24.0 has the weakness of FT-7 whenever it is started,
@@ -1712,8 +2478,9 @@ the run on real hardware, scenario MT-4b in
   file. CretLink starts no program by its name alone, but it does not check
   itself. Check the download as [`verifying-artifacts.md`](verifying-artifacts.md)
   describes, and keep it in a folder that other accounts cannot write. A
-  customer program that is installed where only administrators can write is
-  ST-M009-017.
+  customer can keep the support program where only administrators can write
+  (ST-M009-017, under "One application, two roles"): that closes this for
+  the kept program, and it stays for the copy that is downloaded first.
 - Command Prompt looks for a program that is named without its folder in the
   working directory first. A job that names no working directory starts in
   the system folder. A job or a terminal that the technician lets work in a
@@ -1726,16 +2493,24 @@ the run on real hardware, scenario MT-4b in
   environment of the account that approved, not that of the program that
   asked, so an account without rights does not choose the search path of an
   elevated session. CretLink relies on that, and MT-4b checks it on real
-  hardware. The same holds for the profile of the elevated window's web
-  view, which lies in the local application data of the account that
-  approved.
+  hardware. The places that the elevated program keeps for itself are not
+  taken from that environment: the profile of the elevated window's webview
+  lies in a private folder in `CretLink Data`, the variables that WebView2
+  obeys are dropped from the program's own environment before the webview is
+  created, and a helper that it starts gets an environment built from the
+  system's folders alone (ST-M009-014, ST-M009-017).
 - A program without rights can still get in the way. It can hold a file in
   the old folder open so that the folder cannot be removed, or fill the
   folder so that removing it takes long: a start and `recover --remove` wait
   a bounded time, say that the folder is still there, and go on. It can also
   make the old folder again, so that every elevated start names it until an
   administrator removes it. That delays a cleanup and costs a notice; it
-  gives nothing away.
+  gives nothing away. It can also keep one request of the agent waiting in
+  the operating system, for example by holding an entry of a folder under an
+  opportunistic lock and not answering when the agent opens it. The agent
+  serves one request at a time, so everything else waits with it, a stop by
+  the customer included, until that program lets go or CretLink is ended.
+  This holds for every file operation, not only for the removal of a folder.
 - A process that is elevated without being an administrator, and a computer
   whose `Program Files` is not a folder of the system, get no staging area
   from an elevated CretLink.
@@ -1768,6 +2543,110 @@ the run on real hardware, scenario MT-4b in
 - Resource limits are robustness bounds, not quotas. An authorised session can
   still legitimately fill a disk with a large installer; limits exist to stop
   unbounded or accidental exhaustion, not to police approved work.
+- Only a folder page is built to fit one record of the secure channel. Other
+  answers can still be larger than a record within the bounds of the
+  protocol: a list of very many jobs or staged files, a cleanup report that
+  names very many files, a file read of more bytes than a record carries, a
+  large screenshot, a long clipboard text. Such a request fails with the
+  reason and the session goes on (ST-M010-005), but its answer cannot be had
+  that way. The transfer engine asks for file content in chunks that fit.
+- A removed folder is gone. The removal does not use a recycle bin and cannot
+  be undone; the operation removes what it is asked to remove, and any
+  question before it is the calling screen's. The defence is consent, the
+  customer's view of the action, the audit record, and the stop control.
+- A file sent to a folder stays. It is outside the staging area by design, so
+  the cleanup that removes staged files does not remove it; the audit record
+  and the customer's activity are what remains of how it got there.
+- A part can outlive a killed agent. The list of unfinished parts outside the
+  staging area is kept in memory. An agent that is killed, or a computer that
+  loses power, in the middle of such a transfer leaves a file named
+  `.cretlink-part.` followed by sixteen hexadecimal digits beside the
+  destination, and `cretlink recover` does not look for it.
+- A folder of a cloud drive is removed with its content. A folder that is a
+  reparse point without standing for another place — a folder that OneDrive
+  manages — is walked like any folder, and the cloud service may then remove
+  the same files from the cloud, as it does when the folder is removed in
+  Windows itself.
+- Where a folder really lies is verified on Windows only. Elsewhere the
+  removal of a folder, a file sent to a folder and a change to one entry (a
+  delete, the removal of an empty folder, a new folder, a move) work on the
+  path they are given, without following a link in the last part of a name;
+  a non-Windows agent is a development and test tool that is never elevated
+  on a customer computer.
+- A path through a link is refused, also when the link is harmless. A
+  removal, a transfer or a change to one entry whose path leads through a
+  junction or a symbolic link — the ones Windows keeps itself, such as
+  `C:\Documents and Settings`, included — or that lies on a drive made with
+  `subst` or on a network drive is refused as `invalid_path`. The technician
+  and the AI use the path where the folder really lies. Since ST-M010-004
+  this also holds for the four AI tools that change one entry, which worked
+  through such a path before.
+- The folder is the one that lies at the path when the operation begins, and
+  the entry is the one that has its name in that folder when the operation
+  opens it. The agent refuses a link in the path and a folder that is
+  swapped during a removal; it cannot know which real folder, or which file
+  under a name, the technician saw a moment earlier. A program that may
+  rename a folder or a file can put it where the technician is about to act,
+  as it could before these operations existed.
+- Reading goes on by name. A stat, a folder listing, a file read and a
+  digest resolve their path as before: they change nothing on the customer
+  computer, and what they answer is the target's own account of that path.
+- The explorer names a place from listings that were true when they were
+  made (FT-12). A program on the customer computer can rename a folder, or
+  put a link in its place, after the explorer was led there. The explorer
+  then still shows the old path; the agent lists whatever lies at that path
+  now, and for a change it refuses a path through a link (FT-11). What the
+  session remembers of confirmed places is a help against needless requests,
+  not a check.
+- The customer sees that the technician looks through files and which folder
+  is open now, as one item. The item does not keep every folder that was
+  opened on the way: those are in the technician's audit trail, one record
+  for each, and not in the customer's activity or end report.
+- A name can be made to look like another one, for example with characters
+  that change the direction of writing. The explorer writes a name as text
+  and reads the type of a file from the end of its real name, but it does
+  not mark or rewrite such names. It opens no file and runs nothing.
+- The explorer was not run against a customer computer on real hardware yet
+  (MT-14). Its window was tested in jsdom and looked at in Chromium with a
+  simulated customer computer, not in WebView2; a drop from a real file
+  manager and the system's own dialogs were not exercised, and no screen
+  reader has read its grid, its questions or its queue.
+- The technician decides about a name that is taken from a look at the
+  folder that was true when it was made (FT-13). A file that appears under
+  a free name afterwards is not replaced: its transfer fails. A name the
+  technician chose to replace is replaced whatever file lies under it when
+  the transfer commits: the one that was listed, or another that took its
+  place since.
+- A delete removes what lies under the selected names when it runs. The
+  technician confirmed names of a listing; a program on the customer
+  computer can put another file under one of them in between. The agent
+  removes only inside the folder that was named, and a folder only as the
+  folder it took up (FT-8, FT-11).
+- The names a copy writes are checked for what they could do to the place of
+  the file (FT-13), not for what they look like. A name can still be made to
+  look like another one, and a copied file is the customer computer's
+  content: the explorer opens and runs none of it, and what the technician
+  does with it afterwards is outside CretLink.
+- A copy to the technician computer that is cancelled, or that fails on the
+  technician computer, stays in progress in the customer's activity until
+  the session ends: the wire has no way to tell the agent that a copy was
+  given up, so the agent closes that item with the session. What left the
+  computer is never under-reported by this; the item never reads as done.
+- While one file is being sent or copied, the session serves nothing else
+  from the technician computer: a listing, the terminal and a call of the AI
+  wait until that file has ended. A stop by either side does not wait: it
+  cancels the transfer.
+- An operation on a staging name works by path (FT-11). That rests on the
+  staging area being a place that no other account can change (FT-7).
+- The identity of a folder is only as good as its file system. On FAT and
+  exFAT it is the volume serial number and a file index that such a file
+  system can hand to another folder later. Those file systems have neither
+  links nor permissions that a removal could be turned against.
+- A step that runs out of its time before it could remove anything ends the
+  removal as blocked. On a very slow disk a removal can therefore end with
+  that reason although nothing stands in its way; asking again goes on.
+- The behaviour that only Windows has was not run on real hardware yet
+  (MT-14), and its automated tests run on the Windows CI runner only.
 - Cleanup can fail. A staged file may survive an unclean shutdown; the
   commitment is to report residual artifacts prominently (REQ-F-019), not to
   guarantee their removal. This honesty is verified by
@@ -1952,11 +2831,12 @@ full-control consent still runs (ST-M006-002). It is the **single reviewed
 exception** to ADR-0003's "no key material persists across sessions", bounded
 to authority-reducing continuity proof only. The owned-resource inventory and
 `cretlink recover [--remove]` (ST-M006-003, ST-M009-010; also `cretlink-cli
-recover` and a `CretLink-Support*` copy's `recover`, the only subcommand such a
-copy accepts) report and remove CretLink residue offline — staged trees,
-sealed tickets, what lies in the staging area without being CretLink's, and
-the folder of a release up to 0.24.0 (FT-7) — and assert every other ownable
-kind empty. The verb opens no
+recover` and a `CretLink-Support*` copy's `recover`, one of the two subcommands
+such a copy accepts) report and remove CretLink residue offline — staged trees,
+sealed tickets, what lies in the staging area without being CretLink's,
+the folder of a release up to 0.24.0 (FT-7), and the webview profile folders
+that the application's window left (ST-M009-014, under "One application,
+two roles") — and assert every other ownable kind empty. The verb opens no
 connection and grants no control; removing exits with an error whenever
 something was kept or could not be read. The Get help role runs the startup
 sweep that reclaims staging trees a crashed run left behind before it
@@ -1975,7 +2855,7 @@ otherwise it is skipped, nothing is claimed, and a later start retries. The
 operating system releases the lock with the process, so a crash cannot strand
 it. `recover --remove` is an explicit customer action and does not take the
 lock. The same verb and sweep remain in the `cretlink-support-agent`
-development tool.
+development tool, which has no window and does not look for webview folders.
 The staging area and the ticket store of an elevated program lie in a folder
 that only administrators can write and that is private from the moment it
 exists; the folder in which earlier releases kept them, where every account
@@ -2004,6 +2884,9 @@ a hard kill of the agent reaps it.
   on either endpoint (REQ-S-007).
 - Files staged onto the customer computer during the session: scripts,
   utilities, installers, and drivers (REQ-F-012).
+- The unfinished part of a file on its way into a folder outside the staging
+  area (ST-M010-001): it lies beside its destination until the verified
+  commit gives the file its name.
 - The cleanup process itself, including its result reporting (REQ-F-019) — a
   cleanup that misreports success is an asset an attacker can hide behind.
 
@@ -2097,6 +2980,13 @@ while cleanup is incomplete.
   windows, or connection state (REQ-S-002), any residue that does survive is
   at least discoverable by ordinary inspection rather than concealed, and the
   audit trail (REQ-S-017) records what was created during the session.
+- *Parts outside the staging area.* A file sent into a folder is written to a
+  part beside its destination. The agent remembers each such part until the
+  transfer is committed or discarded, removes the remaining ones with the
+  session's cleanup — on Windows inside the opened, verified folder, never
+  through a link that took the folder's place — and reports a part it could
+  not remove in the cleanup report, where the next cleanup tries again
+  (ST-M010-001, REQ-F-019; see FT-9).
 
 **Residual risks.**
 
@@ -2117,6 +3007,11 @@ while cleanup is incomplete.
   (disk failure, forced power-off, removal of the portable media), residue can
   remain until the documented manual remediation is followed. The commitment
   is honest reporting and recoverable tooling, not impossibility of residue.
+- A part beside a destination can outlive a killed agent. The agent remembers
+  the unfinished parts outside the staging area in memory only, so a hard
+  kill or a power loss in the middle of a transfer into a folder leaves the
+  part where it is (see the residual risks of
+  [File transfer and staging](#file-transfer-and-staging)).
 - The reboot-resume window is persistence by design. Between the approved
   reboot and the resumed session, reconnect authority necessarily exists on
   disk. Scoping, expiry, and single-use consumption bound the risk; they do
@@ -2143,6 +3038,12 @@ are the rules the shipped code satisfies, not merely a future commitment. The
 end-to-end trust model is unchanged by the relay's presence (REQ-F-022,
 REQ-S-021).
 
+The application itself runs a session through the relay (ST-M007-013): the
+technician's copy waits on the relay of its profile when the technician
+chooses **Use relay**, and the customer's copy joins when a relay code is
+typed. Until then the relay path existed only in the headless development
+tools. The paragraphs below that name the application say what this adds.
+
 Equally important is what the endpoints expose: neither the console nor the
 support agent opens an internet-reachable listener (REQ-S-010). On the LAN path
 discovery and control traffic are limited to the intended local interfaces,
@@ -2161,7 +3062,16 @@ single-use rendezvous ticket) so the relay can match the two ends of a session;
 a forwarding channel that carries opaque, end-to-end encrypted session frames
 between the matched endpoints; and relay-operator surfaces (admission
 authentication, rate limits, concurrency quotas, and metadata-only metrics and
-event logs) for self-hosted deployments.
+event logs) for self-hosted deployments. The relay answers each preamble once,
+with a fixed frame that says "admitted" or names the reason of a refusal
+(ST-M007-012); it is the only thing the relay itself ever writes to an
+endpoint.
+
+The ticket of a session is derived from a **relay code** that the technician
+reads to the customer, and from the host name of the relay that both programs
+have in their settings (ST-M007-012). The code is a third thing a person
+reads or types, next to the LAN connection code and the approval code, and
+like the first it is addressing only.
 
 **Threat actors.** A malicious or compromised relay operator — the defining
 actor for this boundary, modelled as fully hostile: it may observe, store,
@@ -2249,6 +3159,183 @@ metadata rather than content.
   an anonymous abuse service, plus self-hosting documentation with verifiable
   release provenance (REQ-S-019; M007 scope covering REQ-S-017 through
   REQ-S-022).
+- *A relay behind a proxy, and the relay as an image.* A relay started with
+  `--behind-proxy` serves WebSocket without TLS, for a reverse proxy that ends
+  TLS in front of it (ST-M007-015). The proxy then sees what the relay sees,
+  ciphertext with its size and timing, and the rendezvous preamble with the
+  admission key crosses the hop between them in the clear: that hop must be
+  one host or a private network, and the relay says so when it starts. The
+  mode excludes a certificate of the relay's own, and a switch that is neither
+  on nor off is refused instead of read as off, so a relay never ends up
+  without TLS by a typing error. The container image holds the one program
+  and its licence texts on an empty base and runs as a user without rights;
+  it is published only by the release workflow, with a provenance attestation
+  that names the commit, which an operator verifies before running a version.
+- *One admission key per customer.* An operator gives every customer copy and
+  technician a key of its own and withdraws one by deleting its line from the
+  relay's key file, without a restart and without touching the others
+  (ST-M007-014). A key that leaks, for example with a customer copy that was
+  passed on, lets a stranger use the forwarder under that label until it is
+  withdrawn. It reveals no session and controls none: a key is checked once,
+  when a connection arrives, and is never session authority (ADR-0016 §4). The
+  relay's log, events and metrics name the label and never the key, and a key
+  file that breaks a rule is refused as a whole, so a typing error neither
+  opens the relay nor locks everybody out.
+- *A relay profile is addressing, and its file is untrusted input.* A copy
+  learns its relay from a relay profile: the relay's address, an optional
+  admission key, an optional certificate authority file and an optional name
+  in the certificate (ST-M007-011). It is read from `cretlink.toml` next to
+  the program, by both roles, or from the settings of the installed technician
+  copy; the customer role reads the file next to its program and nothing
+  else, and writes nothing. Nothing in a profile grants control (ADR-0016 §2,
+  §4). Somebody who can write next to the program or into the settings can
+  point a copy at a relay of their own, which is then the hostile relay this
+  section already models: it sees metadata and can deny service, and the
+  approval codes differ when it puts itself in between. With `name` and `ca`
+  that person can also give their server the name of the technician's relay
+  and vouch for it with an authority of their own, so the name alone would
+  mislead both people. The application therefore names a relay with what the
+  copy really does: it shows the address beside the name when the copy
+  connects to another host than the name says, and says when the certificate
+  is checked against a file of the profile and not against the system's
+  authorities, on every screen of both roles, in the end report and in the
+  words of every failure. The waiting screen of the installed technician
+  copy says when the relay comes from the file next to the program and not
+  from Settings. The file may have
+  been written by somebody else, so it is read up to a fixed size in a small,
+  strict form: every unknown section and setting is refused, every setting is
+  bounded, the certificate file must be a plain name next to the profile, and
+  a file that cannot be used is explained before any connection and never
+  passed over for another relay. An explanation names the line and the
+  setting and never repeats text from the file.
+- *The application speaks only `wss` to a relay.* A profile has no setting
+  that turns TLS off and an address with a scheme is refused. The relay's
+  certificate is validated against the system's authorities, or against the
+  profile's certificate file and nothing else when it names one, for the
+  profile's name or else the host of its address. A certificate that is not
+  trusted, or that carries another name, ends the dial before the rendezvous
+  preamble is written, so neither the admission key nor the ticket leaves the
+  computer, and the application never falls back to a connection without TLS.
+- *The admission key stays where it is needed.* It is held in a type that is
+  erased when dropped and redacted in debug output. The application never
+  shows it again once it is saved, never logs it, puts it in no audit record
+  and in no error text; a form that leaves the key alone tells the backend to
+  keep it instead of sending it back. A kept key stays with the relay it was
+  saved for, and that is more than its name: the host of the address, the
+  name its certificate must carry and the authority that certificate is
+  checked against. When a form changes one of the three, the application
+  refuses to keep the key and asks for it again, so neither a test nor a
+  save presents the key to another host that claims the same name, or to
+  the same host under an authority that somebody else chose. The test of a
+  relay in Settings presents a ticket of its own, meets nobody and carries
+  nothing of a session.
+- *The settings and the certificate file change together.* The installed
+  copy keeps the relay in `settings.toml` and, for a private authority, the
+  certificates of the chosen file in `relay-ca.pem`. A save writes the new
+  certificate file under another name, then the settings, and only then lets
+  the certificate file take its place; when a step fails, both are as they
+  were. A save that reached only one of them would leave the relay of before
+  with the authority of after. A crash between the two steps leaves the new
+  relay with the old authority, which fails closed: nothing is sent to a
+  relay whose certificate that authority did not sign. The kept file holds
+  the certificates only, written anew, so that a private key which stood in
+  the chosen file is never copied next to the settings.
+- *A customer copy carries a key of its own, and nothing of the
+  technician's.* **Make a customer copy** writes one folder for one customer:
+  the support program, a `cretlink.toml` with the relay of the technician's
+  copy and that customer's admission key, the relay's certificate file when
+  the profile names one, and a note (ST-M007-016). The key is the one the
+  technician typed or had generated for this customer, or none; nothing reads
+  the key of the technician's own profile, and the form has no way to ask for
+  it, so handing out copies never spreads the technician's key. A generated
+  key comes from the system's random source and is shown once, as the line
+  for the relay's key file; the application keeps it nowhere but in the copy.
+  The key stands in the copy in readable form, and whoever has the folder
+  has it: it admits to the forwarder and nothing else, and the operator
+  withdraws it by deleting its line. The certificate file of a copy holds
+  certificates only, also when the technician's own file holds the private
+  key of the authority. The program is copied byte for byte, so its signature
+  is the one of the release. Every name that goes into a path (the label, the
+  folder, the certificate file) is checked as one plain name that Windows
+  takes before anything is written; the window names the program, the place
+  and the copy by a number and never sends a path. The folder is written
+  beside its place and takes its name only when it is whole and was read back
+  as the customer's copy will read it, so a failure leaves no folder that
+  looks like a copy; a folder that is there already is replaced only on the
+  technician's answer. Nothing is sent anywhere: how the folder reaches the
+  customer is the technician's to choose, and a folder that is intercepted on
+  the way gives away the key and the relay's address, not a session.
+- *A relay code grants nothing.* It holds a random seed of 64 bits and a
+  typing check, no address and no key. Someone who overhears or guesses a code
+  can at most reach the rendezvous before the customer does: the approval
+  codes then differ on the two screens and the session ends before consent
+  (REQ-S-006, REQ-S-009). The relay's rate limit bounds guessing, a ticket
+  works once, and a code is minted for one session. Someone who holds the
+  code and joins without speaking can hold up one parked leg; the waiting
+  side gives up a silent leg after 45 seconds and parks a new one. Because
+  the relay's host name enters the derivation, a code read
+  aloud names nothing on any other relay. The code is named and drawn
+  differently from the approval code, which alone establishes trust.
+- *The relay is chosen by the technician, for one session.* The application
+  reaches a relay only when the technician presses **Use relay** on the
+  waiting screen, or when the customer types a relay code into a copy that
+  has a profile (ST-M007-013). Nothing reaches out before that, and discovery
+  and the connection code of one network work as before with a profile
+  present. A wait on a relay opens no listener: the technician's copy dials
+  out, and the listener of the network it waited on is closed first. Every
+  wait has a turn of its own on the console's state: should the task of an
+  earlier wait still be there, it ends what it holds and writes nothing into
+  the state of the newer one, so a late connection to an old listener never
+  shows as a customer of the wait that is on screen. The
+  technician's copy draws a new relay code for every wait and keeps its
+  rendezvous open only while the waiting screen is open; **Cancel** closes
+  the connection, and the code then leads nowhere. Both windows name the
+  relay from the first moment to the end report, by its host name and, when
+  the copy connects to another host than that name says, by that address
+  too, so neither person is left guessing which way the session goes.
+- *A relayed session takes every step of a session on one network.* The
+  handle of a relayed session is driven by the same code as one from the
+  network listener, on both sides: the approval code is shown and compared,
+  the technician confirms, the customer decides, either side stops, and the
+  cleanup is reported (REQ-F-005, REQ-F-006, REQ-F-018, REQ-F-019). The
+  relay's part ends when the two connections have found each other. The
+  console state names the relay as a label and no transition reads it. An
+  end-to-end test runs both roles of the application against the real relay
+  server with TLS inside the test: pairing through a typed code, a command, a
+  transfer there and back, a stop from each side, and a relay that stops in
+  the middle.
+- *The relay code stays on the two screens.* It is shown on the technician's
+  screen to be read out and typed on the customer's. The relay never gets it:
+  both copies present a ticket derived from the code and from the relay's
+  host name. The technician's audit trail records that the session ran
+  through a relay, as the first thing it says of the session
+  (`session_route`): the relay's host name, the address the copy connected
+  to and whether the certificate was checked against the system's
+  authorities or against a file of the profile. A reader of the trail can
+  thus tell the relay that was meant from a server that was given its name.
+  The trail holds neither the code nor the admission key, and no log or
+  error text does.
+- *Every relay failure is said, and nothing connects again by itself.* A
+  relay that cannot be reached, a certificate that is not trusted, a key the
+  relay refuses and a code that nobody waits on each end the wait or the dial
+  with words of their own and a next step (REQ-N-008, REQ-N-015); the
+  customer is told what to pass on, the technician what to change. A relay
+  that drops the connection ends the session on both sides, fail closed, and
+  both windows say that the connection through the relay was lost and that
+  the relay may have stopped. Neither copy dials again after a failure or an
+  end: a relay cannot keep an endpoint reconnecting, and a session never
+  comes back without a new code, a new comparison and a new consent
+  (REQ-S-009). The one thing that is repeated is the technician's waiting
+  connection while nobody has joined, with the same code, for as long as the
+  waiting screen is open.
+- *The relay's answer says only what admission decided.* The reasons it can
+  name (no key, an unknown key, the rate limit, the quota, not available,
+  another preamble version) concern the use of the forwarder, never a session
+  (ADR-0016 §4). The answer carries no credential, no ticket and no session
+  data, and an endpoint never takes an unknown status for an admission. To a
+  stranger it confirms what the port already shows, that a relay runs there
+  and whether it asks for a key; something that sends no preamble gets no
+  answer.
 - *Adversarial validation gates release.* M007 cannot exit until tests
   demonstrate that a relay which observes, delays, drops, replays, reorders,
   or modifies traffic gains neither plaintext nor command authority (M007 exit
@@ -2267,6 +3354,47 @@ metadata rather than content.
 - Availability is not defended. A hostile relay can always refuse, delay, or
   degrade service. The guarantee is fail-closed denial of control, not
   liveness.
+- The admission key stands in readable form on disk: in `cretlink.toml` next
+  to a copy, and in the settings of the installed technician copy. The
+  settings file is created for the user only where the system has file modes
+  (`0600` on macOS and Linux) and has the access rules of the user's
+  `%LOCALAPPDATA%` folder on Windows; a customer copy is a folder that is
+  handed over, and whoever has it has its key. A key admits to the forwarder
+  and nothing else, and one key per customer bounds what a leaked one is
+  worth until its line is deleted.
+- The environment can replace the system's authorities. A copy whose
+  profile names no certificate file checks the relay's certificate against
+  the authorities of the operating system, which it reads with
+  `rustls-native-certs`. When the environment variable `SSL_CERT_FILE` or
+  `SSL_CERT_DIR` is set for the program, that library reads the certificates
+  named there instead of the operating system's store, on Windows, macOS and
+  Linux alike, and it offers no way to read the system's store without them.
+  Whoever can set the environment a copy starts with can therefore choose
+  the authorities that vouch for a relay, as somebody who can write the
+  profile file can with `ca`; the screens then still speak of the
+  certificate authorities of this computer, because the copy cannot tell the
+  two apart. What they gain is the place of a hostile relay: they see
+  ciphertext, sizes and timing and can deny service, and the approval codes
+  differ when they put themselves in between. A profile with a certificate
+  file is not affected: its file replaces every other authority, and the
+  environment is not read at all. A technician who wants a relay checked
+  against one authority and nothing else gives the profile that authority's
+  certificate file.
+- The relay code is read over the same call as the approval code. Somebody
+  who listens to that call learns the relay code; to use it they also need a
+  copy that the relay admits. If they join before the customer, the
+  technician's screen shows an approval code that the customer cannot
+  confirm, and the customer's copy says that nobody waits on the code. The
+  protection is the comparison: a technician who confirms a code that the
+  customer did not read back gives the listener the consent screen, and only
+  the listener's own computer is then at stake, never the customer's.
+- A lost connection has no cause that an endpoint can see. When a relayed
+  session ends because the connection is gone, neither copy can tell a relay
+  that stopped from a computer that went offline; the windows say both.
+- The relay in the application has not been run between real computers on
+  two networks yet. Its behaviour is covered by automated tests against a
+  relay inside the test process; the manual scenario MT-15 in
+  [`manual-tests.md`](manual-tests.md) is pending.
 - Third-party relay deployments. As MIT-licensed software, relay code can be
   self-hosted by anyone; the project cannot police hostile or negligent
   deployments beyond making endpoint security independent of relay honesty.
@@ -2315,8 +3443,10 @@ help from the start screen, ST-M009-009), and the subcommands.
   process, so a customer process has no way to reach them, and the reverse. A
   `CretLink-Support*` copy refuses subcommands and `--role technician`, so a
   file handed to a customer cannot serve MCP or open the console
-  (REQ-F-024). Its one accepted subcommand is the offline `recover
-  [--remove]` (ST-M009-010), which opens no connection and grants nothing.
+  (REQ-F-024). It accepts two subcommands, both offline and neither with any
+  authority over a session: `recover [--remove]` (ST-M009-010) and
+  `uninstall`, which removes the support program that a customer kept
+  (ST-M009-017, below).
 - *Silent or repeated elevation.* Get help elevates only through the visible
   UAC prompt (`ShellExecuteExW`, `runas`), and only after the unelevated
   window has explained it and the customer pressed **Continue** (`#c-admin`,
@@ -2334,10 +3464,13 @@ help from the start screen, ST-M009-009), and the subcommands.
   prompt somebody answered), no session without the customer's actions. It
   adds no hidden path (REQ-S-002). `--from-start` only changes where **Back**
   goes.
-- *Persistence through the application.* Get help installs nothing and adds no
-  auto-start entry (REQ-F-001, REQ-F-019). Only the technician role installs,
-  per user (ST-M009-006, below); the customer role never offers it, and a
-  `CretLink-Support*` copy refuses `install` and `uninstall`.
+- *Persistence through the application.* Get help installs nothing by itself
+  and adds no auto-start entry (REQ-F-001, REQ-F-019). The technician role
+  installs per user (ST-M009-006, below); the customer role never offers
+  that, and a `CretLink-Support*` copy refuses the technician's `install` and
+  `uninstall`. On the customer's own choice the support program is kept on
+  the computer, as a program that stays and never as a way in (ST-M009-017,
+  below).
 - *Missing WebView2 runtime.* The program says so in a native message box and
   starts nothing, rather than failing in a half-open state.
 
@@ -2427,6 +3560,15 @@ writes nothing of its own but the audit trail.
   desktop entry, the uninstall entry and the recorded registrations, and
   reports anything it could not remove instead of claiming success. The audit
   trail stays on purpose, and the uninstall says so.
+- *A relay profile next to the installed program outlives the install.* The
+  installed copy keeps its relay in its settings, which uninstall removes with
+  the key in them. A file `cretlink.toml` next to the installed program is not
+  part of the install: a person put it there, and it may hold an admission
+  key in readable form. Uninstall leaves it, and both the command and the
+  Settings screen say before anything is removed that it stays, where it lies
+  and whether it holds a key, so that a key is never left behind without the
+  technician knowing. The key admits to the relay and controls no session;
+  its operator can withdraw it.
 - *A tampered `install.json` turns uninstall into a deletion primitive.*
   Uninstall deletes only the fixed paths of the layout, never a path read from
   the record, and reads at most 64 KiB of it. The record decides only which
@@ -2447,16 +3589,308 @@ writes nothing of its own but the audit trail.
   a process id, which is why PowerShell is used; the script is cmdlets only and
   passes paths as single-quoted literals.
 - *A customer copy installs itself.* The customer role never shows the
-  install choice, and the install and uninstall functions refuse a
-  `CretLink-Support*` program as well as the launch rules (REQ-F-024).
+  technician's install choice, and the install and uninstall functions of the
+  technician role refuse a `CretLink-Support*` program as well as the launch
+  rules (REQ-F-024). Keeping the support program is another thing, with its
+  own rules (ST-M009-017, below).
 
 **Residual risks.** The install is not code-signed yet (ST-M006-005); on
-macOS the generated bundle is unsigned and Gatekeeper may ask. The webview
-keeps its own profile in a per-user data folder (Tauri's `dev.cretlink.app`)
-for run-once and installed copies alike; uninstall does not remove it. An AI
+macOS the generated bundle is unsigned and Gatekeeper may ask. The webview's
+profile no longer stays behind: a copy that runs once keeps it in a temporary
+folder that it removes when it closes, and uninstall removes the installed
+copy's (ST-M009-014, below), except on macOS, where WebKit keeps its data
+outside the program's control. An AI
 client registration points at the installed path, so anyone who can replace
 that per-user file can run code as the user when the client starts it — the
 same as any per-user program, and the folder is the user's own.
+
+#### The webview's profile folder (ST-M009-014)
+
+**What it adds.** The application's window is a webview, which keeps a
+profile — cache and local storage, no session secret and no credential — in a
+folder. Releases up to 0.24.1 left the choice to the webview: a folder named
+`dev.cretlink.app` in the per-user data folder, which stayed after the window
+closed, on the customer computer too. Now every window is given its folder:
+
+- a copy that is not installed, and every customer process, gets a new folder
+  of its own, `CretLink-webview-<random>`, in the temporary folder, for the
+  user only where the platform has file modes, and removes it after its last
+  window has closed;
+- the installed technician copy keeps `webview` in the application's data
+  folder, next to the audit trail (`%LOCALAPPDATA%\CretLink\webview`,
+  `~/.local/share/CretLink/webview`), and uninstall lists and removes it;
+- a process with administrator rights makes its folder in `webview` in
+  `CretLink Data`, the private folder of an elevated program, instead of the
+  temporary folder, and opens that one folder to the account signed in at
+  the desktop, whose browser process uses it (see below);
+- every start of a window removes the temporary folders of copies that no
+  longer run; `cretlink recover` lists those folders and the one that earlier
+  releases left, and `recover --remove` removes them. With administrator
+  rights both look only in the private folder.
+
+**Threats and mitigations.**
+
+- *A folder that stays on the customer computer.* The process removes its
+  folder itself, at its very end. A webview holds its profile for as long as
+  it exists, so an exit that the program asks for closes every window first,
+  and the removal is tried again for about five seconds while the closing
+  webview still holds files. A process that could not remove its folder, or
+  was killed, leaves one whose lock is free: the next start of any CretLink
+  window removes it, `recover` lists it, and `recover --remove` removes it or
+  exits with an error and names it (REQ-F-019, REQ-N-008).
+- *A start removes the profile of a copy that is running.* Each process holds
+  a lock on `cretlink.lock` in its folder for as long as it runs; the
+  operating system gives it back with the process, however it ends. A folder
+  is removed only by a process that holds its lock, or when it has no lock
+  file at all and yet has content, which only an unfinished removal leaves: a
+  process puts nothing into its folder before it holds the lock. On Windows
+  the lock file is opened without sharing deletion, so nothing removes it
+  under the process that holds it. A folder whose lock cannot be told —
+  something that is no file stands under the lock's name, or the file cannot
+  be opened — is left alone, and `recover` names it and does not call the
+  computer clean. A process skips its own folder whatever its lock says.
+- *The elevated window trusts the account's folders.* The account that
+  approves the elevation owns the environment the elevated program starts
+  with, its temporary folder and its local application data; a program of
+  that account without administrator rights can write there while the window
+  runs, and can lead a path there elsewhere (REQ-S-024). So a process with
+  administrator rights takes none of them: its profile is a new folder in
+  `webview` in `CretLink Data`, which is created with its owner and its
+  permissions in one step, or found to be such a folder already, with
+  `CretLink Data` above it (ST-M006-020). Leftovers are looked for and
+  removed only there, and a link in the place of that folder is not entered.
+- *The elevated window's browser does not run elevated.* WebView2 does not
+  run its browser with administrator rights: with an elevated host it starts
+  the browser through the desktop's shell (Explorer), with the unelevated
+  token of the account signed in at the desktop, in which the administrators
+  are a group that only refuses. After a consent elevation that is the
+  account that approved; after an elevation with another administrator's
+  password it is the standard account at the keyboard. A profile folder that
+  admits only the administrators and the system keeps that browser out
+  ("can't read and write to its data directory", an empty window), which is
+  what a preview of this change showed on a Windows computer. So the process
+  first makes its profile folder private, puts its lock file into it, and
+  then gives that one folder permissions of its own: the administrators and
+  the system keep full control; the account of the desktop (the user of the
+  shell's token, or the program's own account when there is no shell) may
+  read the folder and make files and folders in it, and has full control over
+  what is made there; it may not remove or rename the folder, remove what
+  others made in it, or change its permissions or its owner, and it has no
+  right on `webview` or `CretLink Data`. So the path of the folder stays one
+  that only administrators can change: the account cannot swap the folder
+  for a link, and cannot make it a link either, since it never sees it empty
+  (the lock file, which it cannot remove while the process holds it, is in
+  it first). The removal at the end, and the sweep of an elevated start,
+  remove that folder whole through handles and remove a link that the
+  account put inside as a link, never entering it. A folder that the account
+  emptied and made a link after its process ended is not a profile folder to
+  the sweep and is left where it is. Nothing in
+  the temporary folder or the local application data, and not the folder of
+  earlier versions, is removed with administrator rights: a start or a
+  recovery without them removes what lies there, and the report of an
+  elevated `recover` says that it does not cover those folders and names
+  the command to run without administrator rights. Before WebView2 is asked
+  anything, the process drops every `WEBVIEW2_*` variable from its own
+  environment (among them `WEBVIEW2_USER_DATA_FOLDER`,
+  `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` and
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`), so that the account cannot move
+  the profile, choose the browser that runs the window or give it
+  arguments.
+- *A folder that somebody else made first.* A process without administrator
+  rights makes its folder in the temporary folder, which other programs of
+  the same account can write. A process uses only a folder
+  that it created itself, new, under a name of 32 digits from the system's
+  random source. A name under which anything stands — a folder, a file, a
+  link — is never taken over: the creation fails and another name is drawn.
+- *The sweep, or the removal at the end, as a way to delete something else.*
+  The sweep looks only at real folders directly inside the temporary folder
+  whose name is the prefix followed by the 32 digits the program generates: a
+  link with such a name is not one and is left where it is. A lock is opened
+  only where a file stands under its name, and nothing is read from it. A
+  folder is removed whole through the call that removes every tree of
+  CretLink: a link, as the folder itself or inside it, is removed as a link
+  and never entered. Uninstall and `recover` remove the installed copy's
+  profile and the earlier releases' folder only at their fixed paths, never
+  at a path read from a file, and in the same way.
+- *A process that goes on without a window.* Removing the folder can take a
+  few seconds. The process first stops its async runtime, so no session task,
+  listener or IPC endpoint outlives the last window: what remains for those
+  seconds only removes a folder. Windows that do not close for an exit delay
+  it by at most three seconds, after which the process ends and leaves the
+  folder to the next start.
+- *The unelevated and the elevated customer window share a profile.* They do
+  not: every customer process has a folder of its own, also when the
+  installed copy started it. The installed copy's profile is used by the
+  technician role only.
+- *A webview that falls back to the folder that stays.* When the temporary
+  folder cannot be created, the program says so and opens no window. An
+  installed copy whose data folder cannot be written runs with a temporary
+  profile.
+
+**Residual risks.** A killed process leaves its folder until the next start
+of a CretLink window by that account or `recover --remove`; on a customer
+computer that never runs CretLink again it stays, holding cache and local
+storage only. That WebView2 lets go of the folder within the few seconds is a
+manual check on Windows (`docs/manual-tests.md`, MT-10). The temporary
+profiles that a window without administrator rights left, and the folder of
+earlier versions, are removed only by a start or a recovery without
+administrator rights of that account; an elevated recovery names them as
+not covered and does not call them gone. **The elevated window's profile is
+open to its account while the window runs**, and this cannot be closed while
+WebView2 hosts the window: its browser process runs without administrator
+rights as the account signed in at the desktop, and whatever that browser
+can write, any other program of that account can write too. Such a program
+can therefore change the cache and local storage of the elevated window
+(which hold no session secret and no credential) and, more directly, can
+reach the browser process itself, which runs with the same token. What the
+window shows and sends to the elevated program is then only as trustworthy
+as that account's programs; Microsoft recommends hosting WebView2 in an
+unelevated process for this reason. That boundary is not new with this
+folder — the browser has always run so — but the profile folder no longer
+pretends otherwise. The account can also take the administrators' rights off
+the files it made in a leftover folder, so that an elevated start cannot
+remove them; the folder then stays in `CretLink Data\webview` and `recover`
+names it. That WebView2 opens the elevated window with this folder, after a
+consent elevation and after an elevation with another administrator's
+password, is a manual check on Windows (`docs/manual-tests.md`, MT-16): the
+Windows computers of continuous verification run with user account control
+switched off, where the browser is not started unelevated. WebView2 also takes settings from
+policies in the registry of the account, which the program does not read or
+clear; they are outside this change. On macOS WebKit keeps
+the webview's data
+in its own folders under `~/Library`, where CretLink can neither direct nor
+remove it; that is a limit of the technician role there, and the customer
+role does not exist on macOS. A copy of a release up to 0.24.1 that is
+running loses its profile when uninstall or `recover --remove` removes
+`dev.cretlink.app`.
+
+#### A customer keeps the support program (ST-M009-017)
+
+**What it adds, and what it does not.** On the customer's own choice the
+elevated customer program writes itself to
+`%ProgramFiles%\CretLink Support\CretLink-Support.exe`, with a Start-menu
+entry for all users, a desktop shortcut on request, an entry in Installed
+apps under `HKEY_LOCAL_MACHINE`, a record of all of that, and the relay
+settings of the copy that was kept. It adds **no access path**: no service,
+no scheduled task, no entry that starts with Windows, no listener, no stored
+permission, no handler for a protocol or a kind of file. Between sessions no
+CretLink process runs, and a session from the kept program takes every step
+of a session from a downloaded copy: the customer starts it, Windows asks,
+the technician is chosen or the code typed, the approval code is compared
+and full control is allowed, each time (REQ-F-002, REQ-F-005, REQ-F-006,
+REQ-S-007). What it does add is **a program that stays**, in the version it
+was kept at.
+
+**The attacker.** A program of an account without administrator rights on
+the same computer (REQ-S-024). It can write the folder a downloaded copy was
+started from, and its account can be the one that asks an administrator to
+answer the elevation prompt. It wants the file that later asks for
+administrator rights to be its own.
+
+**Threats and mitigations.**
+
+- *Another file is installed than the one that runs.* A running program's
+  file can be renamed away, and another file put under the path it was
+  started with, so the program is not copied by a path. The system is asked
+  where the image of the process lies now; the file under that name is opened
+  for reading without sharing changes, so that from then on nobody can write
+  it, rename it or remove it; and the system is asked again. When both
+  answers are the same name, the held file is the image, and its bytes are
+  read through that one handle. What was written is read back against it
+  before it takes its name. When the file moved in between, or another
+  program holds it in a way that allows changes, nothing is kept and the
+  window says why. The file is held before anything is made, so a refusal
+  leaves nothing behind.
+- *The kept program is replaced later.* It lies in a folder that is created
+  with its owner and its permissions in one step: owned by the
+  administrators, with a list of its own that gives full control to them and
+  the system, and to the accounts of the computer the right to read and to
+  start the program and nothing more. A folder that is already there must be
+  exactly such a folder, read through one handle that follows no link; it is
+  never put right afterwards, because whoever could write it before may have
+  put something into it. `Program Files` itself must belong to Windows, the
+  system or the administrators. Every file is written new under another name
+  and then given its name; a link or a folder under a name of the program is
+  never written through; a kept program that is running is never replaced.
+  Because the folder is the program's own and not a download folder, a
+  library planted beside the program is closed for the kept program too.
+- *Relay settings that somebody else wrote.* The `cretlink.toml` next to the
+  running copy lies in that same writable folder. It is read without
+  following a link, up to a bound, refused when it or its certificate file
+  has more than one name (a hard link could give the folder a name for a
+  file that the account cannot read itself), with the reader of relay
+  profiles, which refuses everything it does not know and never repeats
+  what a file held. A
+  profile that cannot be used is not kept, and the screen says so. Before
+  the customer chooses, the screen names the relay: its name, where the copy
+  would connect when that is another host, and that a certificate file of
+  the copy vouches for the name when that is so. What is written is the
+  value that was read for that screen, never a second reading, and of the
+  certificate file only its certificates. A relay is addressing, never
+  authority (ADR-0016): a planted relay would see encrypted traffic of
+  sessions that the customer still has to allow.
+- *The program is kept without the customer.* There is no command-line
+  option, no environment variable and no remote operation for it; a copy for
+  getting help refuses every argument that is not `recover` or `uninstall`.
+  The commands exist in the customer role only, refuse while a session
+  exists and before the permission step, and carry out only the plan that
+  the window showed. The window offers keeping before a session and on the
+  end report, never during a session, and only with administrator rights.
+- *Removing removes something else.* Removal takes what the record names, as
+  far as it lies in the layout: a file directly in the folder of the kept
+  program, a shortcut in its own place, the entry under its own key. A
+  record that names anything else changes nothing about it, and that is
+  said. Every file is removed as what stands under its name: a link is
+  removed as a link and never followed, and a link in the place of the
+  folder is not entered. The record lies in the folder that only
+  administrators can write. Without a record that can be read, a shortcut
+  goes only when it starts the kept program and the entry in Installed apps
+  only when its location is the folder of the kept program; a desktop
+  shortcut that is no longer wanted goes only when it starts the kept
+  program. Removing always shows the list and asks: `uninstall --yes` is
+  refused for the kept program, also in a console build that was renamed.
+- *A helper with administrator rights loads what the account chose.* From
+  the kept program itself the folder goes once the process has exited,
+  through Windows PowerShell. It is started by its full path in the system
+  folder that the system names, in that folder, without a profile, and with
+  a cleared environment that holds only the Windows folder, the system
+  folder as its search path and the modules of PowerShell in the system
+  folder as its module path. Nothing of the environment that the elevated
+  program was started with, which the account that approved owns, is passed
+  on.
+- *An older plan replaces a newer program, or a keep is interrupted.* Once
+  the folder is prepared, keeping looks again at what is kept and in which
+  version, and refuses when that is no longer what the screen showed.
+  Keeping writes the record and each file under a temporary name before the
+  program file takes its name; a folder with any of them and no complete
+  program is a keep that did not finish. It is not reported as kept on
+  purpose: `recover` names it, with the command that removes it, and does
+  not call the computer clean.
+- *An older copy brings an old program back.* A copy replaces the kept
+  program only when it is newer by its version; an older one, the same
+  version and a version that cannot be compared never do.
+- *A session report takes the kept program for something left behind, or the
+  other way round.* The end report says beside the cleanup result that the
+  program is installed because the customer chose that, and the cleanup
+  result stays the session's own. `recover` names the program as kept on
+  purpose and never lists, counts or removes it (REQ-F-019).
+
+**Residual risks.** There is no update channel: the kept program stays at
+the version it was kept at until a newer copy is started and the customer
+updates it, also when that version has a known defect. The version is what
+the program says of itself; refusing an older copy prevents an accident, not
+an attacker who can already run a program with administrator rights. The
+copy that is downloaded first is as before: a program of its account can
+change the file before it is started, and what is then started, and kept,
+is that file. The check of the running program rests on the file system
+refusing to rename a folder while a file in it is held open, as NTFS does;
+on another file system the program is still read through a handle that
+nobody can write. The kept relay settings, with the admission key of the
+relay, can be read by every account of the computer: the key admits to the
+relay and grants nothing in a session. The Windows parts of this (the
+folder's permissions, the held program file, the entry and the shortcuts)
+are tested by continuous verification on Windows and were not run on
+customer hardware yet (`docs/manual-tests.md`, MT-16).
 
 ### Supply chain and distribution
 
@@ -2561,7 +3995,11 @@ REQ-N-017; M001 exit criteria, ST-M001-004) — *configured and enforced on
 advisory, ban, and source checks on every pull request that changes more than
 documentation, and again on `main` after the merge, and `hygiene.yml` runs
 gitleaks secret scanning and the private-data check (ST-M006-016) on every
-pull request, with all actions SHA-pinned. The ruleset on `main` requires the
+pull request, with all actions SHA-pinned. The same job of `ci.yml` checks the
+application package, which is detached and has a lockfile and a `cargo-deny`
+configuration of its own, and audits the npm packages of the application's
+frontend and of the release tooling; the job of the documentation site audits
+the site's (ST-M006-019). The ruleset on `main` requires the
 result of both, merges a pull request only when it is up to date with `main`,
 so the merged tree is the tested one, and rejects a direct push, which the
 [release policy](releasing.md) forbids*. The committed Cargo lockfile pins the
@@ -2779,8 +4217,11 @@ Known upcoming triggers for revision:
 
 - the maintainer-run hardware half of the privileged adversarial and negative
   execution suite (ST-M003-007) and the other hardware scenarios in
-  [`manual-tests.md`](manual-tests.md), including the reboot-resume run (MT-8),
-  being recorded;
+  [`manual-tests.md`](manual-tests.md), including the reboot-resume run (MT-8)
+  and the file operations of the explorer (MT-14), being recorded;
+- a way to tell the agent that a copy was given up, and a session service
+  that serves other requests while a file is on its way, which would lift two
+  of the residual risks of the explorer (FT-13);
 - promotion of desktop observation and control (M005) or the technician
   terminal (M008) out of draft, which must record their actual status and any
   new residual risk in the

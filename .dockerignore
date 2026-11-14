@@ -1,0 +1,27 @@
+# The build context of the relay server image (apps/relay-server/Dockerfile,
+# ST-M007-015) is the root of the repository. Only what a build of the Rust
+# workspace and the notices need is sent to the builder.
+
+# Build output and installed packages.
+**/target
+**/node_modules
+**/dist
+
+# Not part of the Rust workspace: the application (a detached package), the
+# documentation site, the documentation and the continuous verification.
+apps/app
+website
+docs
+.github
+.git
+
+# The image builds with the toolchain of its builder image, which is pinned in
+# the Dockerfile. This file would make rustup fetch whatever "stable" is today.
+rust-toolchain.toml
+
+# Local state that must never reach a builder.
+.env
+.env.*
+*.pem
+*.pfx
+*.p12

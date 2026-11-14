@@ -1,0 +1,525 @@
+// Development-only page for the relay screens (ST-M007-011, ST-M007-013): the
+// real technician controller and views, driven against a copy and a relay
+// that are held in memory instead of a backend. Tauri's own mocks answer the
+// commands, so nothing here reads a file, keeps a key or opens a connection.
+//
+// `?copy=` picks what the copy holds when the page opens:
+//
+// | Value          | The copy |
+// |----------------|----------|
+// | `installed`    | installed, no relay yet (the default) |
+// | `kept`         | installed, with a relay in its settings |
+// | `file`         | installed, with a profile file next to the program that wins |
+// | `file-problem` | installed, with a profile file that cannot be used |
+// | `run-once`     | runs once, and keeps no settings |
+//
+// `?relay=` picks how the relay answers a test and a session: `admit` (the
+// default), `key` (it does not know the key) or `down` (it cannot be
+// reached). The relay takes a moment to answer (`?pause=`, in milliseconds),
+// so the waiting states can be looked at.
+//
+// Settings also offers **Uninstall…** in an installed copy: the plan names a
+// profile file next to the program among what stays (`?copy=file`).
+//
+// **Make a customer copy…** (ST-M007-016) is offered with a relay that can be
+// used. `?os=windows` makes the copy this program itself; otherwise the
+// program is chosen, and the dialog "chooses" a file at once. The label
+// `exists` names a folder that is there already, and `fail` a copy that
+// cannot be written. Nothing is written anywhere.
+//
+// A session through the relay (ST-M007-013) starts from **Start a session**
+// and **Use relay** on the waiting screen: the simulated backend stops the
+// wait on the network, answers with a relay code, and a moment later says
+// that the relay holds it, or why it cannot be used. With `?customer=arrives`
+// a customer then types the code: the approval code follows, **Codes match**
+// leads to the customer's decision, and the customer allows. `?customer=lost`
+// lets the relay stop while the code is compared.
+//
+// The simulated backend follows the rules of the real one where the screens
+// depend on them: an address needs a port, a key is never sent back, a kept
+// key stays with its relay (the host of the address, the name in the
+// certificate and the certificate authority), the certificate file is named
+// by a number, and a copy that runs once refuses to keep anything. A relay is
+// named with where it is reached and what vouches for its name, as the real
+// backend names one (`../src/shared/relay`).
+
+import "../src/base.css";
+import { emit } from "@tauri-apps/api/event";
+import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
+import type {
+  AppInfo,
+  ChosenCa,
+  CustomerCopyForm,
+  CustomerCopyMade,
+  RelayForm,
+  RelaySettings,
+  RelayTest,
+  RelayView,
+} from "../src/shared/contract";
+import { addressHost, relayWords } from "../src/shared/relay";
+import type { ConsoleState, RelayRoute } from "../src/technician/api";
+import {
+  APP_INSTALLED,
+  APP_RUN_ONCE,
+  NETWORKS,
+  RELAY_FILE,
+  RELAY_FILE_PROBLEM,
+  RELAY_NONE,
+  RELAY_RUN_ONCE,
+  RELAY_STORED,
+  consoleIn,
+} from "../src/technician/fixtures";
+import { start } from "../src/technician/main";
+import { activeRelay } from "../src/technician/model";
+
+const params = new URLSearchParams(window.location.search);
+const copy = params.get("copy") ?? "installed";
+const answers = params.get("relay") ?? "admit";
+/** How long the simulated relay takes to answer a test, in milliseconds. */
+const pause = Number(params.get("pause") ?? 600);
+
+const COPIES: Record<string, RelaySettings> = {
+  installed: RELAY_NONE,
+  kept: RELAY_STORED,
+  file: RELAY_FILE,
+  "file-problem": RELAY_FILE_PROBLEM,
+  "run-once": RELAY_RUN_ONCE,
+};
+
+let settings: RelaySettings = COPIES[copy] ?? RELAY_NONE;
+const app: AppInfo = settings.editable ? APP_INSTALLED : APP_RUN_ONCE;
+/** Whether the copy keeps a key. The key itself is not kept on this page. */
+let keySet = settings.stored?.relay?.keySet ?? false;
+let nextPick = 1;
+let picked: ChosenCa | null = null;
+
+/** A refusal as the backend words one. */
+function refuse(stage: string, message: string): never {
+  throw { stage, message };
+}
+
+// --- Make a customer copy (ST-M007-016) ---
+
+/** What was "chosen" in the dialogs, by its number, and the copy made last. */
+const copyPicks: { program?: number; place?: number } = {};
+let nextCopyPick = 1;
+let madeCopy = 0;
+
+/** The customer copy of a form, by the rules of the backend. */
+function makeCustomerCopy(form: CustomerCopyForm): CustomerCopyMade {
+  if (!/^[A-Za-z0-9-]{1,40}$/.test(form.label)) {
+    refuse(
+      "copy_label",
+      "The label holds letters, digits and hyphens only, at least one and at most 40. It becomes part of the folder's name.",
+    );
+  }
+  if (form.keyMode === "set") {
+    if (!form.key) {
+      refuse(
+        "copy_key",
+        "Type the admission key of this customer or generate one, or say that the relay asks for no key.",
+      );
+    }
+    if (/\s/.test(form.key)) {
+      refuse("copy_key", "The key holds a blank or a character that is not plain text.");
+    }
+  }
+  if (params.get("os") !== "windows" && form.programPick !== copyPicks.program) {
+    refuse("copy_program", "Choose cretlink.exe from the Windows archive of a CretLink release.");
+  }
+  if (form.placePick === undefined || form.placePick !== copyPicks.place) {
+    refuse("copy_place", "Choose the folder to make the copy in.");
+  }
+  const folder = `C:\\Users\\sam\\Documents\\Customers\\CretLink-Support-${form.label}`;
+  if (form.label === "exists" && !form.replace) {
+    refuse("copy_exists", `A folder ${folder} is there already. Nothing was changed.`);
+  }
+  if (form.label === "fail") {
+    refuse(
+      "copy_write",
+      "The customer copy could not be written: the disk is full. Nothing of it was left behind.",
+    );
+  }
+  madeCopy += 1;
+  const relay = activeRelay(settings);
+  return {
+    copy: madeCopy,
+    folder,
+    files: [
+      "CretLink-Support.exe",
+      "cretlink.toml",
+      ...(relay?.ca ? [relay.ca] : []),
+      "README.txt",
+    ],
+  };
+}
+
+/** The relay of a form, as the backend would keep it. */
+function relayOf(form: RelayForm): RelayView {
+  const address = form.address.trim();
+  const colon = address.lastIndexOf(":");
+  if (address === "") {
+    refuse(
+      "relay_address",
+      "`address` is empty; write the relay's host name and port, like relay.example.org:443.",
+    );
+  }
+  if (address.includes("/")) {
+    refuse(
+      "relay_address",
+      "`address` is the relay's host name and port only, like relay.example.org:443, without wss:// and without a path; CretLink always uses TLS.",
+    );
+  }
+  if (colon <= 0 || !/^\d{1,5}$/.test(address.slice(colon + 1))) {
+    refuse(
+      "relay_address",
+      "`address` needs a port; write the relay's host name and port, like relay.example.org:443.",
+    );
+  }
+  if (form.keyMode === "set" && /\s/.test(form.key ?? "")) {
+    refuse("relay_key", "`key` holds a blank or a character that is not plain text.");
+  }
+  if (form.caMode === "chosen" && form.caPick !== picked?.pick) {
+    refuse(
+      "relay_ca",
+      "The certificate file that was chosen is no longer at hand; choose it again.",
+    );
+  }
+  const stored = settings.stored?.relay;
+  const reached = address.slice(0, colon).toLowerCase();
+  const host = (form.name ?? reached).toLowerCase();
+  const withFile = form.caMode === "chosen" || (form.caMode === "keep" && stored?.ca !== undefined);
+  // A file that is chosen here is another one than the file that is kept.
+  const sameAuthority = form.caMode !== "chosen" && withFile === (stored?.ca !== undefined);
+  if (
+    form.keyMode === "keep" &&
+    keySet &&
+    stored &&
+    (addressHost(stored.address) !== reached || stored.host !== host || !sameAuthority)
+  ) {
+    refuse(
+      "relay_key",
+      `The key that is kept was saved for the relay ${stored.host} as it was: its host, the name in its certificate and its certificate authority. This form changes one of them, so enter the key again, or remove the key.`,
+    );
+  }
+  const relay: RelayView = {
+    host,
+    address: address.toLowerCase(),
+    trust: withFile ? "profile_file" : "system_authorities",
+    keySet: form.keyMode === "set" || (form.keyMode === "keep" && keySet),
+  };
+  if (withFile) relay.ca = "relay-ca.pem";
+  if (form.name) relay.name = form.name.toLowerCase();
+  return relay;
+}
+
+function runOnce(): never {
+  return refuse(
+    "relay_run_once",
+    "This copy runs once and keeps no settings. To give it a relay, put a file cretlink.toml next to the program.",
+  );
+}
+
+/** What the simulated relay says to a test of `relay`. */
+function test(relay: RelayView): RelayTest {
+  switch (answers) {
+    case "key":
+      return {
+        ok: false,
+        kind: relay.keySet ? "key_refused" : "key_required",
+        message: relay.keySet
+          ? `The relay ${relayWords(relay)} does not know the admission key of this copy. The key may be mistyped, or it was withdrawn.`
+          : `The relay ${relayWords(relay)} asks for an admission key, and this copy has none.`,
+        next: relay.keySet
+          ? "Enter the key again, or ask the relay's operator for a new one."
+          : "Enter the key that the relay's operator gave this copy.",
+      };
+    case "down":
+      return {
+        ok: false,
+        kind: "unreachable",
+        message: `CretLink could not connect to the relay at ${relay.address}. The relay may be off, the address may be wrong, or this network does not let this computer reach it.`,
+        next: "Check that the relay is running and that its address and port are right, then try again.",
+      };
+    default:
+      return {
+        ok: true,
+        kind: "admitted",
+        message: `The relay ${relayWords(relay)} answered and admits this copy. Its certificate is valid for ${relay.host}, checked against ${relay.trust === "profile_file" ? "the certificate file of this profile, and not against the certificate authorities of this computer" : "the certificate authorities of this computer"}.`,
+        next: "",
+      };
+  }
+}
+
+// --- A session, on this network or through the relay (ST-M007-013) ---
+
+/** What the simulated customer does once the relay holds the code. */
+const customer = params.get("customer") ?? "";
+/** The relay codes of this page, one for every wait, as the backend draws one. */
+const CODES = ["53ST-A71D-JKKV-0VGH", "7KQM-2D8R-XW4H-91TC", "B6ZN-QF03-M5YJ-8E2A"];
+let waits = 0;
+/** Counts the waits and sessions, so that a late step of an old one is dropped. */
+let generation = 0;
+
+let state: ConsoleState = consoleIn({ phase: "idle" }, { displayName: "Sam" });
+
+/** Sets the state and pushes it to the window, as the session's task does. */
+function show(next: ConsoleState): ConsoleState {
+  state = next;
+  void emit("console-state", next);
+  return next;
+}
+
+/** Runs `step` after the relay's pause, unless the wait it belongs to is over. */
+function later(step: () => void, times = 1): void {
+  const mine = generation;
+  window.setTimeout(() => {
+    if (mine === generation) step();
+  }, pause * times);
+}
+
+function listening(): ConsoleState {
+  return consoleIn(
+    { phase: "listening", code: "6RRR-2H8F", address: "10.0.0.42:7000" },
+    { displayName: "Sam" },
+  );
+}
+
+/** The words of a relay that cannot be used, as the backend gives them. */
+function relayFailure(relay: RelayView): { stage: string; message: string; next: string } {
+  const where = " You can change and test the relay in Settings, under Relay.";
+  const result = test(relay);
+  return { stage: `relay_${result.kind}`, message: result.message, next: result.next + where };
+}
+
+/** **Use relay**: the wait on the network ends, and the wait on the relay begins. */
+function useRelay(): Promise<ConsoleState> {
+  if (state.phase.phase !== "listening" || state.relay) {
+    refuse("relay", "A relay can be chosen only while waiting for the customer.");
+  }
+  const relay = activeRelay(settings);
+  if (!relay) {
+    const problem = settings.source === "file" ? settings.file.problem : settings.stored?.problem;
+    if (problem) refuse("relay_profile", `${problem.message} (${problem.file})`);
+    refuse(
+      "relay_none",
+      settings.editable
+        ? "This copy has no relay. Set one up in Settings, under Relay."
+        : "This copy has no relay. Put a file cretlink.toml next to the program; Settings, Relay shows where and what it holds.",
+    );
+  }
+  generation += 1;
+  // The listener of this network goes first, as in the application.
+  show(consoleIn({ phase: "stopped", reason: "technician_requested" }, { displayName: "Sam" }));
+  const code = CODES[waits % CODES.length] ?? "";
+  waits += 1;
+  const route: RelayRoute = {
+    host: relay.host,
+    address: relay.address,
+    trust: relay.trust,
+    admitted: false,
+  };
+  const waiting = (admitted: boolean): ConsoleState =>
+    consoleIn(
+      { phase: "listening", code, address: relay.address },
+      { displayName: "Sam", relay: { ...route, admitted } },
+    );
+  const mine = generation;
+  return new Promise((resolve) => {
+    window.setTimeout(() => {
+      if (mine !== generation) {
+        resolve(state);
+        return;
+      }
+      resolve(show(waiting(false)));
+      later(() => {
+        if (answers !== "admit") {
+          const failure = relayFailure(relay);
+          show(
+            consoleIn(
+              { phase: "failed", ...failure },
+              { displayName: "Sam", relay: { ...route, admitted: false } },
+            ),
+          );
+          return;
+        }
+        const held = { ...route, admitted: true };
+        show(waiting(true));
+        if (customer === "") return;
+        later(() => {
+          show(
+            consoleIn(
+              { phase: "awaiting_approval_code", code: "482913" },
+              { session: true, target: true, displayName: "Sam", relay: held },
+            ),
+          );
+          if (customer !== "lost") return;
+          later(() => {
+            show(
+              consoleIn(
+                {
+                  phase: "failed",
+                  stage: "relay_lost",
+                  message: `The connection through the relay ${relayWords(relay)} was lost.`,
+                },
+                { displayName: "Sam", relay: held },
+              ),
+            );
+          });
+        });
+      });
+    }, pause);
+  });
+}
+
+/** **Codes match**: the customer decides, and here allows. */
+function confirmCode(): ConsoleState {
+  if (state.phase.phase !== "awaiting_approval_code") {
+    refuse("compare", "there is no approval code to confirm right now");
+  }
+  const relay = state.relay;
+  const next = show(
+    consoleIn(
+      { phase: "awaiting_consent" },
+      { session: true, target: true, displayName: "Sam", ...(relay ? { relay } : {}) },
+    ),
+  );
+  later(() => {
+    show(
+      consoleIn(
+        { phase: "full_control" },
+        { session: true, target: true, displayName: "Sam", ...(relay ? { relay } : {}) },
+      ),
+    );
+  });
+  return next;
+}
+
+/** **Cancel**, **Stop** and Escape. */
+function stopSession(): ConsoleState {
+  generation += 1;
+  const relay = state.relay;
+  state = consoleIn(
+    { phase: "stopped", reason: "technician_requested" },
+    { displayName: "Sam", ...(relay ? { relay } : {}) },
+  );
+  return state;
+}
+
+mockWindows("main");
+mockIPC(
+  (cmd, args) => {
+    const payload = (args ?? {}) as Record<string, unknown>;
+    switch (cmd) {
+      case "get_state":
+        return state;
+      case "start_live_session":
+        generation += 1;
+        return show(listening());
+      case "get_listen_networks":
+        return NETWORKS;
+      case "use_relay":
+        return useRelay();
+      case "confirm_code":
+        return confirmCode();
+      case "stop_session":
+        return stopSession();
+      case "get_app_info":
+        return app;
+      case "get_relay_settings":
+        return settings;
+      case "customer_copy_options": {
+        const relay = activeRelay(settings);
+        if (!relay) refuse("relay_none", "This copy has no relay. Set one up in Settings, under Relay.");
+        return {
+          relay: { ...relay, keySet: false },
+          program: params.get("os") === "windows" ? "this_program" : "choose",
+          labelMax: 40,
+          folderPrefix: "CretLink-Support-",
+          programName: "CretLink-Support.exe",
+        };
+      }
+      case "choose_customer_program":
+        // The system's dialog cannot open here: a file is "chosen" at once.
+        copyPicks.program = nextCopyPick;
+        nextCopyPick += 1;
+        return { pick: copyPicks.program, name: "cretlink.exe" };
+      case "choose_customer_place":
+        copyPicks.place = nextCopyPick;
+        nextCopyPick += 1;
+        return { pick: copyPicks.place, name: "C:\\Users\\sam\\Documents\\Customers" };
+      case "generate_customer_key": {
+        // As the backend draws one: 32 random bytes as 64 hexadecimal digits.
+        const bytes = crypto.getRandomValues(new Uint8Array(32));
+        return { key: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("") };
+      }
+      case "make_customer_copy":
+        return makeCustomerCopy(payload.form as CustomerCopyForm);
+      case "show_customer_copy":
+        if (payload.copy !== madeCopy) refuse("copy_show", "That customer copy is no longer at hand.");
+        return null;
+      case "uninstall_plan": {
+        // What uninstall leaves in place: a relay profile next to the
+        // installed program stays, and the plan says what it holds.
+        const profile = settings.source === "file" ? settings.file.path : undefined;
+        return {
+          removes: [
+            "C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\cretlink.exe",
+            "Your settings (the relay with its key, the network to wait on): C:\\Users\\sam\\AppData\\Local\\Programs\\CretLink\\settings.toml",
+          ],
+          stays: profile
+            ? [
+                `The relay profile ${profile}, which CretLink did not write and does not remove. It holds the address of a relay and no admission key`,
+              ]
+            : [],
+        };
+      }
+      case "choose_relay_ca":
+        // The system's dialog cannot open here: a file is "chosen" at once.
+        picked = { pick: nextPick, name: "authority.pem" };
+        nextPick += 1;
+        return picked;
+      case "save_relay": {
+        if (!settings.editable) runOnce();
+        const form = payload.form as RelayForm;
+        const relay = relayOf(form);
+        keySet = relay.keySet;
+        picked = null;
+        settings = {
+          ...settings,
+          source: settings.source === "file" ? "file" : "settings",
+          stored: { path: settings.stored?.path ?? "", relay },
+        };
+        return settings;
+      }
+      case "remove_relay":
+        if (!settings.editable) runOnce();
+        keySet = false;
+        picked = null;
+        settings = {
+          ...settings,
+          source: settings.source === "file" ? "file" : "none",
+          stored: { path: settings.stored?.path ?? "" },
+        };
+        return settings;
+      case "test_relay": {
+        const form = payload.form as RelayForm | undefined;
+        const relay = form
+          ? relayOf(form)
+          : settings.source === "file"
+            ? settings.file.relay
+            : settings.stored?.relay;
+        if (!relay) refuse("relay_none", "This copy has no relay to test.");
+        return new Promise((resolve) => {
+          window.setTimeout(() => resolve(test(relay)), pause);
+        });
+      }
+      default:
+        // As Tauri answers a command the backend does not register.
+        throw `Command ${cmd} not found`;
+    }
+  },
+  { shouldMockEvents: true },
+);
+
+void start({ version: "dev" });
